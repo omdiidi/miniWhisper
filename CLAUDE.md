@@ -29,3 +29,5 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 - No server-side speaker rename — client-only, atomic local rewrite.
 - No tunnel token in `.env` or any file — stdin only during setup; cloudflared stores it in the macOS system keychain.
 - Secrets: `HF_TOKEN` and `WISPRALT_API_KEY` in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
+
+@CLAUDE.local.md

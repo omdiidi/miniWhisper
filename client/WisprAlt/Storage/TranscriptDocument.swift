@@ -97,6 +97,8 @@ struct TranscriptDocument: Codable {
     var segments: [Segment]
     /// Keyed by `speaker_raw`. This is the single source of truth for current display names.
     var speakers: [String: SpeakerInfo]
+    /// Optional server-emitted warnings (e.g. "mono input — dual-channel mode unavailable").
+    var warnings: [String]?
 
     // MARK: - Decode with validation
 
@@ -130,6 +132,52 @@ struct TranscriptDocument: Codable {
             guard seg.end >= seg.start else {
                 throw TranscriptError.malformedJSON("segment[\(i)].end (\(seg.end)) < start (\(seg.start))")
             }
+
+            // Per-word timestamp validation.
+            var prevWordStart: Double? = nil
+            for (j, word) in seg.words.enumerated() {
+                if let ws = word.start {
+                    guard ws.isFinite else {
+                        throw TranscriptError.malformedJSON("segment[\(i)].words[\(j)].start is not finite: \(ws)")
+                    }
+                    guard ws >= 0 else {
+                        throw TranscriptError.malformedJSON("segment[\(i)].words[\(j)].start is negative: \(ws)")
+                    }
+                    if let prev = prevWordStart, ws < prev {
+                        throw TranscriptError.malformedJSON(
+                            "segment[\(i)].words[\(j)].start (\(ws)) is not monotonic (prev: \(prev))")
+                    }
+                    prevWordStart = ws
+                }
+                if let we = word.end {
+                    guard we.isFinite else {
+                        throw TranscriptError.malformedJSON("segment[\(i)].words[\(j)].end is not finite: \(we)")
+                    }
+                    guard we >= 0 else {
+                        throw TranscriptError.malformedJSON("segment[\(i)].words[\(j)].end is negative: \(we)")
+                    }
+                    if let ws = word.start {
+                        guard we >= ws else {
+                            throw TranscriptError.malformedJSON(
+                                "segment[\(i)].words[\(j)].end (\(we)) < start (\(ws))")
+                        }
+                    }
+                }
+            }
+
+            // Segment bounds must contain all word timestamps.
+            if let firstWord = seg.words.first, let firstStart = firstWord.start {
+                guard seg.start <= firstStart else {
+                    throw TranscriptError.malformedJSON(
+                        "segment[\(i)].start (\(seg.start)) > words[0].start (\(firstStart))")
+                }
+            }
+            if let lastWord = seg.words.last, let lastEnd = lastWord.end {
+                guard seg.end >= lastEnd else {
+                    throw TranscriptError.malformedJSON(
+                        "segment[\(i)].end (\(seg.end)) < words.last.end (\(lastEnd))")
+                }
+            }
         }
         return doc
     }
@@ -147,11 +195,26 @@ struct TranscriptDocument: Codable {
     ///   - rawKey: The stable pyannote label (`"SPEAKER_00"`, `"mic"`, etc.).
     ///   - newName: The new display name. Must not collide with any existing display name.
     /// - Throws: `TranscriptError.unknownSpeaker` or `TranscriptError.speakerNameConflict`.
+    /// Returns true if *s* contains control characters, Unicode format characters
+    /// (Cf), zero-width spaces/joiners, or RTL/LTR override characters.
+    /// These are disallowed in speaker names to prevent display spoofing.
+    private static func containsForbiddenChars(_ s: String) -> Bool {
+        s.unicodeScalars.contains {
+            CharacterSet.controlCharacters.contains($0)
+                || ($0.value >= 0x200B && $0.value <= 0x200F)  // zero-width chars
+                || ($0.value >= 0x202A && $0.value <= 0x202E)  // LTR/RTL overrides
+        }
+    }
+
     mutating func renameSpeaker(rawKey: String, to newName: String) throws {
         // G2: Sanitise the input name before any other check.
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw TranscriptError.invalidSpeakerName("name cannot be empty")
+        }
+        // Reject names containing control/format/RTL-override characters.
+        if TranscriptDocument.containsForbiddenChars(trimmed) {
+            throw TranscriptError.invalidSpeakerName("name contains disallowed characters")
         }
         // Reject names that match an existing speaker_raw key (not just display_name).
         if speakers.keys.contains(trimmed) && trimmed != rawKey {
@@ -195,8 +258,13 @@ struct TranscriptDocument: Codable {
     // MARK: - Export
 
     /// Plain-text export: `[Speaker] text` per segment, joined by newlines.
+    /// Speaker and text are stripped of control characters to avoid breaking line structure.
     func toTXT() -> String {
-        segments.map { "[\($0.speaker)] \($0.text)" }.joined(separator: "\n")
+        segments.map { seg in
+            let speaker = TranscriptDocument.escapedForSRT(seg.speaker)
+            let text = TranscriptDocument.escapedForSRT(seg.text)
+            return "[\(speaker)] \(text)"
+        }.joined(separator: "\n")
     }
 
     /// SRT subtitle export with `Speaker: text` body convention.
@@ -205,7 +273,7 @@ struct TranscriptDocument: Codable {
         for (index, segment) in segments.enumerated() {
             lines.append(String(index + 1))
             lines.append("\(srtTimecode(segment.start)) --> \(srtTimecode(segment.end))")
-            lines.append("\(segment.speaker): \(segment.text)")
+            lines.append("\(TranscriptDocument.escapedForSRT(segment.speaker)): \(TranscriptDocument.escapedForSRT(segment.text))")
             lines.append("")  // blank separator
         }
         return lines.joined(separator: "\n")
@@ -216,7 +284,7 @@ struct TranscriptDocument: Codable {
         var lines = ["WEBVTT", ""]
         for segment in segments {
             lines.append("\(vttTimecode(segment.start)) --> \(vttTimecode(segment.end))")
-            lines.append("<v \(segment.speaker)>\(segment.text)</v>")
+            lines.append("<v \(TranscriptDocument.escapedForVTT(segment.speaker))>\(TranscriptDocument.escapedForVTT(segment.text))</v>")
             lines.append("")  // blank separator
         }
         return lines.joined(separator: "\n")

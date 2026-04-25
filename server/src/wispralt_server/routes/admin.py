@@ -28,11 +28,11 @@ import psutil
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from wispralt_server import auth, observability
-from wispralt_server.auth import require_api_key
-from wispralt_server.config import settings
-from wispralt_server.ops import env_writer
-from wispralt_server.ops.env_writer import find_env_path
+from .. import auth, observability
+from ..auth import require_api_key
+from ..config import settings
+from ..ops import env_writer
+from ..ops.env_writer import find_env_path
 
 logger = logging.getLogger(__name__)
 

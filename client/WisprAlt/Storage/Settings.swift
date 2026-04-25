@@ -24,6 +24,7 @@ final class Settings: ObservableObject {
         static let meetingsPath = "meetingsPath"
         static let holdMinDuration = "holdMinDuration"
         static let tripleTapWindow = "tripleTapWindow"
+        static let maxMeetingMinutes = "maxMeetingMinutes"
     }
 
     // MARK: - Published properties
@@ -83,6 +84,19 @@ final class Settings: ObservableObject {
         }
     }
 
+    /// Maximum meeting recording duration in minutes. Default 90.
+    /// Clamped to [5, 240] on set.
+    @Published var maxMeetingMinutes: Int {
+        didSet {
+            let clamped = min(max(maxMeetingMinutes, 5), 240)
+            if clamped != maxMeetingMinutes {
+                maxMeetingMinutes = clamped
+                return
+            }
+            defaults.set(maxMeetingMinutes, forKey: Key.maxMeetingMinutes)
+        }
+    }
+
     // MARK: - Init
 
     private init() {
@@ -96,12 +110,14 @@ final class Settings: ObservableObject {
 
         let storedHold = suite.object(forKey: Key.holdMinDuration) as? Double ?? 0.30
         let storedTriple = suite.object(forKey: Key.tripleTapWindow) as? Double ?? 0.40
+        let storedMaxMeetingMinutes = suite.object(forKey: Key.maxMeetingMinutes) as? Int ?? 90
 
         // @Published properties must be set before the object is fully initialised;
         // assign directly via stored property (bypasses didSet observers).
         self._meetingsPath = Published(initialValue: storedMeetingsPath)
         self._holdMinDuration = Published(initialValue: storedHold)
         self._tripleTapWindow = Published(initialValue: storedTriple)
+        self._maxMeetingMinutes = Published(initialValue: storedMaxMeetingMinutes)
         self._serverURL = Published(initialValue: nil) // set below after init completes
         self.serverURL = loadServerURL(from: suite)
     }

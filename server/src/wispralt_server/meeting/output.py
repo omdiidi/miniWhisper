@@ -50,6 +50,9 @@ def _atomic_write(content: bytes, dest: Path) -> None:
         delete=False,
         suffix=".tmp",
     )
+    assert os.stat(tmp.name).st_mode & 0o777 == 0o600, (
+        "tempfile default mode changed; review _atomic_write"
+    )
     try:
         tmp.write(content)
         tmp.flush()

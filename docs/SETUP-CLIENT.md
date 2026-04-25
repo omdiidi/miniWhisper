@@ -93,6 +93,10 @@ After the permission wizard, the app is ready for server configuration.
 4. The UI moves through three explicit states: **Uploading (with %)** → **Processing** → **Done**.
 5. Completed transcripts are saved to `~/Documents/WisprAlt/Meetings/` as `.json`, `.srt`, `.vtt`, and `.txt`.
 
+### Recording Limits
+
+Meeting recording is capped at **90 minutes** by default (configurable via Settings → Max meeting length). At the 60-minute mark, a system notification fires warning that the recording will auto-stop in 30 minutes. After the cap is reached, recording stops automatically and the upload begins immediately. You can change the cap (5–240 minutes) in the WisprAlt settings popover.
+
 ### In-Person Mode Auto-Detection
 
 If channel 2 (system audio) is silent for more than 90% of 100ms frames during the recording, the server automatically uses single-channel diarization with "Speaker 1", "Speaker 2", … labels instead of "You" / "Other".

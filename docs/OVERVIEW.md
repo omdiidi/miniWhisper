@@ -38,7 +38,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/jobs/store.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — SQLite job store, orphan recovery |
 | `server/src/wispralt_server/jobs/runner.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — asyncio.to_thread runner, semaphore |
 | `server/src/wispralt_server/ops/staging.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — staging area management |
-| `server/src/wispralt_server/ops/env_writer.py` | [SETUP-SERVER.md](SETUP-SERVER.md) — atomic .env rewrite, key rotation |
+| `server/src/wispralt_server/ops/env_writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — atomic .env rewrite, verify_env_perms, key rotation |
 | `server/src/wispralt_server/middleware/rate_limit.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [API.md](API.md) — per-IP rate limiting middleware |
 | `server/src/wispralt_server/observability.py` | [API.md](API.md) — thread-safe counters + latency histogram for `/metrics` |
 | `server/src/wispralt_server/_errors.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — typed domain exceptions |
@@ -93,7 +93,7 @@ This file is the single source of truth for which documentation file covers each
 | `scripts/doctor.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/server-uninstall.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/build-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) |
-| `scripts/uninstall-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) |
+| `scripts/uninstall-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — full client removal including Keychain, UserDefaults, app bundle |
 
 ## CI / GitHub (`github/`)
 

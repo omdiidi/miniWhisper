@@ -84,7 +84,7 @@ final class TranscriptStore: ObservableObject {
 
         for url in jsonURLs {
             guard let data = try? Data(contentsOf: url),
-                  let doc = try? JSONDecoder().decode(TranscriptDocument.self, from: data)
+                  let doc = try? TranscriptDocument.decode(data)
             else {
                 Log.warning("Could not parse transcript at \(url.lastPathComponent)", category: "store")
                 continue
@@ -123,11 +123,7 @@ final class TranscriptStore: ObservableObject {
         } catch {
             throw TranscriptError.ioError(error)
         }
-        do {
-            return try JSONDecoder().decode(TranscriptDocument.self, from: data)
-        } catch {
-            throw TranscriptError.decodingError(error)
-        }
+        return try TranscriptDocument.decode(data)
     }
 
     /// Renames a speaker in a transcript and atomically rewrites all four output formats.
@@ -300,7 +296,7 @@ final class TranscriptStore: ObservableObject {
 
         for url in contents where url.pathExtension == "json" {
             guard let data = try? Data(contentsOf: url),
-                  let doc = try? JSONDecoder().decode(TranscriptDocument.self, from: data),
+                  let doc = try? TranscriptDocument.decode(data),
                   doc.job_id == jobID
             else { continue }
             return url.deletingPathExtension()

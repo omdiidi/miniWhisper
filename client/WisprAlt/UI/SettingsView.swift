@@ -119,6 +119,18 @@ struct SettingsView: View {
                 }
             }
             .help("Maximum time between taps to count as a triple-tap.")
+
+            LabeledContent("Max meeting length (min)") {
+                Stepper(
+                    value: $settings.maxMeetingMinutes,
+                    in: 5...240,
+                    step: 5
+                ) {
+                    Text("\(settings.maxMeetingMinutes)")
+                        .monospacedDigit()
+                }
+            }
+            .help("Maximum meeting recording duration (5–240 min). Default 90.")
         }
     }
 

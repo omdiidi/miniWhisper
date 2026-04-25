@@ -48,6 +48,12 @@ final class MenuBarController: NSObject {
     /// True when a meeting recording is in progress. Used for mic mutual exclusion.
     var isMeetingActive: Bool { meetingActive }
 
+    // MARK: - Sparkle update error
+
+    /// Non-nil when the most recent Sparkle update cycle aborted with an error.
+    /// Cleared when the user retries the update check.
+    var lastUpdateError: String? = nil
+
     // MARK: - Recording state (observed by RecordingIndicatorView)
 
     let recordingState = RecordingState()
@@ -96,19 +102,21 @@ final class MenuBarController: NSObject {
 
     @objc private func handleMeetingMaxDurationReached() {
         guard MeetingRecorder.shared.isActive else { return }
-        Log.info("Meeting max duration reached — stopping and uploading.", category: "meeting")
+        let capMin = Settings.shared.maxMeetingMinutes
+        Log.info("Meeting max duration reached (\(capMin) min) — stopping and uploading.", category: "meeting")
         AppNotifications.notify(
             title: "Meeting Recording Stopped",
-            body: "90-minute cap reached. Uploading now."
+            body: "\(capMin)-minute cap reached. Uploading now."
         )
         toggleMeetingRecording()
     }
 
     @objc private func handleMeetingApproachingCap() {
-        Log.info("Meeting approaching 90-minute cap (60 min elapsed).", category: "meeting")
+        let capMin = Settings.shared.maxMeetingMinutes
+        Log.info("Meeting approaching \(capMin)-minute cap (60 min elapsed).", category: "meeting")
         AppNotifications.notify(
             title: "Meeting Recording",
-            body: "60 minutes elapsed; maximum recording length is 90 minutes."
+            body: "60 minutes elapsed; maximum recording length is \(capMin) minutes."
         )
     }
 
@@ -264,6 +272,8 @@ final class MenuBarController: NSObject {
             let pollDeadline = Date(timeIntervalSinceNow: max(2 * estimatedDurationSeconds, 600))
 
             // Poll every 5 seconds until done, failed, or deadline exceeded.
+            // Capture the `outputs` map from the done response for format-aware downloads.
+            var outputFormats: [String] = []
             pollLoop: while true {
                 if Date() > pollDeadline {
                     // Server did not respond in time; clean up and surface error.
@@ -274,7 +284,8 @@ final class MenuBarController: NSObject {
                 try await Task.sleep(nanoseconds: 5_000_000_000)
                 let status = try await MeetingAPI.poll(jobID)
                 switch status {
-                case .done:
+                case .done(let outputs):
+                    outputFormats = Array(outputs.keys)
                     break pollLoop
                 case .failed(let reason):
                     throw MeetingProcessingError.serverFailed(reason)
@@ -283,8 +294,17 @@ final class MenuBarController: NSObject {
                 }
             }
 
-            // --- Download all four formats ---
-            for fmt in ["json", "srt", "vtt", "txt"] {
+            // --- Download all formats ---
+            // Use the server-supplied `outputs` keys (sorted for deterministic ordering)
+            // so future server-side format additions are tracked automatically.
+            // Fall back to the hardcoded list if the server returned an empty outputs map.
+            let formatsToDownload: [String]
+            if !outputFormats.isEmpty {
+                formatsToDownload = outputFormats.sorted()
+            } else {
+                formatsToDownload = ["json", "srt", "vtt", "txt"]
+            }
+            for fmt in formatsToDownload {
                 let data = try await MeetingAPI.download(jobID, format: fmt)
                 try data.write(to: baseURL.appendingPathExtension(fmt), options: .atomic)
             }

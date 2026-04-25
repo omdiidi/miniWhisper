@@ -17,6 +17,7 @@ import base64
 import hashlib
 import os
 import shutil
+import struct
 import time
 import uuid
 from pathlib import Path
@@ -169,11 +170,18 @@ def sweep_old(
 def validate_wav_completeness(path: Path) -> None:
     """Validate that *path* is a plausible non-truncated WAV file.
 
-    Checks:
+    Checks
+    ------
     1. File is at least 44 bytes (minimum RIFF/WAVE/fmt/data header).
     2. First 4 bytes are ``RIFF`` and bytes 8–12 are ``WAVE``.
     3. The RIFF chunk size field (bytes 4–8, LE uint32) + 8 is within 4 bytes of
        the actual file size.  A truncated upload will be shorter than declared.
+    4. Sub-chunk walk: iterate all sub-chunks after the WAVE marker (each is an
+       8-byte header: 4-byte id + 4-byte LE uint32 size).  Verify that:
+       - ``fmt `` and ``data`` sub-chunks are present and non-empty (size > 0).
+       - No sub-chunk's declared size extends beyond the remaining file bytes.
+       - Total walked bytes equal the declared RIFF payload size (within 4 bytes
+         for encoders that pad to even boundaries).
 
     Raises
     ------
@@ -200,7 +208,6 @@ def validate_wav_completeness(path: Path) -> None:
         raise UploadTruncatedError("Not a valid WAV file (missing WAVE marker)")
 
     # RIFF chunk size = total file size - 8 (excludes the RIFF id + size field itself)
-    import struct
     declared_size = struct.unpack_from("<I", header, 4)[0]
     expected_file_size = declared_size + 8
     # Allow a small tolerance (4 bytes) for rounding / padding in some encoders.
@@ -209,6 +216,54 @@ def validate_wav_completeness(path: Path) -> None:
             f"WAV file appears truncated: declared {expected_file_size} bytes, "
             f"actual {file_size} bytes"
         )
+
+    # Sub-chunk walk: read every chunk after the 12-byte RIFF/WAVE header.
+    # Each sub-chunk is: 4-byte id  +  4-byte LE uint32 size  +  <size> bytes of data.
+    # RIFF payload starts at offset 12 and is declared_size - 4 bytes long (the
+    # -4 accounts for the "WAVE" fourcc that is part of the RIFF payload).
+    found_fmt = False
+    found_data = False
+
+    offset = 12  # position of first sub-chunk
+    payload_end = 8 + declared_size  # last byte of RIFF payload (exclusive)
+
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        while offset < payload_end:
+            chunk_header = fh.read(8)
+            if len(chunk_header) < 8:
+                raise UploadTruncatedError(
+                    f"WAV file truncated mid sub-chunk header at offset {offset}"
+                )
+            chunk_id = chunk_header[:4]
+            chunk_size = struct.unpack_from("<I", chunk_header, 4)[0]
+
+            chunk_data_end = offset + 8 + chunk_size
+            if chunk_data_end > file_size + 4:
+                raise UploadTruncatedError(
+                    f"Sub-chunk '{chunk_id.decode(errors='replace')}' at offset {offset} "
+                    f"declares size {chunk_size} bytes but only "
+                    f"{file_size - offset - 8} bytes remain in the file"
+                )
+
+            if chunk_id == b"fmt ":
+                if chunk_size == 0:
+                    raise UploadTruncatedError("WAV 'fmt ' sub-chunk is empty")
+                found_fmt = True
+            elif chunk_id == b"data":
+                if chunk_size == 0:
+                    raise UploadTruncatedError("WAV 'data' sub-chunk is empty (no audio samples)")
+                found_data = True
+
+            # Advance: 8-byte header + chunk data, padded to even boundary per RIFF spec.
+            step = 8 + chunk_size + (chunk_size % 2)  # RIFF pad byte on odd sizes
+            offset += step
+            fh.seek(offset)
+
+    if not found_fmt:
+        raise UploadTruncatedError("WAV file missing required 'fmt ' sub-chunk")
+    if not found_data:
+        raise UploadTruncatedError("WAV file missing required 'data' sub-chunk")
 
 
 def assert_same_filesystem(a: Path, b: Path) -> None:

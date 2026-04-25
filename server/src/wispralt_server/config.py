@@ -8,57 +8,16 @@ Exposes a module-level ``settings`` singleton used throughout the package.
 from __future__ import annotations
 
 import logging
-import os
-import stat
 from pathlib import Path
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Re-export verify_env_perms from ops.env_writer so callers that import it
+# from config continue to work without a duplicate definition.
+from wispralt_server.ops.env_writer import verify_env_perms as verify_env_perms  # noqa: F401
+
 logger = logging.getLogger(__name__)
-
-
-def verify_env_perms(env_path: Path) -> bool:
-    """Return True iff *env_path* is mode 0600 and owned by the current user.
-
-    Logs a loud WARNING (not an exception) on any violation so the server can
-    still start in CI/container environments where the .env is intentionally
-    world-readable via secret injection.
-    """
-    try:
-        st = env_path.stat()
-    except FileNotFoundError:
-        # No .env on disk is fine — values may come from the real environment.
-        return True
-    except OSError as exc:
-        logger.warning("Could not stat %s: %s", env_path, exc)
-        return False
-
-    mode = stat.S_IMODE(st.st_mode)
-    owner_ok = st.st_uid == os.getuid()
-    mode_ok = mode == 0o600
-
-    if not owner_ok:
-        logger.warning(
-            "SECURITY WARNING: %s is owned by uid %d, but current uid is %d. "
-            "This means other users on the system may read your secrets. "
-            "Fix with: sudo chown $(whoami) %s",
-            env_path,
-            st.st_uid,
-            os.getuid(),
-            env_path,
-        )
-    if not mode_ok:
-        logger.warning(
-            "SECURITY WARNING: %s has mode %o, expected 0600. "
-            "Other processes may be able to read your HF_TOKEN and API key. "
-            "Fix with: chmod 600 %s",
-            env_path,
-            mode,
-            env_path,
-        )
-
-    return owner_ok and mode_ok
 
 
 class Settings(BaseSettings):
@@ -90,6 +49,11 @@ class Settings(BaseSettings):
     # Rate-limit values (M6) — configurable from .env
     dictate_rate_per_min: int = 60
     meeting_rate_per_hour: int = 4
+
+    # Trust CF-Connecting-IP / X-Forwarded-For headers for rate-limit IP extraction.
+    # Set to False if exposing FastAPI directly without Cloudflare Tunnel (e.g. LAN testing)
+    # to avoid IP spoofing in rate limiting.
+    trust_forwarded_headers: bool = True
 
 
 # Module-level singleton — import as ``from wispralt_server.config import settings``

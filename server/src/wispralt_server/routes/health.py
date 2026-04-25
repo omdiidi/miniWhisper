@@ -27,7 +27,7 @@ import psutil
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from wispralt_server.auth import require_api_key
+from ..auth import require_api_key
 
 router = APIRouter()
 

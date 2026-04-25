@@ -199,6 +199,9 @@ Poll job status. The client should poll every 5 seconds.
 | `error` | When `status == "failed"`. Human-readable error string. |
 | `formats` | When `status == "done"`. Always `["json", "srt", "txt", "vtt"]`. Kept for backward compatibility. |
 | `outputs` | When `status == "done"`. Maps each format name to its download URL path. **Preferred** over `formats` for new clients. |
+| `attempts` | Always. Integer. Number of times this job has been set to `running`. Incremented each attempt. |
+
+**Retry policy:** Jobs that fail are automatically retried up to 3 times by the runner. After 3 failed attempts the job is marked `failed` with `error: "max retries exceeded"` and no further attempts are made.
 
 **Response 404** — job not found.
 

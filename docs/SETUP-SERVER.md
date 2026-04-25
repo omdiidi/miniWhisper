@@ -74,6 +74,8 @@ The setup script validates the token with `huggingface-cli whoami` **and** perfo
 
 The tunnel token will be passed to `setup-cloudflared.sh` via stdin. It is never written to any file on disk — `cloudflared` stores its persistent credential in the macOS system keychain automatically.
 
+> **Network security model:** FastAPI binds exclusively to `127.0.0.1:8000`; only `cloudflared` has external network access. Rate limiting reads `CF-Connecting-IP` from Cloudflare's authoritative header. If you change the bind address for LAN testing, set `TRUST_FORWARDED_HEADERS=false` in `.env` to avoid IP spoofing in rate limiting. Rate limiting reads `CF-Connecting-IP` from Cloudflare's authoritative header; if you bypass the tunnel for testing, the rate limiter falls back to direct client IP.
+
 ---
 
 ## Installation
@@ -145,6 +147,18 @@ All configuration is read from `server/.env` (mode 0600). The template is `serve
 | `MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum upload size in bytes (default 2 GiB) |
 
 Never commit `server/.env`. The `.gitignore` excludes it. The file must remain mode 0600 — the server warns loudly at startup if it is not (`config.py:verify_env_perms`).
+
+### Configuration Knobs
+
+| Variable | Default | When to change |
+|---|---|---|
+| `DICTATE_RATE_PER_MIN` | `60` | Lower if you want stricter per-IP rate limiting on the dictation endpoint |
+| `MEETING_RATE_PER_HOUR` | `4` | Lower to reduce concurrency risk; raise if multiple users share one server |
+| `TRUST_FORWARDED_HEADERS` | `true` | Set to `false` if you expose FastAPI directly without Cloudflare Tunnel (e.g. LAN testing) to avoid IP spoofing in rate limiting |
+
+### Migration
+
+On second startup, `jobs.db` is migrated to add the `attempts` column automatically (SQLite `ALTER TABLE`; idempotent — safe to restart multiple times).
 
 ---
 

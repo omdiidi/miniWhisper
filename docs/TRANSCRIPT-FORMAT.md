@@ -38,12 +38,17 @@ The following schema is the canonical contract between server output and client 
     "mic":         { "display_name": "You",     "channel": 1 },
     "SPEAKER_00":  { "display_name": "Other",   "channel": 2 },
     "SPEAKER_01":  { "display_name": "Other 2", "channel": 2 }
-  }
+  },
+  "warnings": [                      // optional; present when server has non-fatal notices
+    "mono input — dual-channel mode unavailable"
+  ]
 }
 ```
 
 **Important notes:**
 
+- `warnings` is an optional top-level array of human-readable server notices. The client displays these in a yellow banner at the top of the Transcript Detail view. Known warning strings:
+  - `"mono input — dual-channel mode unavailable"`: the uploaded WAV contained only one usable channel (e.g. microphone only, no system audio), so dual-channel remote diarization was not possible. The server fell back to single-channel mode.
 - `speaker_raw` is preserved even after rename so the client can map raw pyannote labels back to user names if a recording is reprocessed.
 - `speakers` is keyed by `speaker_raw` (not display name). This is a v3 change from the v1/v2 schema where `speakers` was keyed by display name.
 - `speaker` in each segment is the denormalized current display name; it is rewritten on every rename to keep the file self-contained for human readers.

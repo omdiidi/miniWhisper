@@ -23,6 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from wispralt_server._errors import UploadTruncatedError
+from wispralt_server.ops.staging import validate_wav_completeness
+
 
 @dataclass
 class Job:
@@ -232,8 +235,6 @@ class JobStore:
 
                 # C14: Validate WAV completeness before re-queuing. A truncated
                 # upload would succeed submit but fail transcription; fail-fast here.
-                from wispralt_server.ops.staging import validate_wav_completeness
-                from wispralt_server._errors import UploadTruncatedError
                 try:
                     validate_wav_completeness(wav)
                 except UploadTruncatedError as exc:

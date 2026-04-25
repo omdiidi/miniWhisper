@@ -234,6 +234,7 @@ def create_app() -> FastAPI:
         RateLimitMiddleware,
         dictate_per_min=settings.dictate_rate_per_min,
         meeting_per_hour=settings.meeting_rate_per_hour,
+        trust_forwarded_headers=settings.trust_forwarded_headers,
     )
 
     # Mount routers

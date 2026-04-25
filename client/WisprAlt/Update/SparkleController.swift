@@ -84,6 +84,13 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
             title: "Auto-update Failed",
             body: "Auto-update failed: \(error.localizedDescription)"
         )
+        menuBarController?.lastUpdateError = error.localizedDescription
+    }
+
+    /// Retry a failed update check and clear the stored error.
+    func retryUpdateCheck() {
+        menuBarController?.lastUpdateError = nil
+        updaterController.checkForUpdates(nil)
     }
 
     /// Called after each complete update cycle.  `error` is non-nil when the cycle

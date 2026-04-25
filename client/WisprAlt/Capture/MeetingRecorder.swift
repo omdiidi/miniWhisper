@@ -130,7 +130,12 @@ final class MeetingRecorder: NSObject {
     /// - Throws: `MeetingRecorderError.alreadyRunning` if a session is in progress.
     ///   `MeetingRecorderError.noDisplayAvailable` if no display is enumerable
     ///   (v3 P5#13).
-    func start(to url: URL, maxDuration: TimeInterval = 5400) async throws {
+    func start(to url: URL, maxDuration: TimeInterval = -1) async throws {
+        // Resolve maxDuration: negative sentinel means "read from Settings at call time".
+        let resolvedMaxDuration = maxDuration < 0
+            ? TimeInterval(Settings.shared.maxMeetingMinutes * 60)
+            : maxDuration
+        let maxDuration = resolvedMaxDuration
         guard !isActive else { throw MeetingRecorderError.alreadyRunning }
 
         // Enumerate shareable content to get the primary display.

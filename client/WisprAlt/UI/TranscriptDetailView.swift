@@ -66,13 +66,27 @@ struct TranscriptDetailView: View {
 
     @ViewBuilder
     private func transcriptContent(_ doc: TranscriptDocument) -> some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 12) {
-                ForEach(Array(doc.segments.enumerated()), id: \.offset) { _, segment in
-                    SegmentView(segment: segment)
+        VStack(spacing: 0) {
+            if let warnings = doc.warnings, !warnings.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                    Text(warnings.joined(separator: "\n"))
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                    Spacer()
                 }
+                .padding(10)
+                .background(Color.yellow.opacity(0.15))
             }
-            .padding()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(Array(doc.segments.enumerated()), id: \.offset) { _, segment in
+                        SegmentView(segment: segment)
+                    }
+                }
+                .padding()
+            }
         }
     }
 

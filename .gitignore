@@ -40,3 +40,4 @@ server/.env
 
 # Logs
 *.log
+CLAUDE.local.md
