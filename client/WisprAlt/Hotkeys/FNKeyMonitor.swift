@@ -40,11 +40,24 @@ final class FNKeyMonitor {
     private(set) weak var delegate: FNKeyEventsDelegate?
 
     // MARK: - Configuration
+    //
+    // holdThreshold and tripleWindow are read from Settings at use-site so that
+    // changes in the Settings UI take effect immediately without restarting the
+    // monitor.  Values are clamped to sane ranges on read.
 
-    /// Seconds FN must be held before dictation is confirmed (v3 binding: fires on `q`).
-    private let holdThreshold: Double = 0.30
+    /// Seconds FN must be held before dictation is confirmed.
+    /// Clamped to [0.10, 1.00] at read time; persisted clamping is in Settings.
+    private var holdThreshold: Double {
+        let v = Settings.shared.holdMinDuration
+        return min(max(v, 0.10), 1.00)
+    }
+
     /// Window in seconds within which three FN taps trigger meeting toggle.
-    private let tripleWindow: Double = 0.40
+    /// Clamped to [0.20, 0.80] at read time; persisted clamping is in Settings.
+    private var tripleWindow: Double {
+        let v = Settings.shared.tripleTapWindow
+        return min(max(v, 0.20), 0.80)
+    }
 
     // MARK: - Private state — ALL mutations on `q`
 
@@ -219,11 +232,18 @@ final class FNKeyMonitor {
         let duration = t - downTime
         fnDownTime = nil
 
-        // FN + another key: ignore entirely.
-        if otherKeyDuringFN { return }
+        // FN + another key: ignore entirely — these are modifier combos (FN+arrow etc.).
+        // Invariant: tapTimes must not contain spurious modifier-combo presses, so clear it.
+        if otherKeyDuringFN {
+            tapTimes.removeAll()
+            return
+        }
 
         if duration >= holdThreshold {
             // Confirmed hold release → stop dictation.
+            // Clear tapTimes so stale short-press records from before the hold
+            // cannot poison a subsequent triple-tap window.
+            tapTimes.removeAll()
             let del = delegate
             DispatchQueue.main.async {
                 del?.dictationStop()

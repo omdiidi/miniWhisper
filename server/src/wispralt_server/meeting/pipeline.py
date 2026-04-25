@@ -118,7 +118,8 @@ def _load_channels(wav_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
 
     try:
         audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-    except sf.SoundFileError as exc:
+    except (sf.LibsndfileError, RuntimeError) as exc:
+        # soundfile raises LibsndfileError since 0.12+; older versions raise RuntimeError.
         raise CorruptAudioError(f"Cannot decode WAV: {exc}") from exc
 
     # audio shape: (samples, channels)
@@ -211,6 +212,17 @@ def transcribe_meeting(
     ch1 = _resample_to_16k(ch1_raw, src_sr)
     ch2 = _resample_to_16k(ch2_raw, src_sr)
 
+    # ── Step 1b: Detect mono input ───────────────────────────────────────────
+    # I9: _load_channels returns a zero ch2 array when the WAV is mono.  Detect
+    # this by checking the on-disk channel count and add a warnings entry so the
+    # client/user can see why dual-channel features are absent.
+    _mono_warnings: list[str] = []
+    with sf.SoundFile(str(wav_path)) as _probe:
+        _on_disk_channels = _probe.channels
+    if _on_disk_channels == 1:
+        logger.warning("[%s] Input WAV is mono — dual-channel mode unavailable.", job_id)
+        _mono_warnings.append("mono input — dual-channel mode unavailable")
+
     # ── Step 2: Detect in-person mode via ch2 silence ─────────────────────────
     in_person = is_silent_robust(
         ch2,
@@ -279,6 +291,9 @@ def transcribe_meeting(
         segments=segments,
         audio_16k=ch1,  # use ch1 length for duration
     )
+    # I9: Add warnings field for non-standard input conditions (e.g. mono WAV).
+    if _mono_warnings:
+        transcript["warnings"] = _mono_warnings
 
     # ── Step 6: Write output files ────────────────────────────────────────────
     logger.debug("[%s] Writing output files to %s …", job_id, output_dir)

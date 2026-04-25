@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     # Upload guard (default 2 GiB)
     max_upload_bytes: int = 2_147_483_648
 
+    # Rate-limit values (M6) — configurable from .env
+    dictate_rate_per_min: int = 60
+    meeting_rate_per_hour: int = 4
+
 
 # Module-level singleton — import as ``from wispralt_server.config import settings``
 settings = Settings()

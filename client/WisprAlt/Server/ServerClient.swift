@@ -100,6 +100,16 @@ final class ServerClient {
     ///
     /// Retries once on `URLError.networkConnectionLost` or `.timedOut` when
     /// `retryOnReset` is true (dictation only — never for meeting uploads).
+    /// Transient URLError codes that warrant a single retry for dictation requests.
+    /// Meeting uploads (large files) are NEVER retried blindly — see submit() in MeetingAPI.
+    private static let retryableURLErrorCodes: Set<URLError.Code> = [
+        .networkConnectionLost,
+        .timedOut,
+        .dnsLookupFailed,
+        .cannotConnectToHost,
+        .cannotFindHost,
+    ]
+
     func execute(
         _ request: URLRequest,
         retryOnReset: Bool = false
@@ -107,7 +117,7 @@ final class ServerClient {
         do {
             return try await performRequest(request)
         } catch let urlErr as URLError
-            where retryOnReset && (urlErr.code == .networkConnectionLost || urlErr.code == .timedOut)
+            where retryOnReset && Self.retryableURLErrorCodes.contains(urlErr.code)
         {
             Log.warning(
                 "URLError \(urlErr.code.rawValue) — retrying once.",

@@ -33,6 +33,19 @@ step() { echo -e "\n${GREEN}==>${NC} $*"; }
 warn() { echo -e "${YELLOW}WARNING:${NC} $*" >&2; }
 die()  { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
+# ── 0. Platform + Xcode CLT pre-flight (G7) ──────────────────────────────────
+step "Checking Apple Silicon..."
+if [ "$(uname -m)" != "arm64" ]; then
+    die "WisprAlt server requires Apple Silicon (M-series Mac). Detected: $(uname -m)"
+fi
+echo "Apple Silicon detected — OK"
+
+step "Checking Xcode Command Line Tools..."
+if ! xcrun -p >/dev/null 2>&1; then
+    die "Xcode Command Line Tools are required. Install them with: xcode-select --install"
+fi
+echo "Xcode CLT found at: $(xcrun -p) — OK"
+
 # ── 1. macOS version ──────────────────────────────────────────────────────────
 step "Checking macOS version (require ≥ 13.0)..."
 OS_VERSION="$(sw_vers -productVersion)"

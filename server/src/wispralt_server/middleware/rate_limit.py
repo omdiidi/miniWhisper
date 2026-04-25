@@ -8,6 +8,17 @@ Two independent windows:
 
 The deques are never pruned for removed IPs; on a single-user Mac mini this is
 acceptable (one real IP, a handful of load-balancer IPs at most).
+
+IP extraction (Cloudflare Tunnel deployment):
+  Rate limits use the real client IP, not the Cloudflare edge node IP.
+  Priority:
+    1. CF-Connecting-IP  — set by Cloudflare edge; cannot be spoofed by clients
+       when the origin is only reachable through Cloudflare Tunnel.
+    2. Leftmost entry of X-Forwarded-For (pre-CF proxy, if any).
+    3. TCP remote address (request.client.host) as last resort.
+  ``trust_forwarded_headers=True`` (default) enables steps 1 & 2.  Set to
+  ``False`` in environments where CF-Connecting-IP/X-Forwarded-For are not
+  trustworthy.
 """
 
 from __future__ import annotations
@@ -21,6 +32,29 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 
+def _extract_client_ip(request: Request, *, trust_forwarded: bool = True) -> str:
+    """Return the best-effort real client IP for rate-limiting.
+
+    When behind a Cloudflare Tunnel, CF-Connecting-IP is the authoritative
+    source — it is injected by Cloudflare and cannot be forged by the client.
+    """
+    if trust_forwarded:
+        # 1. CF-Connecting-IP (Cloudflare's authoritative real-IP header)
+        cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+        if cf_ip:
+            return cf_ip
+
+        # 2. Leftmost entry of X-Forwarded-For
+        xff = request.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            first = xff.split(",")[0].strip()
+            if first:
+                return first
+
+    # 3. TCP remote address
+    return request.client.host if request.client else "unknown"
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Per-IP rolling-window rate limiter.
 
@@ -30,6 +64,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         Maximum dictation requests per IP per 60-second rolling window.
     meeting_per_hour:
         Maximum meeting POST submissions per IP per 3600-second rolling window.
+    trust_forwarded_headers:
+        When True (default), read CF-Connecting-IP / X-Forwarded-For for the
+        real client IP.  The deployment model is Cloudflare Tunnel so this is
+        always safe; set to False only for local development without CF.
     """
 
     def __init__(
@@ -38,19 +76,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         *,
         dictate_per_min: int = 60,
         meeting_per_hour: int = 4,
+        trust_forwarded_headers: bool = True,
     ) -> None:
         super().__init__(app)
         self.dictate_window = 60.0
         self.meeting_window = 3600.0
         self.dictate_max = dictate_per_min
         self.meeting_max = meeting_per_hour
+        self.trust_forwarded_headers = trust_forwarded_headers
         # Separate deque-per-IP registries for the two route groups
         self._dictate: dict[str, deque[float]] = defaultdict(deque)
         self._meeting: dict[str, deque[float]] = defaultdict(deque)
 
     async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[type-arg]
         path = request.url.path
-        ip: str = request.client.host if request.client else "unknown"
+        ip: str = _extract_client_ip(request, trust_forwarded=self.trust_forwarded_headers)
         now = time.time()
 
         if path.startswith("/transcribe/dictate"):

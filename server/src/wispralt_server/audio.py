@@ -44,7 +44,8 @@ def decode_wav_bytes(b: bytes) -> tuple[np.ndarray, int]:
     """
     try:
         audio, sr = sf.read(io.BytesIO(b), dtype="float32", always_2d=False)
-    except sf.SoundFileError as exc:
+    except (sf.LibsndfileError, RuntimeError) as exc:
+        # soundfile raises LibsndfileError since 0.12+; older versions raise RuntimeError.
         raise CorruptAudioError(f"Cannot decode audio: {exc}") from exc
     return audio, int(sr)
 

@@ -44,9 +44,19 @@ final class MeetingRecorder: NSObject {
     static let shared = MeetingRecorder()
 
     // MARK: - Public state
+    //
+    // I1: `isActive` is read from @MainActor callers (MenuBarController, FNKeyMonitor)
+    // AND written from `ioQueue` (SCStreamDelegate). Using OSAllocatedUnfairLock makes
+    // the getter/setter data-race-free on macOS 13+ without requiring the caller to
+    // hop queues.
 
-    /// `true` while capture is active. Queried by `DictationRecorder.start()` for mic exclusion.
-    private(set) var isActive: Bool = false
+    private let _isActiveLock = OSAllocatedUnfairLock(initialState: false)
+
+    /// `true` while capture is active. Thread-safe; safe to read from any thread.
+    var isActive: Bool {
+        get { _isActiveLock.withLock { $0 } }
+        private set { _isActiveLock.withLock { $0 = newValue } }
+    }
 
     // MARK: - Private capture state
 
@@ -92,9 +102,15 @@ final class MeetingRecorder: NSObject {
 
     private var flushTimer: DispatchSourceTimer?
 
-    // MARK: - Sleep/wake observer
+    // MARK: - Sleep/wake observers
 
     private var sleepWakeObserver: NSObjectProtocol?
+    private var willSleepObserver: NSObjectProtocol?
+
+    // MARK: - Max duration timers (C13)
+
+    private var capTimer: DispatchSourceTimer?
+    private var warningTimer: DispatchSourceTimer?
 
     // MARK: - Init
 
@@ -106,11 +122,15 @@ final class MeetingRecorder: NSObject {
 
     /// Starts dual-channel meeting capture and writes output to `url`.
     ///
-    /// - Parameter url: Destination WAV file URL (will be overwritten if it exists).
+    /// - Parameters:
+    ///   - url: Destination WAV file URL (will be overwritten if it exists).
+    ///   - maxDuration: Hard recording cap in seconds (default 5400 = 90 min).
+    ///     At 3600 s (60 min) a `.meetingApproachingCap` notification is posted.
+    ///     At `maxDuration` a `.meetingMaxDurationReached` notification is posted.
     /// - Throws: `MeetingRecorderError.alreadyRunning` if a session is in progress.
     ///   `MeetingRecorderError.noDisplayAvailable` if no display is enumerable
     ///   (v3 P5#13).
-    func start(to url: URL) async throws {
+    func start(to url: URL, maxDuration: TimeInterval = 5400) async throws {
         guard !isActive else { throw MeetingRecorderError.alreadyRunning }
 
         // Enumerate shareable content to get the primary display.
@@ -179,7 +199,19 @@ final class MeetingRecorder: NSObject {
         // Install 100 ms flush timer for wall-clock stall detection (v3 P5#8).
         startFlushTimer()
 
+        // C13: Install max-duration and approach-warning timers.
+        startCapTimers(maxDuration: maxDuration)
+
         // Register for sleep/wake notifications (v3 P5#5).
+        // willSleepObserver captures the Mach time just before sleep so the wake
+        // handler can compute the exact gap duration for silence padding.
+        willSleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.preSleepMachTime = mach_absolute_time()
+        }
         sleepWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
@@ -190,6 +222,37 @@ final class MeetingRecorder: NSObject {
 
         isActive = true
         Log.info("MeetingRecorder: capture started → \(url.lastPathComponent)", category: "capture")
+    }
+
+    // MARK: - Cap timer helpers (C13)
+
+    private func startCapTimers(maxDuration: TimeInterval) {
+        // 60-minute warning.
+        if maxDuration > 3600 {
+            let warnTimer = DispatchSource.makeTimerSource(queue: .main)
+            warnTimer.schedule(deadline: .now() + 3600, repeating: .never)
+            warnTimer.setEventHandler {
+                NotificationCenter.default.post(name: .meetingApproachingCap, object: nil)
+            }
+            warnTimer.resume()
+            warningTimer = warnTimer
+        }
+
+        // Hard cap at maxDuration.
+        let hardTimer = DispatchSource.makeTimerSource(queue: .main)
+        hardTimer.schedule(deadline: .now() + maxDuration, repeating: .never)
+        hardTimer.setEventHandler {
+            NotificationCenter.default.post(name: .meetingMaxDurationReached, object: nil)
+        }
+        hardTimer.resume()
+        capTimer = hardTimer
+    }
+
+    private func stopCapTimers() {
+        capTimer?.cancel()
+        capTimer = nil
+        warningTimer?.cancel()
+        warningTimer = nil
     }
 
     // MARK: - Stop
@@ -203,10 +266,15 @@ final class MeetingRecorder: NSObject {
             throw MeetingRecorderError.notRunning
         }
 
-        // Stop the wall-clock timer first.
+        // Stop the wall-clock timer and cap timers first.
         stopFlushTimer()
+        stopCapTimers()
 
-        // Remove sleep/wake observer.
+        // Remove sleep/wake observers.
+        if let obs = willSleepObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            willSleepObserver = nil
+        }
         if let obs = sleepWakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
             sleepWakeObserver = nil
@@ -218,7 +286,7 @@ final class MeetingRecorder: NSObject {
 
         // Final alignment: pad any lagging channel with silence up to the longest tail.
         ioQueue.sync {
-            self.aligned.padMissing(toEnd: true)
+            self.aligned.padMissing(toEnd: true)  // stop path: pad to longest tail
             self.drainToFile(forceFlush: true)
 
             // v3 P4#14: nil out stereoFile inside the ioQueue block so the AVAudioFile
@@ -268,13 +336,42 @@ final class MeetingRecorder: NSObject {
         flushTimer = nil
     }
 
+    // MARK: - Sleep/wake wall-clock tracking
+
+    /// Mach absolute time captured just before the system goes to sleep.
+    /// Set by a willSleepNotification observer; read by handleSystemWake.
+    private var preSleepMachTime: UInt64 = 0
+
     // MARK: - Private: sleep/wake handler
 
+    /// Called on wake.  Computes the wall-clock sleep gap, converts to samples,
+    /// pads silence into the lagging channel, then drains the aligned buffer.
+    ///
+    /// ## Contract
+    /// The sleep gap is converted to 16 kHz samples and added to the current
+    /// maximum channel tail.  `padMissing(uptoSampleEnd:)` fills both channels
+    /// up to that position.  Subsequent `flushAligned(forceFlush: true)` calls
+    /// drain the padded data in normal-sized chunks.
     private func handleSystemWake() {
+        let wakeTime = mach_absolute_time()
         ioQueue.async { [weak self] in
             guard let self, self.isActive else { return }
-            Log.info("MeetingRecorder: system wake detected — force-flushing aligned buffer with silence pad.", category: "capture")
-            self.aligned.padMissing(toEnd: false)
+            Log.info("MeetingRecorder: system wake detected — inserting silence for sleep gap.", category: "capture")
+
+            // Compute gap in seconds using Mach timebase (avoids float drift).
+            let sleepMachDelta = preSleepMachTime > 0 ? wakeTime - preSleepMachTime : 0
+            var timebase = mach_timebase_info_data_t()
+            mach_timebase_info(&timebase)
+            let gapSeconds = Double(sleepMachDelta) * Double(timebase.numer) / Double(timebase.denom) * 1e-9
+
+            // Convert gap to sample count and compute the target end position.
+            let gapSamples = Int(gapSeconds * 16_000.0)
+            let micTail = self.aligned.channelTail(.mic)
+            let sysTail = self.aligned.channelTail(.system)
+            let currentMax = max(micTail, sysTail)
+            let expectedEnd = currentMax + max(0, gapSamples)
+
+            self.aligned.padMissing(uptoSampleEnd: expectedEnd)
             self.drainToFile(forceFlush: true)
         }
     }

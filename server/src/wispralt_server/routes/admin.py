@@ -20,6 +20,7 @@ import logging
 import os
 import secrets
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -27,14 +28,20 @@ import psutil
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from wispralt_server import auth
+from wispralt_server import auth, observability
 from wispralt_server.auth import require_api_key
 from wispralt_server.config import settings
 from wispralt_server.ops import env_writer
+from wispralt_server.ops.env_writer import find_env_path
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# C10: Module-level lock prevents concurrent rotate-key requests from interleaving
+# rewrite_env_var and set_current_key, which would leave the in-memory key and
+# the on-disk key out of sync for a brief window.
+_rotate_lock = threading.Lock()
 
 # Fallback key file — chmod 600; deleted on next successful auth (Phase 2 wires that)
 _LAST_ROTATION_KEY_PATH = (
@@ -60,32 +67,35 @@ async def rotate_key(request: Request) -> JSONResponse:
     5. Call ``auth.set_current_key(new_key)`` for in-memory hot-swap.
     6. Return ``{"rotated": true}`` — key is NEVER in the response body.
     """
-    new_key = secrets.token_hex(32)
+    # C10: both rewrite_env_var AND set_current_key must execute under the lock so
+    # that concurrent rotate-key requests cannot interleave and leave the on-disk
+    # and in-memory keys out of sync.
+    with _rotate_lock:
+        new_key = secrets.token_hex(32)
 
-    # Locate the .env file — search in the server/ directory relative to CWD,
-    # then fall back to CWD itself.
-    env_path = _find_env_path()
+        # Locate the .env file via the canonical shared helper (M4).
+        env_path = find_env_path()
 
-    # 1. Persist to .env atomically (chmod 600 guaranteed by env_writer)
-    try:
-        env_writer.rewrite_env_var(env_path, "WISPRALT_API_KEY", new_key)
-    except OSError as exc:
-        logger.error("Failed to rewrite .env during key rotation: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to persist new key") from exc
+        # 1. Persist to .env atomically (chmod 600 guaranteed by env_writer)
+        try:
+            env_writer.rewrite_env_var(env_path, "WISPRALT_API_KEY", new_key)
+        except OSError as exc:
+            logger.error("Failed to rewrite .env during key rotation: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to persist new key") from exc
 
-    # 2. Write to fallback retrieval file (chmod 600)
-    try:
-        _LAST_ROTATION_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _write_secure_file(_LAST_ROTATION_KEY_PATH, new_key)
-    except OSError as exc:
-        # Non-fatal — log but continue; key is already in .env and stdout
-        logger.warning("Could not write last-rotation-key file: %s", exc)
+        # 2. Write to fallback retrieval file (chmod 600)
+        try:
+            _LAST_ROTATION_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _write_secure_file(_LAST_ROTATION_KEY_PATH, new_key)
+        except OSError as exc:
+            # Non-fatal — log but continue; key is already in .env and stdout
+            logger.warning("Could not write last-rotation-key file: %s", exc)
 
-    # 3. Emit to stdout (launchd captures → server.log)
-    print(f"NEW_API_KEY={new_key}", flush=True)  # noqa: T201
+        # 3. Emit to stdout (launchd captures → server.log)
+        print(f"NEW_API_KEY={new_key}", flush=True)  # noqa: T201
 
-    # 4. Hot-swap in-memory key — after this line the old key is invalid
-    auth.set_current_key(new_key)
+        # 4. Hot-swap in-memory key — after this line the old key is invalid
+        auth.set_current_key(new_key)
 
     logger.info("API key rotated successfully at %s", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
 
@@ -161,6 +171,10 @@ async def metrics(request: Request) -> JSONResponse:
     except OSError:
         staging_count_live = 0
 
+    # Observability data from module-level singletons (G4).
+    all_routes = observability.latency_histogram.all_routes()
+    latencies_by_route = {route: observability.latency_histogram.percentiles(route) for route in sorted(all_routes)}
+
     return JSONResponse(
         content={
             "parakeet": {
@@ -184,29 +198,16 @@ async def metrics(request: Request) -> JSONResponse:
                 "free_gb": free_gb,
                 "staging_count": staging_count_live,
             },
+            "requests_total": observability.request_counter.as_dict(),
+            "errors_total": observability.error_counter.as_dict(),
+            "latencies": latencies_by_route,
         }
     )
 
 
+# M4: _find_env_path removed — use ops.env_writer.find_env_path() instead.
+
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-
-def _find_env_path() -> Path:
-    """Locate the .env file used by the server.
-
-    Search order:
-    1. ``server/.env`` relative to CWD (typical when started from repo root).
-    2. ``.env`` in CWD (typical when started from the server/ directory).
-    3. Fall back to CWD/.env and let env_writer create it.
-    """
-    candidates = [
-        Path.cwd() / "server" / ".env",
-        Path.cwd() / ".env",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return Path.cwd() / ".env"
 
 
 def _write_secure_file(path: Path, content: str) -> None:

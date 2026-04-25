@@ -74,6 +74,42 @@ final class MenuBarController: NSObject {
         configureStatusItem()
         configurePopover()
         updateIcon()
+        configureMeetingCapObservers()
+    }
+
+    // MARK: - C13: Recording cap observers
+
+    private func configureMeetingCapObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMeetingMaxDurationReached),
+            name: .meetingMaxDurationReached,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMeetingApproachingCap),
+            name: .meetingApproachingCap,
+            object: nil
+        )
+    }
+
+    @objc private func handleMeetingMaxDurationReached() {
+        guard MeetingRecorder.shared.isActive else { return }
+        Log.info("Meeting max duration reached — stopping and uploading.", category: "meeting")
+        AppNotifications.notify(
+            title: "Meeting Recording Stopped",
+            body: "90-minute cap reached. Uploading now."
+        )
+        toggleMeetingRecording()
+    }
+
+    @objc private func handleMeetingApproachingCap() {
+        Log.info("Meeting approaching 90-minute cap (60 min elapsed).", category: "meeting")
+        AppNotifications.notify(
+            title: "Meeting Recording",
+            body: "60 minutes elapsed; maximum recording length is 90 minutes."
+        )
     }
 
     // MARK: - Configuration
@@ -210,6 +246,10 @@ final class MenuBarController: NSObject {
 
         do {
             // --- Upload ---
+            // Estimate recording duration from file size (2-ch 16kHz Float32 = 128 kB/s).
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: wavURL.path)[.size] as? Int) ?? 0
+            let estimatedDurationSeconds = Double(fileSize) / (2 * 16_000 * 4)  // 2ch * 16kHz * 4 bytes
+
             let jobID = try await MeetingAPI.submit(wavURL) { [weak self] fraction in
                 guard let self else { return }
                 self.recordingState.uploadFraction = fraction
@@ -219,8 +259,18 @@ final class MenuBarController: NSObject {
             mode = .processing
             Log.info("Meeting uploaded — job_id: \(jobID), polling for completion.", category: "meeting")
 
-            // Poll every 5 seconds until done or failed.
+            // C11: compute a deadline — allow at least 2× the recording duration or 600s,
+            // whichever is larger. If the deadline expires, give up and notify the user.
+            let pollDeadline = Date(timeIntervalSinceNow: max(2 * estimatedDurationSeconds, 600))
+
+            // Poll every 5 seconds until done, failed, or deadline exceeded.
             pollLoop: while true {
+                if Date() > pollDeadline {
+                    // Server did not respond in time; clean up and surface error.
+                    Log.error("Meeting poll timed out for job \(jobID) — deadline exceeded.", category: "meeting")
+                    try? await MeetingAPI.delete(jobID)
+                    throw MeetingProcessingError.pollTimedOut
+                }
                 try await Task.sleep(nanoseconds: 5_000_000_000)
                 let status = try await MeetingAPI.poll(jobID)
                 switch status {
@@ -331,11 +381,14 @@ extension MenuBarController: FNKeyEventsDelegate {
 
 private enum MeetingProcessingError: Error, LocalizedError {
     case serverFailed(String)
+    case pollTimedOut
 
     var errorDescription: String? {
         switch self {
         case .serverFailed(let reason):
             return "Server-side processing failed: \(reason)"
+        case .pollTimedOut:
+            return "Server didn't respond in time; check /metrics for job status."
         }
     }
 }

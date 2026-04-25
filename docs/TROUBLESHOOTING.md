@@ -200,6 +200,46 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 ---
 
+### Meeting stuck in "Processing" indefinitely
+
+**Symptom:** The menubar shows "Processing" for far longer than expected (more than twice the recording duration), and the job never transitions to done.
+
+**Diagnosis:** The poll loop in `MenuBarController` enforces a deadline of `max(2 × recording_duration, 600 s)`. When the deadline elapses the client automatically cancels the job via `DELETE /transcribe/meeting/{job_id}` and surfaces a `pollTimedOut` error notification. If you see the error, the server-side pipeline likely crashed or was killed mid-run.
+
+**Fix:**
+1. Check `GET /metrics` for `meeting.active` and `meeting.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/server.log` for Python tracebacks.
+2. Restart the server (`scripts/server-launchd.sh restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staging WAV.
+3. If the server is healthy but the job consistently times out for long recordings, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
+
+---
+
+### Auto-update failed
+
+**Symptom:** An error notification from WisprAlt says the automatic update could not be applied, or the app's "Check for Updates…" menu item shows an error badge.
+
+**Diagnosis:** `SparkleController` implements `updater(_:didAbortWithError:)` and logs the failure to `~/Library/Logs/WisprAlt/client.log`. Common causes: network error fetching the appcast, EdDSA signature mismatch (self-built binary with wrong key pair), or Sparkle was unable to replace the app bundle (SIP / permissions issue).
+
+**Fix:**
+1. Open **Console.app**, filter by `co.wispralt`, and look for `[sparkle]` error entries — the Sparkle error description is logged there.
+2. If the error mentions "signature invalid": for self-built versions, confirm that `SPARKLE_ED_PRIVATE_KEY` in your GitHub Actions secrets matches the `SUPublicEDKey` embedded in `Info.plist`.
+3. If the error mentions "permission denied" or "code signing": ensure WisprAlt lives in `/Applications` and is owned by your user account (`chown -R $(whoami) /Applications/WisprAlt.app`).
+4. As a last resort, download the latest release DMG from the project releases page and replace the app manually.
+
+---
+
+### Meeting transcript has a "warnings" field with "mono input"
+
+**Symptom:** The downloaded meeting transcript JSON contains a `"warnings"` array with an entry like `"mono input — dual-channel mode unavailable"`. Speaker diarization may be less accurate than expected.
+
+**Diagnosis:** `MeetingRecorder` is supposed to produce a 2-channel WAV (ch1 = mic, ch2 = system audio). The server's `pipeline.py` probes the file at the start of processing and detected only 1 channel. This usually means `SCStream` did not deliver system-audio frames during the recording (e.g. screen capture permission was denied or no system audio was playing), so `AlignedRingBuffer` had nothing to mix into channel 2 and the WAV was written as mono.
+
+**Fix:**
+1. Open **System Settings → Privacy & Security → Screen & System Audio Recording** and confirm WisprAlt is listed and enabled.
+2. On macOS 14.4+, this permission requires a process restart after granting — use the in-app permission wizard (Settings → Permissions).
+3. Re-record the meeting after confirming the permission is active. If system audio is intentionally absent (e.g. in-person meeting with no system playback), the mono path is expected and diarization will run on mic audio only — quality may be lower for multi-speaker scenarios.
+
+---
+
 ### Sparkle update not appearing or blocked
 
 **Symptom:** "Check for Updates…" reports no update, or the update sheet is deferred.

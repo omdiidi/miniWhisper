@@ -8,10 +8,14 @@ enum TranscriptError: Error, LocalizedError {
     case unknownSpeaker(String)
     /// The requested `newName` is already used as a display name by another speaker.
     case speakerNameConflict(String)
+    /// The new name is empty after trimming, or clashes with an existing raw key.
+    case invalidSpeakerName(String)
     /// A file system I/O error occurred.
     case ioError(Error)
     /// The JSON file could not be decoded.
     case decodingError(Error)
+    /// The decoded JSON is structurally valid but contains out-of-range segment values.
+    case malformedJSON(String)
 
     var errorDescription: String? {
         switch self {
@@ -19,10 +23,14 @@ enum TranscriptError: Error, LocalizedError {
             return "No speaker found with raw key "\(key)"."
         case .speakerNameConflict(let name):
             return "The name "\(name)" is already used by another speaker."
+        case .invalidSpeakerName(let reason):
+            return "Invalid speaker name: \(reason)."
         case .ioError(let underlying):
             return "File I/O error: \(underlying.localizedDescription)"
         case .decodingError(let underlying):
             return "Could not decode transcript: \(underlying.localizedDescription)"
+        case .malformedJSON(let detail):
+            return "Transcript JSON is malformed: \(detail)"
         }
     }
 }
@@ -90,6 +98,42 @@ struct TranscriptDocument: Codable {
     /// Keyed by `speaker_raw`. This is the single source of truth for current display names.
     var speakers: [String: SpeakerInfo]
 
+    // MARK: - Decode with validation
+
+    /// Decodes *data* as a `TranscriptDocument` and validates each segment.
+    ///
+    /// Validation rules per segment:
+    /// - `start >= 0`
+    /// - `end >= start`
+    /// - Both `start` and `end` are finite (not NaN / Inf).
+    /// - `text` is never nil (guaranteed by the Codable field type, checked for safety).
+    ///
+    /// - Throws: `TranscriptError.decodingError` on JSON parse failure.
+    ///           `TranscriptError.malformedJSON` on semantic validation failure.
+    static func decode(_ data: Data) throws -> TranscriptDocument {
+        let doc: TranscriptDocument
+        do {
+            doc = try JSONDecoder().decode(TranscriptDocument.self, from: data)
+        } catch {
+            throw TranscriptError.decodingError(error)
+        }
+        for (i, seg) in doc.segments.enumerated() {
+            guard seg.start.isFinite else {
+                throw TranscriptError.malformedJSON("segment[\(i)].start is not finite: \(seg.start)")
+            }
+            guard seg.end.isFinite else {
+                throw TranscriptError.malformedJSON("segment[\(i)].end is not finite: \(seg.end)")
+            }
+            guard seg.start >= 0 else {
+                throw TranscriptError.malformedJSON("segment[\(i)].start is negative: \(seg.start)")
+            }
+            guard seg.end >= seg.start else {
+                throw TranscriptError.malformedJSON("segment[\(i)].end (\(seg.end)) < start (\(seg.start))")
+            }
+        }
+        return doc
+    }
+
     // MARK: - Rename
 
     /// Renames speaker identified by `rawKey` to `newName`.
@@ -104,17 +148,48 @@ struct TranscriptDocument: Codable {
     ///   - newName: The new display name. Must not collide with any existing display name.
     /// - Throws: `TranscriptError.unknownSpeaker` or `TranscriptError.speakerNameConflict`.
     mutating func renameSpeaker(rawKey: String, to newName: String) throws {
+        // G2: Sanitise the input name before any other check.
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw TranscriptError.invalidSpeakerName("name cannot be empty")
+        }
+        // Reject names that match an existing speaker_raw key (not just display_name).
+        if speakers.keys.contains(trimmed) && trimmed != rawKey {
+            throw TranscriptError.invalidSpeakerName("name conflicts with an existing raw speaker key")
+        }
+
         guard speakers[rawKey] != nil else {
             throw TranscriptError.unknownSpeaker(rawKey)
         }
-        // Collision check: newName must not already be a display_name of a different entry.
-        if speakers.contains(where: { $0.key != rawKey && $0.value.display_name == newName }) {
-            throw TranscriptError.speakerNameConflict(newName)
+        // Collision check: trimmed must not already be a display_name of a different entry.
+        if speakers.contains(where: { $0.key != rawKey && $0.value.display_name == trimmed }) {
+            throw TranscriptError.speakerNameConflict(trimmed)
         }
-        speakers[rawKey]?.display_name = newName
+        speakers[rawKey]?.display_name = trimmed
         for i in segments.indices where segments[i].speaker_raw == rawKey {
-            segments[i].speaker = newName
+            segments[i].speaker = trimmed
         }
+    }
+
+    // MARK: - Escape helpers for subtitle formats
+
+    /// Escapes *s* for inclusion in an SRT cue body.
+    /// Replaces newlines with spaces to avoid breaking the SRT block structure.
+    static func escapedForSRT(_ s: String) -> String {
+        s.replacingOccurrences(of: "\r\n", with: " ")
+         .replacingOccurrences(of: "\r",   with: " ")
+         .replacingOccurrences(of: "\n",   with: " ")
+    }
+
+    /// Escapes *s* for inclusion in a WebVTT cue payload.
+    /// HTML-escapes `<`, `>`, `&` and replaces newlines with `<br/>`.
+    static func escapedForVTT(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+         .replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;")
+         .replacingOccurrences(of: "\r\n", with: "<br/>")
+         .replacingOccurrences(of: "\r",   with: "<br/>")
+         .replacingOccurrences(of: "\n",   with: "<br/>")
     }
 
     // MARK: - Export

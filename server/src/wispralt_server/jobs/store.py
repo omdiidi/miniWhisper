@@ -10,6 +10,7 @@ Design decisions (v3 deltas P4#4 + P5#2):
     * running → failed (server restarted mid-job)
     * pending with missing WAV → failed (staging file disappeared)
     * pending with existing WAV → requeue (runner will re-enqueue)
+    * pending with truncated WAV → failed + file deleted (C14)
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ class Job:
     error: Optional[str]
     output_dir: Optional[str]
     wav_path: str
+    attempts: int = 0      # C9: incremented each time the job is set to running
 
 
 class JobStore:
@@ -72,9 +74,15 @@ class JobStore:
                 finished_at REAL,
                 error       TEXT,
                 output_dir  TEXT,
-                wav_path    TEXT NOT NULL
+                wav_path    TEXT NOT NULL,
+                attempts    INTEGER DEFAULT 0
             )"""
         )
+        # C9: add `attempts` column to existing DBs that were created without it.
+        try:
+            self.con.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # ── private ───────────────────────────────────────────────────────────────
 
@@ -98,9 +106,9 @@ class JobStore:
         return jid
 
     def set_running(self, jid: str) -> None:
-        """Transition a job from pending → running."""
+        """Transition a job from pending → running.  Increments `attempts`."""
         self._exec(
-            "UPDATE jobs SET status='running', started_at=? WHERE id=?",
+            "UPDATE jobs SET status='running', started_at=?, attempts=attempts+1 WHERE id=?",
             time.time(),
             jid,
         )
@@ -134,7 +142,7 @@ class JobStore:
         """Return a Job by id, or None if not found."""
         cur = self._exec(
             "SELECT id, status, mode, created_at, started_at, finished_at,"
-            " error, output_dir, wav_path FROM jobs WHERE id=?",
+            " error, output_dir, wav_path, attempts FROM jobs WHERE id=?",
             jid,
         )
         row = cur.fetchone()
@@ -151,6 +159,32 @@ class JobStore:
             time.time() - 86400,
         )
         return int(cur.fetchone()[0])
+
+    def list_active_jobs(self) -> list[Job]:
+        """Return all non-terminal jobs (pending or running)."""
+        cur = self._exec(
+            "SELECT id, status, mode, created_at, started_at, finished_at,"
+            " error, output_dir, wav_path, attempts FROM jobs WHERE status IN ('pending','running')"
+        )
+        return [Job(*row) for row in cur.fetchall()]
+
+    def list_pending_ids(self) -> list[str]:
+        """Return the IDs of all pending jobs. Used by MeetingRunner.reenqueue_pending."""
+        cur = self._exec("SELECT id FROM jobs WHERE status='pending'")
+        return [row[0] for row in cur.fetchall()]
+
+    def fail_running_jobs(self, reason: str) -> int:
+        """Mark all currently running jobs as failed with *reason*.
+
+        Returns the number of rows updated.  Used by the SIGTERM handler (M1).
+        """
+        cur = self._exec(
+            "UPDATE jobs SET status='failed', error=?, finished_at=?"
+            " WHERE status='running'",
+            reason,
+            time.time(),
+        )
+        return cur.rowcount
 
     # ── startup recovery ──────────────────────────────────────────────────────
 
@@ -184,10 +218,9 @@ class JobStore:
 
             requeue: list[str] = []
             failed: list[str] = []
-            for jid, wav_path in rows:
-                if Path(wav_path).exists():
-                    requeue.append(jid)
-                else:
+            for jid, wav_path in rows:  # type: ignore[misc]
+                wav = Path(wav_path)
+                if not wav.exists():
                     self.con.execute(
                         "UPDATE jobs SET status='failed',"
                         " error='staging file missing after restart'"
@@ -195,5 +228,27 @@ class JobStore:
                         (jid,),
                     )
                     failed.append(jid)
+                    continue
+
+                # C14: Validate WAV completeness before re-queuing. A truncated
+                # upload would succeed submit but fail transcription; fail-fast here.
+                from wispralt_server.ops.staging import validate_wav_completeness
+                from wispralt_server._errors import UploadTruncatedError
+                try:
+                    validate_wav_completeness(wav)
+                except UploadTruncatedError as exc:
+                    self.con.execute(
+                        "UPDATE jobs SET status='failed', error=?"
+                        " WHERE id=?",
+                        (f"WAV truncated; re-record ({exc})", jid),
+                    )
+                    try:
+                        wav.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    failed.append(jid)
+                    continue
+
+                requeue.append(jid)
 
         return {"requeue": requeue, "failed": failed}

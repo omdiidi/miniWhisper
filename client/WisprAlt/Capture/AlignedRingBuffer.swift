@@ -129,16 +129,39 @@ final class AlignedRingBuffer {
         return micStale || sysStale
     }
 
-    /// Pads the lagging channel with silence up to the longest tail of either channel,
-    /// so that `flushAligned(forceFlush: true)` can drain all remaining data.
+    /// Pads the lagging channel with silence so that `flushAligned(forceFlush: true)`
+    /// can drain all remaining data.
     ///
-    /// Call this once after stopping capture, before the final drain loop.
-    func padMissing(toEnd: Bool) {
+    /// ## Contract
+    /// - When `uptoSampleEnd` is provided the lagging channel is padded up to that
+    ///   absolute sample position.  This is the sleep/wake path: the caller computes
+    ///   the expected sample position from the wall-clock gap and passes it here so
+    ///   the silence inserted exactly covers the sleep interval.
+    /// - When `toEnd` is true both channels are padded up to the longest tail of
+    ///   either channel.  Use this on `stop()` before the final drain loop.
+    /// - Both flags are mutually exclusive; `uptoSampleEnd` takes precedence.
+    ///
+    /// Call `flushAligned(forceFlush: true)` in a loop after this to drain.
+    func padMissing(uptoSampleEnd: Int? = nil, toEnd: Bool = false) {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
 
+        if let target = uptoSampleEnd {
+            // Sleep/wake path: pad whichever channel is short up to the given position.
+            let micTail = mic.last?.end ?? committed
+            let sysTail = sys.last?.end ?? committed
+            if micTail < target {
+                silencePad(into: &mic, from: micTail, to: target)
+            }
+            if sysTail < target {
+                silencePad(into: &sys, from: sysTail, to: target)
+            }
+            return
+        }
+
         guard toEnd else { return }
 
+        // Stop path: pad both channels up to the longest tail.
         let micTail = mic.last?.end ?? committed
         let sysTail = sys.last?.end ?? committed
         let target = max(micTail, sysTail)
@@ -151,6 +174,18 @@ final class AlignedRingBuffer {
         }
     }
 
+    /// Returns the sample position of the last queued sample in `channel`, or
+    /// `committed` if the channel queue is empty.  Used by `MeetingRecorder` to
+    /// compute the expected end position after a sleep gap.
+    func channelTail(_ channel: AudioChannel) -> Int {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        switch channel {
+        case .mic:  return mic.last?.end ?? committed
+        case .system: return sys.last?.end ?? committed
+        }
+    }
+
     // MARK: - Internal flush (must be called under lock)
 
     private func _flushAligned(forceFlush: Bool) -> AVAudioPCMBuffer? {
@@ -158,6 +193,20 @@ final class AlignedRingBuffer {
         // If a channel has no data, use committedCursor as its end.
         let micEnd = mic.first?.end ?? committed
         let sysEnd = sys.first?.end ?? committed
+
+        // Step 1b: When forceFlush is true and one channel is completely empty
+        // (queue is empty AND committed hasn't reached the other channel's head),
+        // generate silence for the empty channel up to the other's head so we
+        // can drain what the live channel has.  This handles the sleep/wake case
+        // where system audio is silent through a suspend.
+        if forceFlush {
+            if mic.isEmpty && sysEnd > committed {
+                silencePad(into: &mic, from: committed, to: sysEnd)
+            }
+            if sys.isEmpty && micEnd > committed {
+                silencePad(into: &sys, from: committed, to: micEnd)
+            }
+        }
 
         // Step 2: target = min of both ends — the smallest range both channels cover.
         let target = min(micEnd, sysEnd)

@@ -19,10 +19,10 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from wispralt_server.audio import CorruptAudioError
-from wispralt_server.auth import require_api_key
-from wispralt_server.config import settings
-from wispralt_server.dictate.parakeet import MODEL_ID
+from ..audio import CorruptAudioError
+from ..auth import require_api_key
+from ..config import settings
+from ..dictate.parakeet import MODEL_ID
 
 logger = logging.getLogger(__name__)
 

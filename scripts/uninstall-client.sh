@@ -80,9 +80,31 @@ security delete-generic-password -s co.wispralt 2>/dev/null && {
     echo "  Keychain item not found (already removed or key was never stored)."
 }
 
-# ── 5. Move app to Trash ──────────────────────────────────────────────────────
+# ── 5. Remove Sparkle caches and application support data (G10) ──────────────
 echo ""
-echo "Step 5: Moving /Applications/WisprAlt.app to Trash..."
+echo "Step 5: Removing Sparkle caches and application support data..."
+
+_remove_if_exists() {
+    local path="$1"
+    if [[ -e "$path" ]]; then
+        rm -rf "$path" && echo "  Removed: $path" || {
+            echo "  WARNING: Could not remove $path" >&2
+            ERRORS=$(( ERRORS + 1 ))
+        }
+    else
+        echo "  Not found (already removed): $path"
+    fi
+}
+
+_remove_if_exists "$HOME/Library/Caches/Sparkle"
+_remove_if_exists "$HOME/Library/Caches/co.wispralt.WisprAlt"
+_remove_if_exists "$HOME/Library/Application Support/co.wispralt"
+_remove_if_exists "$HOME/Library/Application Support/co.wispralt.WisprAlt"
+_remove_if_exists "$HOME/Library/Saved Application State/co.wispralt.WisprAlt.savedState"
+
+# ── 6. Move app to Trash ──────────────────────────────────────────────────────
+echo ""
+echo "Step 6: Moving /Applications/WisprAlt.app to Trash..."
 if [[ -d "/Applications/WisprAlt.app" ]]; then
     osascript \
         -e 'tell application "Finder" to delete POSIX file "/Applications/WisprAlt.app"' \

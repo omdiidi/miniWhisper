@@ -79,11 +79,25 @@ def require_api_key(request: Request) -> None:
     """FastAPI dependency that raises HTTP 401 on missing or wrong bearer token.
 
     Uses ``secrets.compare_digest`` to prevent timing-oracle attacks.
+
+    G5: Also rejects:
+    - Multiple Authorization headers (returns 400 — ambiguous intent).
+    - Empty bearer token after stripping the "Bearer " prefix (returns 401).
+    - M7: No .strip() on the provided token; 32-byte hex tokens never contain
+      legitimate whitespace, so trailing spaces indicate a malformed client.
     """
-    authorization = request.headers.get("authorization", "")
+    # G5: Detect duplicate Authorization headers.
+    auth_values = request.headers.getlist("authorization")
+    if len(auth_values) > 1:
+        raise HTTPException(status_code=400, detail="Multiple Authorization headers not allowed")
+
+    authorization = auth_values[0] if auth_values else ""
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
 
-    provided = authorization[len("bearer "):].strip()
+    # M7: exact match — no .strip(); tokens are 32-byte hex, whitespace is never valid.
+    provided = authorization[len("bearer "):]
+    if not provided:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
     if not secrets.compare_digest(provided, current_key()):
         raise HTTPException(status_code=401, detail="Invalid token")

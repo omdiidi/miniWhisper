@@ -40,6 +40,8 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/ops/staging.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — staging area management |
 | `server/src/wispralt_server/ops/env_writer.py` | [SETUP-SERVER.md](SETUP-SERVER.md) — atomic .env rewrite, key rotation |
 | `server/src/wispralt_server/middleware/rate_limit.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [API.md](API.md) — per-IP rate limiting middleware |
+| `server/src/wispralt_server/observability.py` | [API.md](API.md) — thread-safe counters + latency histogram for `/metrics` |
+| `server/src/wispralt_server/_errors.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — typed domain exceptions |
 
 ## Client (`client/`)
 
@@ -49,6 +51,7 @@ This file is the single source of truth for which documentation file covers each
 | `client/README.md` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — client build and run |
 | `client/WisprAlt/Info.plist` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — permission usage descriptions, Sparkle config |
 | `client/WisprAlt/WisprAlt.entitlements` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — required entitlements |
+| `client/WisprAlt/WisprAltApp.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — SwiftUI App entry point, AppDelegate bridge |
 | `client/WisprAlt/App/AppDelegate.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — app lifecycle |
 | `client/WisprAlt/App/MenuBarController.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — state machine, mic exclusion |
 | `client/WisprAlt/App/PermissionGate.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — 4-permission wizard, 14.4+ restart |

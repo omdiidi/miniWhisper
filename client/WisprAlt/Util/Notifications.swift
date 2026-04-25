@@ -1,6 +1,18 @@
 import Foundation
 import UserNotifications
 
+// MARK: - Notification names (NSNotification.Name extensions)
+
+extension Notification.Name {
+    /// Posted by MeetingRecorder when the 90-minute recording cap is reached.
+    /// Observer (MenuBarController) should stop and upload immediately.
+    static let meetingMaxDurationReached = Notification.Name("co.wispralt.meetingMaxDurationReached")
+
+    /// Posted by MeetingRecorder at 60 minutes as an advance warning that the
+    /// 90-minute cap is approaching.
+    static let meetingApproachingCap = Notification.Name("co.wispralt.meetingApproachingCap")
+}
+
 /// App-level notification helpers.
 ///
 /// Call `AppNotifications.requestAuthorization()` once at startup (e.g. in

@@ -179,10 +179,10 @@ final class TranscriptStore: ObservableObject {
         }
 
         // Atomically write each format using the resolved base URL.
-        try writeAtomic(jsonData, to: baseURL.appendingPathExtension("json"))
-        try writeAtomic(Data(doc.toSRT().utf8), to: baseURL.appendingPathExtension("srt"))
-        try writeAtomic(Data(doc.toVTT().utf8), to: baseURL.appendingPathExtension("vtt"))
-        try writeAtomic(Data(doc.toTXT().utf8), to: baseURL.appendingPathExtension("txt"))
+        try writeAtomic(jsonData, to: baseURL.appendingPathExtension("json"), jobID: jobID)
+        try writeAtomic(Data(doc.toSRT().utf8), to: baseURL.appendingPathExtension("srt"), jobID: jobID)
+        try writeAtomic(Data(doc.toVTT().utf8), to: baseURL.appendingPathExtension("vtt"), jobID: jobID)
+        try writeAtomic(Data(doc.toTXT().utf8), to: baseURL.appendingPathExtension("txt"), jobID: jobID)
 
         Log.info("Speaker renamed in \(jobID): rawKey=\(rawKey) → \(newName)", category: "store")
         refresh()
@@ -212,20 +212,28 @@ final class TranscriptStore: ObservableObject {
 
         Log.warning("Found \(sentinels.count) orphan transcript write sentinel(s); recovering.", category: "store")
 
-        // Collect all tmp files in the directory.
-        let tmpFiles = contents.filter { url in
-            let name = url.lastPathComponent
-            return name.hasSuffix(".tmp") && name.hasPrefix(".")
-        }
-
-        for tmp in tmpFiles {
-            try? fm.removeItem(at: tmp)
-            Log.debug("Removed orphan tmp file: \(tmp.lastPathComponent)", category: "store")
-        }
-
+        // I4: Only delete .tmp files whose name is derived from a known sentinel's jobID.
+        // Tmp file format: .<jobID>.<uuid>.<fmt>.tmp  (set by writeAtomic)
+        // We do NOT delete all .tmp files indiscriminately — other processes may use them.
         for sentinel in sentinels {
+            // Extract jobID from ".transcriptWriteInProgress.<jobID>"
+            let sentinelName = sentinel.lastPathComponent
+            let prefix = ".transcriptWriteInProgress."
+            guard sentinelName.hasPrefix(prefix) else { continue }
+            let jobID = String(sentinelName.dropFirst(prefix.count))
+
+            // Match tmp files for this specific jobID: .<jobID>.*.tmp
+            let jobTmpFiles = contents.filter { url in
+                let name = url.lastPathComponent
+                return name.hasPrefix(".\(jobID).") && name.hasSuffix(".tmp")
+            }
+            for tmp in jobTmpFiles {
+                try? fm.removeItem(at: tmp)
+                Log.debug("Removed orphan tmp file: \(tmp.lastPathComponent)", category: "store")
+            }
+
             try? fm.removeItem(at: sentinel)
-            Log.debug("Removed orphan sentinel: \(sentinel.lastPathComponent)", category: "store")
+            Log.debug("Removed orphan sentinel: \(sentinelName)", category: "store")
         }
     }
 
@@ -235,10 +243,14 @@ final class TranscriptStore: ObservableObject {
     ///
     /// The temp file is placed in the SAME directory as `destination` so the
     /// `replaceItemAt` rename stays on the same APFS volume (O(1) rename).
-    private func writeAtomic(_ data: Data, to destination: URL) throws {
+    ///
+    /// I4: The tmp filename is `.<jobID>.<uuid>.<fmt>.tmp` so `recoverOrphanSentinels`
+    /// can identify which tmp files belong to which sentinel without deleting unrelated files.
+    private func writeAtomic(_ data: Data, to destination: URL, jobID: String) throws {
+        let fmt = destination.pathExtension
         let tmpURL = destination
             .deletingLastPathComponent()
-            .appendingPathComponent(".\(UUID().uuidString).tmp")
+            .appendingPathComponent(".\(jobID).\(UUID().uuidString).\(fmt).tmp")
 
         do {
             // Write without .atomic option — we do the atomic swap manually below.

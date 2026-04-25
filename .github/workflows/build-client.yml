@@ -28,6 +28,33 @@ jobs:
     runs-on: macos-14
 
     steps:
+      # -----------------------------------------------------------------------
+      # Validate that all required secrets are present before spending CI time.
+      # G8: Each secret is mapped to a 1-char env var so the actual value is
+      # never printed even in debug mode.
+      # -----------------------------------------------------------------------
+      - name: Validate required secrets
+        run: |
+          missing=()
+          for s in DEVELOPER_ID_APP DEVELOPER_ID_APP_CERT_P12 DEVELOPER_ID_APP_CERT_PASSWORD APPLE_ID APP_SPECIFIC_PASSWORD TEAM_ID SPARKLE_ED_PRIVATE_KEY; do
+            varname="${s}_LEN"
+            v="${!varname}"
+            [ -n "$v" ] || missing+=("$s")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "All required secrets are present."
+        env:
+          DEVELOPER_ID_APP_LEN: ${{ secrets.DEVELOPER_ID_APP != '' && '1' || '' }}
+          DEVELOPER_ID_APP_CERT_P12_LEN: ${{ secrets.DEVELOPER_ID_APP_CERT_P12 != '' && '1' || '' }}
+          DEVELOPER_ID_APP_CERT_PASSWORD_LEN: ${{ secrets.DEVELOPER_ID_APP_CERT_PASSWORD != '' && '1' || '' }}
+          APPLE_ID_LEN: ${{ secrets.APPLE_ID != '' && '1' || '' }}
+          APP_SPECIFIC_PASSWORD_LEN: ${{ secrets.APP_SPECIFIC_PASSWORD != '' && '1' || '' }}
+          TEAM_ID_LEN: ${{ secrets.TEAM_ID != '' && '1' || '' }}
+          SPARKLE_ED_PRIVATE_KEY_LEN: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' && '1' || '' }}
+
       - name: Checkout
         uses: actions/checkout@v4
 

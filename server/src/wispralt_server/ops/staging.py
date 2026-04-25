@@ -76,6 +76,7 @@ async def stream_to_staging(
     path = staging_dir / f"{uuid.uuid4()}.wav"
     md5 = hashlib.md5()
     total = 0
+    chunk_count = 0
 
     try:
         with open(path, "wb") as fh:
@@ -86,10 +87,12 @@ async def stream_to_staging(
                 total += len(chunk)
                 if total > max_bytes:
                     raise HTTPException(413, "Upload too large")
-                # P5#10: mid-upload disk guard — leave at least 4 chunks of
-                # headroom so we don't fill the filesystem to zero.
-                if shutil.disk_usage(str(staging_dir)).free < _CHUNK_SIZE * 4:
-                    raise HTTPException(507, "Disk full during upload")
+                # I6: Only call disk_usage once every 64 chunks (64 MiB) to avoid
+                # the syscall overhead on every 1 MiB write during large uploads.
+                chunk_count += 1
+                if chunk_count % 64 == 0:
+                    if shutil.disk_usage(str(staging_dir)).free < _CHUNK_SIZE * 4:
+                        raise HTTPException(507, "Disk full during upload")
                 md5.update(chunk)
                 fh.write(chunk)
     except Exception:
@@ -123,26 +126,89 @@ def cleanup(wav_path: Path) -> None:
         pass
 
 
-def sweep_old(staging_dir: Path, max_age_seconds: int = 86400) -> int:
+def sweep_old(
+    staging_dir: Path,
+    max_age_seconds: int = 86400,
+    exclude_paths: set[Path] | None = None,
+) -> int:
     """Remove WAV files in *staging_dir* older than *max_age_seconds*.
 
     Called once at server startup to clean up any files left over from a
     previous run (e.g. if the server crashed mid-upload).
 
+    Parameters
+    ----------
+    staging_dir:
+        Directory to scan for stale WAV files.
+    max_age_seconds:
+        Files older than this many seconds are removed. Default 86400 (24 h).
+    exclude_paths:
+        Set of ``Path`` objects that must NOT be deleted even if they are old.
+        Pass ``{Path(j.wav_path) for j in store.list_active_jobs()}`` to protect
+        WAV files that are referenced by pending or running jobs (C7 fix).
+
     Returns the count of files removed.
     """
     if not staging_dir.exists():
         return 0
+    _exclude = exclude_paths or set()
     now = time.time()
     removed = 0
     for p in staging_dir.glob("*.wav"):
         try:
+            if p.resolve() in {ep.resolve() for ep in _exclude}:
+                continue
             if now - p.stat().st_mtime > max_age_seconds:
                 p.unlink()
                 removed += 1
         except OSError:
             pass
     return removed
+
+
+def validate_wav_completeness(path: Path) -> None:
+    """Validate that *path* is a plausible non-truncated WAV file.
+
+    Checks:
+    1. File is at least 44 bytes (minimum RIFF/WAVE/fmt/data header).
+    2. First 4 bytes are ``RIFF`` and bytes 8–12 are ``WAVE``.
+    3. The RIFF chunk size field (bytes 4–8, LE uint32) + 8 is within 4 bytes of
+       the actual file size.  A truncated upload will be shorter than declared.
+
+    Raises
+    ------
+    UploadTruncatedError
+        If any check fails.  Callers should mark the job failed and delete the
+        file rather than re-queuing it (C14).
+    """
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise UploadTruncatedError(f"Cannot stat WAV file: {exc}") from exc
+
+    if file_size < 44:
+        raise UploadTruncatedError(
+            f"WAV file too small ({file_size} bytes); minimum RIFF header is 44 bytes"
+        )
+
+    with open(path, "rb") as fh:
+        header = fh.read(12)
+
+    if header[:4] != b"RIFF":
+        raise UploadTruncatedError("Not a valid WAV file (missing RIFF marker)")
+    if header[8:12] != b"WAVE":
+        raise UploadTruncatedError("Not a valid WAV file (missing WAVE marker)")
+
+    # RIFF chunk size = total file size - 8 (excludes the RIFF id + size field itself)
+    import struct
+    declared_size = struct.unpack_from("<I", header, 4)[0]
+    expected_file_size = declared_size + 8
+    # Allow a small tolerance (4 bytes) for rounding / padding in some encoders.
+    if file_size < expected_file_size - 4:
+        raise UploadTruncatedError(
+            f"WAV file appears truncated: declared {expected_file_size} bytes, "
+            f"actual {file_size} bytes"
+        )
 
 
 def assert_same_filesystem(a: Path, b: Path) -> None:

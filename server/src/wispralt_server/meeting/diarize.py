@@ -139,4 +139,25 @@ def diarize(
         min_speakers=min_speakers,
         max_speakers=max_speakers,
     )
-    return annotation_to_df(annotation)
+    df = annotation_to_df(annotation)
+
+    # A3: Post-condition diagnostics — log warnings for unexpected results but
+    # always continue; these are observability aids, not hard failures.
+    if not df.empty:
+        distinct_labels = df["speaker"].nunique()
+        if distinct_labels > max_speakers + 2:
+            logger.warning(
+                "Pyannote returned %d distinct speakers (max_speakers=%d); "
+                "diarization may be over-segmented.",
+                distinct_labels,
+                max_speakers,
+            )
+    else:
+        if duration_s > 5.0:
+            logger.warning(
+                "Pyannote returned 0 speakers for %.1f s audio; "
+                "check model/device setup.",
+                duration_s,
+            )
+
+    return df

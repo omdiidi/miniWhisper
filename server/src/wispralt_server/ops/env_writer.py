@@ -100,6 +100,27 @@ def rewrite_env_var(path: Path, key: str, value: str) -> None:
     logger.debug("Rewrote %s in %s", key, path)
 
 
+def find_env_path() -> Path:
+    """Locate the .env file used by the server.
+
+    Search order:
+    1. ``server/.env`` relative to CWD (typical when started from repo root).
+    2. ``.env`` in CWD (typical when started from the server/ directory).
+    3. Fall back to CWD/.env (let callers create it if needed).
+
+    M4: Single canonical implementation; used by both main.py and routes/admin.py
+    to avoid the duplicated _locate_env / _find_env_path functions.
+    """
+    candidates = [
+        Path.cwd() / "server" / ".env",
+        Path.cwd() / ".env",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path.cwd() / ".env"
+
+
 def verify_env_perms(path: Path) -> bool:
     """Return True iff *path* is mode 0600 and owned by the current user.
 

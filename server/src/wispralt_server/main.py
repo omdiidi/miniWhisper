@@ -28,19 +28,24 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from wispralt_server.config import settings, verify_env_perms
 from wispralt_server.dictate.parakeet import ParakeetService
 from wispralt_server.jobs.runner import MeetingRunner
 from wispralt_server.jobs.store import JobStore
+from wispralt_server.meeting.output import sweep_stale_tmp
 from wispralt_server.meeting.pipeline import bootstrap_models
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
+from wispralt_server import observability
 from wispralt_server.ops import staging
+from wispralt_server.ops.env_writer import find_env_path
 from wispralt_server.routes import admin, dictate, health
 from wispralt_server.routes import meeting as meeting_routes
 
@@ -63,7 +68,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── startup ───────────────────────────────────────────────────────────────
 
     # 1. Validate .env permissions
-    env_path = _locate_env()
+    env_path = find_env_path()
     if not verify_env_perms(env_path):
         logger.warning(
             "Continuing startup despite .env permission issues — "
@@ -80,12 +85,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Log as ERROR — server can still start, but atomicity is compromised.
         logger.error("Filesystem check failed: %s", exc)
 
-    # 3. Sweep stale staging WAVs (> 24 h) left from the previous run.
-    removed = staging.sweep_old(settings.staging_dir, max_age_seconds=86400)
-    if removed:
-        logger.info("Startup staging sweep removed %d old WAV(s).", removed)
-
-    # 4. Job store + orphan recovery (P4#4 WAL, P5#2 policy).
+    # 3. Job store + orphan recovery (P4#4 WAL, P5#2 policy).
+    #    recover_orphans MUST run BEFORE sweep_old so that pending jobs whose
+    #    WAV files still exist are observed and their paths can be excluded from
+    #    the sweep.  If sweep ran first it could delete WAVs that orphan recovery
+    #    would later try to re-queue (C7 fix).
     job_store = JobStore(settings.job_db_path)
     recovery = job_store.recover_orphans()
     logger.info(
@@ -94,6 +98,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovery["failed"],
     )
     app.state.job_store = job_store
+
+    # 4. Sweep stale staging WAVs (> 24 h) left from the previous run.
+    #    Exclude WAVs referenced by any non-terminal job so re-queue candidates
+    #    are not accidentally removed by the sweep (C7 fix).
+    active_wav_paths = {Path(j.wav_path) for j in job_store.list_active_jobs()}
+    removed = staging.sweep_old(
+        settings.staging_dir,
+        max_age_seconds=86400,
+        exclude_paths=active_wav_paths,
+    )
+    if removed:
+        logger.info("Startup staging sweep removed %d old WAV(s).", removed)
+
+    # 4b. Sweep stale .tmp files in meeting output dir (I8).
+    tmp_removed = sweep_stale_tmp(settings.meeting_output_dir)
+    if tmp_removed:
+        logger.info("Startup tmp sweep removed %d stale .tmp file(s).", tmp_removed)
 
     # 5. Meeting runner — re-enqueue any pending jobs that survived the restart.
     meeting_runner = MeetingRunner(job_store)
@@ -125,36 +146,65 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:
             logger.error("Meeting model bootstrap failed: %s", exc)
 
-    asyncio.create_task(_bootstrap_and_reenqueue())
+    # I3: Store the task so it can be cancelled cleanly during shutdown.
+    app.state.bootstrap_task = asyncio.create_task(_bootstrap_and_reenqueue())
 
     # 8. SIGTERM handler (P5#5 + P5#ExitTimeOut).
-    #    Sets shutting_down flag, marks any running jobs as failed, then exits
-    #    with code 0 so launchd sees a clean stop and ExitTimeOut=15 takes over.
-    def _sigterm_handler(signum: int, frame: object) -> None:
+    #    I2: Use loop.add_signal_handler so the handler runs safely in the asyncio
+    #    event loop rather than interrupting arbitrary C-extension code via the raw
+    #    signal module.  sys.exit(0) is replaced with os._exit(0) which is safe
+    #    from an asyncio callback.
+    def _sigterm_handler() -> None:
         logger.info("SIGTERM received — initiating graceful shutdown.")
         app.state.shutting_down = True
         try:
-            # Mark all currently running jobs as failed so clients see a
-            # definitive terminal status rather than a stuck "running" entry.
-            with job_store._lock:
-                job_store.con.execute(
-                    "UPDATE jobs SET status='failed', error='server shutdown'"
-                    " WHERE status='running'"
-                )
+            # M1: Use the JobStore public method rather than raw SQL.
+            n = job_store.fail_running_jobs("server shutdown")
+            if n:
+                logger.info("Marked %d running job(s) as failed on SIGTERM.", n)
         except Exception as exc:  # noqa: BLE001 — best effort; don't block shutdown
             logger.warning("Could not mark running jobs failed on SIGTERM: %s", exc)
-        sys.exit(0)
+        import os as _os
+        _os._exit(0)
 
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
 
     # ── yield — server is live ─────────────────────────────────────────────────
     yield
 
     # ── shutdown ──────────────────────────────────────────────────────────────
+    # I3: Cancel the bootstrap task if it is still running (e.g. models loading
+    # when a fast shutdown is triggered).
+    bootstrap_task: asyncio.Task | None = getattr(app.state, "bootstrap_task", None)
+    if bootstrap_task is not None and not bootstrap_task.done():
+        bootstrap_task.cancel()
+        await asyncio.gather(bootstrap_task, return_exceptions=True)
+
     logger.info("WisprAlt server clean shutdown.")
 
 
 # ── application factory ───────────────────────────────────────────────────────
+
+
+class _ObservabilityMiddleware(BaseHTTPMiddleware):
+    """Times each request and records it in the observability singletons (G4)."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[type-arg]
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - t0) * 1_000.0
+
+        # Use the first two path segments as the route key to avoid per-job-id cardinality.
+        parts = request.url.path.strip("/").split("/")
+        route_key = "/".join(parts[:2]) if len(parts) >= 2 else request.url.path
+
+        observability.request_counter.increment(route_key, response.status_code)
+        if response.status_code >= 400:
+            observability.error_counter.increment(route_key, response.status_code)
+        observability.latency_histogram.record(route_key, latency_ms)
+
+        return response
 
 
 def create_app() -> FastAPI:
@@ -174,12 +224,16 @@ def create_app() -> FastAPI:
         redoc_url=None,
     )
 
+    # G4: Per-request observability instrumentation (must be added before rate limiter
+    # so it captures the full request including 429s).
+    app.add_middleware(_ObservabilityMiddleware)
+
     # P5#6: Per-IP rolling-window rate limiter.
     # add_middleware must be called before the first request is handled.
     app.add_middleware(
         RateLimitMiddleware,
-        dictate_per_min=60,
-        meeting_per_hour=4,
+        dictate_per_min=settings.dictate_rate_per_min,
+        meeting_per_hour=settings.meeting_rate_per_hour,
     )
 
     # Mount routers
@@ -198,16 +252,4 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-
-def _locate_env() -> Path:
-    """Find the .env file; return a Path whether or not it exists."""
-    candidates = [
-        Path.cwd() / "server" / ".env",
-        Path.cwd() / ".env",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return Path.cwd() / ".env"
+# M4: _locate_env removed — use ops.env_writer.find_env_path() instead.

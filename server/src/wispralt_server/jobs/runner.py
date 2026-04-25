@@ -57,6 +57,9 @@ class MeetingRunner:
         # Semaphore enforces at-most-one concurrent meeting job.
         self._semaphore = asyncio.Semaphore(1)
         self._active_job_id: str | None = None
+        # C8: submit lock prevents TOCTOU race between the semaphore check,
+        # store.create, and asyncio.create_task.  All three must be atomic.
+        self._submit_lock = asyncio.Lock()
 
     # ── public properties ──────────────────────────────────────────────────────
 
@@ -72,7 +75,7 @@ class MeetingRunner:
 
     # ── public methods ─────────────────────────────────────────────────────────
 
-    def submit_or_429(self, wav_path: Path) -> str:
+    async def submit_or_429(self, wav_path: Path) -> str:
         """Create a job and fire-and-forget its execution coroutine.
 
         Raises MeetingInProgressError (which the route converts to HTTP 429) if:
@@ -80,20 +83,25 @@ class MeetingRunner:
         - Available RAM is below 2 GiB (P5#11 OOM guard).
 
         Returns the new job's UUID.
-        """
-        if self._semaphore.locked():
-            raise MeetingInProgressError(
-                "Another meeting is currently being transcribed"
-            )
-        if psutil.virtual_memory().available < _2GiB:
-            raise MeetingInProgressError(
-                "Insufficient memory to start a new meeting job; try again later"
-            )
 
-        jid = self.store.create(str(wav_path))
-        # Schedule as a background task; the route handler returns immediately.
-        asyncio.create_task(self._run(jid, wav_path))
-        return jid
+        C8: the semaphore check, store.create, and asyncio.create_task all run
+        under ``_submit_lock`` to prevent a TOCTOU race where two concurrent
+        requests both observe `locked() == False` and both create tasks.
+        """
+        async with self._submit_lock:
+            if self._semaphore.locked():
+                raise MeetingInProgressError(
+                    "Another meeting is currently being transcribed"
+                )
+            if psutil.virtual_memory().available < _2GiB:
+                raise MeetingInProgressError(
+                    "Insufficient memory to start a new meeting job; try again later"
+                )
+
+            jid = self.store.create(str(wav_path))
+            # Schedule as a background task; the route handler returns immediately.
+            asyncio.create_task(self._run(jid, wav_path))
+            return jid
 
     async def reenqueue_pending(self) -> None:
         """Re-enqueue pending jobs whose WAV files survived the last restart.
@@ -101,8 +109,11 @@ class MeetingRunner:
         Called once at startup after ``JobStore.recover_orphans()`` returns its
         "requeue" list.  Each job is submitted as a new asyncio task; the
         semaphore ensures they run one at a time.
+
+        C9: Jobs with attempts >= 3 are skipped and immediately failed to prevent
+        unbounded poison-pill re-enqueue loops.
         """
-        pending_ids = self._get_pending_ids()
+        pending_ids = self.store.list_pending_ids()  # I7: use public API
         if pending_ids:
             logger.info(
                 "Re-enqueueing %d pending job(s) from last run: %s",
@@ -112,6 +123,15 @@ class MeetingRunner:
         for jid in pending_ids:
             job = self.store.get(jid)
             if job is None:
+                continue
+            # C9: cap retries at 3 to prevent poison-pill loops.
+            if job.attempts >= 3:
+                logger.warning(
+                    "[%s] Skipping re-enqueue: job has %d attempts (max 3). Marking failed.",
+                    jid,
+                    job.attempts,
+                )
+                self.store.set_failed(jid, "max retries exceeded")
                 continue
             asyncio.create_task(self._run(job.id, Path(job.wav_path)))
 
@@ -148,10 +168,3 @@ class MeetingRunner:
                 # Always clean up the staging WAV (R1#2).
                 staging.cleanup(wav_path)
 
-    def _get_pending_ids(self) -> list[str]:
-        """Fetch all pending job IDs directly from the SQLite connection."""
-        with self.store._lock:
-            cur = self.store.con.execute(
-                "SELECT id FROM jobs WHERE status='pending'"
-            )
-            return [row[0] for row in cur.fetchall()]

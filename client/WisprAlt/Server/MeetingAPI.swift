@@ -47,9 +47,9 @@ enum MeetingAPI {
 
     /// Uploads the meeting WAV file to `POST /transcribe/meeting`.
     ///
-    /// Computes a `Content-MD5` header (base64 MD5 of the file body) so the server
-    /// can verify upload integrity. Progress is reported via the `progress` callback
-    /// on the main queue as a fraction in `[0.0, 1.0]`.
+    /// Computes a `Content-MD5` header (streaming, no full-file RAM load) so the
+    /// server can verify upload integrity.  Progress is reported via the `progress`
+    /// callback on the main queue as a fraction in `[0.0, 1.0]`.
     ///
     /// A dedicated `URLSession` with an `UploadSessionDelegate` is created per upload
     /// so the delegate can own lifetime and progress reporting. The session is
@@ -57,6 +57,11 @@ enum MeetingAPI {
     ///
     /// Meetings are NEVER retried on transport error — the file is too large for a
     /// transparent retry to be acceptable.
+    ///
+    /// TODO (G3): Add resumable upload support.  On transport error, persist the WAV
+    /// path to `~/Library/Application Support/co.wispralt/pending-uploads/<uuid>.path`
+    /// so the user can resubmit on next launch without re-recording.  A background
+    /// URLSession with resume-data capture from the delegate is the full solution.
     ///
     /// - Parameters:
     ///   - wavURL: Local file URL of the 2-channel 16 kHz WAV to upload.
@@ -75,16 +80,26 @@ enum MeetingAPI {
             throw ServerError.invalidServerURL
         }
 
-        // Compute Content-MD5 before streaming so the server can validate integrity.
-        let fileData = try Data(contentsOf: wavURL)
-        let md5Digest = Insecure.MD5.hash(data: fileData)
-        let md5Base64 = Data(md5Digest).base64EncodedString()
+        // Compute Content-MD5 via streaming so we never load the entire WAV into RAM.
+        // Large meetings can be hundreds of MB; loading them whole causes peak-RSS spikes.
+        var hasher = Insecure.MD5()
+        let handle = try FileHandle(forReadingFrom: wavURL)
+        defer { try? handle.close() }
+        while true {
+            let chunk = try handle.read(upToCount: 1 << 20)
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        let md5Base64 = Data(hasher.finalize()).base64EncodedString()
+
+        // Determine file size separately (needed for Content-Length header).
+        let fileSize = try FileManager.default.attributesOfItem(atPath: wavURL.path)[.size] as? Int ?? 0
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
         request.setValue(md5Base64, forHTTPHeaderField: "Content-MD5")
-        request.setValue(String(fileData.count), forHTTPHeaderField: "Content-Length")
+        request.setValue(String(fileSize), forHTTPHeaderField: "Content-Length")
 
         if let apiKey = try? KeychainHelper.getAPIKey(), let key = apiKey {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")

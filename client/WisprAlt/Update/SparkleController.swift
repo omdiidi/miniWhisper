@@ -73,4 +73,32 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     func updater(_ updater: SPUUpdater, willInstallUpdate item: SUAppcastItem) {
         Log.info("Installing update: \(item.versionString)", category: "update")
     }
+
+    // MARK: - G9: Error surfacing
+
+    /// Called when the update cycle aborts with an error (e.g. network failure,
+    /// appcast parse error, signature mismatch).
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        Log.error("Sparkle update aborted: \(error.localizedDescription)", category: "update")
+        AppNotifications.notify(
+            title: "Auto-update Failed",
+            body: "Auto-update failed: \(error.localizedDescription)"
+        )
+    }
+
+    /// Called after each complete update cycle.  `error` is non-nil when the cycle
+    /// ended due to an error that did not trigger `didAbortWithError`.
+    func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        if let error {
+            Log.error("Sparkle update cycle finished with error: \(error.localizedDescription)", category: "update")
+            AppNotifications.notify(
+                title: "Auto-update Failed",
+                body: "Auto-update failed: \(error.localizedDescription)"
+            )
+        }
+    }
 }

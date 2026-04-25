@@ -58,15 +58,27 @@ final class Settings: ObservableObject {
     }
 
     /// Minimum FN-hold duration (seconds) before dictation starts. Default 0.30.
+    /// Clamped to [0.10, 1.00] on set.
     @Published var holdMinDuration: Double {
         didSet {
+            let clamped = min(max(holdMinDuration, 0.10), 1.00)
+            if clamped != holdMinDuration {
+                holdMinDuration = clamped  // triggers didSet once more, but value is already clamped
+                return
+            }
             defaults.set(holdMinDuration, forKey: Key.holdMinDuration)
         }
     }
 
     /// Window (seconds) within which three FN taps must occur to trigger meeting recording. Default 0.40.
+    /// Clamped to [0.20, 0.80] on set.
     @Published var tripleTapWindow: Double {
         didSet {
+            let clamped = min(max(tripleTapWindow, 0.20), 0.80)
+            if clamped != tripleTapWindow {
+                tripleTapWindow = clamped
+                return
+            }
             defaults.set(tripleTapWindow, forKey: Key.tripleTapWindow)
         }
     }

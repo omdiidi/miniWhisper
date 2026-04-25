@@ -57,6 +57,14 @@ def is_silent_robust(
 
     frame_size = max(1, int(sr * frame_ms / 1000))
 
+    # I5: Very short clips (< 1 frame = < 100ms by default) are evaluated as a
+    # single frame of their actual data without zero-padding.  Padding distorts
+    # the RMS downward and would cause short transients to be misclassified as
+    # silent, which in turn would incorrectly trigger "in-person mode".
+    if audio.size < frame_size:
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        return rms < threshold
+
     # Pad to a whole number of frames so we don't discard the trailing samples.
     remainder = audio.size % frame_size
     if remainder != 0:

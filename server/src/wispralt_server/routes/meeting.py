@@ -15,6 +15,7 @@ file rewrite; see plan locked decisions).
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, UploadFile
@@ -80,7 +81,7 @@ async def submit_meeting(
     )
 
     try:
-        jid = runner.submit_or_429(wav_path)
+        jid = await runner.submit_or_429(wav_path)
     except MeetingInProgressError as exc:
         staging.cleanup(wav_path)
         return JSONResponse(
@@ -115,7 +116,15 @@ def poll_meeting(request: Request, job_id: str) -> JSONResponse:
     if job.error is not None:
         body["error"] = job.error
     if job.status == "done":
+        # `formats` kept for backward compat; `outputs` is what the client expects.
+        # Both fields carry the same set of available formats; `outputs` maps each
+        # format name to its download URL fragment so the client can resolve it
+        # without string-building knowledge of the URL structure.
         body["formats"] = sorted(_VALID_FORMATS)
+        body["outputs"] = {
+            fmt: f"/transcribe/meeting/{job.id}/download/{fmt}"
+            for fmt in sorted(_VALID_FORMATS)
+        }
 
     return JSONResponse(body)
 
@@ -133,10 +142,15 @@ def download_meeting(request: Request, job_id: str, fmt: str) -> StreamingRespon
     Returns
     -------
     200  Streaming file response.
-    400  Unknown format.
+    400  Unknown format or invalid job_id.
     404  Job not found or not done.
     410  Output file missing from disk (e.g. manually deleted).
     """
+    # G6: defence-in-depth — job_id must be a well-formed UUID (server-issued, so this
+    # is effectively a no-op in practice, but prevents path-traversal surprises).
+    if not re.fullmatch(r"[0-9a-f-]{36}", job_id):
+        raise HTTPException(400, "Invalid job_id format")
+
     if fmt not in _VALID_FORMATS:
         raise HTTPException(400, f"Unknown format '{fmt}'; valid: {sorted(_VALID_FORMATS)}")
 

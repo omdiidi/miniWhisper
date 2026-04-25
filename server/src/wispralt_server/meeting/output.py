@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,9 @@ def _atomic_write(content: bytes, dest: Path) -> None:
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp.close()
-        os.chmod(tmp.name, 0o644)
+        # M8: Use 0o600 (more conservative) rather than 0o644 for transcript files.
+        # chmod BEFORE replace so the file is never visible at dest with wrong perms.
+        os.chmod(tmp.name, 0o600)
         # Defend against path-traversal: temp file must be in dest.parent.
         assert os.path.dirname(os.path.abspath(tmp.name)) == os.path.abspath(
             str(dest.parent)
@@ -62,7 +65,21 @@ def _atomic_write(content: bytes, dest: Path) -> None:
             f"Temp file {tmp.name!r} is not inside output directory "
             f"{dest.parent!r} — aborting atomic write."
         )
-        os.replace(tmp.name, dest)
+        try:
+            os.replace(tmp.name, dest)
+        except OSError as exc:
+            # A2: EXDEV means tmp file and dest are on different filesystems.
+            # os.replace() cannot atomically rename across devices; log CRITICAL.
+            if getattr(exc, "errno", None) == errno.EXDEV:
+                logger.critical(
+                    "FATAL: os.replace('%s' -> '%s') failed with EXDEV — "
+                    "STAGING_DIR and MEETING_OUTPUT_DIR must be on the same filesystem.",
+                    tmp.name,
+                    dest,
+                )
+            raise RuntimeError(
+                f"Atomic rename failed ({exc}); ensure output_dir and tmp dir are on the same filesystem."
+            ) from exc
     except Exception:
         try:
             os.unlink(tmp.name)
@@ -165,6 +182,32 @@ def write_txt(transcript: dict, dest: Path) -> None:
 
     content = "\n".join(lines).encode("utf-8")
     _atomic_write(content, dest)
+
+
+# ── stale tmp sweep ───────────────────────────────────────────────────────────
+
+
+def sweep_stale_tmp(output_dir: Path, max_age_seconds: int = 3600) -> int:
+    """Remove ``*.tmp`` files in *output_dir* older than *max_age_seconds*.
+
+    Called once at server startup (after recover_orphans + sweep_old) to clean
+    up any temp files left by a previous crash during an atomic write.
+
+    Returns the count of files removed (I8).
+    """
+    if not output_dir.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for p in output_dir.glob("*.tmp"):
+        try:
+            if now - p.stat().st_mtime > max_age_seconds:
+                p.unlink()
+                removed += 1
+                logger.debug("Removed stale tmp file: %s", p)
+        except OSError:
+            pass
+    return removed
 
 
 # ── orchestration ──────────────────────────────────────────────────────────────
