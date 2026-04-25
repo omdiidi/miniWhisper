@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew:*)",
+      "Bash(uv:*)",
+      "Bash(launchctl:*)",
+      "Bash(cloudflared:*)",
+      "Bash(xcodebuild:*)",
+      "Bash(huggingface-cli:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(curl:*)",
+      "Bash(stat:*)",
+      "Bash(df:*)",
+      "Bash(security:*)",
+      "Bash(codesign:*)",
+      "Bash(hdiutil:*)",
+      "Bash(xcrun:*)",
+      "Bash(./scripts/*:*)",
+      "Read(./*)",
+      "Edit(./**/*)",
+      "Write(./**/*)"
+    ]
+  }
+}

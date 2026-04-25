@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Menubar-only app: no Dock icon -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Bundle identity -->
+    <key>CFBundleIdentifier</key>
+    <string>co.wispralt.WisprAlt</string>
+    <key>CFBundleName</key>
+    <string>WisprAlt</string>
+    <key>CFBundleDisplayName</key>
+    <string>WisprAlt</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>WisprAlt</string>
+
+    <!-- Minimum macOS version -->
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+
+    <!-- Privacy usage strings (required for App Store / notarization) -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>WisprAlt records your voice for dictation and meeting transcription.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>WisprAlt inserts transcribed text at your cursor.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>WisprAlt sends text to other applications.</string>
+
+    <!-- Sparkle auto-update (SUAutomaticallyUpdate = false: require user "Restart Now" click) -->
+    <key>SUFeedURL</key>
+    <string>https://omid.example/wispralt/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>REPLACE_WITH_PUBLIC_KEY</string>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
+</dict>
+</plist>

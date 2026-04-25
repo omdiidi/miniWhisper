@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+.pyright/
+.mypy_cache/
+
+# Swift / Xcode
+*.xcuserdata/
+*.xcworkspace/xcuserdata/
+build/
+DerivedData/
+.swiftpm/
+*.xcarchive
+*.dmg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Models cache (HuggingFace)
+models/
+.cache/huggingface/
+
+# Secrets (never commit)
+server/.env
+*.env
+*.key
+
+# Logs
+*.log
