@@ -151,9 +151,9 @@ Right-click → Open the first time to bypass Gatekeeper. Skips Path A's automat
 ```bash
 xed client/Package.swift
 ```
-Run with ⌘R. Xcode handles the bundling and ad-hoc signing automatically.
+Run with ⌘R. Xcode handles the bundling automatically and signs with whichever identity your Personal Team provides — typically an `Apple Development` certificate (free, issued automatically when you sign into Xcode with any Apple ID at Settings → Accounts). This matches Path A's signing requirement for `SMAppService.mainApp.register()`.
 
-For distributing to friends, you do need a Developer ID — `scripts/build-client.sh` covers the full notarized-DMG flow (and inherits the same `Package.swift` rpath setting, plus a pre-notarization `otool` check).
+For distributing to friends without a per-machine Apple ID setup, you'd need an Apple Developer Program enrollment ($99/yr) and `scripts/build-client.sh`'s notarized-DMG flow (inherits the same `Package.swift` rpath setting, plus a pre-notarization `otool` check). The free Apple Development cert is sufficient for personal use across your own Macs.
 
 ## Audio capture: write Float32, NOT Int16
 

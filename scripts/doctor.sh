@@ -87,7 +87,7 @@ if command -v cloudflared >/dev/null 2>&1; then
         pass "cloudflared found in launchctl list"
     else
         warn "cloudflared service does not appear to be running"
-        info "Start it: sudo cloudflared service install <token>  (or check System Preferences → Login Items)"
+        info "Start it: bash scripts/setup-cloudflared.sh  (NOT 'sudo cloudflared service install' — broken on macOS 14/15)"
     fi
 else
     warn "cloudflared not installed — tunnel will not work"
