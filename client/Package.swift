@@ -28,6 +28,17 @@ let package = Package(
                 // wasn't audited for Sendable conformance — turning off until we
                 // do a proper concurrency-safety pass.
                 .swiftLanguageMode(.v5)
+            ],
+            linkerSettings: [
+                // SPM does NOT add an @executable_path/../Frameworks rpath for
+                // executable targets, so the bundled Sparkle.framework would
+                // fail to load at runtime ("Library not loaded: @rpath/Sparkle").
+                // Adding it here means both build-client-local.sh (ad-hoc) and
+                // build-client.sh (xcodebuild via SPM project) inherit the fix.
+                .unsafeFlags([
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", "@executable_path/../Frameworks"
+                ])
             ]
         )
     ]

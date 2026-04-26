@@ -149,26 +149,55 @@ These are documented in `docs/TROUBLESHOOTING.md` under "Client build errors on 
 
 ## Build the client without an Apple Developer ID
 
-You don't need a signed/notarized DMG for personal use. Two paths:
+You don't need a signed/notarized DMG for personal use. Three paths, in order of preference:
 
-**Path A — local SPM build, ad-hoc signed:**
+**Path A (recommended) — `scripts/build-client-local.sh`:**
+```bash
+./scripts/build-client-local.sh
+```
+The script handles everything: SPM release build, `.app` bundle assembly with bundled `Sparkle.framework`, ad-hoc codesign with entitlements, and an `otool` verification that the `@executable_path/../Frameworks` rpath is wired (without it, the app crashes at launch with `Library not loaded: @rpath/Sparkle.framework/...`). Output: `client/build/WisprAlt.app`. Right-click → Open the first time to bypass Gatekeeper.
+
+The Sparkle rpath is set via `Package.swift` `linkerSettings` (`-Xlinker -rpath -Xlinker @executable_path/../Frameworks`). SPM does not add this for executable targets by default — that's the gotcha that breaks every hand-rolled local build.
+
+**Path B — manual SPM + codesign:**
 ```bash
 cd client && swift build -c release --arch arm64
 # Wrap the executable in a .app bundle:
-mkdir -p WisprAlt.app/Contents/MacOS
+mkdir -p WisprAlt.app/Contents/MacOS WisprAlt.app/Contents/Frameworks
 cp .build/arm64-apple-macosx/release/WisprAlt WisprAlt.app/Contents/MacOS/
+cp -R .build/arm64-apple-macosx/release/Sparkle.framework WisprAlt.app/Contents/Frameworks/
 cp WisprAlt/Info.plist WisprAlt.app/Contents/
 codesign --force --sign - --entitlements WisprAlt/WisprAlt.entitlements WisprAlt.app
 ```
-Right-click → Open the first time to bypass Gatekeeper.
+Right-click → Open the first time to bypass Gatekeeper. Skips Path A's automated rpath verification — if the build fails at launch, run `otool -l WisprAlt.app/Contents/MacOS/WisprAlt | grep -A2 LC_RPATH` to confirm `@executable_path/../Frameworks` is present.
 
-**Path B — open the SPM package in Xcode:**
+**Path C — Xcode:**
 ```bash
 xed client/Package.swift
 ```
 Run with ⌘R. Xcode handles the bundling and ad-hoc signing automatically.
 
-For distributing to friends, you do need a Developer ID — `scripts/build-client.sh` covers the full notarized-DMG flow.
+For distributing to friends, you do need a Developer ID — `scripts/build-client.sh` covers the full notarized-DMG flow (and inherits the same `Package.swift` rpath setting, plus a pre-notarization `otool` check).
+
+## Audio capture: write Float32, NOT Int16
+
+Two separate AVFoundation conversion bugs we hit and worked around:
+
+1. **`AVAudioConverter` default channel-mix** sums input channels rather than averaging. Stereo input → mono produces peak floats ≈ 3.97. We dropped the converter entirely; server resamples + downmixes via librosa.
+
+2. **`AVAudioFile.write(from:)` with Int16 commonFormat** applies a buggy ~140x amplification when the source buffer is Float32 and target settings ask for Int16. A clean 0.24-peak voice writes as Int16 ≈ 32750 (rail-clipped). Decoded fine on server, but Parakeet returned random one-word hallucinations from the destroyed audio. Fix: write Float32 at native sample rate, matching the tap buffer's format byte-for-byte. AVAudioFile then performs zero conversion. Server's `audio.py` reads Float32 via soundfile + librosa.
+
+The diagnostic that caught it: log the **pre-write float peak** from inside the tap callback alongside the post-write file peak. When pre-write peak ≈ 0.24 but post-write Int16 peak ≈ 32750, the conversion stage is doing something it shouldn't.
+
+## TCC permissions and ad-hoc / self-signed builds
+
+macOS Tahoe (26) keys ad-hoc and self-signed apps in TCC by `cdhash` (a hash of the binary). Every code change → new cdhash → TCC sees a brand-new app and re-prompts for all four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording). This is the Apple-enforced behavior; only **Developer ID** apps get team-identifier-based matching that survives binary changes.
+
+`scripts/setup-local-codesign.sh` adds a self-signed code-signing cert to System trust as a code-signing root. This helps for **launches of the same build** (TCC remembers across kill+relaunch) but does **not** survive rebuilds — macOS still falls back to cdhash for self-signed identities. There's no workaround on the OS side.
+
+Practical mitigation when iterating:
+- Make code changes in batches, rebuild less frequently.
+- Use `tccutil reset {Accessibility,ListenEvent,ScreenCapture,Microphone} co.wispralt.WisprAlt` to clear stale entries cleanly between rebuilds (sometimes UI shows toggles as "on" but TCC has the wrong cdhash internally — symptom is "I granted them but the app still says denied").
 
 ## What's NOT documented elsewhere
 

@@ -123,7 +123,30 @@ To check for updates manually: click the WisprAlt menubar icon → **Check for U
 
 See [client/README.md](../client/README.md) for the build/run quickstart.
 
-For a signed, notarized DMG:
+### Personal use (no Apple Developer ID)
+
+If you only need WisprAlt on your own Mac and don't plan to distribute it, use the local build flow.
+
+**One-time setup** (avoids the TCC re-grant loop on every rebuild):
+```bash
+./scripts/setup-local-codesign.sh
+```
+This creates a persistent self-signed cert in your login keychain and trusts it as a System code-signing root. Requires sudo once — after that, every future rebuild reuses the same identity, so macOS TCC keeps your Accessibility / Input Monitoring / Microphone / Screen Recording grants. Without this step, TCC sees each rebuild as a fresh app and re-prompts for all four permissions.
+
+**Build:**
+```bash
+./scripts/build-client-local.sh
+```
+Output: `client/build/WisprAlt.app`. The script auto-detects whether the persistent identity is set up; otherwise falls back to ad-hoc and prints a hint pointing at the setup script. Right-click → Open the first time to bypass Gatekeeper.
+
+Caveats:
+- Sparkle auto-update will not work for self-signed builds.
+- The bundled `Sparkle.framework` rpath is set via `Package.swift` `linkerSettings` so dyld can resolve it; the script also verifies this before signing.
+- Without the setup-local-codesign step, every code change forces a fresh re-grant of all four TCC permissions.
+
+### Distribution build (signed + notarized DMG)
+
+For a signed, notarized DMG suitable for sharing:
 ```bash
 ./scripts/build-client.sh "$DEVELOPER_ID_APP"
 ```

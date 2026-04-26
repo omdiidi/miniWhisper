@@ -384,6 +384,22 @@ extension MenuBarController: FNKeyEventsDelegate {
                     title: "Dictation Failed",
                     body: "API key rejected. Re-paste your API key in Settings."
                 )
+            } catch DictationRecorder.DictationError.emptyRecording {
+                // FN tapped without speaking, or mic returned silence.
+                // Don't notify — would be noisy on accidental taps.
+                Log.info("Dictation: empty recording (no audio captured).", category: "dictation")
+            } catch DictationRecorder.DictationError.writeFailed(let underlying) {
+                Log.error("Dictation failed — file write error: \(underlying)", category: "dictation")
+                AppNotifications.notify(
+                    title: "Dictation Failed",
+                    body: "Could not write audio to disk: \(underlying.localizedDescription)"
+                )
+            } catch DictationRecorder.DictationError.meetingRecordingActive {
+                Log.info("Dictation suppressed — meeting recording is active.", category: "dictation")
+                AppNotifications.notify(
+                    title: "Dictation Unavailable",
+                    body: "A meeting is recording — release the meeting first."
+                )
             } catch {
                 Log.error("Dictation failed: \(error.localizedDescription)", category: "dictation")
                 AppNotifications.notify(title: "Dictation Failed", body: error.localizedDescription)

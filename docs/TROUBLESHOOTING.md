@@ -155,6 +155,39 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 ---
 
+### Dictation returns empty text or random one-word hallucinations
+
+**Symptoms:**
+- FN-hold dictation completes (icon returns to idle) but no text is injected.
+- Server returns `duration_ms=0.0` for clearly-audible speech, OR
+- Server returns one-word random hallucinations like "Yeah." / "Proof." / "Okay." for an actual sentence.
+
+**Two distinct historical root causes — both fixed:**
+
+**Cause 1 — `AVAudioConverter` downmix bug.** The first version of `DictationRecorder` used `AVAudioConverter` to downmix to 16 kHz mono Float32 client-side. AVAudioConverter's default channel-mix sums channels without averaging, producing peak floats ≈ 3.97 on stereo input. Server's libsndfile rejected the WAV → `duration_ms=0`. **Fixed:** removed AVAudioConverter, kept native sample rate and channel count.
+
+**Cause 2 — `AVAudioFile` Float→Int16 amplification.** The second version asked AVAudioFile.write to convert Float32 buffers to Int16 PCM inline. AVAudioFile's internal converter applies a buggy ~140x normalization: a clean 0.24-peak voice landed in the WAV as a 32750/32767 (rail-clipped) Int16. Audio "decoded" fine on the server side (right format, right size), but Parakeet saw heavily distorted speech and returned random one-word hallucinations. **Fixed:** the recorder now writes **Float32 PCM** at native rate, format-matched to the tap buffer so AVAudioFile streams the float bytes verbatim without any conversion.
+
+**How to verify the fix is working:**
+1. Console.app, filter by `co.wispralt`.
+2. FN-hold and speak a sentence in TextEdit.
+3. Look for a log line like:
+   ```
+   DictationRecorder: stopped, 100800 frames at 48000Hz 1ch. peak=0.286
+   ```
+4. **Healthy ranges:** `peak` between **0.05 and 0.95** (Float32 normalized magnitude). `0.1–0.5` is typical for normal speech.
+5. **Red flags:**
+   - `peak > 0.95` followed by `(CLAMP ENGAGED — mic delivered out-of-range floats)` → input chain is over-amplifying. Check Control Center → Mic Mode → set to "Standard" (not Voice Isolation / Wide Spectrum). Check input volume (`osascript -e "input volume of (get volume settings)"`) and lower it.
+   - `peak < 0.005` → microphone effectively silent. Check the right device is the default input (`Settings → Sound → Input`).
+   - No log line at all → recording was empty. Client surfaces this as `DictationError.emptyRecording` (silent — no toast, since it would be noisy on accidental FN taps).
+   - "Could not parse the server response" error → server returned `duration_ms` as a float (e.g. `119.94`) but the client struct decoded it as `Int`. Fixed; client struct is now `Double`.
+
+**Related errors:**
+- `DictationError.writeFailed` — toasts if a tap-side `AVAudioFile.write` fails (disk full, ENOSPC). These were silently swallowed in the original implementation.
+- `DictationError.emptyRecording` — thrown when fewer than ~50ms of frames captured (FN tap-and-release without speech, or mic permission revoked mid-recording). Logged but not toasted.
+
+---
+
 ### Text injection silently fails in Electron apps (VS Code, Slack, etc.)
 
 **Symptom:** Dictation completes successfully (status goes back to idle) but no text appears in the focused field in an Electron app.

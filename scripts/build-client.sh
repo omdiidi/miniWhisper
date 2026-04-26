@@ -109,6 +109,24 @@ xcodebuild \
     | grep -E "^(error:|warning:|=== BUILD|Export Succeeded)" || true
 echo "Exported app: $APP_PATH"
 
+# ── Step 2.5: Verify Sparkle rpath ───────────────────────────────────────────
+# Package.swift adds @executable_path/../Frameworks via linkerSettings so the
+# bundled Sparkle.framework resolves at runtime. If anyone strips that out,
+# the resulting .app crashes at first launch with a dyld error — but only
+# AFTER it's been signed, notarized, stapled, and shipped. Catch it here.
+echo ""
+echo "Step 2.5: Verifying Sparkle rpath..."
+if ! otool -l "$APP_PATH/Contents/MacOS/WisprAlt" \
+        | grep -A2 LC_RPATH \
+        | grep -q '@executable_path/../Frameworks'; then
+    echo "ERROR: rpath @executable_path/../Frameworks missing from $APP_PATH/Contents/MacOS/WisprAlt" >&2
+    echo "       The bundle would fail at launch with:" >&2
+    echo "       'Library not loaded: @rpath/Sparkle.framework/Versions/B/Sparkle'" >&2
+    echo "       Check Package.swift linkerSettings." >&2
+    exit 1
+fi
+echo "  ✓ rpath present"
+
 # ── Step 3: Deep codesign with hardened runtime ───────────────────────────────
 # --options runtime: mandatory for notarization (hardened runtime).
 # --timestamp: embed a secure timestamp from Apple's time-stamp server.

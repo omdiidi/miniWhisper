@@ -7,7 +7,10 @@ enum DictationAPI {
     private struct TranscribeResponse: Decodable {
         let text: String
         let model_id: String
-        let duration_ms: Int
+        // Server returns this as a float (e.g. 119.94 ms), so we decode as Double.
+        // Decoding as Int would silently fail with a "data not in correct format"
+        // error because Foundation's JSONDecoder rejects float→Int coercion.
+        let duration_ms: Double
     }
 
     // MARK: - Public API

@@ -92,7 +92,9 @@ This file is the single source of truth for which documentation file covers each
 | `scripts/server-launchd.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/doctor.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/server-uninstall.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
-| `scripts/build-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) |
+| `scripts/build-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — Developer-ID signed + notarized DMG (distribution path) |
+| `scripts/build-client-local.sh` | [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — ad-hoc-signed `.app` for personal use; no Apple Developer ID required. Verifies `@executable_path/../Frameworks` rpath (set in `Package.swift` `linkerSettings`) so bundled `Sparkle.framework` resolves at runtime |
+| `scripts/setup-local-codesign.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — one-time setup that creates a persistent self-signed code-signing cert and trusts it as a System code-signing root, so TCC permission grants survive client rebuilds |
 | `scripts/uninstall-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — full client removal including Keychain, UserDefaults, app bundle |
 
 ## CI / GitHub (`github/`)
