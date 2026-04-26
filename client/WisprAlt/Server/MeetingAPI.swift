@@ -86,8 +86,7 @@ enum MeetingAPI {
         let handle = try FileHandle(forReadingFrom: wavURL)
         defer { try? handle.close() }
         while true {
-            let chunk = try handle.read(upToCount: 1 << 20)
-            if chunk.isEmpty { break }
+            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
             hasher.update(data: chunk)
         }
         let md5Base64 = Data(hasher.finalize()).base64EncodedString()
@@ -101,8 +100,8 @@ enum MeetingAPI {
         request.setValue(md5Base64, forHTTPHeaderField: "Content-MD5")
         request.setValue(String(fileSize), forHTTPHeaderField: "Content-Length")
 
-        if let apiKey = try? KeychainHelper.getAPIKey(), let key = apiKey {
-            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if let apiKey = try? KeychainHelper.getAPIKey() {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
         // Perform upload with a dedicated session so we can set a per-upload delegate.

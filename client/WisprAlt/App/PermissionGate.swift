@@ -71,7 +71,7 @@ enum PermissionGate {
 
         Log.info("Accessibility: requesting trust.", category: "permissions")
         // Triggers the TCC prompt (shows "Allow" dialog if not yet decided).
-        let opts = [kAXTrustedCheckOptionPrompt: true] as CFDictionary
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(opts)
 
         if trusted {
@@ -168,7 +168,7 @@ enum PermissionGate {
         Log.info("Screen Recording: attempting SCShareableContent to trigger TCC prompt.", category: "permissions")
         // Calling SCShareableContent.current() triggers the TCC prompt on macOS 14+.
         do {
-            _ = try await SCShareableContent.current()
+            _ = try await SCShareableContent.current
             Log.info("Screen Recording: granted after SCShareableContent prompt.", category: "permissions")
             return .granted
         } catch {

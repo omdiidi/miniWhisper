@@ -2,6 +2,8 @@ import AVFoundation
 import CoreMedia
 import ScreenCaptureKit
 import AppKit
+import os
+import os.lock
 
 // MARK: - MeetingRecorderError
 
@@ -54,8 +56,13 @@ final class MeetingRecorder: NSObject {
 
     /// `true` while capture is active. Thread-safe; safe to read from any thread.
     var isActive: Bool {
-        get { _isActiveLock.withLock { $0 } }
-        private set { _isActiveLock.withLock { $0 = newValue } }
+        _isActiveLock.withLock { $0 }
+    }
+
+    /// Thread-safe setter, used internally instead of `isActive = newValue` to
+    /// avoid Swift accessor-syntax issues with `private set` on locked values.
+    private func setActive(_ value: Bool) {
+        _isActiveLock.withLock { $0 = value }
     }
 
     // MARK: - Private capture state
@@ -95,8 +102,7 @@ final class MeetingRecorder: NSObject {
     // queue semantics change, and has negligible overhead (always uncontended
     // on a serial queue).
 
-    private var startPTS: CMTime?
-    private var ptsLock = os_unfair_lock_s()
+    private let ptsState = OSAllocatedUnfairLock<CMTime?>(initialState: nil)
 
     // MARK: - Wall-clock flush timer (100 ms)
 
@@ -151,9 +157,7 @@ final class MeetingRecorder: NSObject {
 
         // Reset per-session state.
         aligned = AlignedRingBuffer()
-        os_unfair_lock_lock(&ptsLock)
-        startPTS = nil
-        os_unfair_lock_unlock(&ptsLock)
+        ptsState.withLock { $0 = nil }
         micConverter = CMSampleBufferConverter()
         sysConverter = CMSampleBufferConverter()
         outputURL = url
@@ -225,7 +229,7 @@ final class MeetingRecorder: NSObject {
             self?.handleSystemWake()
         }
 
-        isActive = true
+        setActive(true)
         Log.info("MeetingRecorder: capture started → \(url.lastPathComponent)", category: "capture")
     }
 
@@ -299,7 +303,7 @@ final class MeetingRecorder: NSObject {
             self.stereoFile = nil
         }
 
-        isActive = false
+        setActive(false)
         Log.info("MeetingRecorder: capture stopped → \(url.lastPathComponent)", category: "capture")
         return url
     }
@@ -395,11 +399,10 @@ extension MeetingRecorder: SCStreamOutput {
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
         // Determine and latch the recording start PTS (first arriving buffer wins).
-        var localStart: CMTime
-        os_unfair_lock_lock(&ptsLock)
-        if startPTS == nil { startPTS = pts }
-        localStart = startPTS!
-        os_unfair_lock_unlock(&ptsLock)
+        let localStart: CMTime = ptsState.withLock { current in
+            if current == nil { current = pts }
+            return current!
+        }
 
         // Compute sample offset using CMTimeSubtract (not float subtraction) to avoid
         // accumulating drift over multi-hour recordings (R1#18 / known gotcha).
@@ -434,6 +437,6 @@ extension MeetingRecorder: SCStreamDelegate {
         Log.error("MeetingRecorder: SCStream stopped with error: \(error)", category: "capture")
         // Record the stream stopping so the UI can surface it.
         // Full stop/cleanup is left to the caller via stop().
-        isActive = false
+        setActive(false)
     }
 }

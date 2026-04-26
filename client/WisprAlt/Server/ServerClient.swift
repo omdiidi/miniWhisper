@@ -76,8 +76,8 @@ final class ServerClient {
         request.httpMethod = method
 
         // Bearer auth — tolerate missing key gracefully (health check doesn't need it).
-        if let apiKey = try? KeychainHelper.getAPIKey(), let key = apiKey {
-            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if let apiKey = try? KeychainHelper.getAPIKey() {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
         if let body {

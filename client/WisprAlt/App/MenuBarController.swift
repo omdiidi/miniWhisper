@@ -108,7 +108,11 @@ final class MenuBarController: NSObject {
             title: "Meeting Recording Stopped",
             body: "\(capMin)-minute cap reached. Uploading now."
         )
-        toggleMeetingRecording()
+        // toggleMeetingRecording is @MainActor; this NotificationCenter callback
+        // is nonisolated. Hop to the main actor before invoking.
+        Task { @MainActor in
+            self.toggleMeetingRecording()
+        }
     }
 
     @objc private func handleMeetingApproachingCap() {

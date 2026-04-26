@@ -59,11 +59,11 @@ final class CMSampleBufferConverter {
     func convertTo16kMono(_ sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
         // Lazily build converter on first buffer, then reuse.
         if converter == nil {
-            guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
-                  let src = AVAudioFormat(cmAudioFormatDescription: desc) else {
+            guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
                 Log.error("CMSampleBufferConverter: missing format description", category: "capture")
                 return nil
             }
+            let src = AVAudioFormat(cmAudioFormatDescription: desc)
             guard let conv = AVAudioConverter(from: src, to: AudioFormat.canonical16kFloat32Mono) else {
                 Log.error("CMSampleBufferConverter: failed to create AVAudioConverter from \(src) to 16k mono", category: "capture")
                 return nil

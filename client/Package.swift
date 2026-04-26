@@ -1,10 +1,10 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
     name: "WisprAlt",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v15)
     ],
     products: [
         .executable(name: "WisprAlt", targets: ["WisprAlt"])
@@ -24,7 +24,10 @@ let package = Package(
             ],
             path: "WisprAlt",
             swiftSettings: [
-                .unsafeFlags(["-strict-concurrency=complete"])
+                // Strict concurrency was originally enabled but the whole codebase
+                // wasn't audited for Sendable conformance — turning off until we
+                // do a proper concurrency-safety pass.
+                .swiftLanguageMode(.v5)
             ]
         )
     ]

@@ -12,7 +12,7 @@ import Sparkle
 final class SparkleController: NSObject, SPUUpdaterDelegate {
     // MARK: - Sparkle components
 
-    private let updaterController: SPUStandardUpdaterController
+    private var updaterController: SPUStandardUpdaterController
 
     // MARK: - Meeting guard
     // Set by AppDelegate after MenuBarController is ready.

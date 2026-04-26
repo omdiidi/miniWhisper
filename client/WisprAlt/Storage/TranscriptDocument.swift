@@ -20,9 +20,9 @@ enum TranscriptError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unknownSpeaker(let key):
-            return "No speaker found with raw key "\(key)"."
+            return "No speaker found with raw key \"\(key)\"."
         case .speakerNameConflict(let name):
-            return "The name "\(name)" is already used by another speaker."
+            return "The name \"\(name)\" is already used by another speaker."
         case .invalidSpeakerName(let reason):
             return "Invalid speaker name: \(reason)."
         case .ioError(let underlying):
