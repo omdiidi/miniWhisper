@@ -2,6 +2,15 @@ import AVFoundation
 import Foundation
 import os.lock
 
+extension Notification.Name {
+    /// Posted when AVAudioEngine's input configuration changes mid-recording
+    /// (e.g. user plugs in / unplugs AirPods, switches default input device).
+    /// MenuBarController observes this to abort the in-flight dictation and
+    /// return the UI to idle — the engine has already invalidated the tap by
+    /// the time this fires.
+    static let dictationConfigChanged = Notification.Name("co.wispralt.dictationConfigChanged")
+}
+
 // MARK: - DictationRecorder
 
 /// Records microphone audio via `AVAudioEngine` and produces a native-rate
@@ -229,6 +238,11 @@ final class DictationRecorder {
                     )
                 }
             }
+            // Notify the UI layer so the menubar state machine can abort the
+            // recording session — without this, the menubar shows "recording"
+            // forever (FN release won't fire stop() because the engine has
+            // already invalidated the tap).
+            NotificationCenter.default.post(name: .dictationConfigChanged, object: nil)
         }
 
         // Install tap in input format. AVAudioFile.write performs the format

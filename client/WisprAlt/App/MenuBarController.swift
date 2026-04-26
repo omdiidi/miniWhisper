@@ -98,6 +98,37 @@ final class MenuBarController: NSObject {
             name: .meetingApproachingCap,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDictationConfigChanged),
+            name: .dictationConfigChanged,
+            object: nil
+        )
+    }
+
+    /// Fires when the audio input device changes mid-dictation (AirPods plugged
+    /// in/out, default input switched). The recorder has already invalidated
+    /// its tap — we just need to reset the menubar state to idle and surface a
+    /// brief notification so the user knows to retry.
+    @objc private func handleDictationConfigChanged() {
+        Task { @MainActor in
+            guard self.mode == .dictating else { return }
+            Log.info(
+                "MenuBarController: aborting in-flight dictation — audio device changed.",
+                category: "dictation"
+            )
+            // Best-effort cleanup: stop the recorder if it's still running.
+            // We discard whatever partial WAV exists; transcribing it would
+            // fail anyway (engine state is invalid).
+            Task.detached {
+                _ = try? await self.dictationRecorder.stop()
+            }
+            self.mode = .idle
+            AppNotifications.notify(
+                title: "Dictation Cancelled",
+                body: "Audio input device changed mid-recording. Press FN again to retry."
+            )
+        }
     }
 
     @objc private func handleMeetingMaxDurationReached() {
