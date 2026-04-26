@@ -13,7 +13,7 @@ struct WisprAltApp: App {
     var body: some Scene {
         // Empty Settings scene: gives macOS a target for the Settings menu item;
         // the actual settings UI lives in the menubar popover (MenuBarController).
-        Settings {
+        SwiftUI.Settings {
             EmptyView()
         }
     }

@@ -21,14 +21,21 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     // MARK: - Init
 
     override init() {
-        // hostBundle nil → main bundle; delegate set to self after super.init.
-        updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
+        // Pre-init self ref via deferred-start trick: instantiate the controller
+        // without auto-starting, set delegate, then start the updater.
+        let placeholderController = SPUStandardUpdaterController(
+            startingUpdater: false,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
+        updaterController = placeholderController
         super.init()
-        updaterController.updater.delegate = self
+        // Re-init with self as delegate; Sparkle 2 requires delegate at construction time.
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: self,
+            userDriverDelegate: nil
+        )
     }
 
     // MARK: - Public interface

@@ -41,3 +41,17 @@ server/.env
 # Logs
 *.log
 CLAUDE.local.md
+
+# Local secrets / setup state (never commit)
+tmp/credentials.txt
+tmp/client-config.txt
+
+# Local debug screenshots (not part of the project)
+tmp/mac-mini-screen-*.png
+
+# Swift Package build artifacts and resolved deps
+client/.build/
+client/Package.resolved
+
+# Claude Code internal state
+.claude/scheduled_tasks.lock
