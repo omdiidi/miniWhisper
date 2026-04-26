@@ -284,3 +284,108 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 **Diagnosis (not appearing):** The appcast URL may be unreachable, or the Sparkle EdDSA signature may not match the embedded `SUPublicEDKey` in `Info.plist` (affects self-built versions).
 
 **Fix (not appearing):** Check network connectivity to GitHub Pages. For self-built versions, ensure `SPARKLE_ED_PRIVATE_KEY` in your GitHub secrets matches the public key in `Info.plist`.
+
+---
+
+## Server Auto-start and Cloudflare Tunnel
+
+### Cloudflared not running after Mac mini reboot
+
+**Symptom:** The public endpoint (`https://transcribe.yourdomain.com`) is unreachable after a reboot or power cycle.
+
+**Diagnosis:**
+```bash
+launchctl print gui/$UID/co.wispralt.cloudflared
+```
+Look for `state = running`. If the service is absent from the output, the LaunchAgent is not loaded.
+
+**Fix:**
+1. If the service is absent: re-run `bash scripts/setup-cloudflared.sh` to regenerate and reload the plist.
+2. If the service is present but `state = running` says "waiting" or keeps cycling: cloudflared is crashing and KeepAlive is restarting it. Check stderr first:
+   ```bash
+   tail -50 ~/Library/Logs/WisprAlt/cloudflared.err.log
+   ```
+   Auth errors (invalid token, tunnel not found) appear here. **Check the log before assuming a process or network fault** — a KeepAlive hot-loop is almost always a bad token.
+
+---
+
+### Mac mini rebooted with no internet
+
+**Symptom:** Mac mini rebooted while the network was down. cloudflared didn't come up.
+
+**Diagnosis:** This is expected and self-healing. The LaunchAgent uses `KeepAlive: {NetworkState: true}` — launchd waits for a network interface to come up before starting cloudflared. Once the network returns, launchd starts the process automatically. `ThrottleInterval: 10` enforces at most one restart per 10 seconds during flapping.
+
+**Fix:** No manual intervention needed. Wait ~30 seconds after the network returns, then check `launchctl print gui/$UID/co.wispralt.cloudflared | grep state`.
+
+---
+
+### Token file missing or corrupted
+
+**Symptom:** cloudflared is restarting repeatedly (KeepAlive loop) with auth errors in the log. Typical log line: `Couldn't start tunnel` or `failed to authenticate`.
+
+**Diagnosis:**
+```bash
+ls -la ~/.config/wispralt/cloudflare-token
+```
+Confirm the file exists and is mode 0600. If missing or zero-length, the token was not written correctly during setup.
+
+**Fix:** Recreate the token file via the rotation procedure in [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) under "Cloudflared LaunchAgent — Token rotation". Use Procedure A (modern) or Procedure B (legacy) depending on your cloudflared version.
+
+---
+
+## Client Auto-start
+
+### Client menubar app didn't appear after login
+
+**Symptom:** After logging in, the WisprAlt menubar icon does not appear. Opening the app manually from `/Applications` works fine.
+
+**Diagnosis:**
+1. **System Settings → General → Login Items & Extensions** — check whether WisprAlt is listed and enabled.
+2. If the toggle shows "requires approval", it is in a pending state waiting for user confirmation.
+3. If the entry is not listed at all, the SMAppService registration may be stale after an OS upgrade or a `resetbtm` event.
+
+**Fix:**
+- If "requires approval": toggle it on in System Settings → Login Items & Extensions.
+- If not listed: run `sfltool resetbtm` in Terminal, then reboot. This clears the Launch Services BTM (Background Task Management) database — Apple's recommended recovery for stale login-item entries. On next launch, WisprAlt re-registers automatically.
+
+---
+
+### Friend's Mac shows "WisprAlt cannot be opened because the developer cannot be verified"
+
+**Symptom:** Gatekeeper dialog blocks launch on a friend's Mac (or on your own Mac after downloading a DMG).
+
+**Diagnosis:** This is a first-time Gatekeeper quarantine warning. Apple Development-signed builds are not notarized (no Apple Developer Program enrollment), so Gatekeeper flags them on first open from a download.
+
+**Fix (command line):**
+```bash
+xattr -dr com.apple.quarantine /path/to/WisprAlt.app
+open /path/to/WisprAlt.app
+```
+
+**Fix (Finder):** Right-click the app → **Open** → click **Open** (not just double-clicking). The dialog will have an Open button the second time.
+
+This is a one-time step per version. After the app is approved, all subsequent launches and login-launches open silently.
+
+---
+
+### TCC prompts returned out of nowhere — I didn't rebuild
+
+**Symptom:** Accessibility, Input Monitoring, Microphone, or Screen Recording prompts appeared even though you haven't installed a new version.
+
+**Diagnosis:** This is most likely the annual Apple Development certificate renewal. Xcode auto-renews the cert while signed in, but the renewed cert has a new SHA-1 and a new Designated Requirement — macOS TCC sees the next launch as a new app identity.
+
+**To confirm:**
+```bash
+security find-certificate -c "Apple Development:" -p login.keychain | \
+  openssl x509 -noout -dates
+```
+A "Not Before" date within the past few days confirms a recent renewal.
+
+**Fix:** Same as after any rebuild — run the canonical TCC reset and re-grant:
+```bash
+tccutil reset Accessibility   co.wispralt.WisprAlt
+tccutil reset ListenEvent     co.wispralt.WisprAlt
+tccutil reset ScreenCapture   co.wispralt.WisprAlt
+tccutil reset Microphone      co.wispralt.WisprAlt
+```
+Then reopen WisprAlt and grant all four permissions. This happens at most once a year.

@@ -58,7 +58,8 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Hotkeys/FNKeyMonitor.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — FN key state machine |
 | `client/WisprAlt/Hotkeys/HotkeyEvents.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — delegate protocol |
 | `client/WisprAlt/Capture/DictationRecorder.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — AVAudioEngine dictation |
-| `client/WisprAlt/Capture/MeetingRecorder.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — SCStream dual-channel capture |
+| `client/WisprAlt/Capture/MeetingRecorder.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — SCStream dual-channel capture; `.meetingConfigChanged` notification; partial-WAV cleanup on abort |
+| `client/WisprAlt/Capture/AudioDeviceListener.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — CoreAudio HAL listener for default-input-device changes; posts `.meetingConfigChanged` for MenuBarController to abort cleanly |
 | `client/WisprAlt/Capture/AlignedRingBuffer.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — sample-aligned ring buffer |
 | `client/WisprAlt/Capture/AudioFormat.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — format conversion, CMSampleBuffer→AVAudioPCMBuffer |
 | `client/WisprAlt/Server/ServerClient.swift` | [API.md](API.md) — URLSession, multipart upload, progress |
@@ -93,8 +94,8 @@ This file is the single source of truth for which documentation file covers each
 | `scripts/doctor.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/server-uninstall.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/build-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — Developer-ID signed + notarized DMG (distribution path) |
-| `scripts/build-client-local.sh` | [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — ad-hoc-signed `.app` for personal use; no Apple Developer ID required. Verifies `@executable_path/../Frameworks` rpath (set in `Package.swift` `linkerSettings`) so bundled `Sparkle.framework` resolves at runtime |
-| `scripts/setup-local-codesign.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — one-time setup that creates a persistent self-signed code-signing cert and trusts it as a System code-signing root, so TCC permission grants survive client rebuilds |
+| `scripts/build-client-local.sh` | [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — Apple-Development-signed `.app` for personal use; requires free Apple Development cert from Xcode (no Apple Developer Program enrollment); fails clearly if cert is missing or multiple ambiguous identities exist. Verifies `@executable_path/../Frameworks` rpath (set in `Package.swift` `linkerSettings`) so bundled `Sparkle.framework` resolves at runtime |
+| `scripts/setup-local-codesign.sh` | [CONTRIBUTING.md](CONTRIBUTING.md) — Legacy self-signed cert script; no longer wired into the build flow; retained for `--ad-hoc` developer fallback only; see CONTRIBUTING.md |
 | `scripts/uninstall-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — full client removal including Keychain, UserDefaults, app bundle |
 
 ## CI / GitHub (`github/`)
@@ -113,3 +114,4 @@ This file is the single source of truth for which documentation file covers each
 | `.claude/commands/test-connection.md` | [CLAUDE.md](../CLAUDE.md) |
 | `.claude/commands/docs-check.md` | [CLAUDE.md](../CLAUDE.md) |
 | `.claude/commands/update-models.md` | [CLAUDE.md](../CLAUDE.md) |
+| `.claude/commands/verify-autostart.md` | [CLAUDE.md](../CLAUDE.md) |

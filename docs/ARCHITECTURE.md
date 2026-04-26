@@ -43,7 +43,7 @@ WisprAlt is a two-component system: a native macOS menubar client running on you
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port-forwarding, no firewall rule changes required. The tunnel token is read from stdin during setup and stored exclusively in the macOS system keychain by `cloudflared`; it is never written to `.env` or any plist.
+The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port-forwarding, no firewall rule changes required. The tunnel token is read from stdin during setup and persisted to `~/.config/wispralt/cloudflare-token` (mode 0600), referenced by the user-level `co.wispralt.cloudflared` LaunchAgent via `--token-file` (or inlined into a 0600 plist on cloudflared < 2025.4.0). It is never committed to the repo.
 
 ---
 
@@ -55,7 +55,8 @@ The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port
 |---|---|---|
 | **FNKeyMonitor** | `client/WisprAlt/Hotkeys/FNKeyMonitor.swift` | CGEventTap (`kCGSessionEventTap`, `.listenOnly`) on `flagsChanged | keyDown`. Hops to serial private queue immediately. Tracks FN-DOWN time; detects 300ms hold for dictation; detects triple-tap within 400ms window for meeting toggle. Clears `tapTimes` when hold is confirmed to prevent stale taps poisoning future triple-taps. |
 | **DictationRecorder** | `client/WisprAlt/Capture/DictationRecorder.swift` | AVAudioEngine input tap that writes a native-format **Float32 PCM** WAV via `AVAudioFile.write(from:)`. Sample rate, channel count, and PCM format all match the tap's buffer exactly so AVAudioFile performs zero conversion — it streams the float bytes byte-for-byte to disk. Server (`audio.py`) resamples to 16 kHz and downmixes via `np.mean`. AVAudioConverter is intentionally avoided (default channel-mix sums channels rather than averaging, producing peak floats > 3.0). Int16 PCM output is also avoided (AVAudioFile's internal Float→Int16 converter applies a ~140x normalization that rail-clips the signal and destroys ASR accuracy). Tap callback dispatches each write onto a serial `ioQueue` to keep the realtime render thread free. Defensive in-tap clamp to ±0.95 catches any future regression of out-of-range floats. No-op if `MeetingRecorder.isActive == true`. |
-| **MeetingRecorder** | `client/WisprAlt/Capture/MeetingRecorder.swift` | SCStream dual-channel capture: `captureMicrophone=true` (ch1) + `capturesAudio=true, excludesCurrentProcessAudio=true` (ch2). Both downsampled to 16kHz Float32 via stateful AVAudioConverter. `startPTS` locked with `os_unfair_lock`; `CMTimeSubtract` used (not float subtraction) to avoid float drift over multi-hour meetings. Feeds `AlignedRingBuffer`. |
+| **MeetingRecorder** | `client/WisprAlt/Capture/MeetingRecorder.swift` | SCStream dual-channel capture: `captureMicrophone=true` (ch1) + `capturesAudio=true, excludesCurrentProcessAudio=true` (ch2). Both downsampled to 16kHz Float32 via stateful AVAudioConverter. `startPTS` locked with `os_unfair_lock`; `CMTimeSubtract` used (not float subtraction) to avoid float drift over multi-hour meetings. Feeds `AlignedRingBuffer`. Instantiates `AudioDeviceListener` before `stream.startCapture()`; posts `.meetingConfigChanged` on input-device change. On abort: tears down the listener, deletes the partial WAV, resets state to idle. |
+| **AudioDeviceListener** | `client/WisprAlt/Capture/AudioDeviceListener.swift` | CoreAudio HAL listener for default-input-device changes (`kAudioHardwarePropertyDefaultInputDevice`). Uses a file-scope C function pointer (required by `AudioObjectAddPropertyListener` — cannot be stored on a Swift class instance). Context is heap-allocated via `Unmanaged.passRetained`; `deinit` calls `release()` exactly once and removes the listener. Posts `.meetingConfigChanged` via `DispatchQueue.main.async` so callers always receive the notification on the main thread. |
 | **AlignedRingBuffer** | `client/WisprAlt/Capture/AlignedRingBuffer.swift` | Sample-position-keyed buffer (dictionary keyed by start-sample integer). `flushAligned()` returns aligned 2-channel chunks when both channels have data; pads lagging channel with silence when gap exceeds `GAP_TOLERANCE_MS` (200ms default). `padMissing(toEnd:)` force-flushes at stop time. |
 | **TextInjector** | `client/WisprAlt/Inject/TextInjector.swift` | Strategy wrapper: tries `AccessibilityInjector` first, falls through to `ClipboardInjector` if AX returns success but value did not change (Electron silent-fail mode). |
 | **AccessibilityInjector** | `client/WisprAlt/Inject/AccessibilityInjector.swift` | `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)`. Reads `kAXValueAttribute` before and after to detect silent no-ops. Returns `false` if value unchanged, triggering clipboard fallback. |
@@ -79,7 +80,7 @@ The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port
 
 ### Networking
 
-The Cloudflare Tunnel maps `transcribe.<user-domain>` → `http://127.0.0.1:8000` on the Mac mini. `cloudflared` runs as a launchd system service. Its persistent credential lives in the macOS system keychain; the setup script (`scripts/setup-cloudflared.sh`) discards the token from shell memory immediately after `sudo cloudflared service install <token>`.
+The Cloudflare Tunnel maps `transcribe.<user-domain>` → `http://127.0.0.1:8000` on the Mac mini. `cloudflared` runs as a **user-level LaunchAgent** (`~/Library/LaunchAgents/co.wispralt.cloudflared.plist`), not as a system service — the `sudo cloudflared service install` path is broken on macOS 14/15+. The tunnel token is stored at `~/.config/wispralt/cloudflare-token` (mode 0600); the LaunchAgent reads it via `--token-file` on cloudflared ≥ 2025.4.0, or has it inlined in the plist (mode 0600) on older versions. The setup script (`scripts/setup-cloudflared.sh`) reads the token via `read -r -s` and unsets the shell variable immediately after writing the file.
 
 Tunnel latency overhead: ~50–200ms same-region. The Cloudflare free tier has a community-reported body limit of approximately 100 MB; the server enforces `MAX_UPLOAD_BYTES` (default 2 GiB) at the application layer. A 90-minute 2-channel 16kHz Float32 WAV is approximately 460 MB; clients warn the user at 60 minutes.
 
@@ -201,3 +202,36 @@ Speaker rename is **client-side only**. There is no server `PATCH /speakers` end
 4. A `.transcriptWriteInProgress` sentinel file is created before the first replace and deleted after the last. On app launch, orphan sentinels trigger a revert (delete partial outputs, keep originals).
 
 This is fully offline-capable and requires no network connectivity.
+
+---
+
+## Process Auto-Start
+
+Three launchd entries keep both sides of WisprAlt alive across reboots, crashes, and logins.
+
+```
+Mac mini — launchd gui/<UID>
+  │
+  ├── co.wispralt.server  (~/Library/LaunchAgents/co.wispralt.server.plist)
+  │     RunAtLoad: true
+  │     KeepAlive: true
+  │     → uvicorn on 127.0.0.1:8000
+  │
+  └── co.wispralt.cloudflared  (~/Library/LaunchAgents/co.wispralt.cloudflared.plist)
+        RunAtLoad: true
+        KeepAlive: {SuccessfulExit: false, NetworkState: true}
+        ThrottleInterval: 10
+        → cloudflared tunnel run --token-file ~/.config/wispralt/cloudflare-token
+          (or --token <value> on cloudflared < 2025.4.0)
+
+Client Mac — SMAppService (registered by AppDelegate at first launch)
+  │
+  └── co.wispralt.WisprAlt  (Login Items & Extensions entry)
+        → /Applications/WisprAlt.app
+        Appears in System Settings → General → Login Items & Extensions
+        Configurable via in-app Settings → Launch at login toggle
+```
+
+Both Mac mini LaunchAgents run at user level (`gui/$UID`) — not system level — so they have access to the user's Keychain, home directory, and environment without requiring sudo. `EnvironmentVariables/PATH` is set explicitly in each plist because launchd provides a minimal PATH that may not include Homebrew.
+
+The SMAppService entry on the client is registered via `SMAppService.mainApp.register()` and requires an Apple-issued code-signing identity (Apple Development or Developer ID). Ad-hoc signed builds cannot use SMAppService.

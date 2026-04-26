@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import ServiceManagement
 
 /// Persistent user preferences backed by UserDefaults.
 ///
@@ -144,5 +145,39 @@ final class Settings: ObservableObject {
         return docs
             .appendingPathComponent("WisprAlt", isDirectory: true)
             .appendingPathComponent("Meetings", isDirectory: true)
+    }
+}
+
+// MARK: - Launch-at-login (SMAppService)
+
+/// @MainActor isolation ensures `objectWillChange.send()` always fires on the
+/// main thread even if some future caller mutates `launchAtLogin` from a
+/// background Task.
+@MainActor
+extension Settings {
+
+    /// Whether WisprAlt is registered to launch automatically after login.
+    ///
+    /// Reads the live `SMAppService.mainApp.status`; writing calls `register()`
+    /// or `unregister()` and fires `objectWillChange` so any observing SwiftUI
+    /// views update immediately.
+    ///
+    /// Requires the app to be signed with an Apple Development (or stronger)
+    /// code-signing identity. Ad-hoc or self-signed identities cause
+    /// `register()` to silently fail at runtime (Apple Developer Forums #799910).
+    var launchAtLogin: Bool {
+        get { SMAppService.mainApp.status == .enabled }
+        set {
+            do {
+                if newValue {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+                objectWillChange.send()
+            } catch {
+                Log.warning("Launch-at-login toggle failed: \(error)", category: "lifecycle")
+            }
+        }
     }
 }

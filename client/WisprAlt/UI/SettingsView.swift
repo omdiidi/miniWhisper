@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 
 /// Main settings panel hosted in the menubar popover.
 ///
@@ -26,6 +27,8 @@ struct SettingsView: View {
     @State private var isTesting: Bool = false
     /// File picker presented when "Browse" is tapped.
     @State private var showingFolderPicker: Bool = false
+    /// Error message shown below the export/import buttons when an operation fails.
+    @State private var exportImportError: String?
 
     // MARK: - Body
 
@@ -33,8 +36,10 @@ struct SettingsView: View {
         Form {
             serverSection
             apiKeySection
+            apiKeyExportImportSection
             meetingsFolderSection
             hotkeySection
+            launchAtLoginSection
             connectionSection
         }
         .formStyle(.grouped)
@@ -131,6 +136,77 @@ struct SettingsView: View {
                 }
             }
             .help("Maximum meeting recording duration (5–240 min). Default 90.")
+        }
+    }
+
+    private var launchAtLoginSection: some View {
+        Section("Startup") {
+            Toggle("Launch at login", isOn: Binding(
+                get:  { settings.launchAtLogin },
+                set:  { settings.launchAtLogin = $0 }
+            ))
+            if SMAppService.mainApp.status == .requiresApproval {
+                Button("Open Login Items in System Settings") {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+            }
+        }
+    }
+
+    private var apiKeyExportImportSection: some View {
+        Section("API Key Backup") {
+            HStack {
+                Button("Export API Key…") {
+                    let panel = NSSavePanel()
+                    panel.allowedContentTypes = [.text]
+                    panel.nameFieldStringValue = "wispralt-api-key.wispralt-key"
+                    panel.directoryURL = FileManager.default.urls(
+                        for: .desktopDirectory, in: .userDomainMask
+                    ).first
+                    panel.message = "Exports your API key. Treat this file like a password."
+                    guard panel.runModal() == .OK, let url = panel.url else { return }
+                    do {
+                        try KeychainHelper.exportAPIKey(to: url)
+                        exportImportError = nil
+                    } catch {
+                        Log.error("API key export failed: \(error)", category: "storage")
+                        exportImportError = "Export failed: \(error.localizedDescription)"
+                    }
+                }
+
+                Button("Import API Key…") {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [.text]
+                    panel.directoryURL = FileManager.default.urls(
+                        for: .desktopDirectory, in: .userDomainMask
+                    ).first
+                    panel.message = "Importing replaces any existing API key in the Keychain."
+                    guard panel.runModal() == .OK, let url = panel.url else { return }
+                    do {
+                        try KeychainHelper.importAPIKey(from: url)
+                        exportImportError = nil
+                        // Refresh the in-memory text field so the UI reflects the new key.
+                        do {
+                            apiKeyText = (try KeychainHelper.getAPIKey()) ?? ""
+                        } catch {
+                            Log.error("Failed to re-read API key after import: \(error)", category: "settings")
+                        }
+                    } catch {
+                        Log.error("API key import failed: \(error)", category: "storage")
+                        exportImportError = "Import failed: \(error.localizedDescription)"
+                    }
+                }
+            }
+
+            Text("Save exports to your Desktop, not Documents (Documents may sync to iCloud).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let msg = exportImportError {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
         }
     }
 

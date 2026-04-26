@@ -65,14 +65,14 @@ The setup script validates the token with `huggingface-cli whoami` **and** perfo
 3. Click **Create a tunnel**.
 4. Choose **Cloudflared** as the connector type.
 5. Name your tunnel (e.g. `wispralt-mini`).
-6. On the **Install connector** page, select **macOS** → copy the tunnel **token** (a long base64 string). Do **not** copy the full `cloudflared service install` command — the setup script runs that command itself.
+6. On the **Install connector** page, select **macOS** → copy the tunnel **token** (a long base64 string). Do **not** copy the `cloudflared service install` command — that system-daemon path is broken on macOS 14/15+ (see [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md)). The setup script installs a **user-level LaunchAgent** instead.
 7. Under **Public Hostname**, add a route:
    - **Subdomain**: `transcribe` (or your preferred subdomain)
    - **Domain**: your domain (e.g. `yourdomain.com`)
    - **Type**: `HTTP`; **URL**: `localhost:8000`
 8. Click **Save hostname**.
 
-The tunnel token will be passed to `setup-cloudflared.sh` via stdin. It is never written to any file on disk — `cloudflared` stores its persistent credential in the macOS system keychain automatically.
+The tunnel token will be passed to `setup-cloudflared.sh` via stdin (silent read — not echoed). The script stores the token at `~/.config/wispralt/cloudflare-token` (mode 0600) and configures the cloudflared LaunchAgent to read it via `--token-file` (cloudflared ≥ 2025.4.0). On older cloudflared versions, the token is inlined in the plist (also mode 0600). See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for token rotation procedures for both paths.
 
 > **Network security model:** FastAPI binds exclusively to `127.0.0.1:8000`; only `cloudflared` has external network access. Rate limiting reads `CF-Connecting-IP` from Cloudflare's authoritative header. If you change the bind address for LAN testing, set `TRUST_FORWARDED_HEADERS=false` in `.env` to avoid IP spoofing in rate limiting. Rate limiting reads `CF-Connecting-IP` from Cloudflare's authoritative header; if you bypass the tunnel for testing, the rate limiter falls back to direct client IP.
 
@@ -103,8 +103,8 @@ The script runs these phases in order:
 | **3. HuggingFace validation** | Prompts for `HF_TOKEN`. Runs `huggingface-cli whoami` to confirm the token is valid. Fetches gated metadata for both pyannote models; prints accept-terms URLs and exits if access is denied. |
 | **4. Model download** | Runs `download-models.sh`. Per-model size is echoed before download. Post-download size verification checks each weight file against expected byte ranges. Total: ~5.6 GB. |
 | **5. API key generation** | Runs `generate-api-key.sh`: generates `secrets.token_hex(32)` (64 hex chars), writes `WISPRALT_API_KEY=<key>` to `server/.env`, runs `chmod 600 server/.env`. |
-| **6. Cloudflare Tunnel setup** | Runs `setup-cloudflared.sh`: installs `cloudflared` via Homebrew if missing, prompts for your full `https://` tunnel URL (saved to `.env` as `SERVER_URL`), prompts silently for the tunnel token (never echoed, never saved to disk), runs `sudo cloudflared service install <token>`, immediately unsets the token variable, verifies service via `launchctl list | grep cloudflared`. |
-| **7. LaunchAgent registration** | Runs `server-launchd.sh install`: writes `~/Library/LaunchAgents/co.wispralt.server.plist`, bootstraps it with `launchctl bootstrap gui/$UID`, starts FastAPI on `http://127.0.0.1:8000`. |
+| **6. Cloudflare Tunnel setup** | Runs `setup-cloudflared.sh`: installs `cloudflared` via Homebrew if missing, prompts for your full `https://` tunnel URL (saved to `.env` as `SERVER_URL`), prompts silently for the tunnel token (`read -r -s`; token never echoed), stores token at `~/.config/wispralt/cloudflare-token` (mode 0600), generates `~/Library/LaunchAgents/co.wispralt.cloudflared.plist` (user-level, `RunAtLoad: true`, `KeepAlive`), bootstraps it via `launchctl bootstrap gui/$UID`, verifies with a retry loop. |
+| **7. LaunchAgent registration** | Runs `server-launchd.sh install`: writes `~/Library/LaunchAgents/co.wispralt.server.plist` with `RunAtLoad: true` and `KeepAlive` set, bootstraps it with `launchctl bootstrap gui/$UID`, starts FastAPI on `http://127.0.0.1:8000`. The server starts automatically on every Mac mini reboot and restarts on crash. |
 | **8. Health check** | Runs `doctor.sh` automatically (see Verification section below). |
 | **9. Print client config** | Prints `SERVER_URL=...` and `API_KEY=...` for pasting into the client settings. |
 
@@ -241,10 +241,12 @@ The uninstall script:
 3. Prompts before deleting model weights and meeting outputs.
 4. Does **not** uninstall `cloudflared` — manage that separately if desired.
 
-To remove cloudflared:
+To remove the cloudflared user LaunchAgent and binary:
 
 ```bash
-sudo cloudflared service uninstall
+launchctl bootout gui/$UID/co.wispralt.cloudflared 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/co.wispralt.cloudflared.plist
+rm -f ~/.config/wispralt/cloudflare-token
 brew uninstall cloudflared
 ```
 

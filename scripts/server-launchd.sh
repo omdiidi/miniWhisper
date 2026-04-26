@@ -2,11 +2,12 @@
 # server-launchd.sh — Manage the WisprAlt FastAPI server as a macOS LaunchAgent.
 #
 # Subcommands:
-#   install    Generate the .plist, create log directories, and load the agent.
-#   start      Load the agent (same as install if not yet installed).
-#   stop       Unload the agent (service stops; plist stays in place).
-#   status     Report whether the agent is loaded and the process PID.
-#   uninstall  Unload and remove the plist file.
+#   install         Generate the .plist, create log directories, and load the agent.
+#   start           Load the agent (same as install if not yet installed).
+#   stop            Unload the agent (service stops; plist stays in place).
+#   status          Report whether the agent is loaded and the process PID.
+#   uninstall       Unload and remove the plist file.
+#   bootstrap-test  Simulate reboot-survival: bootout → bootstrap → poll /healthz.
 #
 # LaunchAgent label: co.wispralt.server
 # Plist path:        ~/Library/LaunchAgents/co.wispralt.server.plist
@@ -15,7 +16,7 @@
 # Security: no secrets are written to the plist.
 # The .env file (mode 0600) is loaded by Pydantic Settings at uvicorn startup.
 #
-# Usage: ./scripts/server-launchd.sh <install|start|stop|status|uninstall>
+# Usage: ./scripts/server-launchd.sh <install|start|stop|status|uninstall|bootstrap-test>
 
 set -euo pipefail
 
@@ -109,7 +110,7 @@ generate_plist() {
 
     <!-- Run as the current user (LaunchAgent, not LaunchDaemon) -->
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
 </dict>
 </plist>
 PLIST
@@ -206,18 +207,33 @@ case "$CMD" in
         ;;
 
     help|--help|-h)
-        echo "Usage: server-launchd.sh <install|start|stop|status|uninstall>"
+        echo "Usage: server-launchd.sh <install|start|stop|status|uninstall|bootstrap-test>"
         echo ""
-        echo "  install    Generate plist, create logs dir, load agent"
-        echo "  start      Load agent (uses existing plist)"
-        echo "  stop       Unload agent (plist stays)"
-        echo "  status     Show agent load state and recent log"
-        echo "  uninstall  Unload and delete plist"
+        echo "  install         Generate plist, create logs dir, load agent"
+        echo "  start           Load agent (uses existing plist)"
+        echo "  stop            Unload agent (plist stays)"
+        echo "  status          Show agent load state and recent log"
+        echo "  uninstall       Unload and delete plist"
+        echo "  bootstrap-test  Simulate reboot-survival: bootout → bootstrap → poll /healthz"
+        ;;
+
+    bootstrap-test)
+        # Simulate reboot-survival without an actual reboot.
+        launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+        launchctl bootstrap "gui/$UID" "$PLIST_PATH"
+        echo "Polling /healthz..."
+        if curl --max-time 5 --retry 6 --retry-delay 2 \
+                -fsS http://127.0.0.1:8000/healthz >/dev/null; then
+            echo "server reboot-survival OK"
+        else
+            echo "server failed to come up — check $LOG_DIR/server.err.log" >&2
+            exit 1
+        fi
         ;;
 
     *)
         echo "ERROR: Unknown subcommand '$CMD'" >&2
-        echo "Usage: server-launchd.sh <install|start|stop|status|uninstall>" >&2
+        echo "Usage: server-launchd.sh <install|start|stop|status|uninstall|bootstrap-test>" >&2
         exit 1
         ;;
 esac

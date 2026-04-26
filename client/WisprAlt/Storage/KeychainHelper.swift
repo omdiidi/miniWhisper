@@ -6,6 +6,7 @@ enum KeychainError: Error, LocalizedError {
     case unexpectedStatus(OSStatus)
     case encodingFailed
     case itemNotFound
+    case invalidExportFormat
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +17,8 @@ enum KeychainError: Error, LocalizedError {
             return "Failed to encode API key as UTF-8 data."
         case .itemNotFound:
             return "Keychain item not found."
+        case .invalidExportFormat:
+            return "Export file is not a valid WisprAlt key file."
         }
     }
 }
@@ -97,6 +100,70 @@ enum KeychainHelper {
         default:
             throw KeychainError.unexpectedStatus(status)
         }
+    }
+
+    // MARK: - Export / Import
+
+    /// Version header written to every exported key file so importAPIKey can
+    /// distinguish a genuine export from an arbitrary text file.
+    private static let exportFileHeader =
+        "# WisprAlt API key export\n# Format: v1\n"
+
+    /// Exports the API key to a plain-text file at `url`.
+    ///
+    /// The file contains a version header and a single `wispralt_api_key=<KEY>`
+    /// line. A best-effort `chmod 0600` is applied; failure is logged but not
+    /// fatal (the file still lands on the user's Desktop at mode 0644).
+    ///
+    /// - Parameter url: Destination URL (typically chosen via NSSavePanel).
+    /// - Throws: `KeychainError.itemNotFound` if no API key is stored.
+    static func exportAPIKey(to url: URL) throws {
+        guard let key = try getAPIKey() else { throw KeychainError.itemNotFound }
+        let payload = "\(exportFileHeader)wispralt_api_key=\(key)\n"
+        try payload.write(to: url, atomically: true, encoding: .utf8)
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path)
+        } catch {
+            Log.warning(
+                "Could not set 0600 on exported key file: \(error). File may be world-readable.",
+                category: "storage"
+            )
+        }
+    }
+
+    /// Imports an API key from an export file at `url` and saves it to the Keychain.
+    ///
+    /// The file must contain a `wispralt_api_key=<KEY>` line (comment lines
+    /// starting with `#` and blank lines are ignored). Throws
+    /// `KeychainError.invalidExportFormat` if the file cannot be parsed or the
+    /// key value is empty.
+    ///
+    /// - Parameter url: Source URL (typically chosen via NSOpenPanel).
+    /// - Throws: `KeychainError.invalidExportFormat` on parse failure.
+    static func importAPIKey(from url: URL) throws {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+
+        // Split on any newline form (CRLF, CR, LF) so files edited on Windows
+        // or via webmail don't leave a trailing \r glued to the key — a \r-suffixed
+        // key silently 401s every dictation upload because the Bearer header
+        // contains it. Codex review caught this.
+        let lines = raw.split(whereSeparator: { $0.isNewline })
+            .map(String.init)
+
+        let line = lines.first { $0.hasPrefix("wispralt_api_key=") }
+
+        guard let line, let eqIdx = line.firstIndex(of: "=") else {
+            throw KeychainError.invalidExportFormat
+        }
+        // Trim leading/trailing whitespace so a stray space, tab, or trailing
+        // carriage return on edited files doesn't poison the keychain.
+        let key = line[line.index(after: eqIdx)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { throw KeychainError.invalidExportFormat }
+
+        try setAPIKey(key)
     }
 
     // MARK: - Private helpers

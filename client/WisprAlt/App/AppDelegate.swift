@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 /// Root application delegate.
 ///
@@ -19,6 +20,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("WisprAlt launching.", category: "app")
+
+        // Register for launch-at-login via SMAppService ON FIRST LAUNCH ONLY,
+        // gated by a UserDefaults flag so the user's later "off" toggle persists.
+        //
+        // Without this gate, every app launch would auto-register, silently undoing
+        // a user who turned the Settings toggle off (Codex review found this — the
+        // toggle could never stay disabled across app restarts).
+        //
+        // On first launch the gate fires once, creates the System Settings entry,
+        // sets the flag, and never auto-registers again. From then on, the in-app
+        // toggle in SettingsView is the sole controller via Settings.launchAtLogin.
+        let didAutoRegisterKey = "co.wispralt.didAutoRegisterLoginItem"
+        let suite = UserDefaults(suiteName: "co.wispralt.WisprAlt") ?? .standard
+        if !suite.bool(forKey: didAutoRegisterKey) {
+            let service = SMAppService.mainApp
+            do {
+                switch service.status {
+                case .notRegistered, .notFound:
+                    try service.register()
+                    Log.info("SMAppService: registered for launch at login (first launch).", category: "lifecycle")
+                case .enabled:
+                    Log.info("SMAppService: already enabled (skipping first-launch register).", category: "lifecycle")
+                case .requiresApproval:
+                    Log.warning(
+                        "SMAppService: requires approval in System Settings → Login Items.",
+                        category: "lifecycle"
+                    )
+                @unknown default:
+                    break
+                }
+                suite.set(true, forKey: didAutoRegisterKey)
+            } catch {
+                Log.warning(
+                    "SMAppService.register() failed: \(error). Verify the app is signed with Apple Development identity.",
+                    category: "lifecycle"
+                )
+                // Do NOT set the flag on failure so we retry next launch.
+            }
+        }
 
         // Instantiate the menubar controller first so the status item is visible immediately.
         menuBarController = MenuBarController()

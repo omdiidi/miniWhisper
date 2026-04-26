@@ -59,39 +59,15 @@ This is a known issue with older `cloudflared` versions and/or with the mac inst
 
 ### What works: a user LaunchAgent
 
-Create `~/Library/LaunchAgents/co.wispralt.cloudflared.plist`:
+Run `scripts/setup-cloudflared.sh` — it creates and loads the LaunchAgent automatically. See the Cloudflared LaunchAgent (user-level) section below for full details on install paths, log locations, and token rotation.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>co.wispralt.cloudflared</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/zsh</string>
-        <string>-c</string>
-        <string>exec /opt/homebrew/bin/cloudflared tunnel run --token "$(grep ^TUNNEL_TOKEN $HOME/wispralt/tmp/credentials.txt | cut -d= -f2)"</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key>
-    <string>/Users/USERNAME/Library/Logs/WisprAlt/cloudflared.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/USERNAME/Library/Logs/WisprAlt/cloudflared.log</string>
-</dict>
-</plist>
-```
-
-Then load it (no sudo):
+After running the script, verify:
 
 ```bash
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/co.wispralt.cloudflared.plist
 launchctl print gui/$UID/co.wispralt.cloudflared    # verify state=running
 ```
 
-The tunnel registers immediately, persists across reboots and crashes, and you can rotate tokens by editing `tmp/credentials.txt` and `launchctl kickstart -k gui/$UID/co.wispralt.cloudflared`.
+The tunnel registers immediately and persists across reboots and crashes.
 
 ### Don't forget: `brew upgrade cloudflared`
 
@@ -120,17 +96,17 @@ The setup writes three files containing secrets. None are committed:
 | File | Mode | Contains |
 |---|---:|---|
 | `~/wispralt/server/.env` | 0600 | `HF_TOKEN`, `WISPRALT_API_KEY` |
-| `~/wispralt/tmp/credentials.txt` | 0600 | `HF_TOKEN`, `TUNNEL_TOKEN`, `SERVER_URL` |
+| `~/.config/wispralt/cloudflare-token` | 0600 | Cloudflare tunnel token only |
 | `~/.config/wispralt/client-config.txt` | 0600 | `SERVER_URL`, `WISPRALT_API_KEY` (for paste-into-client) |
 
-`.gitignore` covers all three. Cloudflare tunnel token is **never** stored in `server/.env` — it lives only in `tmp/credentials.txt` and is read at LaunchAgent start time.
+`.gitignore` covers all three. Cloudflare tunnel token is **never** stored in `server/.env` — it lives in `~/.config/wispralt/cloudflare-token` and is read by the cloudflared LaunchAgent via `--token-file` at start time.
 
 ### Rotating tokens
 
 After any setup involving copy/paste into shared tools (chat, screen recordings, etc.), rotate:
 
 - **HF token:** revoke at <https://huggingface.co/settings/tokens>, generate a new one, update `server/.env`, restart the FastAPI LaunchAgent.
-- **Cloudflare tunnel token:** in the Zero Trust dashboard → tunnel → Configure → Rotate token. Update `tmp/credentials.txt`. `launchctl kickstart -k gui/$UID/co.wispralt.cloudflared` to pick up the new value.
+- **Cloudflare tunnel token:** in the Zero Trust dashboard → tunnel → Configure → Rotate token. See "Cloudflared LaunchAgent (user-level)" below for the rotation procedure — the steps differ depending on whether your cloudflared version supports `--token-file`.
 - **`WISPRALT_API_KEY`:** `curl -X POST -H "Authorization: Bearer $OLD" $SERVER_URL/admin/rotate-key` returns `{"rotated": true}` and writes the new key to the server log; copy it into the client.
 
 ## Client (`client/`) — Swift package gotchas
@@ -155,7 +131,7 @@ You don't need a signed/notarized DMG for personal use. Three paths, in order of
 ```bash
 ./scripts/build-client-local.sh
 ```
-The script handles everything: SPM release build, `.app` bundle assembly with bundled `Sparkle.framework`, ad-hoc codesign with entitlements, and an `otool` verification that the `@executable_path/../Frameworks` rpath is wired (without it, the app crashes at launch with `Library not loaded: @rpath/Sparkle.framework/...`). Output: `client/build/WisprAlt.app`. Right-click → Open the first time to bypass Gatekeeper.
+The script handles everything: SPM release build, `.app` bundle assembly with bundled `Sparkle.framework`, **Apple Development codesign** with entitlements (requires a free Apple Development certificate from Xcode → Settings → Accounts — see [Code-signing prerequisite](SETUP-CLIENT.md#code-signing-prerequisite-for-local-builds)), and an `otool` verification that the `@executable_path/../Frameworks` rpath is wired (without it, the app crashes at launch with `Library not loaded: @rpath/Sparkle.framework/...`). Output: `client/build/WisprAlt.app`. Right-click → Open the first time to bypass Gatekeeper. If you have multiple `Apple Development` identities in your keychain, set `SIGN_IDENTITY` explicitly: `SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" ./scripts/build-client-local.sh`.
 
 The Sparkle rpath is set via `Package.swift` `linkerSettings` (`-Xlinker -rpath -Xlinker @executable_path/../Frameworks`). SPM does not add this for executable targets by default — that's the gotcha that breaks every hand-rolled local build.
 
@@ -189,15 +165,132 @@ Two separate AVFoundation conversion bugs we hit and worked around:
 
 The diagnostic that caught it: log the **pre-write float peak** from inside the tap callback alongside the post-write file peak. When pre-write peak ≈ 0.24 but post-write Int16 peak ≈ 32750, the conversion stage is doing something it shouldn't.
 
-## TCC permissions and ad-hoc / self-signed builds
+## TCC permissions and Apple Development-signed builds
 
-macOS Tahoe (26) keys ad-hoc and self-signed apps in TCC by `cdhash` (a hash of the binary). Every code change → new cdhash → TCC sees a brand-new app and re-prompts for all four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording). This is the Apple-enforced behavior; only **Developer ID** apps get team-identifier-based matching that survives binary changes.
+macOS Tahoe (26) keys Apple Development-signed apps in TCC by `cdhash` (a hash of the binary) rather than by team identifier. Only paid **Developer ID** apps get team-identifier-based matching that survives binary changes. This means:
 
-`scripts/setup-local-codesign.sh` adds a self-signed code-signing cert to System trust as a code-signing root. This helps for **launches of the same build** (TCC remembers across kill+relaunch) but does **not** survive rebuilds — macOS still falls back to cdhash for self-signed identities. There's no workaround on the OS side.
+- Every new build → new cdhash → TCC sees a brand-new app → re-prompts for all four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording).
+- Kill + relaunch of the **same build** reuses the existing TCC grants without re-prompting.
+- There is no workaround short of a Developer ID certificate.
 
-Practical mitigation when iterating:
-- Make code changes in batches, rebuild less frequently.
-- Use `tccutil reset {Accessibility,ListenEvent,ScreenCapture,Microphone} co.wispralt.WisprAlt` to clear stale entries cleanly between rebuilds (sometimes UI shows toggles as "on" but TCC has the wrong cdhash internally — symptom is "I granted them but the app still says denied").
+### Re-grant on rebuild looks like a bug but isn't
+
+After every rebuild, run the canonical TCC reset to clear stale entries before re-granting. Sometimes System Settings shows toggles as "on" but TCC has the old cdhash internally — symptom: "I granted them but the app still says denied". The reset fixes this:
+
+```bash
+tccutil reset Accessibility   co.wispralt.WisprAlt
+tccutil reset ListenEvent     co.wispralt.WisprAlt
+tccutil reset ScreenCapture   co.wispralt.WisprAlt
+tccutil reset Microphone      co.wispralt.WisprAlt
+```
+
+Then reopen the app and re-grant all four permissions.
+
+**Practical mitigation when iterating:** batch code changes and rebuild once rather than after each edit.
+
+---
+
+## Cloudflared LaunchAgent (user-level)
+
+The cloudflared tunnel runs as a **user-level LaunchAgent** — not as a system LaunchDaemon. This is the only reliable path on macOS 14/15+. See the "Why not cloudflared service install?" section above for why the system path is broken.
+
+**Install location:** `~/Library/LaunchAgents/co.wispralt.cloudflared.plist`
+
+**Log paths:**
+- stdout: `~/Library/Logs/WisprAlt/cloudflared.log`
+- stderr: `~/Library/Logs/WisprAlt/cloudflared.err.log`
+
+The plist is generated by `scripts/setup-cloudflared.sh`. It sets `RunAtLoad: true` and `KeepAlive: {SuccessfulExit: false, NetworkState: true}` with `ThrottleInterval: 10` so launchd restarts cloudflared at most every 10 seconds if it crashes. `EnvironmentVariables/PATH` is set explicitly so cloudflared can find Homebrew binaries even in the minimal launchd environment.
+
+**Token storage:** the token is stored at `~/.config/wispralt/cloudflare-token` (mode 0600). On cloudflared ≥ 2025.4.0, the plist references it via `--token-file`; older versions inline the token in the plist (also mode 0600).
+
+### Token rotation
+
+Check whether your cloudflared version supports `--token-file`:
+
+```bash
+if cloudflared tunnel run --help 2>&1 | grep -q -- '--token-file'; then
+    echo "modern path — use procedure A"
+else
+    echo "legacy path — use procedure B"
+fi
+```
+
+**Procedure A (modern — cloudflared ≥ 2025.4.0, `--token-file` supported):**
+
+```bash
+# 1. Read the new token silently
+read -r -s -p "New Cloudflare Tunnel token: " NEW_TOKEN
+echo
+
+# 2. Atomically replace the token file
+TMP="$(mktemp)"
+chmod 0600 "$TMP"
+printf '%s' "$NEW_TOKEN" > "$TMP"
+mv "$TMP" ~/.config/wispralt/cloudflare-token
+unset NEW_TOKEN
+
+# 3. Restart cloudflared so it picks up the new token file
+launchctl bootout gui/$UID/co.wispralt.cloudflared
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/co.wispralt.cloudflared.plist
+```
+
+**Procedure B (legacy — cloudflared < 2025.4.0, token is baked into the plist):**
+
+The token is inlined in `ProgramArguments`. Simply updating the token file won't help — the plist still has the old token. Re-run `setup-cloudflared.sh` entirely to regenerate the plist with the new token:
+
+```bash
+bash scripts/setup-cloudflared.sh
+```
+
+This tears down the old LaunchAgent, prompts for the new token, regenerates the plist, and reloads.
+
+---
+
+## Client login-launch via SMAppService
+
+WisprAlt registers itself as a login item using `SMAppService.mainApp.register()` on first launch. This creates a standard System Settings → General → Login Items & Extensions entry so the menubar app relaunches automatically after every login.
+
+**How it works:** `AppDelegate.applicationDidFinishLaunching` calls `SMAppService.mainApp.register()`. The call is idempotent — subsequent launches do nothing if already registered. The registration is tied to the app's code-signing Designated Requirement (DR), not the path, so moving the app does not break it.
+
+**How to disable:** toggle off in System Settings → General → Login Items & Extensions, or use the **Launch at login** toggle in the WisprAlt settings popover.
+
+**What happens on rebuild:** `SMAppService` binds the login item to the app's DR. A new build with a new Apple Development cert (e.g. after annual renewal) will have a new DR. The old login item entry becomes stale. The new build re-registers on first launch, and the old entry clears automatically. In practice this means the login item survives most rebuilds as long as the same cert identity is used; it re-registers transparently when the cert changes.
+
+---
+
+## Quarantine on first download
+
+macOS Gatekeeper quarantines any app downloaded from the internet (Safari, curl, a browser, AirDrop from an unknown sender). Apple Development-signed builds are not notarized, so Gatekeeper shows "developer cannot be verified" on first open.
+
+**Fix for the app owner or friend installing manually:**
+```bash
+xattr -dr com.apple.quarantine /path/to/WisprAlt.app
+open /path/to/WisprAlt.app
+```
+
+Or: right-click the `.app` in Finder → **Open** → click **Open Anyway** in the dialog. The quarantine warning appears only once per version; after approval the app opens normally on all subsequent launches.
+
+The `/setup-client` slash command runs `xattr -dr` automatically. Friends installing the DMG by hand need to do this step themselves.
+
+---
+
+## Annual cert renewal
+
+Free Apple Development certificates auto-renew once per year. Xcode handles renewal silently while you stay signed into your Apple ID in Xcode → Settings → Accounts.
+
+**Why this matters:** the renewed cert has a new SHA-1 → new Designated Requirement → new cdhash. On the next rebuild after renewal, TCC sees the app as a new entity and re-prompts for all four permissions, identical to any other rebuild. Run the standard `tccutil reset` recovery and re-grant.
+
+This happens roughly once a year. It is expected behavior, not a bug. If you see unexpected TCC re-prompts without rebuilding, check for a cert renewal:
+
+```bash
+security find-certificate -c "Apple Development:" -p login.keychain | \
+  openssl x509 -noout -dates
+```
+
+The "Not Before" date should be within the last year if a renewal just occurred.
+
+---
 
 ## What's NOT documented elsewhere
 

@@ -60,6 +60,18 @@ codesign --sign - --force --deep WisprAlt.app
 
 Ad-hoc signed builds work only on the machine they were built on and cannot be notarized.
 
+### Legacy: setup-local-codesign.sh
+
+`scripts/setup-local-codesign.sh` generates a self-signed code-signing certificate and trusts it as a System code-signing root. It was originally intended to make TCC permission grants survive client rebuilds.
+
+**Why it doesn't work across rebuilds:** macOS keys self-signed apps in TCC by `cdhash` (a hash of the binary), not by certificate identity. Even with a trusted self-signed cert, each new binary has a new cdhash, so TCC treats it as a new app and re-prompts for all four permissions. The cert helps within a single build (TCC remembers the grant across kill+relaunch of the same binary), but not across rebuilds.
+
+**Current status:** this script is no longer wired into `scripts/build-client-local.sh`. The build flow now uses a free **Apple Development certificate** from Xcode (see [SETUP-CLIENT.md](SETUP-CLIENT.md)), which is required for `SMAppService.mainApp.register()` (login-at-startup). The self-signed cert path cannot support SMAppService.
+
+**When to use it:** only if you explicitly want to build without any Apple ID (fully offline/air-gapped development, no login-at-startup support). In that case, run `scripts/setup-local-codesign.sh` first, then call `scripts/build-client-local.sh` with `SIGN_IDENTITY="WisprAlt Local Dev"`.
+
+See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) "TCC permissions and Apple Development-signed builds" for the full TCC behavior explanation.
+
 ---
 
 ## Code Style

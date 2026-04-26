@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# build-client-local.sh — Build WisprAlt.app for personal use without an Apple Developer ID.
+# build-client-local.sh — Build WisprAlt.app for personal use.
 #
-# This produces an ad-hoc signed .app bundle that runs on the local machine.
+# Requires a free Apple Development certificate from Xcode (no Apple Developer
+# Program enrollment needed). Open Xcode → Settings → Accounts → sign in with
+# any Apple ID; Xcode auto-creates a Personal Team and issues the cert.
+#
 # For distribution to other users, see build-client.sh (requires Developer ID).
 #
 # Usage:
 #   ./scripts/build-client-local.sh
 #
+#   # Override identity when multiple Apple Development certs exist:
+#   SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" ./scripts/build-client-local.sh
+#
 # Output:
-#   client/build/WisprAlt.app   (ad-hoc signed, runnable via right-click → Open)
+#   client/build/WisprAlt.app   (Apple-Development-signed, runnable via right-click → Open)
 
 set -euo pipefail
 
@@ -97,32 +103,58 @@ if ! otool -l "$APP_PATH/Contents/MacOS/WisprAlt" \
 fi
 xattr -cr "$APP_PATH"
 
-# ── Step 3: Ad-hoc sign with entitlements ─────────────────────────────────────
-# `--deep` recursively re-signs Sparkle.framework with the same ad-hoc identity
+# ── Step 3: Apple Development sign with entitlements ─────────────────────────
+# `--deep` recursively re-signs Sparkle.framework with the same identity
 # in a single pass. Apple has deprecated `--deep` for distribution builds, but
-# it's the simplest path for local ad-hoc and avoids stale-xattr issues that
+# it's the simplest path for local builds and avoids stale-xattr issues that
 # occur when signing nested bundles independently.
 #
 # Pipefail (set -o pipefail via `set -euo pipefail` above) ensures the script
 # fails if codesign fails — `tee` preserves output without masking exit codes.
-# Prefer a persistent self-signed identity so the cdhash stays stable enough
-# that macOS TCC can match grants across rebuilds. Without this, every rebuild
-# is a "new app" to TCC and you re-grant Accessibility, Input Monitoring,
-# Microphone, and Screen Recording every single time.
 #
-# Setup (one-time, see scripts/setup-local-codesign.sh):
-#   1. Generate a self-signed code-signing cert into your login keychain.
-#   2. Trust it as a code-signing root in the System keychain (sudo prompt).
-# After that, this script picks up the identity automatically.
-LOCAL_IDENTITY="WisprAlt Local Dev"
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "$LOCAL_IDENTITY"; then
-    SIGN_IDENTITY="$LOCAL_IDENTITY"
-    echo "Step 3/4: Codesigning with persistent identity '$LOCAL_IDENTITY'..."
-else
-    SIGN_IDENTITY="-"
-    echo "Step 3/4: Codesigning (ad-hoc — TCC permissions will reset on every rebuild)..."
-    echo "          Run scripts/setup-local-codesign.sh once for persistent grants."
+# Use Apple Development identity (free, from Xcode → Settings → Accounts → any Apple ID).
+# Required for SMAppService.mainApp.register() — see Apple Developer Forums thread 799910.
+# Multiple identities trigger an explicit-disambiguation error; set SIGN_IDENTITY env var
+# to override.
+
+# Find ALL Apple Development identities. security find-identity output looks like:
+#   1) <SHA1HASH> "Apple Development: user@example.com (TEAMID)"
+APPLE_DEV_IDENTITIES="$(security find-identity -v -p codesigning \
+    | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p')"
+
+NUM_IDENTITIES="$(printf '%s\n' "$APPLE_DEV_IDENTITIES" | grep -c 'Apple Development:' || true)"
+
+if [ "$NUM_IDENTITIES" -eq 0 ]; then
+    cat >&2 <<'EOM'
+ERROR: WisprAlt requires an Apple Development code-signing identity.
+
+Setup (one time, no Apple Developer Program enrollment needed):
+  1. Open Xcode.
+  2. Settings → Accounts → "+" → sign in with any Apple ID.
+  3. Xcode auto-creates a Personal Team and issues an Apple Development cert.
+  4. Re-run this script.
+
+Why required: SMAppService.mainApp.register() (login-at-startup) refuses
+ad-hoc / self-signed identities. Apple Developer Forums thread 799910.
+EOM
+    exit 1
 fi
+
+if [ "$NUM_IDENTITIES" -gt 1 ] && [ -z "${SIGN_IDENTITY:-}" ]; then
+    cat >&2 <<EOM
+ERROR: Multiple Apple Development identities found. Set SIGN_IDENTITY explicitly:
+
+$APPLE_DEV_IDENTITIES
+
+Example:
+  SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" bash $0
+EOM
+    exit 1
+fi
+
+# Single identity OR explicit override via SIGN_IDENTITY env var.
+SIGN_IDENTITY="${SIGN_IDENTITY:-$(printf '%s' "$APPLE_DEV_IDENTITIES" | head -1)}"
+echo "Step 3/4: Codesigning with '$SIGN_IDENTITY'..."
 
 # Strip Apple metadata. Real-identity signing (unlike ad-hoc) refuses to
 # sign bundles with resource-fork / FinderInfo xattrs. macOS Sequoia/Tahoe
@@ -167,6 +199,7 @@ echo "  $APP_PATH"
 echo ""
 echo "First launch:"
 echo "  1. Drag $APP_PATH to /Applications/."
-echo "  2. Right-click → Open the first time (Gatekeeper bypass for ad-hoc signed)."
-echo "  3. Grant the four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording)."
+echo "  2. Right-click → Open the first time (Gatekeeper: 'Apple Development' cert, not yet trusted)."
+echo "  3. Grant the four TCC permissions (Accessibility, Input Monitoring, Microphone, Screen Recording)."
 echo "  4. Open Settings, paste server URL + API key, click Test Connection."
+echo "  5. Toggle 'Launch at login' in Settings to register WisprAlt as a Login Item."

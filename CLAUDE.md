@@ -19,6 +19,7 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 | `/test-connection` | `curl` `/healthz`, both `/readyz/*`, and a tiny-WAV roundtrip on `/transcribe/dictate` |
 | `/docs-check` | Diff the file→doc map against last-edit timestamps to find stale docs |
 | `/update-models` | Re-run `download-models.sh` then reload `co.wispralt.server.plist` via launchctl |
+| `/verify-autostart` | Non-destructive reboot-survival smoke test for server, cloudflared, and client login-launch. |
 
 ## Key conventions
 
@@ -27,7 +28,11 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 - No model loading per request — all models are resident at startup.
 - No Redis — SQLite-only job store.
 - No server-side speaker rename — client-only, atomic local rewrite.
-- No tunnel token in `.env` or any file — stdin only during setup; cloudflared stores it in the macOS system keychain.
+- Cloudflared tunnel token: stored in `~/.config/wispralt/cloudflare-token` (mode 0600)
+  outside the repo. Read by the cloudflared LaunchAgent via `--token-file`. Never
+  committed, never logged. The legacy `sudo cloudflared service install` flow is
+  abandoned because its plist is broken on macOS 14/15. Rotation: see
+  docs/DEPLOYMENT-NOTES.md.
 - Secrets: `HF_TOKEN` and `WISPRALT_API_KEY` in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
 
 @CLAUDE.local.md

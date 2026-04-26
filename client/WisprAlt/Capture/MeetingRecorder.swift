@@ -5,6 +5,14 @@ import AppKit
 import os
 import os.lock
 
+extension Notification.Name {
+    /// Posted when the default audio input device changes mid-meeting recording.
+    /// MenuBarController observes this to abort the in-flight meeting and
+    /// return the UI to idle — SCStream emits no equivalent device-change callback,
+    /// so we use the CoreAudio HAL listener in AudioDeviceListener instead.
+    static let meetingConfigChanged = Notification.Name("co.wispralt.meetingConfigChanged")
+}
+
 // MARK: - MeetingRecorderError
 
 enum MeetingRecorderError: Error, LocalizedError {
@@ -69,6 +77,17 @@ final class MeetingRecorder: NSObject {
 
     private var stream: SCStream?
     private var outputURL: URL?
+
+    /// Snapshot of the most recently configured output URL. Survives stop() and
+    /// SCStream auto-teardown so the config-change abort handler can delete a
+    /// partial WAV even if isActive has already flipped to false. Cleared only
+    /// at the start of the next start().
+    private(set) var lastOutputURL: URL?
+
+    /// CoreAudio HAL listener for default input device changes.
+    /// Installed BEFORE stream.startCapture() and torn down as the first step
+    /// of stop() and deinit so partial-init failures can't leave an orphan.
+    private var deviceListener: AudioDeviceListener?
 
     // MARK: - Per-channel converters (v3 P4#8: retained, not recreated per call)
 
@@ -144,6 +163,9 @@ final class MeetingRecorder: NSObject {
         let maxDuration = resolvedMaxDuration
         guard !isActive else { throw MeetingRecorderError.alreadyRunning }
 
+        // Clear the previous session's URL snapshot before doing anything else.
+        lastOutputURL = nil
+
         // Enumerate shareable content to get the primary display.
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
@@ -202,6 +224,22 @@ final class MeetingRecorder: NSObject {
             commonFormat: .pcmFormatFloat32,
             interleaved: false
         )
+
+        // Snapshot the output URL as soon as we know the path so the abort
+        // handler can clean up a partial WAV even if SCStream's didStopWithError
+        // beats the device-change notification and isActive is already false.
+        lastOutputURL = url
+
+        // Install the CoreAudio HAL device-change listener BEFORE starting
+        // capture. Installing first means a partial-init failure (where
+        // startCapture() throws) can't leave an orphan SCStream attached to
+        // a listener that still fires. If listener init throws, we propagate
+        // and let the caller see the failure; the stream was never started.
+        deviceListener = try AudioDeviceListener { [weak self] in
+            guard let self, self.isActive else { return }
+            Log.info("Meeting: input device changed, aborting", category: "capture")
+            NotificationCenter.default.post(name: .meetingConfigChanged, object: nil)
+        }
 
         try await stream?.startCapture()
 
@@ -271,9 +309,17 @@ final class MeetingRecorder: NSObject {
     /// - Returns: The URL of the completed WAV file.
     /// - Throws: `MeetingRecorderError.notRunning` if no session is active.
     func stop() async throws -> URL {
-        guard isActive, let url = outputURL else {
-            throw MeetingRecorderError.notRunning
-        }
+        // Tear down all session resources unconditionally. Codex review caught
+        // a leak: when SCStream's didStopWithError flips isActive=false BEFORE
+        // stop() is called, the prior `guard isActive ... else { throw }` returned
+        // early and skipped this teardown — leaving timers, sleep/wake observers,
+        // stream, deviceListener, and stereoFile alive for the next session.
+        // Now we always tear down, then throw `.notRunning` only AFTER cleanup
+        // if there was nothing to return.
+
+        // Tear down the device-change listener first so it can't fire during
+        // the rest of the teardown sequence and post a redundant notification.
+        deviceListener = nil
 
         // Stop the wall-clock timer and cap timers first.
         stopFlushTimer()
@@ -289,21 +335,25 @@ final class MeetingRecorder: NSObject {
             sleepWakeObserver = nil
         }
 
-        // Stop SCStream capture.
+        // Stop SCStream capture (idempotent — try? swallows "already stopped").
         try? await stream?.stopCapture()
         stream = nil
 
         // Final alignment: pad any lagging channel with silence up to the longest tail.
+        // Drain may be a no-op if stereoFile was already nilled by a prior path.
         ioQueue.sync {
-            self.aligned.padMissing(toEnd: true)  // stop path: pad to longest tail
+            self.aligned.padMissing(toEnd: true)
             self.drainToFile(forceFlush: true)
-
-            // v3 P4#14: nil out stereoFile inside the ioQueue block so the AVAudioFile
-            // is deallocated (and its RIFF/WAVE header finalised) before we return.
             self.stereoFile = nil
         }
 
+        // Resolve the final URL state. If the session was never started or already
+        // torn down by didStopWithError, throw .notRunning AFTER cleanup.
+        let wasActive = isActive
         setActive(false)
+        guard wasActive, let url = outputURL else {
+            throw MeetingRecorderError.notRunning
+        }
         Log.info("MeetingRecorder: capture stopped → \(url.lastPathComponent)", category: "capture")
         return url
     }
@@ -383,6 +433,14 @@ final class MeetingRecorder: NSObject {
             self.aligned.padMissing(uptoSampleEnd: expectedEnd)
             self.drainToFile(forceFlush: true)
         }
+    }
+
+    // MARK: - Deinit
+
+    deinit {
+        // Belt-and-suspenders: release the device listener if the recorder is
+        // deallocated while recording is still active (app teardown, etc.).
+        deviceListener = nil
     }
 }
 

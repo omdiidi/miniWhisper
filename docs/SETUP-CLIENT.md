@@ -8,7 +8,23 @@ title: Client Setup
 
 - macOS 14.0 or later (Apple Silicon or Intel)
 - The WisprAlt server running and reachable (see [SETUP-SERVER.md](SETUP-SERVER.md))
-- Apple Developer ID signing (for local builds; pre-built DMGs are already signed)
+
+### Code-signing prerequisite for local builds
+
+Local builds require a **free Apple Development certificate** — no Apple Developer Program enrollment ($99/yr) needed.
+
+**One-time setup (per build machine):**
+1. Open Xcode.
+2. Go to **Settings → Accounts** and click **+** to sign in with any Apple ID.
+3. Xcode automatically creates a Personal Team and issues an `Apple Development` certificate to your login keychain. It auto-renews each year while you stay signed in.
+4. `scripts/build-client-local.sh` picks up the identity automatically from `security find-identity`.
+
+If you have multiple Apple IDs with separate identities, set the `SIGN_IDENTITY` environment variable explicitly when building:
+```bash
+SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" bash scripts/build-client-local.sh
+```
+
+> **Note:** The script will print the full list of found identities and fail clearly if more than one is present and `SIGN_IDENTITY` is not set.
 
 ---
 
@@ -16,8 +32,24 @@ title: Client Setup
 
 1. Download `WisprAlt-<version>.dmg` from the [GitHub Releases](https://github.com/your-org/wisprflowALT/releases) page.
 2. Open the DMG; drag `WisprAlt.app` to `/Applications`.
-3. On first launch, macOS Gatekeeper may show "WisprAlt cannot be opened because Apple cannot check it for malicious software." Click **Cancel**, then open **System Settings > Privacy & Security**, scroll to the bottom, and click **Open Anyway**.
+3. **Remove the quarantine flag** before first launch (required for Apple Development-signed builds not distributed through the App Store):
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/WisprAlt.app
+   open /Applications/WisprAlt.app
+   ```
+   Alternatively: right-click the app in Finder → **Open** → click **Open** in the Gatekeeper dialog. You only need to do this once per version.
 4. The four-step permission wizard starts automatically (see below).
+
+### Installing on a friend's Mac
+
+Your friend installs only the client — they connect to your existing Mac mini server. They do not need their own server, their own cloudflared, or their own API key.
+
+Send your friend:
+- The `WisprAlt.dmg` download link (or the built `.app` directly).
+- Your server URL (`https://transcribe.yourdomain.com`).
+- Your API key (use Settings → Export API Key to generate a `.wispralt-key` file; see [Backing up your API key](#backing-up-your-api-key)).
+
+Your friend will see the same Gatekeeper warning and the same permission wizard described above. The `xattr -dr` step applies to their machine too.
 
 ---
 
@@ -74,6 +106,51 @@ After the permission wizard, the app is ready for server configuration.
 
 ---
 
+## Launch at Login
+
+WisprAlt registers itself as a login item the first time it launches. Your menubar icon will reappear automatically after every login without any manual steps.
+
+**To enable or disable the login item:**
+
+- In the WisprAlt settings popover, use the **Launch at login** toggle.
+- Or: **System Settings → General → Login Items & Extensions** → find WisprAlt in the list and toggle it on or off.
+
+If the toggle shows "requires approval" in System Settings, click it to turn it on. If the entry is missing entirely after a reinstall, run `sfltool resetbtm` in Terminal and reboot — this clears a stale Launch Services database.
+
+---
+
+## Backing up your API key
+
+Your API key is stored in the macOS Keychain. To move it to another Mac or share it with a friend, use the export/import flow in Settings.
+
+**Export:**
+1. Open the WisprAlt settings popover → **Export API Key…**
+2. Save the file to your **Desktop** (the default location).
+3. The file is a plain text `.wispralt-key` file set to mode `0600`.
+
+**IMPORTANT — treat this file like a password. Never save the export file to:**
+- `~/Documents/` (likely synced to iCloud Drive)
+- iCloud Drive
+- Dropbox
+- Google Drive
+- Any cloud-synced location
+
+Once you have moved the file to the destination Mac (e.g. via AirDrop or a USB drive), delete the export file from your Desktop.
+
+**Import:**
+1. On the destination Mac, open Settings → **Import API Key…**
+2. Select the `.wispralt-key` file. The key is written to the Keychain immediately.
+3. Click **Test Connection** to confirm the key works.
+
+### Restoring on a new Mac
+
+1. Export the key from your current Mac (Settings → Export API Key).
+2. Transfer via AirDrop or a USB drive. **Do not email or message it.**
+3. Import on the new Mac (Settings → Import API Key).
+4. Delete the export file from both Macs once the import succeeds.
+
+---
+
 ## Dictation Usage
 
 1. Hold the **FN** key (Globe key on M-series Macs). The menubar icon turns to a filled mic.
@@ -123,26 +200,23 @@ To check for updates manually: click the WisprAlt menubar icon → **Check for U
 
 See [client/README.md](../client/README.md) for the build/run quickstart.
 
-### Personal use (no Apple Developer ID)
+### Personal use (free Apple Development certificate)
 
-If you only need WisprAlt on your own Mac and don't plan to distribute it, use the local build flow.
-
-**One-time setup** (avoids the TCC re-grant loop on every rebuild):
-```bash
-./scripts/setup-local-codesign.sh
-```
-This creates a persistent self-signed cert in your login keychain and trusts it as a System code-signing root. Requires sudo once — after that, every future rebuild reuses the same identity, so macOS TCC keeps your Accessibility / Input Monitoring / Microphone / Screen Recording grants. Without this step, TCC sees each rebuild as a fresh app and re-prompts for all four permissions.
+If you only need WisprAlt on your own Mac and don't plan to distribute it, use the local build flow. You need a **free Apple Development certificate** (see [Code-signing prerequisite for local builds](#code-signing-prerequisite-for-local-builds) above).
 
 **Build:**
 ```bash
-./scripts/build-client-local.sh
+bash scripts/build-client-local.sh
 ```
-Output: `client/build/WisprAlt.app`. The script auto-detects whether the persistent identity is set up; otherwise falls back to ad-hoc and prints a hint pointing at the setup script. Right-click → Open the first time to bypass Gatekeeper.
+Output: `client/build/WisprAlt.app`. Copy it to `/Applications/`, strip the quarantine flag (`xattr -dr com.apple.quarantine /Applications/WisprAlt.app`), and open.
+
+**Per-version TCC re-grant:** Each new build changes the binary's cdhash. macOS sees the new binary as a new app and re-prompts for the four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording). This is Apple-enforced behavior — not a bug. See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for the full explanation and the `tccutil reset` recovery commands.
+
+**Annual cert renewal:** Free Apple Development certs expire after one year. Xcode auto-renews silently while you stay signed in with your Apple ID, but the renewed cert has a new SHA-1 and a new Designated Requirement. This triggers the same TCC re-grant cycle as a binary rebuild — once a year. Expected behavior; not a bug.
 
 Caveats:
-- Sparkle auto-update will not work for self-signed builds.
+- Sparkle auto-update will not work for local builds (EdDSA key not provisioned).
 - The bundled `Sparkle.framework` rpath is set via `Package.swift` `linkerSettings` so dyld can resolve it; the script also verifies this before signing.
-- Without the setup-local-codesign step, every code change forces a fresh re-grant of all four TCC permissions.
 
 ### Distribution build (signed + notarized DMG)
 

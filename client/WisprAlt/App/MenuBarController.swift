@@ -104,6 +104,12 @@ final class MenuBarController: NSObject {
             name: .dictationConfigChanged,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMeetingConfigChanged),
+            name: .meetingConfigChanged,
+            object: nil
+        )
     }
 
     /// Fires when the audio input device changes mid-dictation (AirPods plugged
@@ -127,6 +133,63 @@ final class MenuBarController: NSObject {
             AppNotifications.notify(
                 title: "Dictation Cancelled",
                 body: "Audio input device changed mid-recording. Press FN again to retry."
+            )
+        }
+    }
+
+    /// Fires when the CoreAudio HAL default input device changes mid-meeting
+    /// recording. SCStream emits no equivalent callback, so AudioDeviceListener
+    /// in MeetingRecorder detects this and posts .meetingConfigChanged.
+    ///
+    /// We snapshot `lastOutputURL` BEFORE calling stop() because SCStream's
+    /// `didStopWithError` may have already flipped `isActive` to false, causing
+    /// stop() to throw `.notRunning`. The partial WAV is still on disk in that
+    /// case and must be cleaned up.
+    @objc private func handleMeetingConfigChanged() {
+        Task { @MainActor in
+            guard self.mode == .meetingRecording else { return }
+            Log.info(
+                "MenuBarController: aborting in-flight meeting recording — audio input device changed.",
+                category: "capture"
+            )
+            // Snapshot the URL before stop() so we can delete the partial WAV
+            // even if SCStream's didStopWithError already flipped isActive=false.
+            let partialURL = MeetingRecorder.shared.lastOutputURL
+
+            do {
+                _ = try await MeetingRecorder.shared.stop()
+            } catch {
+                Log.warning(
+                    "Meeting config-change abort: stop() threw \(error)",
+                    category: "capture"
+                )
+            }
+
+            // Delete the partial WAV — an interrupted meeting is not a valid recording.
+            // Containment check: only delete if the URL is inside the configured
+            // meetings directory. This prevents UserDefaults poisoning (or any
+            // future bug that lets a wrong URL leak into MeetingRecorder.lastOutputURL)
+            // from turning this cleanup into a write-anywhere primitive.
+            // Codex review caught this.
+            if let url = partialURL {
+                let meetingsDir = Settings.shared.meetingsPath.standardizedFileURL.path
+                let target = url.standardizedFileURL.path
+                if target.hasPrefix(meetingsDir + "/") {
+                    try? FileManager.default.removeItem(at: url)
+                } else {
+                    Log.warning(
+                        "Meeting config-change abort: refused to delete partial WAV at \(target) (outside \(meetingsDir))",
+                        category: "capture"
+                    )
+                }
+            }
+
+            self.meetingActive = false
+            self.mode = .idle
+
+            AppNotifications.notify(
+                title: "Meeting Cancelled",
+                body: "Audio input device changed mid-recording. Triple-tap FN to start a new meeting."
             )
         }
     }
