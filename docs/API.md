@@ -10,24 +10,33 @@ Complete HTTP API contract for the WisprAlt server. Implemented in `server/src/w
 
 ## Authentication
 
-All `/transcribe/*` and `/admin/*` endpoints require:
+Most routes require:
 
 ```
-Authorization: Bearer <WISPRALT_API_KEY>
+Authorization: Bearer <token>
 ```
 
-Authentication is performed by `auth.py` using `secrets.compare_digest` for constant-time comparison. A missing or wrong token returns **401**.
+The bearer is sha256-hashed and resolved against `wispralt.users` via the asyncpg pool, with a 60-second in-process `TokenCache` in front. See [ARCHITECTURE.md → Auth (multi-token)](ARCHITECTURE.md#auth-multi-token) for the full path.
 
-**Unauthenticated endpoints** (probe-style, no API key required):
+**Unauthenticated endpoints** (probe-style + admin login, no API key required):
 - `GET /healthz` — liveness probe
 - `GET /readyz/dictation` — dictation-pipeline readiness probe
 - `GET /readyz/meeting` — meeting-pipeline readiness probe
+- `GET /admin/login` and `POST /admin/login` — admin UI login form (chicken-and-egg: must be reachable without the cookie it sets)
 
-These are intentionally open so Kubernetes-style probes, Cloudflare health checks, and external monitoring can poll them without API credentials. They expose only ready-flag booleans + free RAM in MB — no user data, no audio, no model output.
+These are intentionally open so Kubernetes-style probes, Cloudflare health checks, and external monitoring can poll them without API credentials. The probes expose only ready-flag booleans + free RAM in MB — no user data, no audio, no model output.
+
+**Bearer required:**
+- `POST /transcribe/dictate`, `POST /transcribe/meeting`, `GET /transcribe/meeting/{id}`, `GET /transcribe/meeting/{id}/download/{fmt}`, `DELETE /transcribe/meeting/{id}`
+- `GET /metrics`
+- All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
+- `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
 
 **Additional auth validation:**
-- An empty token after the `Bearer ` prefix returns **401** `"Empty bearer token"`.
+- A missing or invalid token returns **401**.
+- An empty token after the `Bearer ` prefix returns **401**.
 - Multiple `Authorization` headers in one request return **400** `"Multiple Authorization headers not allowed"`.
+- When Postgres is unreachable AND the bearer doesn't match the break-glass env-var hash, the server returns **503** `"Auth temporarily unavailable"` rather than 401, so the operator can distinguish "wrong key" from "DB down".
 
 ---
 
@@ -322,7 +331,8 @@ Structured server observability snapshot.
   "latencies": {
     "transcribe/dictate": {"p50": 143.0, "p95": 198.5, "p99": 240.1},
     "transcribe/meeting": {"p50": null, "p95": null, "p99": null}
-  }
+  },
+  "process_uptime_seconds": 3712.4
 }
 ```
 
@@ -342,3 +352,29 @@ Structured server observability snapshot.
 | `requests_total` | Request counts keyed by `"route:status"` (last process lifetime) |
 | `errors_total` | Error counts keyed by `"route:status"` for 4xx/5xx responses |
 | `latencies` | Per-route p50/p95/p99 latency in ms; `null` if fewer than 2 observations. **Recent-window only**: percentiles include only observations from the last 5 minutes (`LatencyHistogram._RECENT_WINDOW_S`). This protects p50 from being poisoned by a single old outlier (e.g. a hung 197-second upload). The full deque (last 1000 entries, all-time) remains queryable via `LatencyHistogram.percentiles(route, recent_only=False)` for callers that need the legacy view. Regression-locked by `server/tests/test_observability_time_window.py`. |
+| `process_uptime_seconds` | Wall time since the FastAPI lifespan started (`time.monotonic() - observability.process_started_at_monotonic`). Useful as a deploy/restart sentinel: `< 60` immediately after `bash scripts/server-launchd.sh restart`. |
+
+---
+
+## Admin API
+
+The `/admin/*` routes (other than `/admin/rotate-key` and `/admin/login`) render **HTML** via Jinja2 templates, not JSON. They are intended for browser navigation; curl/Postman work too but you'll get markup back.
+
+Source: `server/src/wispralt_server/routes/admin_ui.py` +
+`server/src/wispralt_server/admin/templates/*.html.j2`.
+
+**Auth:** `role='admin'` required (employee tokens get **403**). Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; curl/Postman users send `Authorization: Bearer <admin-token>` on each request. See [ARCHITECTURE.md → Admin UI](ARCHITECTURE.md#admin-ui) for the two-router pattern.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/admin/login` | — | HTML form (200) |
+| POST | `/admin/login` | `application/x-www-form-urlencoded` `token=...` | 303 → `/admin/` + `Set-Cookie: wispralt_admin_token=...` on success; 401 + form re-render on failure |
+| GET | `/admin/` | — | Overview dashboard HTML |
+| GET | `/admin/users` | — | Users-list HTML with per-row Mint/Revoke forms |
+| POST | `/admin/users/{id}/mint` | — | HTML page showing the new plaintext token **once** |
+| POST | `/admin/users/{id}/revoke` | — | 303 → `/admin/users` (revokes + invalidates cache by hash) |
+| GET | `/admin/users/{id}` | — | Per-user detail HTML (24h/7d/30d tiles + last 50 events) |
+| GET | `/admin/usage` | filters: `kind`, `status`, `user_id`, `since`, `until`, `offset` (query params) | Drill-down HTML, paginated 100/page |
+| GET | `/admin/usage.csv` | same filters as `/admin/usage` | `text/csv` stream (max 10000 rows) |
+
+All authed admin routes return **503** "Admin UI unavailable: Postgres degraded." when `app.state.db_pool` is `None` — the admin UI is unusable without a pool, so it fails loudly rather than crashing on `AttributeError` deeper in. The break-glass admin path (env-var bearer when Postgres is unreachable) lets the operator authenticate to the rest of the API but **not** to the admin UI; restart the server once Postgres is back to recover.

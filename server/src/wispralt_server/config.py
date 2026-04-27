@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     hf_token: SecretStr
     wispralt_api_key: SecretStr
 
+    # Supabase Postgres URL for multi-tenant auth + usage events.
+    # Optional: when None, the server runs in break-glass-only mode
+    # (env-var WISPRALT_API_KEY grants admin; no per-user lookups).
+    supabase_database_url: SecretStr | None = None
+
     # Server identity
     server_url: str
 

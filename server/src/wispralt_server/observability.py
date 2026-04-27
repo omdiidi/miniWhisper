@@ -155,3 +155,10 @@ latency_histogram = LatencyHistogram()
 # Captured once at module import; the `/metrics` route subtracts from
 # `time.monotonic()` to expose process uptime.
 process_started_at_monotonic: float = _time.monotonic()
+
+# Per-request usage events drained into wispralt.usage_events by the
+# background writer task started in main.py's lifespan.  Bounded queue;
+# overflow drops oldest with a WARNING log.
+from wispralt_server.usage.queue import UsageEventQueue  # noqa: E402
+
+usage_queue = UsageEventQueue()

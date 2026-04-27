@@ -186,13 +186,158 @@ Called once at startup (before the event loop accepts requests). Policy from `jo
 
 ## Authentication
 
-All `/transcribe/*` and `/admin/*` endpoints require `Authorization: Bearer <WISPRALT_API_KEY>`. `auth.py` uses `secrets.compare_digest` for constant-time comparison (prevents timing oracle attacks). The authorization header check (line 56–61 in `auth.py`) strips the `Bearer ` prefix before comparing.
+`/healthz`, `/readyz/*`, and `/admin/login` are intentionally **unauthenticated** so Kubernetes-style probes, Cloudflare health checks, external monitoring, and the admin login form can be reached without API credentials. The probes expose only a ready-flag boolean, free RAM in MB, and a `meeting_active` indicator — no user data, no audio, no model output.
 
-`/healthz` and `/readyz/*` are intentionally **unauthenticated** so Kubernetes-style probes, Cloudflare health checks, and external monitoring can probe them without API credentials. These endpoints expose only a ready-flag boolean, free RAM in MB, and a `meeting_active` indicator — no user data, no audio, no model output.
+Every other route requires `Authorization: Bearer <token>`. The legacy single-key compare path was replaced in `2026-04-27-team-distribution` by the multi-token flow described next; `secrets.compare_digest` no longer appears on the request hot path.
 
-The API key is a 64-character hex string (`secrets.token_hex(32)`). It lives in `server/.env` (mode 0600, owner = current user) and in memory as a module-level variable guarded by `threading.Lock` for hot-swap during key rotation.
+### Auth (multi-token)
 
-**Key rotation** (`POST /admin/rotate-key`): generates a new key, atomically rewrites `.env` via `env_writer.rewrite_env_var` (tempfile-in-same-dir + `os.replace`, mode 0600 preserved), writes the new key to `~/Library/Application Support/WisprAlt/.last-rotation-key` (mode 0600, written with `os.O_CREAT | os.O_WRONLY | os.O_TRUNC` at mode 0o600), prints `NEW_API_KEY=<key>` to stdout (captured by launchd to `server.log`), and hot-swaps the in-memory key. The new key is **never** in the response body — response is `{"rotated": true}`.
+```
+Bearer <plaintext>
+   │
+   ▼
+sha256(plaintext) ─────────────► token_hash (hex)
+   │
+   ▼
+TokenCache.get(token_hash)        ← LRU 256 entries × 60s TTL, in-process
+   │ hit
+   ├──► User(id, label, role) ──► request.state.user
+   │
+   │ miss
+   ▼
+asyncpg pool ─► SELECT id, label, role
+                FROM wispralt.users
+               WHERE token_hash = $1
+                 AND revoked_at IS NULL
+   │
+   │ row found
+   ├──► TokenCache.put → User → request.state.user
+   │
+   │ row missing OR pool=None OR PostgresError
+   ▼
+break-glass branch
+   IF token_hash == app.state.break_glass_token_hash:
+       User(id=-1, label="break-glass-admin", role="admin")
+   ELSE:
+       401 Invalid bearer / 503 Auth temporarily unavailable
+```
+
+Source: `server/src/wispralt_server/auth.py` +
+`server/src/wispralt_server/users/{cache.py,store.py}`.
+
+Key invariants:
+
+- **`request.state.user` is populated for every authenticated request.** The observability middleware reads it to attribute usage events; `routes/admin_ui.py:require_admin` reads it to gate role.
+- **The break-glass branch only fires when Postgres is unreachable** OR when the row genuinely is missing. On first boot the lifespan seeds a real `wispralt.users` row whose `token_hash` matches the env-var hash, so 99% of break-glass calls take the normal Postgres path and produce attributable usage events. The `id=-1` sentinel is reserved for the case where the pool is `None` (Postgres degraded).
+- **Cookie fallback:** `_extract_bearer` falls back to the `wispralt_admin_token` cookie when no `Authorization` header is present. Set by `POST /admin/login` for browser navigation; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. CSRF is mitigated by `SameSite=Strict`.
+
+### Usage event tracking
+
+```
+                    request hot path                         background
+                                                             drainer
+┌─ middleware/observability.dispatch ─────────┐    ┌────────────────────────┐
+│ after call_next:                              │    │ usage.writer.drain_loop│
+│   if user.id >= 0 and route in TRACKED_ROUTES │    │  (asyncio task)        │
+│      and method == POST:                      │    │                        │
+│        observability.usage_queue.offer(       │    │  while True:           │
+│          UsageEvent(user_id, ts, kind,        │    │    e = await q.get()   │
+│            status, duration_ms, bytes_in,     │    │    batch.append(e)     │
+│            request_id))                       │    │    if len >= 50 OR     │
+└──────────────────┬───────────────────────────┘    │       1s elapsed:      │
+                   │ asyncio.Queue (maxsize=1000)    │      _flush(pool, batch)
+                   ▼                                  │      batch = []        │
+       UsageEventQueue (bounded)                      └──────────┬─────────────┘
+       full → drop oldest, log WARNING                           │
+                                                                  ▼
+                                                  asyncpg ── INSERT INTO
+                                                            wispralt.usage_events
+                                                            (executemany, in
+                                                             explicit transaction)
+
+                                                  on FK violation:
+                                                  filter survivors (user_id>=0)
+                                                  retry in fresh transaction
+```
+
+Source:
+`server/src/wispralt_server/usage/{events.py,queue.py,writer.py}` +
+`observability.py` (singleton) + `main.py` (drainer task lifecycle).
+
+Why fire-and-forget:
+
+- The dictation hot path is sub-200ms; a Postgres write per request would
+  add ~10–40ms of unified-memory contention.
+- Bounded queue caps unbounded memory growth if Postgres falls behind:
+  on overflow the oldest event is dropped and a WARNING is logged.
+- FK-violation retry is critical: a `ForeignKeyViolationError` aborts the
+  entire transaction, so we explicitly wrap in `async with conn.transaction():`,
+  filter `user_id >= 0` survivors on retry, and re-execute. Without the
+  explicit transaction the post-error connection would be in an aborted
+  state and the retry would hit `InFailedSQLTransactionError`.
+- Cancelled-on-shutdown: lifespan cancels the drainer task and awaits it;
+  `CancelledError` triggers a final batch flush before the task exits.
+
+Tracked routes: `transcribe/dictate` and `transcribe/meeting`, **POST
+only** — status-poll GETs are excluded so a client polling every 5s
+doesn't multiply the event volume by 60.
+
+### Admin UI
+
+```
+┌────── /admin (FastAPI APIRouter) ──────┐
+│                                          │
+│  public_router  ─► /admin/login (GET)   │  no auth — chicken-and-egg
+│                    /admin/login (POST)  │
+│                                          │
+│  authed_router  ─► everything else      │  Depends=[require_admin,
+│      /admin/                            │           _require_db_pool]
+│      /admin/users  /admin/users/{id}    │
+│      /admin/users/{id}/mint  …/revoke   │
+│      /admin/usage  /admin/usage.csv     │
+└──────────────────────────────────────────┘
+```
+
+Source: `server/src/wispralt_server/routes/admin_ui.py` +
+`server/src/wispralt_server/admin/templates/*.html.j2`.
+
+Two-router pattern:
+
+- **`public_router`** carries `/admin/login` (GET form + POST submit).
+  Must be reachable without auth, otherwise the operator has no way to
+  acquire the session cookie that gates the rest of the UI.
+- **`authed_router`** has `dependencies=[Depends(require_admin),
+  Depends(_require_db_pool)]`, so a browser hitting `/admin/` without a
+  valid token gets 401, and a request hitting it while Postgres is
+  degraded gets 503 — never an `AttributeError` on `app.state.db_pool`.
+
+Auth model: `Authorization: Bearer ...` (curl/Postman) or
+`wispralt_admin_token` cookie (browser, set by `POST /admin/login`).
+`auth._extract_bearer` falls back to the cookie when the header is
+absent. CSRF is mitigated by `SameSite=Strict` on the cookie — browsers
+refuse to attach it to cross-site POSTs.
+
+Templates use the `.html.j2` extension. Jinja2's default autoescape list
+does **not** include this extension; `select_autoescape(enabled_extensions=("html.j2", "html", "j2"))`
+is set explicitly so user-supplied fields (label, notes, error_class)
+render escaped, closing the stored-XSS hole on the admin UI.
+
+### Legacy single-key shim
+
+`auth.current_key()` and `auth.set_current_key()` are retained as thin
+shims for `routes/admin.py:rotate_key`, the last-resort tool for
+rotating the env-var token while Postgres is unreachable. Once all
+rotation moves through the admin UI's mint flow, this endpoint can be
+removed.
+
+### Memory budget impact
+
+The asyncpg pool adds ~1 MB per resident connection. Pool sized
+`min_size=1, max_size=10`, so the steady-state footprint is ~1–10 MB
+on top of the existing ~6.5–7.0 GB resident model memory. The drainer
+holds at most one connection during the `executemany` window; auth
+lookups and admin UI requests compete for the other nine. Comfortable
+headroom for ≤10 employees.
 
 ---
 

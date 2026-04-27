@@ -1,0 +1,57 @@
+{% extends "base.html.j2" %}
+{% block title %}{{ user.label }} — Wispralt Admin{% endblock %}
+{% block content %}
+  <h2>{{ user.label }} <span class="warn" style="font-size: 14px;">({{ user.role }})</span></h2>
+  <p><a href="/admin/users">&larr; Back to users</a></p>
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="label">Dictations 24h</div>
+      <div class="value">{{ totals.dictations_24h or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Dictations 7d</div>
+      <div class="value">{{ totals.dictations_7d or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Dictations 30d</div>
+      <div class="value">{{ totals.dictations_30d or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Errors 24h</div>
+      <div class="value">{{ totals.errors_24h or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">p50 latency 24h</div>
+      <div class="value">{% if totals.p50_24h %}{{ "%.0f"|format(totals.p50_24h) }} ms{% else %}—{% endif %}</div>
+    </div>
+  </div>
+
+  <h2>Last 50 events</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Kind</th>
+        <th>Status</th>
+        <th>Duration (ms)</th>
+        <th>Bytes in</th>
+        <th>Request ID</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in events %}
+        <tr>
+          <td>{{ e.ts.strftime('%Y-%m-%d %H:%M:%S') if e.ts else '—' }}</td>
+          <td>{{ e.kind }}</td>
+          <td>{{ e.status }}</td>
+          <td>{% if e.duration_ms is not none %}{{ "%.0f"|format(e.duration_ms) }}{% else %}—{% endif %}</td>
+          <td>{{ e.bytes_in if e.bytes_in is not none else '—' }}</td>
+          <td>{{ e.request_id or '—' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6">No events for this user yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% set hide_chrome = True %}
+{% extends "base.html.j2" %}
+{% block title %}Admin login — Wispralt{% endblock %}
+{% block bare_content %}
+  <div class="login-card">
+    <h2>Wispralt Admin</h2>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="post" action="/admin/login">
+      <label for="token">API token</label>
+      <input id="token" name="token" type="password" autocomplete="off" autofocus required>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+{% endblock %}
