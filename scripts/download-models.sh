@@ -46,19 +46,24 @@ if [[ "$AVAIL_KB" -lt "$REQUIRED_KB" ]]; then
 fi
 echo "Disk pre-flight: OK ($(( AVAIL_KB / 1048576 )) GB free)"
 
-# ── Verify huggingface-cli is available ──────────────────────────────────────
-if ! command -v huggingface-cli >/dev/null 2>&1; then
-    echo "ERROR: huggingface-cli not found." >&2
-    echo "  Install it: pip install huggingface_hub[cli]  (or uv run huggingface-cli)" >&2
-    echo "  If you have the server venv: source server/.venv/bin/activate" >&2
+# ── Locate `hf` CLI (prefer server venv) ──────────────────────────────────────
+HF_CLI=""
+if [[ -x "$REPO_ROOT/server/.venv/bin/hf" ]]; then
+    HF_CLI="$REPO_ROOT/server/.venv/bin/hf"
+elif command -v hf >/dev/null 2>&1; then
+    HF_CLI="$(command -v hf)"
+else
+    echo "ERROR: 'hf' CLI not found." >&2
+    echo "  Run 'cd server && uv sync' first to install it into the venv." >&2
     exit 1
 fi
+echo "Using HF CLI: $HF_CLI"
 
 # ── Authenticate — 3 retries with 5s backoff ─────────────────────────────────
 echo "Checking Hugging Face authentication..."
 AUTH_OK=false
 for attempt in 1 2 3; do
-    HF_WHOAMI_OUTPUT="$(HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" huggingface-cli whoami 2>&1)" && {
+    HF_WHOAMI_OUTPUT="$(HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" "$HF_CLI" auth whoami 2>&1)" && {
         AUTH_OK=true
         echo "Authenticated as: $HF_WHOAMI_OUTPUT"
         break
@@ -91,10 +96,9 @@ fi
 probe_gated_repo() {
     local REPO="$1"
     echo "Probing gated repo: $REPO"
-    PROBE_OUTPUT="$(HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" huggingface-cli download \
+    PROBE_OUTPUT="$(HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" "$HF_CLI" download \
         "$REPO" \
         --include "*.yaml" \
-        --local-dir-use-symlinks=False \
         2>&1)" && return 0
     # If we get here the download failed
     if echo "$PROBE_OUTPUT" | grep -qi "401\|gated\|terms\|accept"; then
@@ -116,10 +120,7 @@ echo "Gated-model access confirmed."
 # ── Download helper with --resume-download ───────────────────────────────────
 hf_download() {
     local REPO="$1"
-    HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" huggingface-cli download \
-        "$REPO" \
-        --resume-download \
-        --local-dir-use-symlinks=False
+    HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" "$HF_CLI" download "$REPO"
 }
 
 # ── Download each model ───────────────────────────────────────────────────────
@@ -164,16 +165,8 @@ hf_download "pyannote/segmentation-3.0"
 echo "Pyannote diarization + segmentation: done"
 echo ""
 
-echo "--- DeepFilterNet 3 (~100 MB) ---"
-echo "  DeepFilterNet downloads weights on first import via the 'df' package."
-echo "  Triggering download now via Python..."
-HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" "$PYTHON_BIN" -c \
-    "from df import init_df; init_df()" \
-    2>&1 || {
-    echo "  WARNING: DeepFilterNet weight download failed. It will be retried on first meeting job." >&2
-    echo "  This is non-fatal — proceeding." >&2
-}
-echo "DeepFilterNet 3: done (or deferred)"
+echo "--- DeepFilterNet 3 — SKIPPED ---"
+echo "  DeepFilterNet was removed (numpy<2.0 conflicts with parakeet-mlx)."
 echo ""
 
 # ── Post-download size report ─────────────────────────────────────────────────

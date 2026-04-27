@@ -55,3 +55,6 @@ client/Package.resolved
 
 # Claude Code internal state
 .claude/scheduled_tasks.lock
+
+# Claude Code tooling state (broad ignore)
+.claude/

@@ -2,15 +2,14 @@
 name = "wispralt-server"
 version = "0.1.0"
 description = "WisprAlt — self-hosted dictation and meeting-transcription server"
-requires-python = "^3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
     # ML — dictation
     "parakeet-mlx==0.5.1",
     "mlx>=0.22.1,<0.32.0",
     # ML — meeting pipeline
-    "whisperx==3.8.5",
+    "whisperx==3.4.0",
     "pyannote.audio==3.3.2",
-    "deepfilternet==0.5.6",
     # torch pinned: torchaudio 2.7+ removes AudioMetaData and breaks pyannote
     "torch==2.6.0",
     "torchaudio==2.6.0",
@@ -31,6 +30,8 @@ dependencies = [
     "huggingface_hub>=0.30.2",
     # OOM guard (v3 delta)
     "psutil>=6.0",
+    # Implicit dep of pyannote.audio.utils.metric (imports matplotlib at module load)
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
