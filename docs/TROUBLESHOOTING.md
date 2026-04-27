@@ -389,3 +389,43 @@ tccutil reset ScreenCapture   co.wispralt.WisprAlt
 tccutil reset Microphone      co.wispralt.WisprAlt
 ```
 Then reopen WisprAlt and grant all four permissions. This happens at most once a year.
+
+---
+
+## Multi-sentence dictation feels slow (3-5 seconds vs <1s for short clips)
+
+**Symptom:** A 1-2 word dictation feels instant; a multi-sentence dictation has a noticeable wait between FN-release and the text appearing.
+
+**What's NOT the cause:** Server-side Parakeet inference. `/metrics` reports `parakeet.p50_ms` ≈ 150ms regardless of clip length up to ~10 seconds. The bottleneck is elsewhere.
+
+**Where to look:** WisprAlt now logs a per-stage timing breakdown to OSLog under subsystem `co.wispralt`, category `dictation`. Run a 3-sentence dictation, then read the breakdown:
+
+```bash
+log show --last 5m \
+  --predicate 'subsystem == "co.wispralt" AND category == "dictation"' \
+  --style compact --info | grep 'dictation/timing'
+```
+
+You'll see three lines per dictation:
+
+```
+dictation/timing: stop_ms=12.3 bytes=1234567
+dictation/timing: net_total_ms=1842.5 chars=234
+dictation/timing: inject_ms=18.7 total_ms=1873.5
+```
+
+| Field | What it tells you |
+|---|---|
+| `stop_ms` | Time to finalize the WAV after FN-release. Should be <50ms. |
+| `bytes` | Size of the upload payload. ~96 KB/sec at 48kHz Float32 mono. |
+| `net_total_ms` | Wall time of `DictationAPI.transcribe(wavData)` — covers multipart upload + Cloudflare Tunnel hop + server queue + Parakeet inference + response. |
+| `inject_ms` | Time inside `TextInjector.inject(text)` (AXUIElement set or Cmd+V fallback). Should be <50ms. |
+| `total_ms` | Sum of all three. |
+
+**Diagnosis ladder:**
+
+1. If `inject_ms` > 200ms — the AX-inject path is slow on the focused app (likely Electron app falling through to clipboard fallback). Switch focus to a native AppKit text field to confirm.
+2. If `net_total_ms` >> server-side `parakeet.p50_ms` (visible in `GET /metrics`) — the gap is upload + tunnel. For a 3-sentence (≈3-second) clip at 48kHz Float32 mono, the WAV is ~580 KB. On a typical home connection that's ~50-150ms upload. If `net_total_ms` minus server inference exceeds 800ms, suspect the Cloudflare Tunnel route (cross-region, slow first-byte) or local network egress.
+3. If `stop_ms` > 100ms — `AVAudioFile` close is taking unexpectedly long; investigate the dictation IO queue.
+
+**Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the Mac mini at `~/Library/Logs/WisprAlt/server.log`.

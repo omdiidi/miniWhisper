@@ -464,12 +464,34 @@ extension MenuBarController: FNKeyEventsDelegate {
         mode = .idle
 
         Task { @MainActor in
+            // Latency breakdown timestamps — surfaces the ~3-5s multi-sentence
+            // hunch by isolating network+upload+inference vs AX-inject. Filter
+            // OSLog with: `log show --last 5m --predicate 'subsystem == "co.wispralt"
+            // AND category == "dictation"' --style compact --info`
+            let tStopStart = Date()
             do {
                 let wavData = try await dictationRecorder.stop()
-                Log.debug("Dictation stopped — \(wavData.count) bytes, sending to server.", category: "dictation")
+                let stopMs = Date().timeIntervalSince(tStopStart) * 1000
+                Log.info(
+                    "dictation/timing: stop_ms=\(String(format: "%.1f", stopMs)) bytes=\(wavData.count)",
+                    category: "dictation"
+                )
 
+                let tNet = Date()
                 let text = try await DictationAPI.transcribe(wavData)
+                let netMs = Date().timeIntervalSince(tNet) * 1000
+                Log.info(
+                    "dictation/timing: net_total_ms=\(String(format: "%.1f", netMs)) chars=\(text.count)",
+                    category: "dictation"
+                )
+
+                let tInj = Date()
                 TextInjector.inject(text)
+                let injMs = Date().timeIntervalSince(tInj) * 1000
+                Log.info(
+                    "dictation/timing: inject_ms=\(String(format: "%.1f", injMs)) total_ms=\(String(format: "%.1f", Date().timeIntervalSince(tStopStart) * 1000))",
+                    category: "dictation"
+                )
                 Log.info("Dictation injected: \"\(text.prefix(60))\"", category: "dictation")
 
             } catch ServerError.unauthorized {
