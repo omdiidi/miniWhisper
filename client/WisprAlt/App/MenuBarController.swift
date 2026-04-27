@@ -45,7 +45,11 @@ final class MenuBarController: NSObject {
     }
 
     var mode: Mode = .idle {
-        didSet { updateIcon() }
+        didSet {
+            updateIcon()
+            let isRec = (mode == .meetingRecording) || (mode == .dictating)
+            AppDelegate.shared?.micMenuBarController?.updateRecordingTint(active: isRec)
+        }
     }
 
     // MARK: - Meeting active flag
@@ -71,6 +75,10 @@ final class MenuBarController: NSObject {
 
     /// Owned dictation recorder — created once and reused across dictation sessions.
     private let dictationRecorder = DictationRecorder()
+
+    // MARK: - Meeting filename rename support
+    private var meetingRecordingStart: Date?
+    private var meetingStartFileURL: URL?
 
     // MARK: - Status item
 
@@ -253,33 +261,12 @@ final class MenuBarController: NSObject {
 
         switch mode {
         case .meetingRecording:
-            // Render a clean, custom solid red dot via NSBezierPath instead of an
-            // SF Symbol. record.circle.fill has an inner ring-and-dot detail that
-            // blurs at menubar size; circle.fill works but tinting it via the
-            // status item's contentTintColor occasionally double-tints depending
-            // on the user's menu-bar style. Drawing the dot ourselves guarantees
-            // a single solid red circle at the exact size we want, every time.
-            let dotSize: CGFloat = 10
-            let imageSize = NSSize(width: dotSize, height: dotSize)
-            let dot = NSImage(size: imageSize, flipped: false) { rect in
-                NSColor.systemRed.setFill()
-                NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5)).fill()
-                return true
-            }
-            dot.isTemplate = false  // we want the dot to stay red, not invert
-            button.image = dot
-            button.contentTintColor = nil  // image already carries its color
-            button.attributedTitle = NSAttributedString(
-                string: " REC",
-                attributes: [
-                    .foregroundColor: NSColor.systemRed,
-                    .font: NSFont.systemFont(
-                        ofSize: NSFont.systemFontSize(for: .small),
-                        weight: .bold
-                    ),
-                ]
-            )
-            button.imagePosition = .imageLeading
+            let composite = renderRecComposite()
+            button.image = composite
+            button.contentTintColor = nil
+            button.attributedTitle = NSAttributedString(string: "")
+            button.title = ""
+            button.imagePosition = .imageOnly
             button.toolTip = "WisprAlt — Meeting Recording"
 
         default:
@@ -342,22 +329,18 @@ final class MenuBarController: NSObject {
     // MARK: - Meeting recording control
 
     private func startMeetingRecording() {
-        // Build output URL: <meetingsPath>/<YYYY-MM-DD_HHmmZZZZZ>_meeting.wav
-        // Strip colons from the timezone offset so the filename is filesystem-safe.
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HHmmZZZZZ"
-        let rawStamp = formatter.string(from: Date())
-        // "2026-04-24_1543-07:00" → "2026-04-24_1543-0700"
-        let stamp = rawStamp.replacingOccurrences(of: ":", with: "", range: rawStamp.range(of: ":", options: .backwards))
-        let fileName = "\(stamp)_meeting.wav"
-        let outputURL = Settings.shared.meetingsPath.appendingPathComponent(fileName)
+        let now = Date()
+        let startName = humanReadableMeetingFilename(start: now, end: nil, in: Settings.shared.meetingsPath)
+        let outputURL = Settings.shared.meetingsPath.appendingPathComponent(startName)
+        self.meetingRecordingStart = now
+        self.meetingStartFileURL = outputURL
 
         Task { @MainActor in
             do {
                 try await MeetingRecorder.shared.start(to: outputURL)
                 meetingActive = true
                 mode = .meetingRecording
-                Log.info("Meeting recording started → \(fileName)", category: "meeting")
+                Log.info("Meeting recording started → \(startName)", category: "meeting")
             } catch {
                 Log.error("Failed to start meeting recording: \(error.localizedDescription)", category: "meeting")
                 AppNotifications.notify(title: "Meeting Recording Failed", body: error.localizedDescription)
@@ -369,12 +352,28 @@ final class MenuBarController: NSObject {
         Task { @MainActor in
             do {
                 let wavURL = try await MeetingRecorder.shared.stop()
+                let endDate = Date()
+                let humanName = humanReadableMeetingFilename(
+                    start: meetingRecordingStart ?? endDate,
+                    end: endDate,
+                    in: Settings.shared.meetingsPath
+                )
+                let renamedURL = Settings.shared.meetingsPath.appendingPathComponent(humanName)
+                let finalURL: URL
+                do {
+                    try FileManager.default.moveItem(at: wavURL, to: renamedURL)
+                    finalURL = renamedURL
+                    Log.info("Meeting WAV renamed → \(humanName)", category: "meeting")
+                } catch {
+                    Log.warning("Could not rename meeting WAV: \(error.localizedDescription). Using start-only name.", category: "meeting")
+                    finalURL = wavURL
+                }
                 meetingActive = false
                 mode = .uploading
                 recordingState.uploadFraction = 0
-                Log.info("Meeting recording stopped — uploading \(wavURL.lastPathComponent)", category: "meeting")
+                Log.info("Meeting recording stopped — uploading \(finalURL.lastPathComponent)", category: "meeting")
 
-                await processMeetingUpload(wavURL: wavURL)
+                await processMeetingUpload(wavURL: finalURL)
             } catch {
                 meetingActive = false
                 mode = .idle
@@ -468,6 +467,91 @@ final class MenuBarController: NSObject {
             Log.error("Meeting processing failed: \(message)", category: "meeting")
             AppNotifications.notify(title: "Meeting Transcription Failed", body: message)
         }
+    }
+
+    // MARK: - Composite REC icon
+
+    private func renderRecComposite() -> NSImage {
+        let dotSize: CGFloat = 8
+        let dotGap: CGFloat = 3
+        let verticalPadding: CGFloat = 1  // descender clearance
+        let font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.systemRed,
+        ]
+        let text = NSAttributedString(string: "REC", attributes: attrs)
+        let textSize = text.size()
+        let canvasHeight = ceil(textSize.height) + verticalPadding * 2
+        let canvasWidth = dotSize + dotGap + ceil(textSize.width) + 2
+        let img = NSImage(
+            size: NSSize(width: canvasWidth, height: canvasHeight),
+            flipped: false
+        ) { _ in
+            let rect = NSRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight)
+            let dotRect = NSRect(
+                x: 0,
+                y: (rect.height - dotSize) / 2,
+                width: dotSize,
+                height: dotSize
+            )
+            NSColor.systemRed.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            text.draw(in: NSRect(
+                x: dotSize + dotGap,
+                y: verticalPadding,
+                width: ceil(textSize.width),
+                height: ceil(textSize.height)
+            ))
+            return true
+        }
+        img.isTemplate = false  // pre-rendered red, not a template
+        return img
+    }
+
+    // MARK: - Human-readable meeting filename
+
+    private func humanReadableMeetingFilename(start: Date, end: Date?, in dir: URL) -> String {
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "EEE MMM d"
+
+        let timeFormatter = DateFormatter()
+        timeFormatter.locale = Locale(identifier: "en_US_POSIX")
+        timeFormatter.amSymbol = "am"
+        timeFormatter.pmSymbol = "pm"
+        // Periods, not colons (filesystem-friendly across rsync to Linux, zip, etc.)
+        // Includes seconds to make collisions effectively impossible across all
+        // sidecar extensions (.wav/.json/.srt/.vtt/.txt) written by processMeetingUpload.
+        timeFormatter.dateFormat = "h.mm.ssa"
+
+        let day = dayFormatter.string(from: start)
+        let startTime = timeFormatter.string(from: start)
+        let base: String
+        if let end = end {
+            let endTime = timeFormatter.string(from: end)
+            base = "\(day) \(startTime)-\(endTime)"
+        } else {
+            base = "\(day) \(startTime)"
+        }
+
+        // Collision guard: check the base name against ALL sidecar extensions.
+        let exts = ["wav", "json", "srt", "vtt", "txt"]
+        func anyExists(_ baseName: String) -> Bool {
+            for ext in exts {
+                if FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(baseName).\(ext)").path) {
+                    return true
+                }
+            }
+            return false
+        }
+        var name = base
+        var i = 2
+        while anyExists(name) {
+            name = "\(base) (\(i))"
+            i += 1
+        }
+        return "\(name).wav"
     }
 
     // MARK: - Toast helper

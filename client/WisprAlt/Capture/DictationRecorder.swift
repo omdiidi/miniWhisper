@@ -1,4 +1,6 @@
 import AVFoundation
+import AudioToolbox
+import CoreAudio
 import Foundation
 import os.lock
 
@@ -144,6 +146,43 @@ final class DictationRecorder {
         guard !isRecording else { return true }
 
         let inputNode = engine.inputNode
+
+        // === Apply preferred input device BEFORE format read & observer install.
+        // The format read MUST happen on the new device — switching device changes
+        // sample rate / channel count. The configChange observer installed below
+        // would also catch our override and abort the recording, so we do this
+        // before the observer is wired up. ===
+        if let preferredUID = Settings.shared.preferredInputDeviceUID,
+           let deviceID = MicEnumerator.audioDeviceID(forUID: preferredUID),
+           let audioUnit = inputNode.audioUnit {
+            var devID = deviceID
+            let status = AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &devID,
+                UInt32(MemoryLayout<AudioDeviceID>.size)
+            )
+            if status != noErr {
+                Log.warning(
+                    "Could not set preferred input device on inputNode: \(status). Falling back to system default.",
+                    category: "audio"
+                )
+            } else {
+                Log.info(
+                    "DictationRecorder: input device set to UID \(preferredUID)",
+                    category: "audio"
+                )
+            }
+        } else if let preferredUID = Settings.shared.preferredInputDeviceUID {
+            // UID resolved to nil — device unplugged since last selection.
+            Log.warning(
+                "DictationRecorder: preferred device UID \(preferredUID) is unavailable; using system default.",
+                category: "audio"
+            )
+        }
+
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
         // Defensive: a headless macOS / disabled mic / not-yet-configured input

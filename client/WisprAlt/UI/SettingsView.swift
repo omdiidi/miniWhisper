@@ -33,6 +33,8 @@ struct SettingsView: View {
     @State private var exportImportError: String?
     /// Reveals the Server URL / API Key / Export-Import block at the bottom of the form.
     @State private var showAdvanced: Bool = false
+    @State private var copyFeedback: String?
+    @State private var hasStoredAPIKey: Bool = false
 
     private enum ConnectionFeedbackKind {
         case neutral, success, warning, error
@@ -52,6 +54,7 @@ struct SettingsView: View {
                 serverSection
                 apiKeySection
                 apiKeyExportImportSection
+                menuBarSection
             }
         }
         .formStyle(.grouped)
@@ -195,6 +198,12 @@ struct SettingsView: View {
     private var apiKeyExportImportSection: some View {
         Section("API Key Backup") {
             HStack {
+                Button("Copy API Key") {
+                    copyAPIKeyToClipboard()
+                }
+                .disabled(!hasStoredAPIKey)
+                .help(hasStoredAPIKey ? "Copy your API key. Auto-cleared from clipboard after 60 seconds." : "Paste an API key first")
+
                 Button("Export API Key…") {
                     let panel = NSSavePanel()
                     panel.allowedContentTypes = [.text]
@@ -246,6 +255,20 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            if let msg = copyFeedback {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+        }
+    }
+
+    private var menuBarSection: some View {
+        Section("Menu Bar") {
+            Toggle("Show input mic in menu bar", isOn: $settings.showMicStatusItem)
+            Text("Restart WisprAlt to apply.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -291,6 +314,7 @@ struct SettingsView: View {
         } catch {
             Log.error("Failed to read API key from Keychain: \(error)", category: "settings")
         }
+        hasStoredAPIKey = ((try? KeychainHelper.getAPIKey()) ?? nil)?.isEmpty == false
     }
 
     private func commitServerURL() {
@@ -316,6 +340,39 @@ struct SettingsView: View {
             Log.info("API key saved to Keychain.", category: "settings")
         } catch {
             Log.error("Failed to save API key: \(error)", category: "settings")
+        }
+    }
+
+    private func copyAPIKeyToClipboard() {
+        do {
+            guard let key = try KeychainHelper.getAPIKey(), !key.isEmpty else {
+                copyFeedback = "No API key to copy."
+                return
+            }
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(key, forType: .string)
+            let mark = pb.changeCount  // post-write changeCount
+            copyFeedback = "Copied! Auto-clearing in 60s."
+            Log.info("API key copied to clipboard.", category: "settings")
+
+            // Two timers: caption fades fast, clipboard auto-clears slow.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2 * 1_000_000_000)
+                copyFeedback = nil
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                if NSPasteboard.general.changeCount == mark {
+                    NSPasteboard.general.clearContents()
+                    Log.info("Auto-cleared API key from clipboard (changeCount unchanged).", category: "settings")
+                } else {
+                    Log.info("Skipped clipboard auto-clear — pasteboard changed.", category: "settings")
+                }
+            }
+        } catch {
+            Log.error("Copy API key failed: \(error)", category: "settings")
+            copyFeedback = "Copy failed: \(error.localizedDescription)"
         }
     }
 

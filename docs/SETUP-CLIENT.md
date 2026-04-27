@@ -122,7 +122,54 @@ After the permission wizard, the app is ready for server configuration.
 | Processing | waveform | While server is transcribing |
 | Done | checkmark | Briefly, before returning to Idle |
 
-The REC indicator (be720a1) is rendered as a custom solid red dot via `NSBezierPath` rather than an SF Symbol so it's pixel-perfect at any menubar density and reads unambiguously even in dark mode.
+The REC indicator is rendered as a single composite NSImage (NSBezierPath red dot + bold red "REC" attributed text drawn into one bitmap). The earlier image+attributedTitle pair was character-wrapping in cramped menubars (R/E/C stacked vertically); the composite-bitmap approach takes layout decisions away from the menubar layout engine entirely.
+
+### Picking your input mic
+
+A second menubar icon (mic SF symbol) sits next to the WisprAlt icon. Click it to drop a native menu:
+
+```
+Input Mic
+─────────────────
+System Default (current: <name>)
+─────────────────
+✓ MacBook Pro Microphone
+  AirPods Pro
+  USB Audio Interface
+─────────────────
+Open Sound Settings…
+```
+
+- **Click any device** → WisprAlt records from that device for both dictation and meetings.
+- **Dictation**: applied via `AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice)` on the AVAudioEngine input node. No system-wide side effect.
+- **Meeting recording**: SCStream has no per-stream mic API, so WisprAlt temporarily overrides the system-wide default input device for the duration of the recording, restoring on stop. **Side effect**: other apps using audio during the meeting will also use your chosen mic. Acceptable because you explicitly picked it.
+- **Crash recovery**: if the app crashes mid-meeting, the system default is restored on the next launch via `pendingMeetingDefaultInputUID` UserDefaults persistence.
+- **Recording state**: while a meeting or dictation is active, the mic icon turns red (`contentTintColor = .systemRed`) so you can spot recording state at a glance.
+- **No input devices found**: the menu shows a fallback row linking to System Settings → Privacy & Security → Microphone if mic permission is revoked.
+- **Hide the icon**: open the menubar popover → Show advanced settings → toggle off "Show input mic in menu bar". Restart WisprAlt to apply.
+
+The mic selector lives in `client/WisprAlt/App/MicMenuBarController.swift`. Device enumeration goes through `client/WisprAlt/Audio/MicEnumerator.swift` which bridges AVFoundation discovery to CoreAudio HAL property reads/writes.
+
+### Meeting filenames
+
+Saved meetings land in your meetings folder with human-readable names:
+
+```
+Mon Apr 27 2.06.34pm-2.07.12pm.wav
+Mon Apr 27 2.06.34pm-2.07.12pm.json
+Mon Apr 27 2.06.34pm-2.07.12pm.srt
+Mon Apr 27 2.06.34pm-2.07.12pm.vtt
+Mon Apr 27 2.06.34pm-2.07.12pm.txt
+```
+
+- Format: `EEE MMM d h.mm.ssa-h.mm.ssa.<ext>` in POSIX (English) locale for stable sorting.
+- Periods instead of colons for filesystem-friendliness across rsync, zip, and Windows.
+- Seconds in both timestamps eliminate sidecar collisions across all five extensions.
+- If the rename fails (rare — concurrent file appearance), WisprAlt falls back to the start-only name and logs a warning.
+
+### Copy your API key
+
+In the popover → Show advanced settings → API Key Backup section, the **Copy API Key** button puts your token on the clipboard for one-shot pastes. The clipboard auto-clears after 60 seconds, but only if you haven't copied something else in the meantime (uses `NSPasteboard.changeCount` snapshot — survives Universal Clipboard correctly).
 
 ---
 

@@ -9,9 +9,12 @@ import ServiceManagement
 ///  - Owns the FNKeyMonitor (strong reference; tap must live for the app lifetime).
 ///  - On launch: runs PermissionGate.checkAll() asynchronously, then starts FNKeyMonitor.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static weak var shared: AppDelegate?
+
     // MARK: - Owned controllers (strong references)
 
     private(set) var menuBarController: MenuBarController!
+    private(set) var micMenuBarController: MicMenuBarController?
     private var sparkleController: SparkleController!
     /// Retains the CGEvent tap for the entire app lifetime.
     private var fnKeyMonitor: FNKeyMonitor!
@@ -19,7 +22,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self  // FIRST — before anything else accesses .shared
         Log.info("WisprAlt launching.", category: "app")
+
+        // Crash recovery: if a prior session crashed mid-meeting with an active
+        // mic override, the system default input is still pointed at the user's
+        // meeting mic. Restore it.
+        if let savedUID = UserDefaults.standard.string(forKey: "pendingMeetingDefaultInputUID"),
+           let savedID = MicEnumerator.audioDeviceID(forUID: savedUID) {
+            _ = MicEnumerator.setSystemDefaultInputDevice(savedID)
+            Log.warning("Recovered system default input after prior-session crash mid-meeting. Restored UID \(savedUID).", category: "audio")
+            UserDefaults.standard.removeObject(forKey: "pendingMeetingDefaultInputUID")
+        }
 
         // Register for launch-at-login via SMAppService ON FIRST LAUNCH ONLY,
         // gated by a UserDefaults flag so the user's later "off" toggle persists.
@@ -62,6 +76,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Instantiate the menubar controller first so the status item is visible immediately.
         menuBarController = MenuBarController()
+
+        // Mic status item (gated on Settings.showMicStatusItem; default true).
+        if Settings.shared.showMicStatusItem {
+            let mic = MicMenuBarController()
+            mic.menuBarController = menuBarController
+            micMenuBarController = mic
+        }
 
         // Sparkle auto-update controller (honours meeting-guard gate).
         sparkleController = SparkleController()

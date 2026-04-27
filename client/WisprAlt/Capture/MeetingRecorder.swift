@@ -89,6 +89,12 @@ final class MeetingRecorder: NSObject {
     /// of stop() and deinit so partial-init failures can't leave an orphan.
     private var deviceListener: AudioDeviceListener?
 
+    /// `true` when start() overrode the system default input device for this
+    /// session. stop() restores the prior default only when this is set, so
+    /// the no-op path (preferred == current) doesn't misleadingly "restore"
+    /// to a value it never changed.
+    private var meetingDidOverrideDefault = false
+
     // MARK: - Per-channel converters (v3 P4#8: retained, not recreated per call)
 
     private var micConverter = CMSampleBufferConverter()
@@ -162,6 +168,48 @@ final class MeetingRecorder: NSObject {
             : maxDuration
         let maxDuration = resolvedMaxDuration
         guard !isActive else { throw MeetingRecorderError.alreadyRunning }
+
+        // === Override system default input device BEFORE AudioDeviceListener
+        // install. The HAL listener (installed below at deviceListener = ...)
+        // fires on default-input changes, so if we overrode AFTER install we'd
+        // immediately trigger meetingConfigChanged and abort our own session.
+        // Short-circuits to no-op when preferred == current default (saves a
+        // HAL set + avoids misleading "we changed the default" tracking on
+        // the no-op path so stop() doesn't restore a value we never changed). ===
+        if let preferredUID = Settings.shared.preferredInputDeviceUID,
+           let deviceID = MicEnumerator.audioDeviceID(forUID: preferredUID) {
+            let currentDefaultID = MicEnumerator.systemDefaultInputDeviceID()
+            let currentDefaultUID = currentDefaultID.flatMap { MicEnumerator.uid(forAudioDeviceID: $0) }
+            if currentDefaultUID == preferredUID {
+                Log.info(
+                    "MeetingRecorder: preferred mic == current default; no override needed.",
+                    category: "audio"
+                )
+            } else {
+                if let savedUID = currentDefaultUID {
+                    UserDefaults.standard.set(savedUID, forKey: "pendingMeetingDefaultInputUID")
+                }
+                if MicEnumerator.setSystemDefaultInputDevice(deviceID) {
+                    self.meetingDidOverrideDefault = true
+                    Log.info(
+                        "MeetingRecorder: overrode system default input to UID \(preferredUID)",
+                        category: "audio"
+                    )
+                } else {
+                    Log.warning(
+                        "MeetingRecorder: could not override default input; using system default.",
+                        category: "audio"
+                    )
+                    UserDefaults.standard.removeObject(forKey: "pendingMeetingDefaultInputUID")
+                }
+            }
+        } else if let preferredUID = Settings.shared.preferredInputDeviceUID {
+            Log.warning(
+                "MeetingRecorder: preferred device UID \(preferredUID) is unavailable; using system default.",
+                category: "audio"
+            )
+        }
+        // === END override ===
 
         // Clear the previous session's URL snapshot before doing anything else.
         lastOutputURL = nil
@@ -309,6 +357,26 @@ final class MeetingRecorder: NSObject {
     /// - Returns: The URL of the completed WAV file.
     /// - Throws: `MeetingRecorderError.notRunning` if no session is active.
     func stop() async throws -> URL {
+        // === Restore pre-meeting system default FIRST, before any guard or
+        // teardown step. If didStopWithError already flipped isActive=false,
+        // we must still unwind the system-wide override or it persists for
+        // every other app on the system. This intentionally runs before the
+        // `guard wasActive ... throw .notRunning` below — that guard would
+        // otherwise leave the override permanently in place. ===
+        if self.meetingDidOverrideDefault {
+            if let savedUID = UserDefaults.standard.string(forKey: "pendingMeetingDefaultInputUID"),
+               let savedID = MicEnumerator.audioDeviceID(forUID: savedUID) {
+                _ = MicEnumerator.setSystemDefaultInputDevice(savedID)
+                Log.info(
+                    "MeetingRecorder: restored system default input to UID \(savedUID)",
+                    category: "audio"
+                )
+            }
+            UserDefaults.standard.removeObject(forKey: "pendingMeetingDefaultInputUID")
+            self.meetingDidOverrideDefault = false
+        }
+        // === END restore ===
+
         // Tear down all session resources unconditionally. Codex review caught
         // a leak: when SCStream's didStopWithError flips isActive=false BEFORE
         // stop() is called, the prior `guard isActive ... else { throw }` returned
