@@ -68,7 +68,7 @@ class ParakeetService:
         # Warmup — forces Metal kernel compilation so the first real request
         # is not penalised by JIT overhead (300ms–2s on first call).
         logger.info("Running Parakeet warmup pass …")
-        dummy = mx.zeros((TARGET_SR // 2,), dtype=mx.bfloat16)
+        dummy = mx.zeros((TARGET_SR // 2,), dtype=mx.float32)
         mel = get_logmel(dummy, self.model.preprocessor_config)  # type: ignore[union-attr]
         result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
         mx.eval(result)
@@ -119,7 +119,7 @@ class ParakeetService:
         if len(audio_np) < MIN_SAMPLES:
             return "", 0.0
 
-        audio_mlx = mx.array(audio_np, dtype=mx.bfloat16)
+        audio_mlx = mx.array(audio_np, dtype=mx.float32)
         mel = get_logmel(audio_mlx, self.model.preprocessor_config)  # type: ignore[union-attr]
         result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
         mx.eval(result)
