@@ -31,6 +31,8 @@ struct SettingsView: View {
     @State private var showingFolderPicker: Bool = false
     /// Error message shown below the export/import buttons when an operation fails.
     @State private var exportImportError: String?
+    /// Reveals the Server URL / API Key / Export-Import block at the bottom of the form.
+    @State private var showAdvanced: Bool = false
 
     private enum ConnectionFeedbackKind {
         case neutral, success, warning, error
@@ -45,7 +47,12 @@ struct SettingsView: View {
             hotkeySection
             launchAtLoginSection
             meetingsFolderSection
-            advancedSection
+            advancedToggleSection
+            if showAdvanced {
+                serverSection
+                apiKeySection
+                apiKeyExportImportSection
+            }
         }
         .formStyle(.grouped)
         .padding()
@@ -58,18 +65,9 @@ struct SettingsView: View {
     /// Top of the popover: the actions a daily user actually reaches for.
     private var quickActionsSection: some View {
         Section {
-            Button {
+            Button("Open Admin Portal", systemImage: "person.2.badge.gearshape") {
                 openAdminPortal()
-            } label: {
-                HStack {
-                    Image(systemName: "person.2.badge.gearshape")
-                    Text("Open Admin Portal")
-                    Spacer()
-                    Image(systemName: "arrow.up.right.square")
-                        .foregroundStyle(.secondary)
-                }
             }
-            .buttonStyle(.plain)
             .disabled(settings.serverURL == nil)
             .help(
                 settings.serverURL == nil
@@ -77,30 +75,17 @@ struct SettingsView: View {
                     : "Opens \(adminURLString()) in your browser. Sign in with your API key."
             )
 
-            Button {
+            Button("Open Meetings Folder", systemImage: "folder") {
                 openMeetingsFolder()
-            } label: {
-                HStack {
-                    Image(systemName: "folder")
-                    Text("Open Meetings Folder")
-                    Spacer()
-                }
             }
-            .buttonStyle(.plain)
             .help("Opens \(settings.meetingsPath.path) in Finder.")
         }
     }
 
-    private var advancedSection: some View {
+    private var advancedToggleSection: some View {
         Section {
-            DisclosureGroup("Advanced") {
-                VStack(alignment: .leading, spacing: 12) {
-                    serverSection
-                    apiKeySection
-                    apiKeyExportImportSection
-                }
-                .padding(.top, 4)
-            }
+            Toggle("Show advanced settings", isOn: $showAdvanced.animation())
+                .help("Server URL, API key, and key export/import. Once you're set up, you rarely need these.")
         }
     }
 
