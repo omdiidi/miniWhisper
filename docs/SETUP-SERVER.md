@@ -47,7 +47,7 @@ Accepting terms on one model is not sufficient; the pipeline downloads both.
 4. Name it (e.g. `wispralt-server`) and click **Generate a token**.
 5. Copy the token — you will paste it when `setup-server.sh` prompts for `HF_TOKEN`.
 
-The setup script validates the token with `huggingface-cli whoami` **and** performs a metadata fetch on both gated model URLs. If your token lacks gated access it will print the accept-terms URLs and exit cleanly.
+The setup script validates the token with `hf auth whoami` (the new HuggingFace CLI; the legacy `huggingface-cli` binary is deprecated upstream and removed from `huggingface_hub >= 0.30`) **and** performs a metadata fetch on both gated model URLs. If your token lacks gated access it will print the accept-terms URLs and exit cleanly.
 
 ---
 
@@ -99,8 +99,8 @@ The script runs these phases in order:
 | Phase | What it does |
 |---|---|
 | **1. Preflight checks** | macOS version ≥ 13; Python 3.11 present; `df -h` confirms ≥ 8 GB free disk; warns if Homebrew Redis is installed (not used, not required). |
-| **2. Python environment** | `uv venv .venv` + `uv sync` inside `server/`. Installs all pinned dependencies from `pyproject.toml` including `torch==2.6.0`, `whisperx==3.8.5`, `pyannote.audio`, `deepfilternet==0.5.6`, `parakeet-mlx==0.5.1`. |
-| **3. HuggingFace validation** | Prompts for `HF_TOKEN`. Runs `huggingface-cli whoami` to confirm the token is valid. Fetches gated metadata for both pyannote models; prints accept-terms URLs and exits if access is denied. |
+| **2. Python environment** | `uv venv .venv` + `uv sync` inside `server/`. Installs all pinned dependencies from `pyproject.toml` including `torch==2.6.0`, `whisperx==3.4.0`, `pyannote.audio==3.3.2`, `parakeet-mlx==0.5.1`, plus `matplotlib>=3.8` (implicit dep of `pyannote.audio.utils.metric` — was missing previously and broke meeting bootstrap). DeepFilterNet was removed because `deepfilternet==0.5.6` pins `numpy<2.0` while `parakeet-mlx` requires `numpy>=2.2.5`; `meeting/deepfilter.py` is now a no-op stub. Test deps (`pytest`, `pytest-asyncio`, `httpx`) are installable via `uv sync --extra dev`. |
+| **3. HuggingFace validation** | Prompts for `HF_TOKEN`. Runs `hf auth whoami` (new CLI) to confirm the token is valid. Fetches gated metadata for both pyannote models; prints accept-terms URLs and exits if access is denied. |
 | **4. Model download** | Runs `download-models.sh`. Per-model size is echoed before download. Post-download size verification checks each weight file against expected byte ranges. Total: ~5.6 GB. |
 | **5. API key generation** | Runs `generate-api-key.sh`: generates `secrets.token_hex(32)` (64 hex chars), writes `WISPRALT_API_KEY=<key>` to `server/.env`, runs `chmod 600 server/.env`. |
 | **6. Cloudflare Tunnel setup** | Runs `setup-cloudflared.sh`: installs `cloudflared` via Homebrew if missing, prompts for your full `https://` tunnel URL (saved to `.env` as `SERVER_URL`), prompts silently for the tunnel token (`read -r -s`; token never echoed), stores token at `~/.config/wispralt/cloudflare-token` (mode 0600), generates `~/Library/LaunchAgents/co.wispralt.cloudflared.plist` (user-level, `RunAtLoad: true`, `KeepAlive`), bootstraps it via `launchctl bootstrap gui/$UID`, verifies with a retry loop. |
