@@ -57,11 +57,20 @@ The bearer is sha256-hashed, looked up in the in-process `TokenCache`
 ### Session cookie (browser)
 
 1. Visit `https://transcribe.<your-domain>/admin/login`.
-2. Paste the admin token, submit.
-3. The server validates it (cache → Postgres → break-glass), then sets a
-   `wispralt_admin_token` cookie with `HttpOnly`, `Secure`,
+2. Paste your token, submit. **Both admin and employee tokens are
+   accepted** — the server routes by role.
+3. The server validates the token (cache → Postgres → break-glass), then
+   sets a `wispralt_admin_token` cookie with `HttpOnly`, `Secure`,
    `SameSite=Strict`, `max_age=8h`.
-4. Subsequent navigation works without the header.
+4. **Role-based redirect on success:**
+   - `role='admin'` → 303 to `/admin/` (full overview dashboard).
+   - `role='employee'` → 303 to `/admin/me` (the employee's own
+     `user_detail` page; admin-only nav links are hidden by
+     `base.html.j2`, replaced with a single "My Usage" link).
+
+The macOS client's menubar **Open Portal** button targets
+`<server>/admin/login` for everyone, so the same install ships to admins
+and employees without a per-role configuration.
 
 The cookie is read by `auth._extract_bearer` as a fallback when no
 `Authorization` header is present. CSRF is mitigated by `SameSite=Strict`
@@ -104,7 +113,26 @@ don't write it on every request (would contend with the usage drainer).
 
 Per-user metrics scoped to one row plus the last 50 `usage_events` for
 that user. Same 24h / 7d / 30d / errors_24h / p50_24h tiles, narrowed to
-`WHERE user_id = $1`.
+`WHERE user_id = $1`. **Admin-only.**
+
+### `GET /admin/me` — My usage (employee self-service)
+
+Same `user_detail` template as `/admin/users/{id}`, scoped to the
+**calling user's own id**. Mounted on a separate router that requires
+`require_api_key` (any authenticated role) instead of `require_admin`,
+so employees can view their own dictation history without being able to
+see anyone else's. Admins hitting `/admin/me` are 303'd to `/admin/`.
+
+`base.html.j2` reads `request.state.user.role` and:
+
+- Hides the admin-only nav (Overview / Users / Usage) for non-admin
+  sessions, replacing it with a single "My Usage" link.
+- Flips the header title from "Wispralt Admin" to "Wispralt Portal" for
+  non-admins.
+
+The macOS menubar **Open Portal** button (renamed from "Open Admin
+Portal" in be720a1) targets `/admin/login`, so a single client build
+serves both roles correctly.
 
 ### `GET /admin/usage` — Usage drill-down
 

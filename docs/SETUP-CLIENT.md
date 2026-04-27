@@ -99,10 +99,30 @@ After the permission wizard, the app is ready for server configuration.
    SERVER_URL=https://transcribe.example.com
    API_KEY=<your-32-byte-hex-key>
    ```
-2. In the WisprAlt menubar popover, open **Settings**:
-   - Paste the `https://` URL into the **Server URL** field and press Return.
-   - Paste the API key into the **API Key** field and press Return. It is stored in the macOS Keychain under service `co.wispralt` and never written to disk as plain text.
-3. Click **Test Connection** to verify `/healthz` and both `/readyz` endpoints are reachable.
+2. Click the WisprAlt menubar icon → toggle **Show advanced settings**.
+   The advanced section reveals:
+   - **Server URL** — paste the `https://` URL and press Return.
+   - **API Key** — paste the bearer token and press Return. Stored in the macOS Keychain under service `co.wispralt` and never written to disk as plain text.
+3. Collapse advanced settings (you don't need it for daily use). At the top:
+   - **Open Portal** — opens `<server>/admin/login` in your browser. Admins land on the global dashboard; employees land on their own usage page. Same button for both roles.
+   - **Open Meetings Folder** — reveals your meeting transcripts directory in Finder.
+4. Click **Test Connection** under the **Connection** section. It calls `/healthz`, `/readyz/dictation`, `/readyz/meeting` in parallel and shows a single status line:
+   - **Green** "Connected — dictation + meeting ready"
+   - **Orange** "Connected — meeting pipeline still loading" (or similar warming variants)
+   - **Red** when the host is unreachable or the API key is rejected
+
+### Menubar icon states
+
+| Mode | Icon | Notes |
+|---|---|---|
+| Idle | mic outline | Default |
+| Dictating | mic filled | While holding FN |
+| Meeting recording | red filled dot + bold red **REC** label | Triple-tap FN to start; cannot be missed in a dense menubar |
+| Uploading | upload-cloud | After meeting stops, while uploading |
+| Processing | waveform | While server is transcribing |
+| Done | checkmark | Briefly, before returning to Idle |
+
+The REC indicator (be720a1) is rendered as a custom solid red dot via `NSBezierPath` rather than an SF Symbol so it's pixel-perfect at any menubar density and reads unambiguously even in dark mode.
 
 ---
 
@@ -188,11 +208,32 @@ If channel 2 (system audio) is silent for more than 90% of 100ms frames during t
 
 ---
 
-## Auto-Updates (Sparkle 2)
+## Auto-Updates
 
-WisprAlt checks for updates via a Sparkle 2 EdDSA-signed appcast hosted on GitHub Pages. Updates are never applied automatically during a meeting recording — the sheet is deferred until recording stops. The user must click **Restart Now** explicitly (`SUAutomaticallyUpdate = NO`).
+**Tier 1.5 distribution** (the current path) uses GitHub Releases via
+the `/wispralt-update` Claude Code slash command. Sparkle is **disabled**
+in be720a1 — the framework is bundled but the auto-updater never runs:
 
-To check for updates manually: click the WisprAlt menubar icon → **Check for Updates…**
+- `SUEnableAutomaticChecks=false` in `Info.plist`
+- `SPUStandardUpdaterController(startingUpdater: false)` in
+  `SparkleController.init()`
+- `didAbortWithError` / `didFinishUpdateCycleFor` only log; no
+  user-facing notifications
+
+The previous `Info.plist` had a placeholder `SUFeedURL` pointing at
+`https://omid.example/wispralt/appcast.xml` that triggered "Unable to
+Check For Updates" alerts every few hours. Disabling Sparkle removes the
+dialog completely.
+
+**To update:** in Claude Code, run `/wispralt-update`. It diffs the
+installed `CFBundleShortVersionString` against the latest GitHub
+Release tag, downloads + verifies + replaces the app, and runs a
+TCC reset cycle if the cdhash changed.
+
+When we move to Tier 2 distribution (Apple Developer Program +
+notarized builds + signed appcast), flip `SUEnableAutomaticChecks=true`
+and `startingUpdater: true`, populate `SUFeedURL` and `SUPublicEDKey`,
+and re-enable the user-facing update notifications.
 
 ---
 

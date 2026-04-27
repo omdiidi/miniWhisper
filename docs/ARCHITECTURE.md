@@ -285,37 +285,53 @@ doesn't multiply the event volume by 60.
 ### Admin UI
 
 ```
-┌────── /admin (FastAPI APIRouter) ──────┐
-│                                          │
-│  public_router  ─► /admin/login (GET)   │  no auth — chicken-and-egg
-│                    /admin/login (POST)  │
-│                                          │
-│  authed_router  ─► everything else      │  Depends=[require_admin,
-│      /admin/                            │           _require_db_pool]
-│      /admin/users  /admin/users/{id}    │
-│      /admin/users/{id}/mint  …/revoke   │
-│      /admin/usage  /admin/usage.csv     │
-└──────────────────────────────────────────┘
+┌────── /admin (FastAPI APIRouter) ─────────────────┐
+│                                                     │
+│  public_router  ─► /admin/login (GET, POST)        │  no auth
+│                                                     │
+│  me_router      ─► /admin/me                       │  Depends=[require_api_key,
+│                                                     │           _require_db_pool]
+│                                                     │  any role — admin or employee
+│                                                     │
+│  authed_router  ─► everything else                  │  Depends=[require_admin,
+│      /admin/                                        │           _require_db_pool]
+│      /admin/users  /admin/users/{id}               │
+│      /admin/users/{id}/mint  …/revoke              │
+│      /admin/usage  /admin/usage.csv                 │
+└─────────────────────────────────────────────────────┘
 ```
 
 Source: `server/src/wispralt_server/routes/admin_ui.py` +
 `server/src/wispralt_server/admin/templates/*.html.j2`.
 
-Two-router pattern:
+Three-router pattern (be720a1 split out `me_router`):
 
 - **`public_router`** carries `/admin/login` (GET form + POST submit).
-  Must be reachable without auth, otherwise the operator has no way to
-  acquire the session cookie that gates the rest of the UI.
+  Must be reachable without auth, otherwise neither role has a way to
+  acquire the session cookie. **The login form accepts ANY valid
+  token** — admin and employee — and redirects by role on success: admin
+  → `/admin/`, employee → `/admin/me`.
+- **`me_router`** carries `/admin/me`, gated by `require_api_key` (NOT
+  `require_admin`). Admins are 303'd to `/admin/`. Employees see their
+  own `user_detail` page; admin nav (Overview/Users/Usage) is hidden by
+  `base.html.j2` for non-admin sessions and replaced with a single "My
+  Usage" link. Header title flips to "Wispralt Portal".
 - **`authed_router`** has `dependencies=[Depends(require_admin),
   Depends(_require_db_pool)]`, so a browser hitting `/admin/` without a
-  valid token gets 401, and a request hitting it while Postgres is
-  degraded gets 503 — never an `AttributeError` on `app.state.db_pool`.
+  valid admin token gets 401/403, and a request hitting it while
+  Postgres is degraded gets 503 — never an `AttributeError` on
+  `app.state.db_pool`.
 
 Auth model: `Authorization: Bearer ...` (curl/Postman) or
 `wispralt_admin_token` cookie (browser, set by `POST /admin/login`).
 `auth._extract_bearer` falls back to the cookie when the header is
 absent. CSRF is mitigated by `SameSite=Strict` on the cookie — browsers
 refuse to attach it to cross-site POSTs.
+
+The macOS client's menubar **Open Portal** button opens
+`<server>/admin/login` for everyone — the same install ships to admins
+and employees without a per-role configuration. The server's
+`login_submit` redirect handles the role-based fork.
 
 Templates use the `.html.j2` extension. Jinja2's default autoescape list
 does **not** include this extension; `select_autoescape(enabled_extensions=("html.j2", "html", "j2"))`

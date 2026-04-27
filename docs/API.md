@@ -363,18 +363,25 @@ The `/admin/*` routes (other than `/admin/rotate-key` and `/admin/login`) render
 Source: `server/src/wispralt_server/routes/admin_ui.py` +
 `server/src/wispralt_server/admin/templates/*.html.j2`.
 
-**Auth:** `role='admin'` required (employee tokens get **403**). Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; curl/Postman users send `Authorization: Bearer <admin-token>` on each request. See [ARCHITECTURE.md → Admin UI](ARCHITECTURE.md#admin-ui) for the two-router pattern.
+**Auth split (be720a1):** Three routers under the same `/admin` prefix.
 
-| Method | Path | Body | Returns |
+- `/admin/login` — public (no auth).
+- `/admin/me` — any authenticated role (admin OR employee). Admins are 303'd to `/admin/`; employees see their own `user_detail` page with admin nav hidden. Universal entry point — the macOS client's "Open Portal" button targets `/admin/login` and the server figures out where to send each role.
+- `/admin/`, `/admin/users`, `/admin/users/{id}`, `/admin/users/{id}/mint`, `/admin/users/{id}/revoke`, `/admin/usage`, `/admin/usage.csv` — admin-only (employee tokens get **403**).
+
+Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; curl/Postman users send `Authorization: Bearer <token>` on each request. See [ARCHITECTURE.md → Admin UI](ARCHITECTURE.md#admin-ui) for the three-router pattern.
+
+| Method | Path | Auth | Returns |
 |---|---|---|---|
-| GET | `/admin/login` | — | HTML form (200) |
-| POST | `/admin/login` | `application/x-www-form-urlencoded` `token=...` | 303 → `/admin/` + `Set-Cookie: wispralt_admin_token=...` on success; 401 + form re-render on failure |
-| GET | `/admin/` | — | Overview dashboard HTML |
-| GET | `/admin/users` | — | Users-list HTML with per-row Mint/Revoke forms |
-| POST | `/admin/users/{id}/mint` | — | HTML page showing the new plaintext token **once** |
-| POST | `/admin/users/{id}/revoke` | — | 303 → `/admin/users` (revokes + invalidates cache by hash) |
-| GET | `/admin/users/{id}` | — | Per-user detail HTML (24h/7d/30d tiles + last 50 events) |
-| GET | `/admin/usage` | filters: `kind`, `status`, `user_id`, `since`, `until`, `offset` (query params) | Drill-down HTML, paginated 100/page |
-| GET | `/admin/usage.csv` | same filters as `/admin/usage` | `text/csv` stream (max 10000 rows) |
+| GET | `/admin/login` | none | HTML form (200) |
+| POST | `/admin/login` | none | 303 → `/admin/` (admin) or `/admin/me` (employee) + `Set-Cookie: wispralt_admin_token=...`. 401 on invalid token. |
+| GET | `/admin/me` | any role | Admin: 303 → `/admin/`. Employee: 200 with that user's `user_detail` page (admin nav hidden). |
+| GET | `/admin/` | admin | Overview dashboard HTML |
+| GET | `/admin/users` | admin | Users-list HTML with per-row Mint/Revoke forms |
+| POST | `/admin/users/{id}/mint` | admin | HTML page showing the new plaintext token **once** |
+| POST | `/admin/users/{id}/revoke` | admin | 303 → `/admin/users` (revokes + invalidates cache by hash) |
+| GET | `/admin/users/{id}` | admin | Per-user detail HTML (24h/7d/30d tiles + last 50 events) |
+| GET | `/admin/usage` | admin | Drill-down HTML, paginated 100/page. Filters: `kind`, `status`, `user_id`, `since`, `until`, `offset`. |
+| GET | `/admin/usage.csv` | admin | `text/csv` stream (max 10000 rows) |
 
 All authed admin routes return **503** "Admin UI unavailable: Postgres degraded." when `app.state.db_pool` is `None` — the admin UI is unusable without a pool, so it fails loudly rather than crashing on `AttributeError` deeper in. The break-glass admin path (env-var bearer when Postgres is unreachable) lets the operator authenticate to the rest of the API but **not** to the admin UI; restart the server once Postgres is back to recover.
