@@ -30,6 +30,8 @@ import soundfile as sf
 from parakeet_mlx import from_pretrained, DecodingConfig  # type: ignore[import-untyped]
 from parakeet_mlx.audio import get_logmel  # type: ignore[import-untyped]
 
+from .._errors import CorruptAudioError
+
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v2"
@@ -103,9 +105,13 @@ class ParakeetService:
         """
         t0 = time.perf_counter()
 
-        # Decode audio
+        # Decode audio — convert any soundfile decode failure to CorruptAudioError
+        # so the route layer can map it to 422 instead of leaking as a 500.
         audio_np: np.ndarray
-        audio_np, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+        try:
+            audio_np, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+        except (sf.LibsndfileError, RuntimeError) as exc:
+            raise CorruptAudioError(f"Cannot decode audio: {exc}") from exc
 
         # Flatten stereo to mono
         if audio_np.ndim == 2:
