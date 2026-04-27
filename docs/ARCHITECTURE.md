@@ -34,7 +34,7 @@ WisprAlt is a two-component system: a native macOS menubar client running on you
 │                          ↓                                                    │
 │                    asyncio.to_thread(run_pipeline)                            │
 │                          ↓                                                    │
-│       MeetingPipeline: DeepFilterNet → WhisperX (CPU int8) → Pyannote (MPS)  │
+│       MeetingPipeline: WhisperX (CPU int8) → Pyannote (MPS)                  │
 │                          ↓                                                    │
 │       output.py: JSON+SRT+VTT+TXT atomic write (tempfile in same dir)         │
 │   /transcribe/meeting/{id}             ── poll                                │
@@ -71,10 +71,11 @@ The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port
 | Component | File | Responsibility |
 |---|---|---|
 | **FastAPI app** | `server/src/wispralt_server/main.py` | Single uvicorn worker. Lifespan: validates `.env` permissions (warns if not 0600), loads Parakeet, runs `JobStore.recover_orphans()`, sweeps staging, registers SIGTERM handler, mounts routers. |
-| **ParakeetService** | `server/src/wispralt_server/dictate/parakeet.py` | Warm-resident `mlx-community/parakeet-tdt-0.6b-v2` (bfloat16). Single `ThreadPoolExecutor(max_workers=1)` serializes all inference (MLX is not thread-safe per model instance). Warmup JIT pass at startup. Defensive return-type handling: checks `hasattr(result, 'text')` vs list of `AlignedToken`. Tracks p50/p95 latency percentiles over last 100 calls. |
+| **ParakeetService** | `server/src/wispralt_server/dictate/parakeet.py` | Warm-resident `mlx-community/parakeet-tdt-0.6b-v2` (float32 — bfloat16 caused a `[matmul] (128,257) vs (514,51)` shape error on first inference). Single `ThreadPoolExecutor(max_workers=1)` serializes all inference (MLX is not thread-safe per model instance). Warmup JIT pass at startup. Defensive return-type handling: checks `hasattr(result, 'text')` vs list of `AlignedToken`. Tracks p50/p95 latency percentiles over last 100 calls. **Audio decode boundary**: `_sync_transcribe` wraps `soundfile.read` in `try/except (LibsndfileError, RuntimeError) → CorruptAudioError` so malformed uploads convert to HTTP 422 (via the route handler) instead of leaking as 500. |
 | **MeetingRunner** | `server/src/wispralt_server/jobs/runner.py` | `asyncio.Semaphore(1)` enforces one meeting at a time. Dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="wispralt-meeting")` isolates meeting CPU work from the default asyncio thread pool. OOM guard: rejects if `psutil.virtual_memory().available < 2 GiB`. Staging WAV always cleaned up in `finally` block. `reenqueue_pending()` called at startup for jobs whose WAVs survived a restart. |
 | **JobStore** | `server/src/wispralt_server/jobs/store.py` | SQLite WAL mode (`PRAGMA journal_mode=WAL; synchronous=NORMAL`). Thread-safe via `threading.Lock`. Job lifecycle: `pending → running → done | failed`. `recover_orphans()`: marks `running` jobs as `failed`; marks `pending` jobs with missing WAV as `failed`; leaves `pending` jobs with existing WAV for `reenqueue_pending()`. |
-| **MeetingPipeline** | `server/src/wispralt_server/meeting/pipeline.py` | Orchestrates: load channels → in-person detection (`silence.py`) → DeepFilterNet (`deepfilter.py`) → WhisperX CPU int8 (`whisperx_loader.py`) → Pyannote MPS diarization (`diarize.py`) → merge/label (`merge.py`) → atomic output write (`output.py`). Returns locked v3 transcript dict. |
+| **MeetingPipeline** | `server/src/wispralt_server/meeting/pipeline.py` | Orchestrates: load channels → in-person detection (`silence.py`) → denoise no-op (`deepfilter.py` is a stub, see note below) → WhisperX CPU int8 (`whisperx_loader.py`) → Pyannote MPS diarization (`diarize.py`) → merge/label (`merge.py`) → atomic output write (`output.py`). Returns locked v3 transcript dict. |
+| **meeting/__init__** | `server/src/wispralt_server/meeting/__init__.py` | Package init that runs **two import-time compat shims** before any submodule loads checkpoints: (1) monkeypatches `torch.load` / `torch.serialization.load` to force `weights_only=False` (required for trusted HF checkpoints since PyTorch 2.6 default flipped to `weights_only=True`, blocking `omegaconf.ListConfig` and other pickled objects in pyannote/WhisperX); (2) intercepts `huggingface_hub.{hf_hub_download, snapshot_download}` to translate the removed `use_auth_token=` kwarg → `token=` (pyannote.audio 3.3.2 still calls the legacy name). |
 | **RateLimitMiddleware** | `server/src/wispralt_server/middleware/rate_limit.py` | In-memory per-IP rolling-window limiter. Two windows: `/transcribe/dictate` 60 req/60s; `POST /transcribe/meeting` 4 req/3600s. Returns 429 with `Retry-After` header. |
 | **staging / env_writer** | `server/src/wispralt_server/ops/` | `staging.py` manages the staging directory; startup sweep removes orphaned WAVs older than 24h. `env_writer.py` atomically rewrites `.env` key-value pairs via tempfile-in-same-dir + `os.replace`, preserving mode 0600. |
 
@@ -141,18 +142,19 @@ The FastAPI event loop is never blocked by inference work. When a meeting is act
 
 | Component | Resident Memory |
 |---|---|
-| Parakeet TDT 0.6B v2 (MLX bfloat16) | ~1.8–2.2 GB unified |
+| Parakeet TDT 0.6B v2 (MLX float32) | ~3.5–4.0 GB unified (≈2× bf16) |
 | WhisperX CrisperWhisper (CTranslate2, CPU int8) | ~1.5 GB |
 | Pyannote 3.1 (PyTorch, MPS) | ~1.0 GB |
-| DeepFilterNet 3 | ~0.5 GB |
 | Python / FastAPI process | ~0.5 GB |
-| **Total resident** | **~7.3 GB** |
+| **Total resident** | **~6.5–7.0 GB** |
 
 The Mac mini M4 16 GB configuration leaves ~8.7 GB for the OS and other processes. `MeetingRunner.submit_or_429()` rejects a new meeting job if `psutil.virtual_memory().available < 2 GiB`.
 
 **Disk guard:** `staging.stream_to_staging()` checks that free disk is at least 1.5x the upload size before accepting a file. `GET /metrics` reports `disk.free_gb` and `disk.staging_count` for monitoring.
 
-**Device matrix:** MLX for Parakeet (Apple Neural Engine / GPU unified memory). CTranslate2 has no MPS support — WhisperX runs on CPU with `compute_type="int8"`. Pyannote supports MPS and runs on `torch.device("mps")` for diarization. DeepFilterNet requires 48kHz input; `deepfilter.py` resamples 16k→48k→enhance→16k.
+**Device matrix:** MLX for Parakeet (Apple Neural Engine / GPU unified memory). CTranslate2 has no MPS support — WhisperX runs on CPU with `compute_type="int8"`. Pyannote supports MPS and runs on `torch.device("mps")` for diarization.
+
+**Denoise note:** `meeting/deepfilter.py` is currently a **no-op stub** — `get_df()` returns `None` and `deepfilter()` returns the audio unchanged. DeepFilterNet 3 was removed because it pins `numpy<2.0` while `parakeet-mlx` requires `numpy>=2.2.5`. The stub keeps function signatures stable so callers don't need conditional branches; re-introducing a numpy-2-compatible denoiser is tracked as future work.
 
 ---
 
@@ -184,7 +186,9 @@ Called once at startup (before the event loop accepts requests). Policy from `jo
 
 ## Authentication
 
-All `/transcribe/*`, `/admin/*`, and `/readyz/*` endpoints require `Authorization: Bearer <WISPRALT_API_KEY>`. `auth.py` uses `secrets.compare_digest` for constant-time comparison (prevents timing oracle attacks). The authorization header check (line 56–61 in `auth.py`) strips the `Bearer ` prefix before comparing.
+All `/transcribe/*` and `/admin/*` endpoints require `Authorization: Bearer <WISPRALT_API_KEY>`. `auth.py` uses `secrets.compare_digest` for constant-time comparison (prevents timing oracle attacks). The authorization header check (line 56–61 in `auth.py`) strips the `Bearer ` prefix before comparing.
+
+`/healthz` and `/readyz/*` are intentionally **unauthenticated** so Kubernetes-style probes, Cloudflare health checks, and external monitoring can probe them without API credentials. These endpoints expose only a ready-flag boolean, free RAM in MB, and a `meeting_active` indicator — no user data, no audio, no model output.
 
 The API key is a 64-character hex string (`secrets.token_hex(32)`). It lives in `server/.env` (mode 0600, owner = current user) and in memory as a module-level variable guarded by `threading.Lock` for hot-swap during key rotation.
 

@@ -28,8 +28,9 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/routes/health.py` | [API.md](API.md) — `/healthz`, `/readyz/dictation`, `/readyz/meeting` |
 | `server/src/wispralt_server/routes/admin.py` | [API.md](API.md) — `/admin/rotate-key` |
 | `server/src/wispralt_server/routes/meeting.py` | [API.md](API.md) — meeting POST/GET/download/DELETE endpoints |
+| `server/src/wispralt_server/meeting/__init__.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — package init that runs torch.load + huggingface_hub compat shims (PyTorch 2.6 weights_only fix + pyannote use_auth_token→token translation) |
 | `server/src/wispralt_server/meeting/silence.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — in-person mode detection |
-| `server/src/wispralt_server/meeting/deepfilter.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — noise reduction pipeline |
+| `server/src/wispralt_server/meeting/deepfilter.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — denoise no-op stub (DeepFilterNet was dropped due to numpy<2 conflict with parakeet-mlx) |
 | `server/src/wispralt_server/meeting/whisperx_loader.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — WhisperX/CrisperWhisper singleton |
 | `server/src/wispralt_server/meeting/diarize.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — Pyannote diarization, MPS device |
 | `server/src/wispralt_server/meeting/merge.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — segment merging, speaker labeling |
@@ -40,8 +41,16 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/ops/staging.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — staging area management |
 | `server/src/wispralt_server/ops/env_writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — atomic .env rewrite, verify_env_perms, key rotation |
 | `server/src/wispralt_server/middleware/rate_limit.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [API.md](API.md) — per-IP rate limiting middleware |
-| `server/src/wispralt_server/observability.py` | [API.md](API.md) — thread-safe counters + latency histogram for `/metrics` |
+| `server/src/wispralt_server/observability.py` | [API.md](API.md) — thread-safe counters + time-windowed latency histogram for `/metrics` (5-min recent window default) |
 | `server/src/wispralt_server/_errors.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — typed domain exceptions |
+
+## Tests (`server/tests/`)
+
+| File | Covered by |
+|---|---|
+| `server/tests/__init__.py` | — (package marker) |
+| `server/tests/test_dictate_corrupt_audio.py` | [API.md](API.md) — pins the LibsndfileError → 422 contract on `/transcribe/dictate` |
+| `server/tests/test_observability_time_window.py` | [API.md](API.md) — pins the recent-window p50 contract on `/metrics` |
 
 ## Client (`client/`)
 

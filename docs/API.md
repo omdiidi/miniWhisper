@@ -10,13 +10,20 @@ Complete HTTP API contract for the WisprAlt server. Implemented in `server/src/w
 
 ## Authentication
 
-All `/transcribe/*`, `/admin/*`, and `/readyz/*` endpoints require:
+All `/transcribe/*` and `/admin/*` endpoints require:
 
 ```
 Authorization: Bearer <WISPRALT_API_KEY>
 ```
 
-Authentication is performed by `auth.py` using `secrets.compare_digest` for constant-time comparison. A missing or wrong token returns **401**. `/healthz` is the only unauthenticated endpoint.
+Authentication is performed by `auth.py` using `secrets.compare_digest` for constant-time comparison. A missing or wrong token returns **401**.
+
+**Unauthenticated endpoints** (probe-style, no API key required):
+- `GET /healthz` — liveness probe
+- `GET /readyz/dictation` — dictation-pipeline readiness probe
+- `GET /readyz/meeting` — meeting-pipeline readiness probe
+
+These are intentionally open so Kubernetes-style probes, Cloudflare health checks, and external monitoring can poll them without API credentials. They expose only ready-flag booleans + free RAM in MB — no user data, no audio, no model output.
 
 **Additional auth validation:**
 - An empty token after the `Bearer ` prefix returns **401** `"Empty bearer token"`.
@@ -56,7 +63,7 @@ Liveness probe. Always returns 200. Used by Cloudflare Tunnel health checks.
 
 ### `GET /readyz/dictation`
 
-**Auth:** Bearer required.
+**Auth:** None required.
 
 Readiness probe for the dictation (Parakeet) endpoint.
 
@@ -80,7 +87,7 @@ Readiness probe for the dictation (Parakeet) endpoint.
 
 ### `GET /readyz/meeting`
 
-**Auth:** Bearer required.
+**Auth:** None required.
 
 Readiness probe for the meeting pipeline.
 
@@ -142,7 +149,7 @@ Transcribe a short audio clip using the warm Parakeet model.
 | 401 | Missing or invalid bearer token |
 | 413 | Upload size exceeds `MAX_UPLOAD_BYTES` |
 | 415 | `Content-Type` is not `audio/*` |
-| 422 | Audio bytes cannot be decoded (corrupt file) |
+| 422 | Audio bytes cannot be decoded (corrupt file). Includes `LibsndfileError` and `RuntimeError` raised by `soundfile.read` — the decode boundary in `parakeet.py:_sync_transcribe` converts both to `CorruptAudioError` and the route handler maps them to 422. Regression-locked by `server/tests/test_dictate_corrupt_audio.py`. |
 | 429 | Rate limit exceeded (60 req/min) — includes `Retry-After: 60` header |
 
 ---
@@ -333,4 +340,4 @@ Structured server observability snapshot.
 | `disk.staging_count` | Number of staging WAV files currently on disk |
 | `requests_total` | Request counts keyed by `"route:status"` (last process lifetime) |
 | `errors_total` | Error counts keyed by `"route:status"` for 4xx/5xx responses |
-| `latencies` | Per-route p50/p95/p99 latency in ms; `null` if fewer than 2 observations |
+| `latencies` | Per-route p50/p95/p99 latency in ms; `null` if fewer than 2 observations. **Recent-window only**: percentiles include only observations from the last 5 minutes (`LatencyHistogram._RECENT_WINDOW_S`). This protects p50 from being poisoned by a single old outlier (e.g. a hung 197-second upload). The full deque (last 1000 entries, all-time) remains queryable via `LatencyHistogram.percentiles(route, recent_only=False)` for callers that need the legacy view. Regression-locked by `server/tests/test_observability_time_window.py`. |
