@@ -45,11 +45,7 @@ final class MenuBarController: NSObject {
     }
 
     var mode: Mode = .idle {
-        didSet {
-            updateIcon()
-            let isRec = (mode == .meetingRecording) || (mode == .dictating)
-            AppDelegate.shared?.micMenuBarController?.updateRecordingTint(active: isRec)
-        }
+        didSet { updateIcon() }
     }
 
     // MARK: - Meeting active flag
@@ -521,9 +517,9 @@ final class MenuBarController: NSObject {
         timeFormatter.amSymbol = "am"
         timeFormatter.pmSymbol = "pm"
         // Periods, not colons (filesystem-friendly across rsync to Linux, zip, etc.)
-        // Includes seconds to make collisions effectively impossible across all
-        // sidecar extensions (.wav/.json/.srt/.vtt/.txt) written by processMeetingUpload.
-        timeFormatter.dateFormat = "h.mm.ssa"
+        // No seconds — user wants the readable form "3.05-5.20pm".
+        // Collision is handled below by appending " (2)" / " (3)" if needed.
+        timeFormatter.dateFormat = "h.mma"
 
         let day = dayFormatter.string(from: start)
         let startTime = timeFormatter.string(from: start)

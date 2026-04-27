@@ -27,7 +27,6 @@ final class Settings: ObservableObject {
         static let tripleTapWindow = "tripleTapWindow"
         static let maxMeetingMinutes = "maxMeetingMinutes"
         static let preferredInputDeviceUID = "preferredInputDeviceUID"
-        static let showMicStatusItem = "showMicStatusItem"
     }
 
     // MARK: - Published properties
@@ -110,10 +109,6 @@ final class Settings: ObservableObject {
         }
     }
 
-    @Published var showMicStatusItem: Bool {
-        didSet { defaults.set(showMicStatusItem, forKey: Key.showMicStatusItem) }
-    }
-
     // MARK: - Init
 
     private init() {
@@ -129,7 +124,6 @@ final class Settings: ObservableObject {
         let storedTriple = suite.object(forKey: Key.tripleTapWindow) as? Double ?? 0.40
         let storedMaxMeetingMinutes = suite.object(forKey: Key.maxMeetingMinutes) as? Int ?? 90
         let storedPreferredInputUID = suite.string(forKey: Key.preferredInputDeviceUID)
-        let storedShowMicStatusItem = suite.object(forKey: Key.showMicStatusItem) as? Bool ?? true
 
         // @Published properties must be set before the object is fully initialised;
         // assign directly via stored property (bypasses didSet observers).
@@ -138,7 +132,6 @@ final class Settings: ObservableObject {
         self._tripleTapWindow = Published(initialValue: storedTriple)
         self._maxMeetingMinutes = Published(initialValue: storedMaxMeetingMinutes)
         self._preferredInputDeviceUID = Published(initialValue: storedPreferredInputUID)
-        self._showMicStatusItem = Published(initialValue: storedShowMicStatusItem)
         self._serverURL = Published(initialValue: nil) // set below after init completes
         self.serverURL = loadServerURL(from: suite)
     }

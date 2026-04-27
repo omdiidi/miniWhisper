@@ -79,10 +79,9 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Info.plist` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — permission usage descriptions, Sparkle config |
 | `client/WisprAlt/WisprAlt.entitlements` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — required entitlements |
 | `client/WisprAlt/WisprAltApp.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — SwiftUI App entry point, AppDelegate bridge |
-| `client/WisprAlt/App/AppDelegate.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — app lifecycle, AppDelegate.shared accessor, mic-override crash recovery |
+| `client/WisprAlt/App/AppDelegate.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — app lifecycle, AppDelegate.shared accessor, defensive cleanup of stale legacy mic-override key |
 | `client/WisprAlt/App/MenuBarController.swift` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — state machine, mic exclusion, composite REC NSImage, human-readable meeting filenames |
-| `client/WisprAlt/App/MicMenuBarController.swift` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — second NSStatusItem with NSMenu of input devices; recording-state red tint |
-| `client/WisprAlt/Audio/MicEnumerator.swift` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — AVCaptureDevice + CoreAudio HAL bridge; UID↔AudioDeviceID translation; system-default get/set |
+| `client/WisprAlt/Audio/MicEnumerator.swift` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — AVCaptureDevice + CoreAudio HAL bridge; powers the SettingsView Input Mic picker |
 | `client/WisprAlt/App/PermissionGate.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — 4-permission wizard, 14.4+ restart |
 | `client/WisprAlt/Hotkeys/FNKeyMonitor.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — FN key state machine |
 | `client/WisprAlt/Hotkeys/HotkeyEvents.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — delegate protocol |

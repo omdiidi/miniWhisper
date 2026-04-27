@@ -126,45 +126,39 @@ The REC indicator is rendered as a single composite NSImage (NSBezierPath red do
 
 ### Picking your input mic
 
-A second menubar icon (mic SF symbol) sits next to the WisprAlt icon. Click it to drop a native menu:
+The WisprAlt menubar popover has an **Input Mic** section near the top:
 
 ```
 Input Mic
-─────────────────
-System Default (current: <name>)
-─────────────────
-✓ MacBook Pro Microphone
-  AirPods Pro
-  USB Audio Interface
-─────────────────
-Open Sound Settings…
+  ┌─────────────────────────────────────┐
+  │ System Default (MacBook Mic)     ▼ │
+  └─────────────────────────────────────┘
 ```
 
-- **Click any device** → WisprAlt records from that device for both dictation and meetings.
-- **Dictation**: applied via `AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice)` on the AVAudioEngine input node. No system-wide side effect.
-- **Meeting recording**: SCStream has no per-stream mic API, so WisprAlt temporarily overrides the system-wide default input device for the duration of the recording, restoring on stop. **Side effect**: other apps using audio during the meeting will also use your chosen mic. Acceptable because you explicitly picked it.
-- **Crash recovery**: if the app crashes mid-meeting, the system default is restored on the next launch via `pendingMeetingDefaultInputUID` UserDefaults persistence.
-- **Recording state**: while a meeting or dictation is active, the mic icon turns red (`contentTintColor = .systemRed`) so you can spot recording state at a glance.
-- **No input devices found**: the menu shows a fallback row linking to System Settings → Privacy & Security → Microphone if mic permission is revoked.
-- **Hide the icon**: open the menubar popover → Show advanced settings → toggle off "Show input mic in menu bar". Restart WisprAlt to apply.
+The dropdown lists every input device macOS sees (built-in, AirPods, USB interfaces) plus a "System Default" entry at the top. Selecting a device sets `Settings.preferredInputDeviceUID`.
 
-The mic selector lives in `client/WisprAlt/App/MicMenuBarController.swift`. Device enumeration goes through `client/WisprAlt/Audio/MicEnumerator.swift` which bridges AVFoundation discovery to CoreAudio HAL property reads/writes.
+- **Scope**: this picker affects **dictation only**. Meeting recording always uses the macOS system default input — SCStream has no per-stream mic API, and WisprAlt deliberately does not override the system-wide default (would affect every other app on the system). If you want a specific mic for meetings, set it in System Settings → Sound.
+- **Application**: WisprAlt sets the dictation engine's input via `AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice)` on the AVAudioEngine input node, with no system-wide side effect.
+- **Live changes**: changing the picker mid-idle takes effect on the next dictation. Mid-recording changes don't disturb the active session — the existing audio-device-change abort logic handles legitimate device disconnects (AirPods unplugged etc.).
+- **Permission**: if mic permission is revoked, the dropdown only shows "System Default" with no other options. Re-grant in System Settings → Privacy & Security → Microphone.
+
+Device enumeration lives in `client/WisprAlt/Audio/MicEnumerator.swift` (AVFoundation discovery + CoreAudio HAL property reads).
 
 ### Meeting filenames
 
 Saved meetings land in your meetings folder with human-readable names:
 
 ```
-Mon Apr 27 2.06.34pm-2.07.12pm.wav
-Mon Apr 27 2.06.34pm-2.07.12pm.json
-Mon Apr 27 2.06.34pm-2.07.12pm.srt
-Mon Apr 27 2.06.34pm-2.07.12pm.vtt
-Mon Apr 27 2.06.34pm-2.07.12pm.txt
+Mon Apr 27 2.06pm-2.07pm.wav
+Mon Apr 27 2.06pm-2.07pm.json
+Mon Apr 27 2.06pm-2.07pm.srt
+Mon Apr 27 2.06pm-2.07pm.vtt
+Mon Apr 27 2.06pm-2.07pm.txt
 ```
 
-- Format: `EEE MMM d h.mm.ssa-h.mm.ssa.<ext>` in POSIX (English) locale for stable sorting.
+- Format: `EEE MMM d h.mma-h.mma.<ext>` in POSIX (English) locale for stable sorting.
 - Periods instead of colons for filesystem-friendliness across rsync, zip, and Windows.
-- Seconds in both timestamps eliminate sidecar collisions across all five extensions.
+- Two meetings ending at the same minute get a `(2)`, `(3)`, etc. suffix.
 - If the rename fails (rare — concurrent file appearance), WisprAlt falls back to the start-only name and logs a warning.
 
 ### Copy your API key

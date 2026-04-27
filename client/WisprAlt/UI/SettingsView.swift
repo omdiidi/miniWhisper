@@ -45,6 +45,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             quickActionsSection
+            inputMicSection
             connectionSection
             hotkeySection
             launchAtLoginSection
@@ -54,7 +55,6 @@ struct SettingsView: View {
                 serverSection
                 apiKeySection
                 apiKeyExportImportSection
-                menuBarSection
             }
         }
         .formStyle(.grouped)
@@ -263,13 +263,32 @@ struct SettingsView: View {
         }
     }
 
-    private var menuBarSection: some View {
-        Section("Menu Bar") {
-            Toggle("Show input mic in menu bar", isOn: $settings.showMicStatusItem)
-            Text("Restart WisprAlt to apply.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+    /// Input mic picker — applies ONLY to WisprAlt's own dictation. Meeting
+    /// recording uses the macOS system default (SCStream has no per-stream
+    /// device API). The picker shows live AVCaptureDevice discovery results.
+    private var inputMicSection: some View {
+        Section("Input Mic") {
+            Picker("", selection: micSelectionBinding) {
+                let sysName = MicEnumerator.systemDefaultInputName() ?? "—"
+                Text("System Default (\(sysName))").tag(String?.none)
+                Divider()
+                ForEach(MicEnumerator.availableInputs(), id: \.uniqueID) { device in
+                    Text(device.name).tag(Optional(device.uniqueID))
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .help("Choose which mic WisprAlt uses for dictation. Meeting recording always uses the macOS system default.")
         }
+    }
+
+    /// Two-way binding that maps the picker's `String?` selection to
+    /// `Settings.shared.preferredInputDeviceUID`.
+    private var micSelectionBinding: Binding<String?> {
+        Binding(
+            get: { settings.preferredInputDeviceUID },
+            set: { settings.preferredInputDeviceUID = $0 }
+        )
     }
 
     private var connectionSection: some View {
