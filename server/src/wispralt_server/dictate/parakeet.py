@@ -17,19 +17,17 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import io
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import librosa
 import mlx.core as mx
 import numpy as np
-import soundfile as sf
 
 from parakeet_mlx import from_pretrained, DecodingConfig  # type: ignore[import-untyped]
 from parakeet_mlx.audio import get_logmel  # type: ignore[import-untyped]
 
+from ..audio import decode_wav_bytes, safe_resample
 from .._errors import CorruptAudioError
 
 logger = logging.getLogger(__name__)
@@ -38,6 +36,11 @@ MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v2"
 TARGET_SR = 16_000
 # Minimum samples required for a meaningful transcription (100ms of audio at 16kHz)
 MIN_SAMPLES = 1_600
+# Hard cap on post-resample length: 60s at 16kHz. Dictation is a hold-FN gesture;
+# anything longer is either pathological encoding (ulaw amplification) or a
+# meeting upload sent to the wrong endpoint. Prevents single-thread executor
+# starvation by an attacker uploading a 1KB body that decodes to many minutes.
+MAX_SAMPLES = TARGET_SR * 60
 
 
 class ParakeetService:
@@ -105,24 +108,33 @@ class ParakeetService:
         """
         t0 = time.perf_counter()
 
-        # Decode audio — convert any soundfile decode failure to CorruptAudioError
-        # so the route layer can map it to 422 instead of leaking as a 500.
-        audio_np: np.ndarray
-        try:
-            audio_np, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
-        except (sf.LibsndfileError, RuntimeError) as exc:
-            raise CorruptAudioError(f"Cannot decode audio: {exc}") from exc
+        # Decode + resample at the audio.py boundary — every decode/resample
+        # failure becomes CorruptAudioError so the route layer maps it to 422.
+        audio_np, sr = decode_wav_bytes(audio_bytes)
 
         # Flatten stereo to mono
         if audio_np.ndim == 2:
             audio_np = audio_np.mean(axis=1)
 
-        # Resample to 16 kHz if necessary
-        if sr != TARGET_SR:
-            audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=TARGET_SR)
+        # Resample to 16 kHz; safe_resample also maps librosa errors to 422.
+        audio_np = safe_resample(audio_np, sr, TARGET_SR)
+
+        # Reject decode-amplification: cap post-resample length at MAX_DURATION_S
+        # to prevent ulaw/alaw or pathological-sr uploads decoding into multi-minute
+        # arrays that block the single-thread executor.
+        if len(audio_np) > MAX_SAMPLES:
+            raise CorruptAudioError(
+                f"Decoded audio too long: {len(audio_np) / TARGET_SR:.1f}s "
+                f"(max {MAX_SAMPLES / TARGET_SR:.0f}s)"
+            )
 
         # Guard against too-short clips (silence or near-silence)
         if len(audio_np) < MIN_SAMPLES:
+            logger.debug(
+                "Parakeet skipping short clip: %d samples (< MIN_SAMPLES=%d)",
+                len(audio_np),
+                MIN_SAMPLES,
+            )
             return "", 0.0
 
         audio_mlx = mx.array(audio_np, dtype=mx.float32)

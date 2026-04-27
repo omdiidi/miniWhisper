@@ -116,11 +116,15 @@ def _load_channels(wav_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
     """
     from wispralt_server._errors import CorruptAudioError
 
+    # `sf.read` on a path can raise the same family as the bytes path
+    # (LibsndfileError, OSError, EOFError, ValueError, MemoryError); map all
+    # to CorruptAudioError so the route layer maps to 422.
     try:
         audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-    except (sf.LibsndfileError, RuntimeError) as exc:
-        # soundfile raises LibsndfileError since 0.12+; older versions raise RuntimeError.
+    except (sf.LibsndfileError, OSError, EOFError, ValueError, MemoryError) as exc:
         raise CorruptAudioError(f"Cannot decode WAV: {exc}") from exc
+    if not isinstance(sr, int) or sr <= 0 or sr > 192_000:
+        raise CorruptAudioError(f"Invalid sample rate: {sr}")
 
     # audio shape: (samples, channels)
     ch1 = audio[:, 0]
@@ -133,12 +137,14 @@ def _load_channels(wav_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
 
 
 def _resample_to_16k(audio: np.ndarray, src_sr: int) -> np.ndarray:
-    """Resample *audio* to 16 kHz if not already at 16 kHz."""
-    import librosa
+    """Resample *audio* to 16 kHz if not already at 16 kHz.
 
-    if src_sr == 16_000:
-        return audio
-    return librosa.resample(audio, orig_sr=src_sr, target_sr=16_000)
+    Delegates to ``audio.safe_resample`` so librosa errors map to
+    CorruptAudioError consistently across dictate and meeting paths.
+    """
+    from wispralt_server.audio import safe_resample
+
+    return safe_resample(audio, src_sr, 16_000)
 
 
 def _build_transcript(

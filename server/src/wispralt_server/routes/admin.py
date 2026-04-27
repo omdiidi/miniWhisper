@@ -201,6 +201,9 @@ async def metrics(request: Request) -> JSONResponse:
             "requests_total": observability.request_counter.as_dict(),
             "errors_total": observability.error_counter.as_dict(),
             "latencies": latencies_by_route,
+            "process_uptime_seconds": round(
+                time.monotonic() - observability.process_started_at_monotonic, 1
+            ),
         }
     )
 

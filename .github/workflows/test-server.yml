@@ -1,0 +1,94 @@
+name: Server tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - ".github/workflows/test-server.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/test-server.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    # The server's heaviest deps (parakeet-mlx, mlx) are Apple-Silicon only and
+    # gated behind the meeting-pipeline tests we don't run in CI yet. The two
+    # unit suites we DO run only need pytest + soundfile + numpy + librosa.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('server/pyproject.toml') }}
+
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Pull just the deps the unit tests touch — avoids parakeet-mlx
+          # (Apple-Silicon only) and torch (large) on CI.
+          pip install \
+            "pytest>=8.0" \
+            "pytest-asyncio>=0.23" \
+            "httpx>=0.27" \
+            "fastapi==0.115.0" \
+            "starlette<1.0" \
+            "soundfile==0.12.1" \
+            "numpy>=2.0,<2.3" \
+            "librosa>=0.11.0,<0.12.0" \
+            "pydantic==2.9" \
+            "pydantic-settings==2.5" \
+            "psutil>=6.0" \
+            "python-multipart==0.0.9"
+
+      - name: Stub Apple-Silicon-only dependencies
+        run: |
+          # parakeet-mlx and mlx are Apple-Silicon-only. Provide minimal
+          # stubs so `import wispralt_server.dictate.parakeet` succeeds in
+          # CI; the tests under tests/ never call into the real model.
+          mkdir -p ci-stubs/parakeet_mlx ci-stubs/mlx ci-stubs/mlx/core
+          cat > ci-stubs/parakeet_mlx/__init__.py <<'PY'
+          def from_pretrained(*a, **k): return object()
+          class DecodingConfig:
+              def __init__(self, *a, **k): pass
+          PY
+          cat > ci-stubs/parakeet_mlx/audio.py <<'PY'
+          def get_logmel(*a, **k): return None
+          PY
+          cat > ci-stubs/mlx/__init__.py <<'PY'
+          PY
+          cat > ci-stubs/mlx/core/__init__.py <<'PY'
+          class _DT: pass
+          bfloat16 = _DT(); float32 = _DT()
+          class _Arr: pass
+          def zeros(shape, dtype=None): return _Arr()
+          def array(x, dtype=None): return _Arr()
+          def eval(x): return None
+          PY
+
+      - name: Run pytest
+        env:
+          PYTHONPATH: server/src:ci-stubs
+          # Test config + dummy values for any settings the imports touch.
+          WISPRALT_API_KEY: "ci-test-key-0000000000000000000000000000000000000000000000000000000000000000"
+          HF_TOKEN: "ci-stub-hf-token"
+          SERVER_URL: "https://ci.example.invalid"
+          MEETING_OUTPUT_DIR: /tmp/wispralt-meetings
+          JOB_DB_PATH: /tmp/wispralt-jobs.db
+          STAGING_DIR: /tmp/wispralt-staging
+        run: |
+          mkdir -p /tmp/wispralt-meetings /tmp/wispralt-staging
+          cd server && pytest tests/ -v

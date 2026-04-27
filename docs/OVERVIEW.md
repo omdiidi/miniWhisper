@@ -49,8 +49,10 @@ This file is the single source of truth for which documentation file covers each
 | File | Covered by |
 |---|---|
 | `server/tests/__init__.py` | — (package marker) |
-| `server/tests/test_dictate_corrupt_audio.py` | [API.md](API.md) — pins the LibsndfileError → 422 contract on `/transcribe/dictate` |
-| `server/tests/test_observability_time_window.py` | [API.md](API.md) — pins the recent-window p50 contract on `/metrics` |
+| `server/tests/test_dictate_corrupt_audio.py` | [API.md](API.md) — unit tests on the LibsndfileError → CorruptAudioError boundary |
+| `server/tests/test_dictate_route_422.py` | [API.md](API.md) — route-level integration tests pinning the HTTP 422 / 415 / 413 / 200 contract on `/transcribe/dictate` |
+| `server/tests/test_observability_time_window.py` | [API.md](API.md) — pins the recent-window p50 + low-traffic fallback contract on `/metrics` |
+| `.github/workflows/test-server.yml` | [CONTRIBUTING.md](CONTRIBUTING.md) — runs `pytest server/tests/` on PR + push to main |
 
 ## Client (`client/`)
 

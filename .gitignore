@@ -53,8 +53,10 @@ tmp/mac-mini-screen-*.png
 client/.build/
 client/Package.resolved
 
-# Claude Code internal state
+# Claude Code internal state — narrow ignores so .claude/commands/*.md
+# (slash command spec, expected to be checked-in by OVERVIEW.md + CLAUDE.md)
+# remain tracked.
 .claude/scheduled_tasks.lock
-
-# Claude Code tooling state (broad ignore)
-.claude/
+.claude/settings.local.json
+.claude/cache/
+.claude/sessions/

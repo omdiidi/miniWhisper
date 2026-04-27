@@ -56,7 +56,10 @@ class TestRecentWindowFiltering:
         assert full["p99"] is not None
         assert full["p99"] > 100_000.0, "outlier should still be visible in full window p99"
 
-    def test_returns_none_when_window_empty(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def test_low_traffic_fallback_returns_full_window(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        # Per the per-route + low-traffic-fallback contract: when the recent
+        # window has < 2 observations, fall back to the full deque so sparse
+        # traffic does not produce permanent null percentiles.
         h = LatencyHistogram()
         fake_now = [1000.0]
         monkeypatch.setattr(
@@ -65,9 +68,15 @@ class TestRecentWindowFiltering:
         # Two observations
         h.record("transcribe/dictate", 100.0)
         h.record("transcribe/dictate", 200.0)
-        # Advance past window
+        # Advance past window — recent has zero entries, fallback should kick in
         fake_now[0] = 1000.0 + h._RECENT_WINDOW_S + 60.0
         result = h.percentiles("transcribe/dictate")
+        # Full window has 2 entries → median of [100, 200] = 150
+        assert result["p50"] == 150.0
+
+    def test_truly_empty_route_returns_none(self) -> None:
+        h = LatencyHistogram()
+        result = h.percentiles("never-hit")
         assert result == {"p50": None, "p95": None, "p99": None}
 
     def test_real_time_recording_does_not_crash(self) -> None:
