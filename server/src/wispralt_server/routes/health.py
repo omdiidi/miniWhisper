@@ -8,26 +8,29 @@ GET /healthz
     to verify the tunnel is up (a 401 from a wrong/missing bearer also proves
     the tunnel is up, but /healthz avoids that confusion).
 
-GET /readyz/dictation  (bearer auth)
+GET /readyz/dictation  (no auth)
     Returns 200 if ParakeetService.ready is True, else 503.
     Adds header ``X-Dictation-Degraded: true`` if a meeting job is currently
     running (indicated by ``app.state.meeting_active_flag``; defaults False
     until Wave 1c wires it).
 
-GET /readyz/meeting  (bearer auth)
+GET /readyz/meeting  (no auth)
     Returns 200 if:
       - app.state.meeting_models_ready is True  AND
       - psutil.virtual_memory().available > 2 GiB
     Otherwise 503.
+
+Auth note: readiness probes intentionally bypass bearer auth so that
+Kubernetes-style probes, Cloudflare health checks, and external monitoring
+do not need API credentials.  These endpoints expose only model-ready /
+memory-available booleans — no user data, no audio, no model output.
 """
 
 from __future__ import annotations
 
 import psutil
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-
-from ..auth import require_api_key
 
 router = APIRouter()
 
@@ -45,8 +48,7 @@ async def healthz() -> JSONResponse:
 
 @router.get(
     "/readyz/dictation",
-    dependencies=[Depends(require_api_key)],
-    summary="Readiness probe for dictation (Parakeet)",
+    summary="Readiness probe for dictation (Parakeet) — no auth required",
 )
 async def readyz_dictation(request: Request) -> JSONResponse:
     """Return 200 if Parakeet is warmed and ready, else 503.
@@ -77,8 +79,7 @@ async def readyz_dictation(request: Request) -> JSONResponse:
 
 @router.get(
     "/readyz/meeting",
-    dependencies=[Depends(require_api_key)],
-    summary="Readiness probe for meeting pipeline",
+    summary="Readiness probe for meeting pipeline — no auth required",
 )
 async def readyz_meeting(request: Request) -> JSONResponse:
     """Return 200 if meeting models are loaded AND >= 2 GiB RAM is free.

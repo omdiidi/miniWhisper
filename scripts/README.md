@@ -41,9 +41,11 @@ Echoes the generated key once for copy-paste into the client.
 
 ### `setup-cloudflared.sh`
 - Installs cloudflared via Homebrew if not present
+- Removes any legacy `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist` (the broken `sudo cloudflared service install` path on macOS 14/15)
 - Prompts for the full `https://` tunnel URL; persists as `SERVER_URL` in `.env`
-- Reads the Cloudflare Tunnel token via `read -s` (silent, never stored to any file)
-- Passes token directly to `sudo cloudflared service install`; `unset`s immediately
+- Reads the Cloudflare Tunnel token via `read -s` (silent); persists it to `~/.config/wispralt/cloudflare-token` mode 0600 and unsets the shell variable immediately
+- Generates a user-level LaunchAgent at `~/Library/LaunchAgents/co.wispralt.cloudflared.plist` with `RunAtLoad: true`, `KeepAlive: { SuccessfulExit: false, NetworkState: true }`, reading the token via `--token-file` on cloudflared ≥ 2025.4.0 (or inlined into a 0600 plist on older versions)
+- Bootstraps via `launchctl bootstrap gui/$UID` (no sudo) — survives reboots
 - Verifies tunnel via `curl $SERVER_URL/healthz`; explains HTTP 401 / 000 / 502 codes
 
 ### `server-launchd.sh`
