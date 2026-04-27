@@ -41,7 +41,7 @@ def _openai_error(
     return JSONResponse(status_code=status, content=body)
 
 
-@router.post("/audio/transcriptions")
+@router.post("/audio/transcriptions", response_model=None)
 async def create_transcription(
     request: Request,
     file: UploadFile,
