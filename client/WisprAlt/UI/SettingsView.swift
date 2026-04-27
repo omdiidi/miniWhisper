@@ -1,15 +1,15 @@
 import SwiftUI
 import ServiceManagement
+import AppKit
 
 /// Main settings panel hosted in the menubar popover.
 ///
-/// Fields:
-///   - Server URL (https only; validated on submit)
-///   - API key (SecureField; stored in Keychain on commit — never in UserDefaults)
-///   - Meetings folder (browse button)
-///   - Hold duration Stepper
-///   - Triple-tap window Stepper
-///   - Test Connection button (wired to ServerClient.healthz by Wave 1b)
+/// Layout is user-priority ordered:
+///   1. Quick Actions — admin portal + meetings folder shortcuts
+///   2. Connection status with a working Test button
+///   3. Hotkey timing + launch-at-login (frequently-tweaked)
+///   4. Meetings folder picker
+///   5. Advanced (collapsed) — server URL, API key, key export/import
 struct SettingsView: View {
     @EnvironmentObject private var settings: Settings
 
@@ -23,6 +23,8 @@ struct SettingsView: View {
     @State private var serverURLError: String? = nil
     /// Feedback message shown after Test Connection press.
     @State private var connectionFeedback: String? = nil
+    /// Color tag for the feedback message (success/warn/error).
+    @State private var connectionFeedbackKind: ConnectionFeedbackKind = .neutral
     /// True while a connection test is in flight.
     @State private var isTesting: Bool = false
     /// File picker presented when "Browse" is tapped.
@@ -30,25 +32,77 @@ struct SettingsView: View {
     /// Error message shown below the export/import buttons when an operation fails.
     @State private var exportImportError: String?
 
+    private enum ConnectionFeedbackKind {
+        case neutral, success, warning, error
+    }
+
     // MARK: - Body
 
     var body: some View {
         Form {
-            serverSection
-            apiKeySection
-            apiKeyExportImportSection
-            meetingsFolderSection
+            quickActionsSection
+            connectionSection
             hotkeySection
             launchAtLoginSection
-            connectionSection
+            meetingsFolderSection
+            advancedSection
         }
         .formStyle(.grouped)
         .padding()
-        .frame(width: 400)
+        .frame(width: 420)
         .onAppear(perform: loadCurrentValues)
     }
 
     // MARK: - Sections
+
+    /// Top of the popover: the actions a daily user actually reaches for.
+    private var quickActionsSection: some View {
+        Section {
+            Button {
+                openAdminPortal()
+            } label: {
+                HStack {
+                    Image(systemName: "person.2.badge.gearshape")
+                    Text("Open Admin Portal")
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(settings.serverURL == nil)
+            .help(
+                settings.serverURL == nil
+                    ? "Set a Server URL under Advanced first."
+                    : "Opens \(adminURLString()) in your browser. Sign in with your API key."
+            )
+
+            Button {
+                openMeetingsFolder()
+            } label: {
+                HStack {
+                    Image(systemName: "folder")
+                    Text("Open Meetings Folder")
+                    Spacer()
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Opens \(settings.meetingsPath.path) in Finder.")
+        }
+    }
+
+    private var advancedSection: some View {
+        Section {
+            DisclosureGroup("Advanced") {
+                VStack(alignment: .leading, spacing: 12) {
+                    serverSection
+                    apiKeySection
+                    apiKeyExportImportSection
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
 
     private var serverSection: some View {
         Section("Server") {
@@ -211,7 +265,7 @@ struct SettingsView: View {
     }
 
     private var connectionSection: some View {
-        Section {
+        Section("Connection") {
             HStack {
                 Button(action: testConnection) {
                     if isTesting {
@@ -226,9 +280,19 @@ struct SettingsView: View {
                 if let feedback = connectionFeedback {
                     Text(feedback)
                         .font(.caption)
-                        .foregroundStyle(feedback.hasPrefix("OK") ? Color.green : Color.red)
+                        .foregroundStyle(feedbackColor)
+                        .lineLimit(2)
                 }
             }
+        }
+    }
+
+    private var feedbackColor: Color {
+        switch connectionFeedbackKind {
+        case .success: return .green
+        case .warning: return .orange
+        case .error:   return .red
+        case .neutral: return .secondary
         }
     }
 
@@ -282,22 +346,92 @@ struct SettingsView: View {
         }
     }
 
-    /// Test Connection: calls ServerClient.healthz and both /readyz endpoints.
-    /// The actual network call is wired by Wave 1b's ServerClient. For now the button
-    /// is visible and the action logs, so the integration point is clear.
+    /// Test Connection: calls `/healthz`, `/readyz/dictation`, `/readyz/meeting` in parallel and
+    /// surfaces a single status line. Green = both ready, orange = healthy but a pipeline still
+    /// loading, red = host unreachable or auth bad.
     private func testConnection() {
-        // Wave 1b wires ServerClient.healthz() here.
-        print("test connection — wired by Wave 1b")
+        guard settings.serverURL != nil else {
+            connectionFeedback = "Set a Server URL under Advanced first."
+            connectionFeedbackKind = .error
+            return
+        }
         isTesting = true
         connectionFeedback = nil
+        connectionFeedbackKind = .neutral
 
-        // Placeholder async simulation so the spinner shows briefly.
         Task {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            await MainActor.run {
-                isTesting = false
-                connectionFeedback = "Wave 1b will wire this."
+            let client = ServerClient.shared
+            do {
+                async let healthOK = client.healthz()
+                async let dictationReady = client.readyz(endpoint: "dictation")
+                async let meetingReady = client.readyz(endpoint: "meeting")
+                let h = try await healthOK
+                let d = try await dictationReady
+                let m = try await meetingReady
+
+                await MainActor.run {
+                    isTesting = false
+                    if !h {
+                        connectionFeedback = "Server reachable but /healthz failed."
+                        connectionFeedbackKind = .error
+                        return
+                    }
+                    if d.ok && m.ok {
+                        connectionFeedback = d.degraded
+                            ? "Connected — dictation degraded (a meeting is using memory)"
+                            : "Connected — dictation + meeting ready."
+                        connectionFeedbackKind = d.degraded ? .warning : .success
+                        return
+                    }
+                    if d.ok && !m.ok {
+                        connectionFeedback = "Connected — meeting pipeline still loading."
+                        connectionFeedbackKind = .warning
+                        return
+                    }
+                    if !d.ok && m.ok {
+                        connectionFeedback = "Connected — dictation pipeline still loading."
+                        connectionFeedbackKind = .warning
+                        return
+                    }
+                    connectionFeedback = "Connected — pipelines still loading."
+                    connectionFeedbackKind = .warning
+                }
+            } catch ServerError.unauthorized {
+                await MainActor.run {
+                    isTesting = false
+                    connectionFeedback = "API key rejected. Re-paste it under Advanced."
+                    connectionFeedbackKind = .error
+                }
+            } catch {
+                await MainActor.run {
+                    isTesting = false
+                    connectionFeedback = "Failed: \(error.localizedDescription)"
+                    connectionFeedbackKind = .error
+                }
             }
         }
+    }
+
+    /// Compose the admin URL from the configured server URL.
+    private func adminURLString() -> String {
+        guard let base = settings.serverURL else { return "<server-url>/admin/" }
+        return base.appendingPathComponent("admin/").absoluteString
+    }
+
+    /// Open the admin portal in the user's default browser.
+    private func openAdminPortal() {
+        guard let base = settings.serverURL else { return }
+        let url = base.appendingPathComponent("admin/")
+        NSWorkspace.shared.open(url)
+        Log.info("Opened admin portal: \(url.absoluteString)", category: "settings")
+    }
+
+    /// Reveal the meetings folder in Finder.
+    private func openMeetingsFolder() {
+        let url = settings.meetingsPath
+        // Make sure the directory exists; opening a non-existent path silently no-ops.
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(url)
+        Log.info("Opened meetings folder: \(url.path)", category: "settings")
     }
 }

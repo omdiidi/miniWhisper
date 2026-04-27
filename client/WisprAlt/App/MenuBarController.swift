@@ -257,7 +257,7 @@ final class MenuBarController: NSObject {
             case .dictating:
                 return ("mic.fill", "WisprAlt — Dictating")
             case .meetingRecording:
-                return ("record.circle", "WisprAlt — Meeting Recording")
+                return ("record.circle.fill", "WisprAlt — Meeting Recording")
             case .uploading:
                 return ("icloud.and.arrow.up", "WisprAlt — Uploading")
             case .processing:
@@ -271,9 +271,32 @@ final class MenuBarController: NSObject {
             systemSymbolName: symbolName,
             accessibilityDescription: accessibilityLabel
         )
-        // Render as template so macOS dark/light mode tints it correctly.
-        image?.isTemplate = true
-        button.image = image
+        switch mode {
+        case .meetingRecording:
+            // Break the menubar template tint so the red dot actually reads as
+            // "recording" instead of blending with mic and other monochrome icons.
+            // Pair with a "REC" text label — the user reported the prior outline
+            // glyph was indistinguishable from idle in dense menu bars.
+            image?.isTemplate = false
+            button.image = image
+            button.contentTintColor = .systemRed
+            button.title = " REC"
+            button.attributedTitle = NSAttributedString(
+                string: " REC",
+                attributes: [
+                    .foregroundColor: NSColor.systemRed,
+                    .font: NSFont.systemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .bold),
+                ]
+            )
+            button.imagePosition = .imageLeading
+        default:
+            image?.isTemplate = true
+            button.image = image
+            button.contentTintColor = nil
+            button.title = ""
+            button.attributedTitle = NSAttributedString(string: "")
+            button.imagePosition = .imageOnly
+        }
         button.toolTip = accessibilityLabel
     }
 
