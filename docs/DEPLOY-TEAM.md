@@ -70,7 +70,7 @@ applied **manually** via the Supabase Studio SQL editor.
 
 Steps:
 
-1. Open <https://supabase.com/dashboard/project/qglwmwmdoxopnubghnul/sql/new>.
+1. Open <https://supabase.com/dashboard/project/lmaffmygjrfgkwrapfax/sql/new>.
 2. Paste the entire contents of
    `server/migrations/2026-04-27-v1-wispralt-schema.sql`.
 3. Click **Run**. Expect three `CREATE` statements + one `INSERT` to

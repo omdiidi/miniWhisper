@@ -1,11 +1,17 @@
 -- =============================================================================
+-- STATUS: APPLIED to project minicrew (lmaffmygjrfgkwrapfax) on 2026-04-27.
+--   Verified via: SELECT * FROM wispralt.schema_version → version 1.
+--   Re-applying this file would fail (tables already exist). Future
+--   migrations should bump schema_version + use IF NOT EXISTS guards.
+-- =============================================================================
+-- =============================================================================
 -- wispralt v1 schema
 -- =============================================================================
 -- Migration name: v1_wispralt_schema
 -- Apply via Supabase MCP `apply_migration` once the project token has the right
 -- scope.  Until then, the operator should paste this file's contents into
 -- Supabase Studio's SQL editor and run it against project
--- `qglwmwmdoxopnubghnul`.
+-- `lmaffmygjrfgkwrapfax`.
 -- =============================================================================
 CREATE SCHEMA IF NOT EXISTS wispralt;
 
