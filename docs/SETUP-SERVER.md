@@ -143,6 +143,7 @@ All configuration is read from `server/.env` (mode 0600). The template is `serve
 | `MEETING_OUTPUT_DIR` | Yes | — | Directory for completed transcript files (JSON/SRT/VTT/TXT) |
 | `JOB_DB_PATH` | Yes | — | Path to SQLite job database file |
 | `STAGING_DIR` | Yes | — | Temporary directory for in-flight WAV uploads |
+| `SUPABASE_DATABASE_URL` | No | — | Postgres URL for the `wispralt` schema (multi-token auth + usage events). When unset, server falls back to env-var break-glass admin only. See [DEPLOY-TEAM.md](DEPLOY-TEAM.md) for the connection-string format and the schema-bootstrap migration. |
 | `SILENCE_THRESHOLD` | No | `0.002` | Per-frame RMS threshold for in-person mode detection |
 | `MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum upload size in bytes (default 2 GiB) |
 

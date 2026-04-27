@@ -52,7 +52,9 @@ jobs:
             "pydantic==2.9" \
             "pydantic-settings==2.5" \
             "psutil>=6.0" \
-            "python-multipart==0.0.9"
+            "python-multipart==0.0.9" \
+            "asyncpg>=0.29" \
+            "jinja2>=3.1"
 
       - name: Stub Apple-Silicon-only dependencies
         run: |
@@ -81,7 +83,9 @@ jobs:
 
       - name: Run pytest
         env:
-          PYTHONPATH: server/src:ci-stubs
+          # PYTHONPATH must be absolute — `cd server` would otherwise reinterpret
+          # the relative paths against the wrong working directory.
+          PYTHONPATH: ${{ github.workspace }}/server/src:${{ github.workspace }}/ci-stubs
           # Test config + dummy values for any settings the imports touch.
           WISPRALT_API_KEY: "ci-test-key-0000000000000000000000000000000000000000000000000000000000000000"
           HF_TOKEN: "ci-stub-hf-token"
