@@ -72,9 +72,15 @@ def install_compat_shims() -> None:
     _orig_snapshot_download = huggingface_hub.snapshot_download
 
     def _shimmed_torch_load(*args, **kwargs):  # type: ignore[no-untyped-def]
-        # Respect explicit weights_only=True from callers that opt in to safe mode.
-        if "weights_only" not in kwargs:
-            kwargs["weights_only"] = False
+        # ALWAYS force weights_only=False for the meeting bootstrap.  Pyannote
+        # 3.3.2 and WhisperX both pass `weights_only=True` explicitly inside
+        # their loaders, which would fail under torch 2.6's stricter
+        # safe-globals check (omegaconf.ListConfig is not in the allowlist).
+        # We trust the HF checkpoints we explicitly downloaded, so override.
+        # Trade-off vs the codex-review finding: we CHOOSE convenience here
+        # because the shim is now scoped (only installed during meeting
+        # bootstrap) — see install_compat_shims() lifecycle below.
+        kwargs["weights_only"] = False
         assert _orig_torch_load is not None
         return _orig_torch_load(*args, **kwargs)
 
