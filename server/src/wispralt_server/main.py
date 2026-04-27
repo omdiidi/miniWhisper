@@ -40,6 +40,7 @@ from wispralt_server.config import settings, verify_env_perms
 from wispralt_server.dictate.parakeet import ParakeetService
 from wispralt_server.jobs.runner import MeetingRunner
 from wispralt_server.jobs.store import JobStore
+from wispralt_server.meeting import install_compat_shims
 from wispralt_server.meeting.output import sweep_stale_tmp
 from wispralt_server.meeting.pipeline import bootstrap_models
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
@@ -134,7 +135,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("WisprAlt server — dictation ready.")
 
     # 7. Bootstrap meeting models in a thread (P4#3; ~7 GB load, CPU-heavy).
-    #    We fire this as an asyncio task so lifespan does not block the event loop.
+    #    Install compat shims FIRST so torch.load & huggingface_hub kwarg
+    #    translation are in place before whisperx/pyannote start loading.
+    install_compat_shims()
+    #    Fire bootstrap as an asyncio task so lifespan does not block the event loop.
     async def _bootstrap_and_reenqueue() -> None:
         hf_token = settings.hf_token.get_secret_value()
         try:
@@ -143,8 +147,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("Meeting pipeline models ready.")
             # Now that models are loaded, re-enqueue surviving pending jobs.
             await meeting_runner.reenqueue_pending()
-        except Exception as exc:
-            logger.error("Meeting model bootstrap failed: %s", exc)
+        except Exception:  # noqa: BLE001 — we want the traceback in err.log
+            # Use logger.exception so the stack trace lands in server.error.log;
+            # bare logger.error("...: %s", exc) drops the traceback and defeats
+            # post-incident err-log scans.
+            logger.exception("Meeting model bootstrap failed")
 
     # I3: Store the task so it can be cancelled cleanly during shutdown.
     app.state.bootstrap_task = asyncio.create_task(_bootstrap_and_reenqueue())
@@ -195,9 +202,12 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         latency_ms = (time.perf_counter() - t0) * 1_000.0
 
-        # Use the first two path segments as the route key to avoid per-job-id cardinality.
-        parts = request.url.path.strip("/").split("/")
-        route_key = "/".join(parts[:2]) if len(parts) >= 2 else request.url.path
+        # First two path segments as the route key to avoid per-job-id cardinality.
+        # Always emit without a leading slash so /healthz and /readyz/dictation
+        # share one keyspace ("healthz", "readyz/dictation"); do not fall through
+        # to request.url.path (which keeps the leading slash).
+        parts = [p for p in request.url.path.strip("/").split("/") if p]
+        route_key = "/".join(parts[:2]) if parts else "root"
 
         observability.request_counter.increment(route_key, response.status_code)
         if response.status_code >= 400:

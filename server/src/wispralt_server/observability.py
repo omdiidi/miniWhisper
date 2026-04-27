@@ -7,17 +7,18 @@ middleware and read by ``GET /metrics``.  No external dependencies; backed by
 
 Exported instances
 ------------------
-request_counter : Counter
+request_counter : ThreadSafeCounter
     Keyed by ``(route_prefix, status_code)``.  Incremented once per response.
-error_counter : Counter
+error_counter : ThreadSafeCounter
     Keyed by ``(route_prefix, status_code)`` for 4xx/5xx responses only.
 latency_histogram : LatencyHistogram
-    Records ``(route_prefix, latency_ms, monotonic_ts)`` triples.  Bounded by
-    entry count (1000) AND by time-window when computing percentiles.  This
-    prevents a single hung-upload outlier (e.g. 197s) from poisoning p50 for
-    the next 1000 requests.  ``percentiles(route)`` filters to the last
-    ``_RECENT_WINDOW_S`` seconds (default 5min); ``percentiles(route, recent_only=False)``
-    returns the full deque view for backwards compatibility.
+    Records ``(latency_ms, monotonic_ts)`` per route in **per-route** deques
+    (bounded individually) so a flood on one route cannot evict another route's
+    samples.  Percentiles default to a 5-minute recent window with a low-traffic
+    fallback to the full deque when the recent window has too few samples.
+process_started_at_monotonic : float
+    Captured at module import time; used by the `/metrics` route to expose
+    ``process_uptime_seconds``.
 """
 
 from __future__ import annotations
@@ -25,7 +26,11 @@ from __future__ import annotations
 import statistics
 import threading
 import time as _time
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
+
+# Allow operators to widen the recent percentile window for low-traffic
+# deployments where 5 min is too short to accumulate 2+ samples per route.
+import os
 
 
 class ThreadSafeCounter:
@@ -49,28 +54,45 @@ class ThreadSafeCounter:
             return sum(self._counter.values())
 
 
-class LatencyHistogram:
-    """Records per-route latency observations and computes percentiles.
+def _env_window_s() -> float:
+    raw = os.environ.get("WISPRALT_LATENCY_WINDOW_S", "")
+    try:
+        v = float(raw)
+        if v > 0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 300.0
 
-    Bounded by both entry count AND time window when computing percentiles —
-    so a single old outlier (e.g. a 197-second hung upload) cannot poison
-    p50 for the next 1000 requests.
+
+class LatencyHistogram:
+    """Per-route latency observations with time-windowed percentiles.
+
+    Each route has its own ``deque(maxlen=_PER_ROUTE_MAX)`` so a flood on one
+    route (e.g. unauth ``/readyz/*`` probes) cannot evict another route's
+    samples.  Percentiles default to a recent time window
+    (``WISPRALT_LATENCY_WINDOW_S`` env var, 300s default) so a single old
+    outlier — e.g. a 197-second hung upload — cannot poison p50 indefinitely.
+
+    Low-traffic fallback: if the recent window has < 2 samples, fall back to
+    the full per-route deque (bounded by entry count) so a sparse-traffic
+    homelab does not see permanent ``null`` percentiles.
     """
 
-    _MAX_ENTRIES = 1000
-    # Window for percentile computation. Observations older than this are
-    # excluded from p50/p95/p99. A long enough window to be stable under
-    # low traffic, short enough that yesterday's outliers don't haunt today.
-    _RECENT_WINDOW_S = 300.0
+    # Cap per route, not global.  500 entries × 5 routes = 2500 max in steady
+    # state — bounded memory and no cross-route eviction.
+    _PER_ROUTE_MAX = 500
+    _RECENT_WINDOW_S = _env_window_s()
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # (route, latency_ms, monotonic_timestamp_seconds)
-        self._entries: deque[tuple[str, float, float]] = deque(maxlen=self._MAX_ENTRIES)
+        self._by_route: dict[str, deque[tuple[float, float]]] = defaultdict(
+            lambda: deque(maxlen=self._PER_ROUTE_MAX)
+        )
 
     def record(self, route: str, latency_ms: float) -> None:
         with self._lock:
-            self._entries.append((route, latency_ms, _time.monotonic()))
+            self._by_route[route].append((latency_ms, _time.monotonic()))
 
     def percentiles(self, route: str, recent_only: bool = True) -> dict[str, float | None]:
         """Return ``{"p50": …, "p95": …, "p99": …}`` for *route*.
@@ -80,20 +102,24 @@ class LatencyHistogram:
         route:
             Route prefix (e.g. ``"transcribe/dictate"``).
         recent_only:
-            If ``True`` (default), include only observations from the last
-            ``_RECENT_WINDOW_S`` seconds. Set to ``False`` for the full
-            entry-bounded window (legacy behavior).
-
-        Returns ``None`` for each percentile if fewer than 2 observations exist
-        in the chosen window.
+            If ``True`` (default), filter to the last ``_RECENT_WINDOW_S``
+            seconds; if that window has fewer than 2 observations, fall back
+            to the full per-route deque so sparse-traffic deployments still
+            get useful numbers.  Set to ``False`` to skip the time filter
+            entirely.
         """
-        cutoff = _time.monotonic() - self._RECENT_WINDOW_S if recent_only else 0.0
         with self._lock:
-            values = sorted(
-                ms
-                for r, ms, ts in self._entries
-                if r == route and ts >= cutoff
-            )
+            entries = list(self._by_route.get(route, ()))
+
+        if not entries:
+            return {"p50": None, "p95": None, "p99": None}
+
+        if recent_only:
+            cutoff = _time.monotonic() - self._RECENT_WINDOW_S
+            recent = [ms for ms, ts in entries if ts >= cutoff]
+            values = sorted(recent) if len(recent) >= 2 else sorted(ms for ms, _ in entries)
+        else:
+            values = sorted(ms for ms, _ in entries)
 
         if len(values) < 2:
             return {"p50": None, "p95": None, "p99": None}
@@ -106,7 +132,7 @@ class LatencyHistogram:
 
     def all_routes(self) -> set[str]:
         with self._lock:
-            return {r for r, _, _ in self._entries}
+            return {r for r, dq in self._by_route.items() if dq}
 
 
 def _percentile(sorted_values: list[float], q: float) -> float:
@@ -126,3 +152,6 @@ def _percentile(sorted_values: list[float], q: float) -> float:
 request_counter = ThreadSafeCounter()
 error_counter = ThreadSafeCounter()
 latency_histogram = LatencyHistogram()
+# Captured once at module import; the `/metrics` route subtracts from
+# `time.monotonic()` to expose process uptime.
+process_started_at_monotonic: float = _time.monotonic()

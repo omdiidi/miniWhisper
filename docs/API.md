@@ -39,6 +39,7 @@ Enforced by `middleware/rate_limit.py` (per-IP, in-memory rolling window):
 |---|---|
 | `POST /transcribe/dictate` | 60 requests per 60-second window (configurable: `DICTATE_RATE_PER_MIN`) |
 | `POST /transcribe/meeting` | 4 requests per 3600-second window (configurable: `MEETING_RATE_PER_HOUR`) |
+| `GET /readyz/*`, `GET /healthz` | 120 requests per 60-second window (configurable: `PROBE_RATE_PER_MIN`). Cloudflare's typical 5–10s health-check cadence sits well under this; the cap exists to bound probe-flood damage on the unauthenticated probe endpoints. |
 
 Exceeded limits return **429** with a `Retry-After` header (value = window duration in seconds).
 

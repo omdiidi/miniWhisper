@@ -17,7 +17,13 @@ import soundfile as sf
 from wispralt_server._errors import CorruptAudioError
 
 # Re-export so callers can import from either location without breakage.
-__all__ = ["CorruptAudioError", "decode_wav_bytes", "split_channels", "resample"]
+__all__ = [
+    "CorruptAudioError",
+    "decode_wav_bytes",
+    "split_channels",
+    "resample",
+    "safe_resample",
+]
 
 
 # ── data-access functions ─────────────────────────────────────────────────────
@@ -26,28 +32,37 @@ __all__ = ["CorruptAudioError", "decode_wav_bytes", "split_channels", "resample"
 def decode_wav_bytes(b: bytes) -> tuple[np.ndarray, int]:
     """Decode raw audio bytes into a float32 NumPy array.
 
-    Parameters
-    ----------
-    b:
-        Raw bytes from an uploaded audio file (WAV, FLAC, …).
+    Returns ``(audio, sample_rate)``.  *audio* is a 1-D or 2-D float32 array
+    (channels last); *sample_rate* is an integer in Hz.
 
-    Returns
-    -------
-    (audio, sample_rate)
-        *audio* is a 1-D or 2-D float32 array (channels last).
-        *sample_rate* is an integer in Hz.
-
-    Raises
-    ------
-    CorruptAudioError
-        If *soundfile* cannot decode the bytes.
+    Raises ``CorruptAudioError`` for any decode failure — covers
+    ``LibsndfileError`` (modern soundfile), plus ``OSError``/``EOFError``/
+    ``ValueError`` (which soundfile raises for unsupported formats and
+    truncated streams) and ``MemoryError`` (header claims more frames than
+    the host can allocate).
     """
     try:
         audio, sr = sf.read(io.BytesIO(b), dtype="float32", always_2d=False)
-    except (sf.LibsndfileError, RuntimeError) as exc:
-        # soundfile raises LibsndfileError since 0.12+; older versions raise RuntimeError.
+    except (sf.LibsndfileError, OSError, EOFError, ValueError, MemoryError) as exc:
         raise CorruptAudioError(f"Cannot decode audio: {exc}") from exc
+    if not isinstance(sr, int) or sr <= 0 or sr > 192_000:
+        raise CorruptAudioError(f"Invalid sample rate: {sr}")
     return audio, int(sr)
+
+
+def safe_resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Resample with corrupt-input failures mapped to ``CorruptAudioError``.
+
+    `librosa.resample` raises ``librosa.util.exceptions.ParameterError``
+    (a ``ValueError`` subclass) for degenerate sample rates and other bad
+    input; we catch those here so the route layer sees one error type.
+    """
+    if src_sr == dst_sr:
+        return audio
+    try:
+        return librosa.resample(audio, orig_sr=src_sr, target_sr=dst_sr)
+    except (ValueError, ZeroDivisionError, OverflowError) as exc:
+        raise CorruptAudioError(f"Cannot resample audio: {exc}") from exc
 
 
 def split_channels(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

@@ -1,6 +1,15 @@
 import AppKit
 import SwiftUI
 
+private extension Duration {
+    /// Convert a `Duration` (returned by `ContinuousClock` arithmetic) into
+    /// floating-point milliseconds for log lines.
+    var milliseconds: Double {
+        let comps = self.components
+        return Double(comps.seconds) * 1_000.0 + Double(comps.attoseconds) * 1e-15
+    }
+}
+
 // MARK: - RecordingState
 
 /// Lightweight ObservableObject that carries upload-progress state into the SwiftUI
@@ -468,28 +477,36 @@ extension MenuBarController: FNKeyEventsDelegate {
             // hunch by isolating network+upload+inference vs AX-inject. Filter
             // OSLog with: `log show --last 5m --predicate 'subsystem == "co.wispralt"
             // AND category == "dictation"' --style compact --info`
-            let tStopStart = Date()
+            //
+            // ContinuousClock is monotonic (cannot go backwards on NTP correction);
+            // Date() was wall-clock and could produce negative latencies during
+            // background `timed` adjustments. Issued at Log.debug so the per-
+            // dictation chatter is off-by-default; flip via OSLog profile when
+            // measuring.
+            let clock = ContinuousClock()
+            let tStopStart = clock.now
             do {
                 let wavData = try await dictationRecorder.stop()
-                let stopMs = Date().timeIntervalSince(tStopStart) * 1000
-                Log.info(
+                let stopMs = (clock.now - tStopStart).milliseconds
+                Log.debug(
                     "dictation/timing: stop_ms=\(String(format: "%.1f", stopMs)) bytes=\(wavData.count)",
                     category: "dictation"
                 )
 
-                let tNet = Date()
+                let tNet = clock.now
                 let text = try await DictationAPI.transcribe(wavData)
-                let netMs = Date().timeIntervalSince(tNet) * 1000
-                Log.info(
+                let netMs = (clock.now - tNet).milliseconds
+                Log.debug(
                     "dictation/timing: net_total_ms=\(String(format: "%.1f", netMs)) chars=\(text.count)",
                     category: "dictation"
                 )
 
-                let tInj = Date()
+                let tInj = clock.now
                 TextInjector.inject(text)
-                let injMs = Date().timeIntervalSince(tInj) * 1000
-                Log.info(
-                    "dictation/timing: inject_ms=\(String(format: "%.1f", injMs)) total_ms=\(String(format: "%.1f", Date().timeIntervalSince(tStopStart) * 1000))",
+                let injMs = (clock.now - tInj).milliseconds
+                let totalMs = (clock.now - tStopStart).milliseconds
+                Log.debug(
+                    "dictation/timing: inject_ms=\(String(format: "%.1f", injMs)) total_ms=\(String(format: "%.1f", totalMs))",
                     category: "dictation"
                 )
                 Log.info("Dictation injected: \"\(text.prefix(60))\"", category: "dictation")
