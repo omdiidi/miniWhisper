@@ -34,11 +34,15 @@
     <key>NSAppleEventsUsageDescription</key>
     <string>WisprAlt sends text to other applications.</string>
 
-    <!-- Sparkle auto-update (SUAutomaticallyUpdate = false: require user "Restart Now" click) -->
-    <key>SUFeedURL</key>
-    <string>https://omid.example/wispralt/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>REPLACE_WITH_PUBLIC_KEY</string>
+    <!-- Sparkle auto-update is intentionally DISABLED until we ship a real
+         appcast + EdDSA public key (Tier 2 distribution). The Tier 1.5
+         path uses GitHub Releases via the /wispralt-update slash command,
+         not Sparkle. SUEnableAutomaticChecks=false stops the framework
+         from background-polling SUFeedURL and surfacing "Unable to Check
+         For Updates" dialogs. SparkleController.init() also passes
+         startingUpdater:false as belt-and-suspenders. -->
+    <key>SUEnableAutomaticChecks</key>
+    <false/>
     <key>SUAutomaticallyUpdate</key>
     <false/>
 </dict>

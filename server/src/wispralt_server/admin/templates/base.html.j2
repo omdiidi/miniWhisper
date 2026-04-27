@@ -127,14 +127,19 @@
 <body>
   {% if not hide_chrome %}
   <header>
-    <h1>Wispralt Admin</h1>
+    {% set _is_admin = request.state.user is defined and request.state.user and request.state.user.role == "admin" %}
+    <h1>{% if _is_admin %}Wispralt Admin{% else %}Wispralt Portal{% endif %}</h1>
     <span class="who">{% if request.state.user is defined and request.state.user %}{{ request.state.user.label }} ({{ request.state.user.role }}){% endif %}</span>
   </header>
   <div class="layout">
     <nav class="sidebar">
+      {% if _is_admin %}
       <a href="/admin/">Overview</a>
       <a href="/admin/users">Users</a>
       <a href="/admin/usage">Usage</a>
+      {% else %}
+      <a href="/admin/me">My Usage</a>
+      {% endif %}
     </nav>
     <main>
       {% block content %}{% endblock %}

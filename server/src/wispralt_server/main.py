@@ -401,9 +401,12 @@ def create_app() -> FastAPI:
     app.include_router(dictate.router)
     # /admin/* legacy JSON endpoints (rotate-key, /metrics) — auth per-route.
     app.include_router(admin.router)
-    # /admin/* Jinja2 UI: two routers — public_router for /admin/login (must
-    # be reachable WITHOUT auth), authed_router for everything else.
+    # /admin/* Jinja2 UI: three routers under the same prefix.
+    # public_router  — /admin/login (must be reachable WITHOUT auth).
+    # me_router      — /admin/me (any authenticated role: self-service for employees).
+    # authed_router  — everything else, admin-only.
     app.include_router(admin_ui.public_router)
+    app.include_router(admin_ui.me_router)
     app.include_router(admin_ui.authed_router)
     # /transcribe/meeting — Phase 2 meeting endpoints.
     app.include_router(meeting_routes.router)

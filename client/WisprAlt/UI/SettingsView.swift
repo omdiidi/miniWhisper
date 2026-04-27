@@ -65,14 +65,14 @@ struct SettingsView: View {
     /// Top of the popover: the actions a daily user actually reaches for.
     private var quickActionsSection: some View {
         Section {
-            Button("Open Admin Portal", systemImage: "person.2.badge.gearshape") {
-                openAdminPortal()
+            Button("Open Portal", systemImage: "safari") {
+                openPortal()
             }
             .disabled(settings.serverURL == nil)
             .help(
                 settings.serverURL == nil
                     ? "Set a Server URL under Advanced first."
-                    : "Opens \(adminURLString()) in your browser. Sign in with your API key."
+                    : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
             )
 
             Button("Open Meetings Folder", systemImage: "folder") {
@@ -397,18 +397,14 @@ struct SettingsView: View {
         }
     }
 
-    /// Compose the admin URL from the configured server URL.
-    private func adminURLString() -> String {
-        guard let base = settings.serverURL else { return "<server-url>/admin/" }
-        return base.appendingPathComponent("admin/").absoluteString
-    }
-
-    /// Open the admin portal in the user's default browser.
-    private func openAdminPortal() {
+    /// Open the portal landing page (`/admin/login`) in the user's default browser.
+    /// The server's role-based redirect sends admins to /admin/ and employees to
+    /// /admin/me, so the same button works for everyone.
+    private func openPortal() {
         guard let base = settings.serverURL else { return }
-        let url = base.appendingPathComponent("admin/")
+        let url = base.appendingPathComponent("admin/login")
         NSWorkspace.shared.open(url)
-        Log.info("Opened admin portal: \(url.absoluteString)", category: "settings")
+        Log.info("Opened portal: \(url.absoluteString)", category: "settings")
     }
 
     /// Reveal the meetings folder in Finder.

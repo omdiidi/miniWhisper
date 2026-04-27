@@ -250,54 +250,61 @@ final class MenuBarController: NSObject {
 
     private func updateIcon() {
         guard let button = statusItem.button else { return }
-        let (symbolName, accessibilityLabel): (String, String) = {
-            switch mode {
-            case .idle:
-                return ("mic", "WisprAlt — Idle")
-            case .dictating:
-                return ("mic.fill", "WisprAlt — Dictating")
-            case .meetingRecording:
-                return ("record.circle.fill", "WisprAlt — Meeting Recording")
-            case .uploading:
-                return ("icloud.and.arrow.up", "WisprAlt — Uploading")
-            case .processing:
-                return ("waveform", "WisprAlt — Processing")
-            case .done:
-                return ("checkmark.circle", "WisprAlt — Done")
-            }
-        }()
 
-        let image = NSImage(
-            systemSymbolName: symbolName,
-            accessibilityDescription: accessibilityLabel
-        )
         switch mode {
         case .meetingRecording:
-            // Break the menubar template tint so the red dot actually reads as
-            // "recording" instead of blending with mic and other monochrome icons.
-            // Pair with a "REC" text label — the user reported the prior outline
-            // glyph was indistinguishable from idle in dense menu bars.
-            image?.isTemplate = false
-            button.image = image
-            button.contentTintColor = .systemRed
-            button.title = " REC"
+            // Render a clean, custom solid red dot via NSBezierPath instead of an
+            // SF Symbol. record.circle.fill has an inner ring-and-dot detail that
+            // blurs at menubar size; circle.fill works but tinting it via the
+            // status item's contentTintColor occasionally double-tints depending
+            // on the user's menu-bar style. Drawing the dot ourselves guarantees
+            // a single solid red circle at the exact size we want, every time.
+            let dotSize: CGFloat = 10
+            let imageSize = NSSize(width: dotSize, height: dotSize)
+            let dot = NSImage(size: imageSize, flipped: false) { rect in
+                NSColor.systemRed.setFill()
+                NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5)).fill()
+                return true
+            }
+            dot.isTemplate = false  // we want the dot to stay red, not invert
+            button.image = dot
+            button.contentTintColor = nil  // image already carries its color
             button.attributedTitle = NSAttributedString(
                 string: " REC",
                 attributes: [
                     .foregroundColor: NSColor.systemRed,
-                    .font: NSFont.systemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .bold),
+                    .font: NSFont.systemFont(
+                        ofSize: NSFont.systemFontSize(for: .small),
+                        weight: .bold
+                    ),
                 ]
             )
             button.imagePosition = .imageLeading
+            button.toolTip = "WisprAlt — Meeting Recording"
+
         default:
+            let (symbolName, accessibilityLabel): (String, String) = {
+                switch mode {
+                case .idle:             return ("mic", "WisprAlt — Idle")
+                case .dictating:        return ("mic.fill", "WisprAlt — Dictating")
+                case .uploading:        return ("icloud.and.arrow.up", "WisprAlt — Uploading")
+                case .processing:       return ("waveform", "WisprAlt — Processing")
+                case .done:             return ("checkmark.circle", "WisprAlt — Done")
+                case .meetingRecording: return ("mic", "WisprAlt")  // unreachable
+                }
+            }()
+            let image = NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: accessibilityLabel
+            )
             image?.isTemplate = true
             button.image = image
             button.contentTintColor = nil
-            button.title = ""
             button.attributedTitle = NSAttributedString(string: "")
+            button.title = ""
             button.imagePosition = .imageOnly
+            button.toolTip = accessibilityLabel
         }
-        button.toolTip = accessibilityLabel
     }
 
     // MARK: - Popover toggle

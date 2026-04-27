@@ -21,21 +21,21 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     // MARK: - Init
 
     override init() {
-        // Pre-init self ref via deferred-start trick: instantiate the controller
-        // without auto-starting, set delegate, then start the updater.
-        let placeholderController = SPUStandardUpdaterController(
+        // We construct the controller but DO NOT start the updater. The Tier 1.5
+        // distribution path uses GitHub Releases via the /wispralt-update slash
+        // command (see scripts/release-client.sh + ~/.claude-dotfiles/commands/
+        // wispralt-update.md). Sparkle's appcast feed is a placeholder URL and
+        // SUPublicEDKey is unset — starting the updater would background-check
+        // a bogus URL and surface "Unable to Check For Updates" dialogs to the
+        // user every few hours. When we move to Tier 2 distribution (Apple
+        // Developer Program + notarized builds + signed appcast), flip
+        // startingUpdater back to true and populate the Info.plist keys.
+        updaterController = SPUStandardUpdaterController(
             startingUpdater: false,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
-        updaterController = placeholderController
         super.init()
-        // Re-init with self as delegate; Sparkle 2 requires delegate at construction time.
-        updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
-            updaterDelegate: self,
-            userDriverDelegate: nil
-        )
     }
 
     // MARK: - Public interface
@@ -84,13 +84,11 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     // MARK: - G9: Error surfacing
 
     /// Called when the update cycle aborts with an error (e.g. network failure,
-    /// appcast parse error, signature mismatch).
+    /// appcast parse error, signature mismatch).  Logged only — no user-facing
+    /// notification, since the only way this fires today is if someone manually
+    /// invokes Sparkle while the appcast is still a placeholder.
     func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
         Log.error("Sparkle update aborted: \(error.localizedDescription)", category: "update")
-        AppNotifications.notify(
-            title: "Auto-update Failed",
-            body: "Auto-update failed: \(error.localizedDescription)"
-        )
         menuBarController?.lastUpdateError = error.localizedDescription
     }
 
@@ -109,10 +107,6 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     ) {
         if let error {
             Log.error("Sparkle update cycle finished with error: \(error.localizedDescription)", category: "update")
-            AppNotifications.notify(
-                title: "Auto-update Failed",
-                body: "Auto-update failed: \(error.localizedDescription)"
-            )
         }
     }
 }

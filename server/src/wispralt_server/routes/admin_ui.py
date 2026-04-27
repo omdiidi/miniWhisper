@@ -43,7 +43,7 @@ from fastapi.templating import Jinja2Templates
 from jinja2 import select_autoescape
 
 from .. import auth as auth_mod
-from ..auth import require_admin
+from ..auth import require_admin, require_api_key
 from ..users import store as users_store
 from ..users.store import User
 
@@ -84,6 +84,13 @@ public_router = APIRouter(prefix="/admin")
 authed_router = APIRouter(
     prefix="/admin",
     dependencies=[Depends(require_admin), Depends(_require_db_pool)],
+)
+# Self-only router: any authenticated user (admin OR employee) can hit /admin/me
+# to see their own usage.  Gated by require_api_key (not require_admin) so
+# employees don't get 403'd out of their own page.
+me_router = APIRouter(
+    prefix="/admin",
+    dependencies=[Depends(_require_db_pool)],
 )
 
 
@@ -133,14 +140,19 @@ async def login_submit(request: Request, token: str = Form(...)) -> Any:
         if bg is not None and th == bg:
             user = User(id=-1, label="break-glass-admin", role="admin")
 
-    if user is None or user.role != "admin":
+    if user is None:
         return templates.TemplateResponse(
             "login.html.j2",
-            {"request": request, "error": "Invalid token or non-admin role"},
+            {"request": request, "error": "Invalid token"},
             status_code=401,
         )
 
-    resp = RedirectResponse("/admin/", status_code=303)
+    # Role-based landing: admins see the global dashboard; employees see only
+    # their own usage page (/admin/me).  Both share the same login form so the
+    # client just opens "<server>/admin/login" without knowing the role ahead
+    # of time.
+    target = "/admin/" if user.role == "admin" else "/admin/me"
+    resp = RedirectResponse(target, status_code=303)
     resp.set_cookie(
         "wispralt_admin_token",
         token,
@@ -298,8 +310,8 @@ SELECT
 """
 
 
-@authed_router.get("/users/{user_id}", response_class=HTMLResponse)
-async def user_detail(request: Request, user_id: int) -> HTMLResponse:
+async def _render_user_detail(request: Request, user_id: int) -> HTMLResponse:
+    """Shared body for the admin /admin/users/{id} and self-only /admin/me routes."""
     pool = request.app.state.db_pool
     user = await users_store.lookup_by_id(pool, user_id)
     if user is None:
@@ -320,6 +332,30 @@ async def user_detail(request: Request, user_id: int) -> HTMLResponse:
             "events": [dict(e) for e in events],
         },
     )
+
+
+@authed_router.get("/users/{user_id}", response_class=HTMLResponse)
+async def user_detail(request: Request, user_id: int) -> HTMLResponse:
+    return await _render_user_detail(request, user_id)
+
+
+@me_router.get("/me", response_class=HTMLResponse)
+async def me(request: Request, user: "User" = Depends(require_api_key)) -> Any:
+    """Self-only landing page.
+
+    Admins are redirected to the global dashboard so /admin/me is a safe
+    universal entry point regardless of role — that lets the macOS client
+    open ``<server>/admin/login`` without needing to know the role first.
+    Employees see their own user_detail page (24h/7d/30d tiles + last 50
+    events) with the admin nav links hidden by base.html.j2.
+    """
+    if user.role == "admin":
+        return RedirectResponse("/admin/", status_code=303)
+    if user.id < 0:
+        # Sentinel break-glass user without an admin role shouldn't reach
+        # here in normal operation, but guard the case to avoid a 500.
+        raise HTTPException(status_code=403, detail="Account not provisioned")
+    return await _render_user_detail(request, user.id)
 
 
 def _parse_dt(raw: str | None) -> datetime | None:
