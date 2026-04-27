@@ -1,7 +1,11 @@
 {% extends "base.html.j2" %}
 {% block title %}{{ user.label }} — Wispralt Admin{% endblock %}
 {% block content %}
-  <h2>{{ user.label }} <span class="warn" style="font-size: 14px;">({{ user.role }})</span></h2>
+  <h2>
+    {% if user.display_name %}{{ user.display_name }} <small class="muted">({{ user.label }})</small>
+    {% else %}{{ user.label }}{% endif %}
+    <span class="warn" style="font-size: 14px;">({{ user.role }})</span>
+  </h2>
   <p><a href="/admin/users">&larr; Back to users</a></p>
 
   <div class="tiles">

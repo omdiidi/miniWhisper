@@ -11,6 +11,10 @@ enum DictationAPI {
         // Decoding as Int would silently fail with a "data not in correct format"
         // error because Foundation's JSONDecoder rejects float→Int coercion.
         let duration_ms: Double
+        // Optional telemetry: server echoes whether smart-formatting was applied.
+        // Older server builds don't return this field — decoding it as Optional
+        // makes the new client tolerant of older servers.
+        let smart_formatted: Bool?
     }
 
     // MARK: - Public API
@@ -28,11 +32,23 @@ enum DictationAPI {
         let boundary = UUID().uuidString
         let body = buildMultipartBody(wavData: wavData, boundary: boundary)
 
+        // Read smart-formatting preference directly. `Settings` is a plain
+        // ObservableObject (not @MainActor-isolated today) and `Bool` reads are
+        // atomic on Apple Silicon under Swift 5 mode, so a direct read avoids an
+        // unnecessary actor hop on the dictation hot path.
+        // TODO(swift6): if/when Settings is migrated to @MainActor or Sendable,
+        // this read becomes a structured-concurrency hop.
+        var additionalHeaders: [String: String] = [:]
+        if Settings.shared.smartFormatting {
+            additionalHeaders["X-Smart-Format"] = "true"
+        }
+
         let request = try ServerClient.shared.buildRequest(
             path: "/transcribe/dictate",
             method: "POST",
             body: body,
-            contentType: "multipart/form-data; boundary=\(boundary)"
+            contentType: "multipart/form-data; boundary=\(boundary)",
+            additionalHeaders: additionalHeaders
         )
 
         let (data, _) = try await ServerClient.shared.execute(request, retryOnReset: true)

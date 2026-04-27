@@ -23,6 +23,9 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "WisprAlt",
+            resources: [
+                .process("Resources/Assets.xcassets")
+            ],
             swiftSettings: [
                 // Strict concurrency was originally enabled but the whole codebase
                 // wasn't audited for Sendable conformance — turning off until we

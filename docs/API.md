@@ -28,6 +28,8 @@ These are intentionally open so Kubernetes-style probes, Cloudflare health check
 
 **Bearer required:**
 - `POST /transcribe/dictate`, `POST /transcribe/meeting`, `GET /transcribe/meeting/{id}`, `GET /transcribe/meeting/{id}/download/{fmt}`, `DELETE /transcribe/meeting/{id}`
+- `POST /v1/audio/transcriptions` (OpenAI-compatible drop-in)
+- `GET /me`, `PATCH /me`
 - `GET /metrics`
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
 - `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
@@ -130,6 +132,12 @@ Transcribe a short audio clip using the warm Parakeet model.
 |---|---|---|---|
 | `file` | UploadFile | Yes | Must have `Content-Type: audio/*`. WAV preferred; any soundfile-supported format accepted. |
 
+**Optional headers:**
+
+| Header | Values | Default | Notes |
+|---|---|---|---|
+| `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized, the raw transcript is post-processed by OpenRouter Mercury 2 to fix punctuation/casing. Fail-soft: any timeout (250ms) or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. The native macOS client sets this header when the user toggles "Smart formatting" in Settings. The `/v1/audio/transcriptions` shim never sets it. |
+
 **Audio format flexibility (server-side resampling):**
 
 - Sample rate: any rate libsndfile / librosa accepts (8 kHz, 16 kHz, 44.1 kHz, 48 kHz, etc.). Server resamples to 16 kHz internally before Parakeet inference.
@@ -146,11 +154,17 @@ Transcribe a short audio clip using the warm Parakeet model.
 {
   "text": "Hello world.",
   "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
-  "duration_ms": 143.7
+  "duration_ms": 143.7,
+  "smart_formatted": false
 }
 ```
 
 `duration_ms` is wall-clock Parakeet inference time (excludes queue wait).
+`smart_formatted` is `true` only when `X-Smart-Format` was truthy AND the
+Mercury cleanup actually replaced the text (i.e. OpenRouter responded within
+the 250ms budget without erroring). It's `false` for every other case,
+including header absent, header non-truthy, server missing
+`OPENROUTER_API_KEY`, Mercury timeout, or Mercury HTTP error.
 
 **Errors:**
 
@@ -161,6 +175,119 @@ Transcribe a short audio clip using the warm Parakeet model.
 | 415 | `Content-Type` is not `audio/*` |
 | 422 | Audio bytes cannot be decoded (corrupt file). Includes `LibsndfileError` and `RuntimeError` raised by `soundfile.read` — the decode boundary in `parakeet.py:_sync_transcribe` converts both to `CorruptAudioError` and the route handler maps them to 422. Regression-locked by `server/tests/test_dictate_corrupt_audio.py`. |
 | 429 | Rate limit exceeded (60 req/min) — includes `Retry-After: 60` header |
+
+---
+
+### `POST /v1/audio/transcriptions`
+
+**Auth:** Bearer required.
+
+OpenAI-compatible drop-in transcription endpoint. **For setup and SDK usage examples, see [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md).** This section documents the wire-level constraints.
+
+**Request:** `multipart/form-data`. Field names follow the OpenAI Audio API spec.
+
+| Field | Required | Notes |
+|---|---|---|
+| `file` | Yes | Audio bytes; any libsndfile-decodable format. |
+| `model` | No | Accepted; ignored. Always routed to Parakeet TDT 0.6B v2. Unknown values are logged for admin visibility. |
+| `response_format` | No | `json` (default) or `text`. `srt`, `vtt`, and `verbose_json` return **422** — Parakeet doesn't emit per-segment timestamps on the dictate path; use `/transcribe/meeting` for those. |
+| `language`, `prompt`, `temperature` | No | Accepted; ignored. |
+
+**Constraints:**
+
+- **Size cap: 25 MB** (matches OpenAI's documented limit; `OPENAI_COMPAT_SIZE_CAP` in `constants.py`). Returns **413** with the OpenAI error envelope.
+- **Sync only** — blocks until Parakeet returns. Use `/transcribe/meeting` for long audio.
+- **Smart formatting is never applied here.** The shim deliberately ignores `X-Smart-Format`. Third-party callers that want cleanup hit `/transcribe/dictate` directly.
+- Per-IP rate limit: shares the 60 req/min window with `/transcribe/dictate`.
+
+**Response 200 (`response_format=json`):**
+```json
+{ "text": "Hello world." }
+```
+
+**Response 200 (`response_format=text`):** plain `text/plain` body, no JSON wrapper.
+
+**Errors** (OpenAI envelope shape, see [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md#auth-failure-shape)):
+
+| Code | `code`                       | Condition |
+|------|------------------------------|-----------|
+| 401  | `invalid_api_key`            | Missing/invalid/revoked bearer |
+| 413  | `file_too_large`             | Body exceeds 25 MB cap |
+| 422  | `unsupported_response_format`| `srt` / `vtt` / `verbose_json` requested |
+| 422  | `invalid_response_format`    | Value isn't a recognized format string |
+| 429  | (rate-limit envelope)        | 60 req/min window exceeded |
+| 500  | `transcription_failed`       | Parakeet raised an exception (unexpected) |
+
+Errors include `error.request_id` when the observability middleware has attached one — quote it in support requests.
+
+Source: `server/src/wispralt_server/routes/v1_transcriptions.py`.
+
+---
+
+### `GET /me`
+
+**Auth:** Bearer required (any role).
+
+Return the calling user's own profile. Each user can only read their own row — there is no path parameter.
+
+**Response 200:**
+```json
+{
+  "label": "alice@example.com",
+  "display_name": "Alice",
+  "role": "employee",
+  "created_at": "2026-04-15T19:32:14+00:00",
+  "last_seen_at": "2026-04-27T17:01:09+00:00"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `label` | string | Operator-visible identifier (typically email). Set at mint time; not user-editable. |
+| `display_name` | string \| null | Self-managed friendly name. `null` until the user fills in the first-launch sheet. |
+| `role` | string | `"admin"` or `"employee"`. |
+| `created_at` | ISO-8601 string | Token mint time. |
+| `last_seen_at` | ISO-8601 string \| null | `MAX(usage_events.ts)` for this user, or `null` if no usage yet. |
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing/invalid bearer |
+| 404 | User row genuinely missing (should not happen for an authed token; indicates DB drift) |
+| 503 | Postgres pool unavailable |
+
+---
+
+### `PATCH /me`
+
+**Auth:** Bearer required (any role).
+
+Update the calling user's own `display_name`. The `label` and `role` are not user-editable; admin must change those via the admin UI.
+
+**Request body** (`application/json`):
+
+```json
+{ "display_name": "Alice" }
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `display_name` | string \| null | 1–40 chars after trim; no control characters (newline, tab, NUL, etc.). Pass `null` to clear. Server-side validation mirrors the SQL CHECK constraint added by `2026-04-27-v2-display-name.sql`. |
+
+**Response 200:** same shape as `GET /me`, reflecting the new `display_name`.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing/invalid bearer |
+| 422 | `display_name` length out of range or contains control chars |
+| 503 | Postgres pool unavailable |
+
+The token cache is **not** invalidated on `display_name` change because the auth `User` object only carries `(id, label, role)` — `display_name` is fetched fresh from `wispralt.users` each time the client opens its Identity section.
+
+Source: `server/src/wispralt_server/routes/me.py`.
 
 ---
 

@@ -22,6 +22,10 @@
     <key>CFBundleExecutable</key>
     <string>WisprAlt</string>
 
+    <!-- App icon (asset catalog) -->
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+
     <!-- Minimum macOS version -->
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>

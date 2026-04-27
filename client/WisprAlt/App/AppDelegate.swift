@@ -82,6 +82,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sparkleController = SparkleController()
         sparkleController.menuBarController = menuBarController
 
+        // Best-effort first-launch check: if the user is already configured
+        // (server URL set + API key in Keychain), GET /me to mirror display_name
+        // locally and possibly present the "What should we call you?" dialog.
+        // Skipped silently for fresh installs to avoid a noisy 401.
+        //
+        // KeychainHelper.getAPIKey() is `throws -> String?` — `try?` produces String??
+        // where outer-nil = function threw, inner-nil = no key stored. We .flatMap
+        // to collapse to a single Optional so a missing key short-circuits cleanly.
+        Task { @MainActor in
+            guard Settings.shared.serverURL != nil,
+                  let _ = (try? KeychainHelper.getAPIKey()).flatMap({ $0 }) else { return }
+            do {
+                let me = try await MeAPI.get()
+                Settings.shared.displayName = me.display_name
+                FirstLaunchCoordinator.shared.maybePresentNameSheet(serverDisplayName: me.display_name)
+            } catch {
+                Log.debug("display_name check skipped: \(error)", category: "lifecycle")
+            }
+        }
+
         // Run the sequential 4-permission wizard asynchronously so the menubar item
         // appears before the first TCC dialog.
         Task { @MainActor in

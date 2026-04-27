@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 private extension Duration {
@@ -84,6 +85,16 @@ final class MenuBarController: NSObject {
 
     private let popover = NSPopover()
 
+    // MARK: - First-launch dialog
+
+    /// Standalone window hosting `DisplayNameSheet`. Reused across present cycles.
+    /// We present a separate NSWindow (not an NSPopover .sheet) because the
+    /// popover + .sheet combination is broken on macOS 15.
+    private var firstLaunchWindow: NSWindow?
+
+    /// Combine subscriptions; held for the controller's lifetime.
+    private var cancellables: Set<AnyCancellable> = []
+
     // MARK: - Init
 
     override init() {
@@ -94,6 +105,49 @@ final class MenuBarController: NSObject {
         configurePopover()
         updateIcon()
         configureMeetingCapObservers()
+        configureFirstLaunchObserver()
+    }
+
+    /// Subscribe to `FirstLaunchCoordinator.shared.$isPresentingNameSheet` so the
+    /// standalone NSWindow shows/hides in lockstep with the coordinator's state.
+    ///
+    /// `FirstLaunchCoordinator` is `@MainActor`-isolated, so we hop onto the main
+    /// actor to subscribe. Hop is one-shot at init; subsequent sink fires already
+    /// run on main since the publisher's source mutations are main-isolated.
+    private func configureFirstLaunchObserver() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            FirstLaunchCoordinator.shared.$isPresentingNameSheet
+                .removeDuplicates()
+                .sink { [weak self] isPresented in
+                    if isPresented {
+                        self?.presentFirstLaunchNameWindow()
+                    } else {
+                        self?.firstLaunchWindow?.close()
+                    }
+                }
+                .store(in: &self.cancellables)
+        }
+    }
+
+    /// Display the first-launch name sheet as a standalone window.
+    /// Avoids NSPopover + SwiftUI .sheet incompatibility on macOS 15.
+    private func presentFirstLaunchNameWindow() {
+        if firstLaunchWindow == nil {
+            let host = NSHostingController(
+                rootView: DisplayNameSheet()
+                    .environmentObject(FirstLaunchCoordinator.shared)
+            )
+            let win = NSWindow(contentViewController: host)
+            win.title = "Welcome to WisprAlt"
+            win.styleMask = [.titled, .closable]
+            win.isReleasedWhenClosed = false
+            win.center()
+            win.level = .floating  // keep above other windows
+            firstLaunchWindow = win
+        }
+        firstLaunchWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - C13: Recording cap observers

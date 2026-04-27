@@ -36,6 +36,15 @@ struct SettingsView: View {
     @State private var copyFeedback: String?
     @State private var hasStoredAPIKey: Bool = false
 
+    // Identity (display_name) editing state. Tri-state Optional<String> fixes the
+    // snap-back bug:
+    //   nil               → field shows the saved value from Settings (read-only display mode)
+    //   Some("text")      → user is actively editing
+    //   Some("")          → user explicitly cleared the field (will trigger PATCH null on commit)
+    @State private var nameDraft: String?
+    @State private var savingName: Bool = false
+    @State private var nameError: String?
+
     private enum ConnectionFeedbackKind {
         case neutral, success, warning, error
     }
@@ -45,8 +54,10 @@ struct SettingsView: View {
     var body: some View {
         Form {
             quickActionsSection
+            identitySection
             inputMicSection
             connectionSection
+            smartFormattingSection
             hotkeySection
             launchAtLoginSection
             meetingsFolderSection
@@ -263,6 +274,63 @@ struct SettingsView: View {
         }
     }
 
+    /// Identity section — lets the user set a friendly `display_name` that the
+    /// admin dashboard will show alongside their token label. Source of truth is
+    /// the server (`PATCH /me`); `Settings.shared.displayName` mirrors it locally.
+    private var identitySection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Your name")
+                    Spacer()
+                    TextField(
+                        Settings.shared.displayName ?? "Set your name",
+                        text: nameBinding
+                    )
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.plain)
+                    .disabled(savingName)
+                    .onSubmit {
+                        Task { await commitDisplayName() }
+                    }
+                    .frame(maxWidth: 220)
+                }
+                if let err = nameError {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+        } header: { Text("Identity") }
+    }
+
+    /// Two-way binding that surfaces the in-progress draft (`nameDraft`) when
+    /// editing, and the saved value otherwise. Any keystroke (including clearing
+    /// the field) flips into edit mode.
+    private var nameBinding: Binding<String> {
+        Binding(
+            get: {
+                nameDraft ?? (settings.displayName ?? "")
+            },
+            set: { nameDraft = $0 }
+        )
+    }
+
+    /// Smart-formatting toggle. Off by default. Sends `X-Smart-Format: true` on
+    /// `/transcribe/dictate` when on. Server silently ignores the flag if
+    /// `OPENROUTER_API_KEY` is not configured.
+    private var smartFormattingSection: some View {
+        Section {
+            Toggle("Smart formatting", isOn: Binding(
+                get: { settings.smartFormatting },
+                set: { settings.smartFormatting = $0 }
+            ))
+            Text("Cleans up dictation output (punctuation, casing, paragraph breaks) without changing words. Adds ~250ms latency. Off by default. Requires admin to set OPENROUTER_API_KEY on the server — silently does nothing otherwise.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } header: { Text("Quality") }
+    }
+
     /// Input mic picker — applies ONLY to WisprAlt's own dictation. Meeting
     /// recording uses the macOS system default (SCStream has no per-stream
     /// device API). The picker shows live AVCaptureDevice discovery results.
@@ -349,6 +417,36 @@ struct SettingsView: View {
         }
         settings.serverURL = url
         Log.info("Server URL saved: \(url.absoluteString)", category: "settings")
+    }
+
+    /// Commit the in-progress `nameDraft` to the server via `PATCH /me`.
+    ///
+    /// On error, `nameDraft` is preserved so the user can retry without retyping
+    /// (snap-back bug fix). Only on success is the draft cleared (returning the
+    /// field to display mode) and `nameError` reset.
+    private func commitDisplayName() async {
+        guard let draft = nameDraft, !savingName else { return }
+        savingName = true
+        defer { savingName = false }  // ONLY toggle saving flag; preserve nameDraft on error
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if trimmed.isEmpty {
+                _ = try await MeAPI.patchDisplayName(nil)
+                await MainActor.run { settings.displayName = nil }
+            } else if (1...40).contains(trimmed.count) {
+                let me = try await MeAPI.patchDisplayName(trimmed)
+                await MainActor.run { settings.displayName = me.display_name }
+            } else {
+                nameError = "Name must be 1-40 characters."
+                return  // KEEP draft so user can fix it
+            }
+            nameDraft = nil   // exit edit mode ONLY on success
+            nameError = nil
+        } catch {
+            Log.warning("display_name update failed: \(error)", category: "settings")
+            nameError = "Couldn't save: \(error.localizedDescription)"
+            // KEEP nameDraft so user can retry without retyping.
+        }
     }
 
     private func commitAPIKey() {

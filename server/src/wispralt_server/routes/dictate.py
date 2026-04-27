@@ -113,10 +113,24 @@ async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse
         len(text),
     )
 
+    # Smart formatting: client-only opt-in via X-Smart-Format header.
+    # /v1/audio/transcriptions never sets this header (raw output by contract).
+    # Permissive value parsing: accept "true", "1", "yes" (case-insensitive).
+    header_val = request.headers.get("X-Smart-Format", "").strip().lower()
+    smart_format_requested = header_val in {"true", "1", "yes"}
+    mercury_client = getattr(request.app.state, "mercury_client", None)
+    applied_smart_format = False
+    if smart_format_requested and mercury_client is not None:
+        cleaned = await mercury_client.clean_up(text)
+        if cleaned is not None:
+            text = cleaned
+            applied_smart_format = True
+
     return JSONResponse(
         content={
             "text": text,
             "model_id": MODEL_ID,
             "duration_ms": round(inference_ms, 2),
+            "smart_formatted": applied_smart_format,
         }
     )

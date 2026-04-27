@@ -102,10 +102,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         ip: str = _extract_client_ip(request, trust_forwarded=self.trust_forwarded_headers)
         now = time.time()
 
-        if path.startswith("/transcribe/dictate"):
+        if path.startswith("/transcribe/dictate") or path.startswith("/v1/audio/transcriptions"):
             self._prune(self._dictate[ip], now - self.dictate_window)
             if len(self._dictate[ip]) >= self.dictate_max:
-                return self._429(int(self.dictate_window))
+                return self._429(int(self.dictate_window), is_v1=path.startswith("/v1/"))
             self._dictate[ip].append(now)
 
         elif path.startswith("/transcribe/meeting") and request.method == "POST":
@@ -131,10 +131,25 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         while d and d[0] < threshold:
             d.popleft()
 
-    @staticmethod
-    def _429(retry_after: int) -> JSONResponse:
+    def _429(self, retry_after: int, is_v1: bool = False) -> JSONResponse:
+        headers = {"Retry-After": str(retry_after)}
+        if is_v1:
+            return JSONResponse(
+                status_code=429,
+                headers=headers,
+                content={
+                    "error": {
+                        "message": "Rate limit exceeded. Try again in a moment.",
+                        "type": "rate_limit_error",
+                        "param": None,
+                        "code": "rate_limit_exceeded",
+                    }
+                },
+            )
+        # PRESERVE existing native shape — do NOT change to {"detail": ...}.
+        # Existing /transcribe/dictate and /transcribe/meeting consumers depend on this.
         return JSONResponse(
-            {"error": "rate limit exceeded"},
             status_code=429,
-            headers={"Retry-After": str(retry_after)},
+            headers=headers,
+            content={"error": "rate limit exceeded"},
         )

@@ -47,11 +47,15 @@ from wispralt_server.jobs.store import JobStore
 from wispralt_server.meeting import install_compat_shims
 from wispralt_server.meeting.output import sweep_stale_tmp
 from wispralt_server.meeting.pipeline import bootstrap_models
+from wispralt_server.middleware import openai_errors
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
 from wispralt_server.ops import staging
 from wispralt_server.ops.env_writer import find_env_path
 from wispralt_server.routes import admin, admin_ui, dictate, health
+from wispralt_server.routes import me as me_routes
 from wispralt_server.routes import meeting as meeting_routes
+from wispralt_server.routes import v1_transcriptions
+from wispralt_server.smart_format.mercury_client import MercuryClient
 from wispralt_server.usage import writer as usage_writer
 from wispralt_server.usage.events import UsageEvent
 from wispralt_server.users import store as users_store
@@ -163,6 +167,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("WisprAlt server — dictation ready.")
 
+    # 6b. Mercury client — fail-soft. If init throws, smart formatting is silently
+    #     disabled. Same fail-soft contract as runtime: any error → None return.
+    app.state.mercury_client = None
+    if settings.openrouter_api_key:
+        try:
+            app.state.mercury_client = MercuryClient(
+                api_key=settings.openrouter_api_key,
+                model=settings.openrouter_model,
+                base_url=settings.openrouter_base_url,
+                timeout_ms=settings.openrouter_timeout_ms,
+                app_title=settings.openrouter_app_title,
+            )
+            logger.info(
+                "mercury_client initialized model=%s timeout_ms=%d",
+                settings.openrouter_model,
+                settings.openrouter_timeout_ms,
+            )
+        except Exception:
+            logger.exception(
+                "mercury_client init failed — smart formatting will be disabled"
+            )
+            app.state.mercury_client = None
+    else:
+        logger.info("mercury_client not configured (OPENROUTER_API_KEY unset)")
+
     # 7. Bootstrap meeting models in a thread (P4#3; ~7 GB load, CPU-heavy).
     #    Install compat shims FIRST so torch.load & huggingface_hub kwarg
     #    translation are in place before whisperx/pyannote start loading.
@@ -269,6 +298,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         drainer.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await drainer
+
+    mercury_client: MercuryClient | None = getattr(app.state, "mercury_client", None)
+    if mercury_client is not None:
+        try:
+            await mercury_client.aclose()
+        except Exception as exc:
+            logger.warning("mercury_client.aclose failed: %s", exc)
+
     await db.close_pool()
 
     logger.info("WisprAlt server clean shutdown.")
@@ -281,8 +318,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 # client may hammer every few seconds.  /transcribe/meeting POST creates a
 # job; /transcribe/meeting/{id} GET is the poll path — exclude it by also
 # filtering on request.method.
-TRACKED_ROUTES = frozenset(["transcribe/dictate", "transcribe/meeting"])
+TRACKED_ROUTES = frozenset(["transcribe/dictate", "transcribe/meeting", "v1/audio"])
 TRACKED_METHODS = frozenset({"POST"})
+
+# Map a tracked route key to the canonical ``kind`` recorded on usage_events.
+# Keeps "v1/audio" from emitting an unhelpful "audio" kind via the default split.
+_KIND_MAP = {
+    "transcribe/dictate": "dictate",
+    "transcribe/meeting": "meeting",
+    "v1/audio": "v1_dictate",
+}
 
 
 class _ObservabilityMiddleware(BaseHTTPMiddleware):
@@ -330,7 +375,7 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
                 UsageEvent(
                     user_id=user.id,
                     ts=time.time(),
-                    kind=route_key.split("/")[-1],
+                    kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
                     status=response.status_code,
                     duration_ms=latency_ms,
                     bytes_in=bytes_in,
@@ -410,6 +455,14 @@ def create_app() -> FastAPI:
     app.include_router(admin_ui.authed_router)
     # /transcribe/meeting — Phase 2 meeting endpoints.
     app.include_router(meeting_routes.router)
+    # /me — JSON identity self-management (any authenticated role).
+    app.include_router(me_routes.router)
+    # /v1/audio/transcriptions — OpenAI-compat shim.
+    app.include_router(v1_transcriptions.router)
+
+    # Re-shape errors on /v1/* paths to OpenAI envelope. Native routes keep their
+    # default {"detail": ...} shape. Must run AFTER include_router calls.
+    openai_errors.install(app)
 
     return app
 

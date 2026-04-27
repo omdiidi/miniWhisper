@@ -110,6 +110,24 @@ if [[ ! -f "$ENV_FILE" ]]; then
     fi
 fi
 
+# Backfill OpenRouter keys to existing .env files so re-runs of setup-server.sh on
+# upgraded checkouts pick up the new optional smart-formatting envs without losing
+# the current values. Each block is idempotent — only appends if the key is absent.
+if ! grep -q "^OPENROUTER_API_KEY=" "$ENV_FILE" 2>/dev/null; then
+    printf '\n# Optional: enable smart formatting via OpenRouter Mercury 2.\n' >> "$ENV_FILE"
+    printf '# Get a key at https://openrouter.ai/keys. Costs ~$0.0001 per dictation cleanup.\n' >> "$ENV_FILE"
+    printf '# Leave unset to disable smart formatting (clients toggling it on get raw text).\n' >> "$ENV_FILE"
+    printf 'OPENROUTER_API_KEY=\n' >> "$ENV_FILE"
+fi
+if ! grep -q "^OPENROUTER_MODEL=" "$ENV_FILE" 2>/dev/null; then
+    printf 'OPENROUTER_MODEL=inception/mercury-2\n' >> "$ENV_FILE"
+fi
+if ! grep -q "^OPENROUTER_TIMEOUT_MS=" "$ENV_FILE" 2>/dev/null; then
+    printf '# 1500 ms covers cross-region OpenRouter calls + TLS handshake.\n' >> "$ENV_FILE"
+    printf 'OPENROUTER_TIMEOUT_MS=1500\n' >> "$ENV_FILE"
+fi
+chmod 600 "$ENV_FILE"
+
 # Prompt for HF_TOKEN if not set
 HF_TOKEN_CURRENT="$(grep "^HF_TOKEN=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
 if [[ -z "$HF_TOKEN_CURRENT" ]]; then

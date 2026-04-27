@@ -39,6 +39,20 @@ class UserRow:
     created_at: datetime
     revoked_at: datetime | None
     last_seen_at: datetime | None  # derived from MAX(usage_events.ts)
+    display_name: str | None  # NEW — additive, defaults to None for any rows fetched
+                              # before the migration ran (none in practice; harmless)
+
+
+@dataclass(frozen=True, slots=True)
+class UserProfile:
+    """Read-only snapshot of a user for /me responses. Includes derived last_seen_at."""
+
+    id: int
+    label: str
+    display_name: str | None
+    role: str
+    created_at: datetime
+    last_seen_at: datetime | None  # derived from MAX(usage_events.ts), same as list_all
 
 
 def hash_token(plaintext: str) -> str:
@@ -143,7 +157,7 @@ async def list_all(pool: asyncpg.Pool) -> list[UserRow]:
     """
     rows = await pool.fetch(
         """
-        SELECT u.id, u.label, u.role, u.created_at, u.revoked_at,
+        SELECT u.id, u.label, u.role, u.created_at, u.revoked_at, u.display_name,
                (SELECT MAX(ts) FROM wispralt.usage_events e
                 WHERE e.user_id = u.id) AS last_seen_at
           FROM wispralt.users u
@@ -158,6 +172,52 @@ async def list_all(pool: asyncpg.Pool) -> list[UserRow]:
             created_at=r["created_at"],
             revoked_at=r["revoked_at"],
             last_seen_at=r["last_seen_at"],
+            display_name=r["display_name"],
         )
         for r in rows
     ]
+
+
+async def fetch_profile_by_id(pool: asyncpg.Pool, user_id: int) -> UserProfile | None:
+    """Fetch profile for any user (including revoked). Used by both /me and admin user-detail.
+
+    Does NOT filter revoked_at — admin must be able to view revoked users (their old
+    usage history, the date they were revoked, etc.). For /me, auth has already
+    verified the caller is non-revoked, so the row will be active by construction at
+    that path.
+    """
+    row = await pool.fetchrow(
+        """
+        SELECT u.id, u.label, u.display_name, u.role, u.created_at,
+               (SELECT MAX(e.ts) FROM wispralt.usage_events e
+                WHERE e.user_id = u.id) AS last_seen_at
+          FROM wispralt.users u
+         WHERE u.id = $1
+        """,
+        user_id,
+    )
+    if row is None:
+        return None
+    return UserProfile(
+        id=row["id"],
+        label=row["label"],
+        display_name=row["display_name"],
+        role=row["role"],
+        created_at=row["created_at"],
+        last_seen_at=row["last_seen_at"],
+    )
+
+
+async def update_display_name(
+    pool: asyncpg.Pool, user_id: int, display_name: str | None
+) -> None:
+    """Update display_name for user_id. Caller validates length 1-40, no control chars, or None.
+
+    Pass NULL to clear. Skips revoked users (UPDATE WHERE revoked_at IS NULL).
+    """
+    await pool.execute(
+        "UPDATE wispralt.users SET display_name = $1 "
+        "WHERE id = $2 AND revoked_at IS NULL",
+        display_name,
+        user_id,
+    )

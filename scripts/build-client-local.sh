@@ -70,6 +70,42 @@ ditto --norsrc --noextattr "$EXEC_PATH" "$APP_PATH/Contents/MacOS/WisprAlt"
 ditto --norsrc --noextattr "$CLIENT_DIR/WisprAlt/Info.plist" "$APP_PATH/Contents/Info.plist"
 ditto --norsrc --noextattr "$SPARKLE_PATH" "$APP_PATH/Contents/Frameworks/Sparkle.framework"
 
+# Compile the asset catalog with actool. SPM does NOT auto-run actool on .xcassets
+# resources — it just copies the directory raw. We compile manually so the bundle
+# ships a proper Assets.car.
+ASSETS_SRC="$CLIENT_DIR/WisprAlt/Resources/Assets.xcassets"
+if [[ ! -d "$ASSETS_SRC" ]]; then
+    echo "ERROR: $ASSETS_SRC missing. Run scripts/build-icon.sh first to generate the source." >&2
+    exit 1
+fi
+ACTOOL_TMP="$(mktemp -d)"
+trap "rm -rf '$ACTOOL_TMP'" EXIT
+xcrun actool \
+    --compile "$ACTOOL_TMP" \
+    --platform macosx \
+    --minimum-deployment-target 14.0 \
+    --app-icon AppIcon \
+    --output-partial-info-plist "$ACTOOL_TMP/AppIcon-info.plist" \
+    "$ASSETS_SRC" >/dev/null 2>&1 || {
+    echo "ERROR: actool failed to compile $ASSETS_SRC into Assets.car." >&2
+    xcrun actool \
+        --compile "$ACTOOL_TMP" \
+        --platform macosx \
+        --minimum-deployment-target 14.0 \
+        --app-icon AppIcon \
+        --output-partial-info-plist "$ACTOOL_TMP/AppIcon-info.plist" \
+        "$ASSETS_SRC" >&2 || true
+    exit 1
+}
+if [[ ! -f "$ACTOOL_TMP/Assets.car" ]]; then
+    echo "ERROR: actool ran but did not produce Assets.car." >&2
+    ls -la "$ACTOOL_TMP" >&2
+    exit 1
+fi
+mkdir -p "$APP_PATH/Contents/Resources"
+cp "$ACTOOL_TMP/Assets.car" "$APP_PATH/Contents/Resources/Assets.car"
+echo "  Compiled + copied Assets.car"
+
 xattr -cr "$APP_PATH"
 
 # Add the @executable_path/../Frameworks rpath so the bundled Sparkle.framework

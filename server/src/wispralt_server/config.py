@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     # to avoid IP spoofing in rate limiting.
     trust_forwarded_headers: bool = True
 
+    # OpenRouter Mercury 2 — server-side smart-formatting post-processor.
+    # Optional: when openrouter_api_key is None, smart formatting is silently disabled
+    # (clients toggling the X-Smart-Format header on get raw text back).
+    openrouter_api_key: str | None = None
+    openrouter_model: str = "inception/mercury-2"
+    # 1500 ms (NOT 250 ms): cross-region OpenRouter calls + TLS handshake on cold
+    # connections regularly exceed 250 ms. 1500 ms is the practical upper bound to
+    # avoid silent fall-through to raw on cold connections.
+    openrouter_timeout_ms: int = 1500
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_app_title: str = "WisprAlt"
+
 
 # Module-level singleton — import as ``from wispralt_server.config import settings``
 settings = Settings()

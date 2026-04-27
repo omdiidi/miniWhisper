@@ -144,6 +144,7 @@ All configuration is read from `server/.env` (mode 0600). The template is `serve
 | `JOB_DB_PATH` | Yes | — | Path to SQLite job database file |
 | `STAGING_DIR` | Yes | — | Temporary directory for in-flight WAV uploads |
 | `SUPABASE_DATABASE_URL` | No | — | Postgres URL for the `wispralt` schema (multi-token auth + usage events). When unset, server falls back to env-var break-glass admin only. See [DEPLOY-TEAM.md](DEPLOY-TEAM.md) for the connection-string format and the schema-bootstrap migration. |
+| `OPENROUTER_API_KEY` | No | — | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` are post-processed by OpenRouter Mercury 2 (~$0.0001 per cleanup, ~250ms added wall-clock, fail-soft on timeout/error). When unset, the header is silently a no-op and the toggle in the macOS client appears to do nothing. Get a key at https://openrouter.ai/keys. |
 | `SILENCE_THRESHOLD` | No | `0.002` | Per-frame RMS threshold for in-person mode detection |
 | `MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum upload size in bytes (default 2 GiB) |
 
@@ -160,6 +161,40 @@ Never commit `server/.env`. The `.gitignore` excludes it. The file must remain m
 ### Migration
 
 On second startup, `jobs.db` is migrated to add the `attempts` column automatically (SQLite `ALTER TABLE`; idempotent — safe to restart multiple times).
+
+#### Postgres schema migrations
+
+The `wispralt` schema in Supabase is versioned via `wispralt.schema_version`. Apply each migration once on initial setup, and run new migrations whenever you upgrade the server. Migrations live in `server/migrations/`:
+
+| Version | File | Adds |
+|---|---|---|
+| v1 | `2026-04-27-v1-wispralt-schema.sql` | `wispralt.users` + `wispralt.usage_events` + `wispralt.schema_version` |
+| v2 | `2026-04-27-v2-display-name.sql` | `display_name TEXT NULL` column on `wispralt.users` (CHECK 1–40 chars, no control chars) |
+
+Apply v2 by either pasting it into Supabase Studio → SQL Editor → Run, or via the Supabase MCP:
+
+```text
+mcp__supabase__apply_migration   # paste contents of 2026-04-27-v2-display-name.sql
+```
+
+Verify both versions are recorded:
+
+```sql
+SELECT version, applied_at, notes FROM wispralt.schema_version ORDER BY version;
+-- Expect rows for version 1 and 2.
+```
+
+The migration is idempotent (`ADD COLUMN IF NOT EXISTS` + `ON CONFLICT DO NOTHING` on the version row), so re-running is safe.
+
+### Optional: enable smart formatting
+
+Smart formatting (server-side punctuation/casing cleanup via OpenRouter Mercury 2) is opt-in. To turn it on:
+
+1. Get an OpenRouter key at https://openrouter.ai/keys. Pricing is roughly $0.0001 per cleanup; for a single employee dictating heavily, expect under $1/month.
+2. Add `OPENROUTER_API_KEY=<key>` to `server/.env` (mode 0600 — never commit).
+3. Restart the server (`bash scripts/server-launchd.sh stop && bash scripts/server-launchd.sh start`).
+
+When the key is present, employees with the **Smart formatting** toggle ON in the macOS client get cleaned text. When the key is absent, the toggle silently does nothing — there is no client-visible error.
 
 ---
 

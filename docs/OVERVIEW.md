@@ -8,6 +8,8 @@ This file is the single source of truth for which documentation file covers each
 |---|---|
 | `README.md` | Top-level project pitch, architecture diagram, quickstart links |
 | `CLAUDE.md` | Claude Code project rules, slash command index, key conventions |
+| `CHANGELOG.md` | (it IS a doc — root index) — release-by-release list of notable changes |
+| `docs/INTEGRATION-GUIDE.md` | (it IS a doc — root index) — third-party drop-in integration guide for the OpenAI-compatible `/v1` endpoint |
 | `.gitignore` | — (no separate doc) |
 | `.editorconfig` | — (no separate doc) |
 | `LICENSE` | — (no separate doc) |
@@ -34,8 +36,10 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/usage/writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — drain loop, batch INSERT, FK-violation retry |
 | `server/src/wispralt_server/admin/__init__.py` | [ADMIN.md](ADMIN.md) — admin package marker (templates only) |
 | `server/src/wispralt_server/admin/templates/*.html.j2` | [ADMIN.md](ADMIN.md) — Jinja2 templates: base / login / overview / users / user_detail / usage / token_minted |
-| `server/src/wispralt_server/routes/dictate.py` | [API.md](API.md) — `/transcribe/dictate` endpoint |
+| `server/src/wispralt_server/routes/dictate.py` | [API.md](API.md) — `/transcribe/dictate` endpoint (incl. `X-Smart-Format` header gating) |
 | `server/src/wispralt_server/routes/health.py` | [API.md](API.md) — `/healthz`, `/readyz/dictation`, `/readyz/meeting` |
+| `server/src/wispralt_server/routes/v1_transcriptions.py` | [API.md](API.md), [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md) — OpenAI-compatible `/v1/audio/transcriptions` |
+| `server/src/wispralt_server/routes/me.py` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — JSON `GET /me` + `PATCH /me` for self-service display name |
 | `server/src/wispralt_server/routes/admin.py` | [API.md](API.md) — `/admin/rotate-key` (legacy single-key shim, retained for break-glass rotation when Postgres is down) |
 | `server/src/wispralt_server/routes/admin_ui.py` | [ADMIN.md](ADMIN.md), [API.md](API.md) — Jinja2 admin UI under `/admin/*` (two-router pattern) |
 | `server/src/wispralt_server/routes/meeting.py` | [API.md](API.md) — meeting POST/GET/download/DELETE endpoints |
@@ -52,9 +56,13 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/ops/staging.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — staging area management |
 | `server/src/wispralt_server/ops/env_writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — atomic .env rewrite, verify_env_perms, key rotation |
 | `server/src/wispralt_server/middleware/rate_limit.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [API.md](API.md) — per-IP rate limiting middleware |
+| `server/src/wispralt_server/middleware/openai_errors.py` | [API.md](API.md), [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md) — translates HTTPExceptions on `/v1/*` into the OpenAI error envelope |
+| `server/src/wispralt_server/smart_format/mercury_client.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — OpenRouter Mercury 2 cleanup client (header-gated, fail-soft 250ms timeout) |
+| `server/src/wispralt_server/constants.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — shared constants (`MAX_DISPLAY_NAME_LEN`, `OPENAI_COMPAT_SIZE_CAP`) |
 | `server/src/wispralt_server/observability.py` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — thread-safe counters, time-windowed latency histogram, `usage_queue` singleton, `process_started_at_monotonic` for uptime |
 | `server/src/wispralt_server/_errors.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — typed domain exceptions |
 | `server/migrations/2026-04-27-v1-wispralt-schema.sql` | [DEPLOY-TEAM.md](DEPLOY-TEAM.md) — v1 Postgres schema (wispralt.users + wispralt.usage_events + wispralt.schema_version) |
+| `server/migrations/2026-04-27-v2-display-name.sql` | [ARCHITECTURE.md](ARCHITECTURE.md), [ADMIN.md](ADMIN.md) — v2 migration: add `display_name` column to `wispralt.users` |
 
 ## Tests (`server/tests/`)
 
@@ -93,6 +101,7 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Server/ServerClient.swift` | [API.md](API.md) — URLSession, multipart upload, progress |
 | `client/WisprAlt/Server/DictationAPI.swift` | [API.md](API.md) — dictation client |
 | `client/WisprAlt/Server/MeetingAPI.swift` | [API.md](API.md) — meeting submit/poll/download/delete |
+| `client/WisprAlt/Server/MeAPI.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — JSON `GET /me` + `PATCH /me` client wrapper for the Identity section |
 | `client/WisprAlt/Server/ServerError.swift` | [API.md](API.md) — typed errors |
 | `client/WisprAlt/Inject/TextInjector.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — injection strategy |
 | `client/WisprAlt/Inject/AccessibilityInjector.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — AX injection with read-back |
@@ -102,8 +111,11 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Storage/TranscriptStore.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — local file index, atomic rewrites |
 | `client/WisprAlt/Storage/TranscriptDocument.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — JSON model, speaker rename |
 | `client/WisprAlt/Update/SparkleController.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — auto-update via Sparkle 2 |
-| `client/WisprAlt/UI/SettingsView.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — settings UI |
+| `client/WisprAlt/UI/SettingsView.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — settings UI (Smart formatting toggle, Identity section) |
+| `client/WisprAlt/UI/DisplayNameSheet.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — first-launch display-name entry sheet |
+| `client/WisprAlt/UI/FirstLaunchCoordinator.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — coordinates the first-launch display-name sheet (`/me` GET → present sheet if `display_name == null`) |
 | `client/WisprAlt/UI/PermissionsView.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — permissions UI |
+| `client/WisprAlt/Resources/Assets.xcassets/AppIcon.appiconset/` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — generated icon set (10 PNGs + `Contents.json`); produced by `scripts/build-icon.sh` |
 | `client/WisprAlt/UI/TranscriptListView.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — transcript list |
 | `client/WisprAlt/UI/TranscriptDetailView.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — rename UI, offline |
 | `client/WisprAlt/UI/RecordingIndicatorView.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — uploading/processing/done states |
@@ -126,6 +138,8 @@ This file is the single source of truth for which documentation file covers each
 | `scripts/setup-local-codesign.sh` | [CONTRIBUTING.md](CONTRIBUTING.md) — Legacy self-signed cert script; no longer wired into the build flow; retained for `--ad-hoc` developer fallback only; see CONTRIBUTING.md |
 | `scripts/uninstall-client.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — full client removal including Keychain, UserDefaults, app bundle |
 | `scripts/release-client.sh` | [DEPLOY-TEAM.md](DEPLOY-TEAM.md) — local-only release script: bump version, build signed `.app`, package DMG, compute SHA256, tag + push + `gh release create` |
+| `scripts/build-icon.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — regenerate `AppIcon.appiconset` PNGs from the master SVG/PNG source |
+| `scripts/measure-dictation-latency.sh` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — placeholder; future helper that times `/transcribe/dictate` round-trips against a fixture WAV (not yet committed) |
 
 ## CI / GitHub (`github/`)
 

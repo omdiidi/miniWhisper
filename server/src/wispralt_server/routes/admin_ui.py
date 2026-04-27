@@ -313,7 +313,7 @@ SELECT
 async def _render_user_detail(request: Request, user_id: int) -> HTMLResponse:
     """Shared body for the admin /admin/users/{id} and self-only /admin/me routes."""
     pool = request.app.state.db_pool
-    user = await users_store.lookup_by_id(pool, user_id)
+    user = await users_store.fetch_profile_by_id(pool, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     totals_row = await pool.fetchrow(_USER_DETAIL_SQL, user_id)

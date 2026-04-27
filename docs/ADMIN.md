@@ -94,7 +94,15 @@ Single-CTE dashboard (`_OVERVIEW_SQL` in `routes/admin_ui.py`). Tiles:
 
 ### `GET /admin/users` — Users
 
-Lists every row in `wispralt.users` (most-recently-created first).
+Lists every row in `wispralt.users` (most-recently-created first). The
+displayed identifier is `display_name (label)` when both are populated
+(e.g. `Alice (alice@example.com)`), or just `label` when
+`display_name IS NULL`. Employees self-manage their own `display_name`
+via the macOS client's Settings → Identity section, which calls
+`PATCH /me` (see [API.md](API.md)). Admins cannot edit another
+employee's `display_name` from the admin UI today — it's deliberately
+self-service so the operator never has to ask "what name should I show?".
+
 Per-row controls:
 
 - **Mint** — `POST /admin/users/{id}/mint` rotates the user's token in
@@ -201,6 +209,46 @@ and continues with `app.state.db_pool = None`. In that mode:
 as the last-resort tool for rotating the env-var token while Postgres is
 down — once the multi-token system is fully migrated, all rotation
 should happen via the admin UI's mint flow.
+
+---
+
+## Server env vars (admin-relevant)
+
+These are read from `server/.env` (mode 0600). For the full
+configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
+
+| Variable | Required | Notes |
+|---|---|---|
+| `WISPRALT_API_KEY` | Yes | First-boot break-glass admin token; seeds the initial admin row in `wispralt.users` if the table is empty. |
+| `SUPABASE_DATABASE_URL` | Yes (multi-tenant) | Postgres connection string for the `wispralt` schema. Without it, multi-token auth and usage events both fall back to break-glass mode. |
+| `HF_TOKEN` | Yes | Pyannote gated-model access. |
+| `OPENROUTER_API_KEY` | No | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` are post-processed by Mercury 2 (~$0.0001/cleanup, ~250ms latency). When unset, the toggle is silently a no-op — the server returns raw text and `smart_formatted: false` regardless of the header. Get a key at https://openrouter.ai/keys. |
+
+---
+
+## Usage events from `/v1/audio/transcriptions`
+
+Third-party API traffic via the OpenAI-compat shim is recorded with
+`kind = "v1_dictate"` (native client traffic uses `kind = "dictate"`).
+Both `kind` values land in the same `wispralt.usage_events` table and
+are folded into the **Dictations 24h / 7d / 30d** tiles on
+`/admin/` and `/admin/users/{id}` because the underlying SQL aggregates
+by user, not by kind. Per-user event lists on `/admin/users/{id}` show
+`v1_dictate` rows alongside `dictate` and `meeting` rows so you can see
+which path generated each request.
+
+To split out third-party traffic, query the table directly:
+
+```sql
+SELECT count(*) FROM wispralt.usage_events
+ WHERE user_id = $1
+   AND kind = 'v1_dictate'
+   AND ts > now() - interval '7 days';
+```
+
+This is by design — the same employee can dictate via the macOS client
+AND ship a Python script that hits `/v1/audio/transcriptions`, and both
+should count toward "their usage" for billing/quota conversations.
 
 ---
 

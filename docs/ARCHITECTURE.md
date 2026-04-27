@@ -29,7 +29,12 @@ WisprAlt is a two-component system: a native macOS menubar client running on you
 ┌────────────────────  Server (Mac mini M4 16GB) ──────────────────────────────┐
 │ uvicorn 1 worker → FastAPI (lifespan: load models, run staging+orphan sweep) │
 │   /healthz  /readyz/dictation  /readyz/meeting  /admin/rotate-key            │
+│   /me  (GET, PATCH)   ──▶ JSON self-service identity (label, display_name)   │
+│   /v1/audio/transcriptions ──▶ OpenAI-compat shim → ParakeetService          │
+│       (sync, dictate-only, 25 MB cap, never invokes Mercury)                  │
 │   /transcribe/dictate ──▶ ParakeetService (warm, single-thread executor)     │
+│       └─ optional X-Smart-Format: true ──▶ Mercury 2 (OpenRouter, 250ms,     │
+│             fail-soft → raw text on timeout/error)                           │
 │   /transcribe/meeting ──▶ enqueue → JobStore (SQLite)                        │
 │                          ↓                                                    │
 │                    asyncio.to_thread(run_pipeline)                            │
@@ -233,6 +238,20 @@ Key invariants:
 - **The break-glass branch only fires when Postgres is unreachable** OR when the row genuinely is missing. On first boot the lifespan seeds a real `wispralt.users` row whose `token_hash` matches the env-var hash, so 99% of break-glass calls take the normal Postgres path and produce attributable usage events. The `id=-1` sentinel is reserved for the case where the pool is `None` (Postgres degraded).
 - **Cookie fallback:** `_extract_bearer` falls back to the `wispralt_admin_token` cookie when no `Authorization` header is present. Set by `POST /admin/login` for browser navigation; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. CSRF is mitigated by `SameSite=Strict`.
 
+#### `wispralt.users` columns
+
+| Column         | Type        | Notes                                                                                |
+|----------------|-------------|--------------------------------------------------------------------------------------|
+| `id`           | bigserial   | Primary key                                                                          |
+| `label`        | text        | Operator-visible identifier (typically the employee email or canonical handle)        |
+| `display_name` | text NULL   | Self-managed friendly name, edited by the user via `PATCH /me`. 1–40 chars, no control chars (CHECK constraint mirrors `MAX_DISPLAY_NAME_LEN` in `constants.py`). NULL until the user fills in the first-launch sheet. Added by migration `2026-04-27-v2-display-name.sql`. |
+| `role`         | text        | `'admin'` or `'employee'` (CHECK)                                                    |
+| `token_hash`   | text        | sha256(plaintext token), partial-indexed `WHERE revoked_at IS NULL`                   |
+| `created_at`   | timestamptz | Set at mint time                                                                     |
+| `revoked_at`   | timestamptz | NULL while active; set on revoke                                                     |
+
+The admin UI's user list renders `display_name (label)` when both are populated, falling back to `label` alone when `display_name IS NULL`. See [ADMIN.md](ADMIN.md).
+
 ### Usage event tracking
 
 ```
@@ -280,9 +299,15 @@ Why fire-and-forget:
 - Cancelled-on-shutdown: lifespan cancels the drainer task and awaits it;
   `CancelledError` triggers a final batch flush before the task exits.
 
-Tracked routes: `transcribe/dictate` and `transcribe/meeting`, **POST
-only** — status-poll GETs are excluded so a client polling every 5s
-doesn't multiply the event volume by 60.
+Tracked routes: `transcribe/dictate`, `transcribe/meeting`, and
+`v1/audio/transcriptions`, **POST only** — status-poll GETs are
+excluded so a client polling every 5s doesn't multiply the event volume
+by 60. The OpenAI-compat shim records its events with
+`kind = "v1_dictate"` so admins can split native-client traffic from
+third-party API traffic without parsing the `route` column. The current
+admin overview tiles (Dictations 24h/7d/30d) sum across all `kind`
+values; query `usage_events` directly with `WHERE kind = 'v1_dictate'`
+to isolate API traffic.
 
 ### Admin UI
 

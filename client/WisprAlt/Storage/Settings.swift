@@ -27,6 +27,8 @@ final class Settings: ObservableObject {
         static let tripleTapWindow = "tripleTapWindow"
         static let maxMeetingMinutes = "maxMeetingMinutes"
         static let preferredInputDeviceUID = "preferredInputDeviceUID"
+        static let smartFormatting = "smartFormatting"
+        static let displayName = "displayName"  // mirror of server-side display_name; source of truth is server
     }
 
     // MARK: - Published properties
@@ -109,6 +111,29 @@ final class Settings: ObservableObject {
         }
     }
 
+    /// Whether dictation requests should ask the server to apply smart formatting
+    /// (punctuation, casing, paragraph breaks) via the `X-Smart-Format` header.
+    /// Off by default. Adds ~250ms latency. Server silently ignores the flag if
+    /// `OPENROUTER_API_KEY` is not configured.
+    @Published var smartFormatting: Bool {
+        didSet {
+            defaults.set(smartFormatting, forKey: Key.smartFormatting)
+        }
+    }
+
+    /// Mirror of the server-side `display_name` field. Source of truth is the
+    /// server (`/me`); this local copy is updated after every successful GET/PATCH
+    /// so the Settings UI can render the current value without an extra round-trip.
+    @Published var displayName: String? {
+        didSet {
+            if let name = displayName {
+                defaults.set(name, forKey: Key.displayName)
+            } else {
+                defaults.removeObject(forKey: Key.displayName)
+            }
+        }
+    }
+
     // MARK: - Init
 
     private init() {
@@ -124,6 +149,8 @@ final class Settings: ObservableObject {
         let storedTriple = suite.object(forKey: Key.tripleTapWindow) as? Double ?? 0.40
         let storedMaxMeetingMinutes = suite.object(forKey: Key.maxMeetingMinutes) as? Int ?? 90
         let storedPreferredInputUID = suite.string(forKey: Key.preferredInputDeviceUID)
+        let storedSmart = suite.object(forKey: Key.smartFormatting) as? Bool ?? false
+        let storedName = suite.string(forKey: Key.displayName)
 
         // @Published properties must be set before the object is fully initialised;
         // assign directly via stored property (bypasses didSet observers).
@@ -132,6 +159,8 @@ final class Settings: ObservableObject {
         self._tripleTapWindow = Published(initialValue: storedTriple)
         self._maxMeetingMinutes = Published(initialValue: storedMaxMeetingMinutes)
         self._preferredInputDeviceUID = Published(initialValue: storedPreferredInputUID)
+        self._smartFormatting = Published(initialValue: storedSmart)
+        self._displayName = Published(initialValue: storedName)
         self._serverURL = Published(initialValue: nil) // set below after init completes
         self.serverURL = loadServerURL(from: suite)
     }
