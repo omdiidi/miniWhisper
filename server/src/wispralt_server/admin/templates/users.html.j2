@@ -1,0 +1,42 @@
+{% extends "base.html.j2" %}
+{% block title %}Users — Wispralt Admin{% endblock %}
+{% block content %}
+  <h2>Users</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Label</th>
+        <th>Role</th>
+        <th>Created</th>
+        <th>Last seen</th>
+        <th>Status</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+        <tr>
+          <td>{{ u.id }}</td>
+          <td><a href="/admin/users/{{ u.id }}">{{ u.label }}</a></td>
+          <td>{{ u.role }}</td>
+          <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
+          <td>{{ u.last_seen_at.strftime('%Y-%m-%d %H:%M') if u.last_seen_at else '—' }}</td>
+          <td>{% if u.revoked_at %}<span class="warn">revoked</span>{% else %}active{% endif %}</td>
+          <td>
+            {% if not u.revoked_at %}
+              <form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke" onsubmit="return confirm('Revoke user {{ u.label }}? This invalidates the token immediately.');">
+                <button type="submit" class="danger">Revoke</button>
+              </form>
+            {% endif %}
+            <form class="inline" method="post" action="/admin/users/{{ u.id }}/mint" onsubmit="return confirm('Mint a new token for {{ u.label }}? The old token will stop working immediately.');">
+              <button type="submit">Mint new token</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7">No users yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

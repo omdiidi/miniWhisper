@@ -1,0 +1,71 @@
+{% extends "base.html.j2" %}
+{% block title %}Overview — Wispralt Admin{% endblock %}
+{% block content %}
+  <h2>Overview</h2>
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="label">Active users</div>
+      <div class="value">{{ totals.active_users or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Dictations 24h</div>
+      <div class="value">{{ totals.dictations_24h or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Dictations 7d</div>
+      <div class="value">{{ totals.dictations_7d or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Dictations 30d</div>
+      <div class="value">{{ totals.dictations_30d or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Errors 24h</div>
+      <div class="value">{{ totals.errors_24h or 0 }}</div>
+    </div>
+    <div class="tile">
+      <div class="label">p50 latency 24h</div>
+      <div class="value">{% if totals.p50_24h %}{{ "%.0f"|format(totals.p50_24h) }} ms{% else %}—{% endif %}</div>
+    </div>
+  </div>
+
+  <h2>Top 5 active users (last 7d)</h2>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Label</th><th>Role</th><th>Events</th></tr>
+    </thead>
+    <tbody>
+      {% for u in top_users %}
+        <tr>
+          <td>{{ u.id }}</td>
+          <td><a href="/admin/users/{{ u.id }}">{{ u.label }}</a></td>
+          <td>{{ u.role }}</td>
+          <td>{{ u.n }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4">No activity yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Last 14 days</h2>
+  <table>
+    <thead>
+      <tr><th>Day</th><th>Count</th><th>Volume</th></tr>
+    </thead>
+    <tbody>
+      {% set max_n = (daily | map(attribute='n') | list | max) if daily else 0 %}
+      {% for row in daily %}
+        {% set width = (row.n / max_n) if max_n and max_n > 0 else 0 %}
+        <tr style="--w: {{ width }};">
+          <td>{{ row.day }}</td>
+          <td>{{ row.n }}</td>
+          <td class="bar"><div style="width: calc(var(--w) * 100%);"></div></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3">No usage events recorded yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

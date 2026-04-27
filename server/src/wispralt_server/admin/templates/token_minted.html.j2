@@ -1,0 +1,14 @@
+{% extends "base.html.j2" %}
+{% block title %}New token — Wispralt Admin{% endblock %}
+{% block content %}
+  <h2>New token for user #{{ user_id }}</h2>
+  <p class="warn">
+    <strong>Copy this token now.</strong> This is the only time it is displayed.
+    The server stores only its sha256 hash — there is no recovery if you close
+    this page without copying.
+  </p>
+  <code class="token">{{ plaintext }}</code>
+  <p style="margin-top: 16px;">
+    <a href="/admin/users">&larr; Back to users</a>
+  </p>
+{% endblock %}

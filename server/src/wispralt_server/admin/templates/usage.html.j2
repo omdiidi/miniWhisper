@@ -1,0 +1,55 @@
+{% extends "base.html.j2" %}
+{% block title %}Usage — Wispralt Admin{% endblock %}
+{% block content %}
+  <h2>Usage</h2>
+
+  <form class="filters" method="get" action="/admin/usage">
+    <input type="text" name="kind" value="{{ filters.kind or '' }}" placeholder="kind (dictate / meeting)">
+    <input type="number" name="status" value="{{ filters.status if filters.status is not none else '' }}" placeholder="status">
+    <input type="number" name="user_id" value="{{ filters.user_id if filters.user_id is not none else '' }}" placeholder="user_id">
+    <input type="datetime-local" name="since" value="{{ filters.since or '' }}">
+    <input type="datetime-local" name="until" value="{{ filters.until or '' }}">
+    <button type="submit">Filter</button>
+    <a href="/admin/usage.csv?{{ csv_query }}">Download CSV</a>
+  </form>
+
+  <table>
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>User</th>
+        <th>Kind</th>
+        <th>Status</th>
+        <th>Duration (ms)</th>
+        <th>Bytes in</th>
+        <th>Error</th>
+        <th>Request ID</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in events %}
+        <tr>
+          <td>{{ e.ts.strftime('%Y-%m-%d %H:%M:%S') if e.ts else '—' }}</td>
+          <td>{% if e.user_id is not none %}<a href="/admin/users/{{ e.user_id }}">{{ e.user_label or e.user_id }}</a>{% else %}—{% endif %}</td>
+          <td>{{ e.kind }}</td>
+          <td>{{ e.status }}</td>
+          <td>{% if e.duration_ms is not none %}{{ "%.0f"|format(e.duration_ms) }}{% else %}—{% endif %}</td>
+          <td>{{ e.bytes_in if e.bytes_in is not none else '—' }}</td>
+          <td>{{ e.error_class or '—' }}</td>
+          <td>{{ e.request_id or '—' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8">No events match.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="filters">
+    {% if prev_offset is not none %}
+      <a href="/admin/usage?{{ prev_query }}">&larr; Newer</a>
+    {% endif %}
+    {% if next_offset is not none %}
+      <a href="/admin/usage?{{ next_query }}">Older &rarr;</a>
+    {% endif %}
+  </div>
+{% endblock %}
