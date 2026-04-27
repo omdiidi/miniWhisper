@@ -62,6 +62,7 @@ def install_compat_shims() -> None:
     if _compat_installed:
         return
 
+    import sys
     import torch
     import torch.serialization
     import huggingface_hub
@@ -87,6 +88,20 @@ def install_compat_shims() -> None:
     torch.load = _shimmed_torch_load  # type: ignore[assignment]
     torch.serialization.load = _shimmed_torch_load  # type: ignore[assignment]
 
+    # Belt-and-suspenders: register omegaconf containers as safe globals so
+    # any code path that calls torch.load with weights_only=True LITERALLY
+    # (bypassing our shim via a pre-bound reference) still survives.
+    try:
+        from omegaconf.listconfig import ListConfig
+        from omegaconf.dictconfig import DictConfig
+        from omegaconf.base import ContainerMetadata, Metadata
+        from omegaconf.nodes import AnyNode
+        torch.serialization.add_safe_globals([
+            ListConfig, DictConfig, ContainerMetadata, Metadata, AnyNode,
+        ])
+    except Exception:  # noqa: BLE001 — optional belt; primary patch is the shim above
+        logger.debug("omegaconf safe_globals registration skipped", exc_info=True)
+
     def _shimmed_hf_hub_download(*args, **kwargs):  # type: ignore[no-untyped-def]
         if "use_auth_token" in kwargs:
             kwargs["token"] = kwargs.pop("use_auth_token")
@@ -102,9 +117,40 @@ def install_compat_shims() -> None:
     huggingface_hub.hf_hub_download = _shimmed_hf_hub_download  # type: ignore[assignment]
     huggingface_hub.snapshot_download = _shimmed_snapshot_download  # type: ignore[assignment]
 
+    # Deep patch: third-party modules (whisperx, pyannote) imported these
+    # symbols by name BEFORE this shim was installed, so they hold bound
+    # references to the originals.  Walk sys.modules and rebind any matching
+    # attribute to our shim so those callers get the wrapped behavior too.
+    _deep_patch_targets = {
+        id(_orig_torch_load): _shimmed_torch_load,
+        id(_orig_torch_ser_load): _shimmed_torch_load,
+        id(_orig_hf_hub_download): _shimmed_hf_hub_download,
+        id(_orig_snapshot_download): _shimmed_snapshot_download,
+    }
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        # Skip ourselves and the modules we just patched directly.
+        if mod_name in ("torch", "torch.serialization", "huggingface_hub", __name__):
+            continue
+        try:
+            mod_dict = vars(mod)
+        except TypeError:
+            continue
+        for attr_name, attr_val in list(mod_dict.items()):
+            try:
+                replacement = _deep_patch_targets.get(id(attr_val))
+            except Exception:  # noqa: BLE001
+                continue
+            if replacement is not None:
+                try:
+                    setattr(mod, attr_name, replacement)
+                except Exception:  # noqa: BLE001 — read-only attrs etc.
+                    continue
+
     _compat_installed = True
     logger.info(
-        "meeting compat shims installed (torch.load weights_only=False; HF use_auth_token→token)"
+        "meeting compat shims installed (torch.load weights_only=False; HF use_auth_token→token; deep-patched bound references)"
     )
 
 
