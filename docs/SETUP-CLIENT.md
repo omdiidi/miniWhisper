@@ -196,6 +196,47 @@ To check for updates manually: click the WisprAlt menubar icon → **Check for U
 
 ---
 
+## Employee install (recommended)
+
+This is the one-command install path for a teammate who has been given a
+WisprAlt API key. It lives in the user's `~/.claude-dotfiles/commands/` —
+it is **not** a project-scoped slash command — so it works on a fresh Mac
+without cloning this repo.
+
+**Prerequisites:**
+- macOS 14.0 or later.
+- [Claude Code](https://claude.com/claude-code) installed.
+- `gh auth login` once (so the slash command can call `gh release
+  download` non-interactively).
+
+**Install:**
+1. Open Claude Code.
+2. Run `/wispralt-setup`.
+
+What it does (full pseudocode in
+`~/.claude-dotfiles/commands/wispralt-setup.md`):
+
+1. Verifies macOS ≥ 14, installs Homebrew + `gh` if missing.
+2. Picks the latest GitHub Release tag for `omdiidi/miniWhisper`.
+3. Downloads the DMG and its `.sha256` sidecar.
+4. Verifies the SHA256.
+5. Mounts, copies `WisprAlt.app` to `/Applications`, unmounts, strips
+   quarantine.
+6. Opens the app — `PermissionGate.swift` walks four macOS permissions.
+7. Prints: "Now paste the API key Omid texted you in Settings → API Key."
+
+**Update path:** later, run `/wispralt-update` to pull the next release.
+That command diffs the installed `CFBundleShortVersionString` against
+the latest tag, replaces the app if newer, and runs `tccutil reset` for
+all four permissions if the cdhash changed (Apple-Development-signed
+re-builds get a new cdhash and re-prompt for permissions on every
+install).
+
+The build-from-source flow below is for **admin-grade** local builds
+(Omid's MacBook, contributor machines). Employees should not need it.
+
+---
+
 ## Building from Source
 
 See [client/README.md](../client/README.md) for the build/run quickstart.

@@ -21,6 +21,8 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 | `/update-models` | Re-run `download-models.sh` then reload `co.wispralt.server.plist` via launchctl |
 | `/verify-autostart` | Non-destructive reboot-survival smoke test for server, cloudflared, and client login-launch. |
 
+> Note: employee-facing slash commands `/wispralt-setup` and `/wispralt-update` live in the user's `~/.claude-dotfiles/commands/`, not in this project. They drive a clone-free install via `gh release download`.
+
 ## Key conventions
 
 - Repository pattern: database queries in repository functions, business logic in services, validation at route boundaries only.

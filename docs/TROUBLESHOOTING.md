@@ -392,6 +392,56 @@ Then reopen WisprAlt and grant all four permissions. This happens at most once a
 
 ---
 
+## Multi-tenant auth and admin UI
+
+### API key rejected (employee install)
+
+**Symptom:** Employee runs `/wispralt-setup`, pastes the texted token into the WisprAlt Settings pane, and Test Connection returns `401 Invalid bearer token`. Or dictation worked previously and now starts returning 401.
+
+**Diagnosis ladder:**
+
+1. **Was the token revoked?** Open `/admin/users` on the Mac mini admin UI. If their row has a non-null `revoked_at`, this is expected — text them a new token via the **Mint** flow.
+2. **Cache TTL window.** Token state is cached in-process for 60 seconds (`TokenCache._TTL_S`). If the row was just rotated, cache hits for the OLD hash will keep failing for up to 60s. Wait one minute, retry. For instant lockout: restart the launchd agent (`bash scripts/server-launchd.sh restart`).
+3. **Can the server reach Postgres?**
+   ```bash
+   curl -s --max-time 4 https://transcribe.<your-domain>/healthz
+   tail -100 ~/Library/Logs/WisprAlt/server.log | grep -i 'postgres\|asyncpg\|db_pool'
+   ```
+   If the log shows `Postgres unavailable at startup; only break-glass admin will work`, the asyncpg pool failed to initialize. Check `SUPABASE_DATABASE_URL` in `server/.env` (mode 0600), check Supabase project status, restart the agent.
+4. **Right token?** A token's plaintext is shown **once** by `/admin/users/<id>/mint`. If the employee misplaced it, mint a new one — there is no recovery for the old plaintext.
+
+---
+
+### Admin UI returns 401 / 403
+
+**Symptom:** Browsing to `/admin/` or curling `/admin/users` returns 401 or 403.
+
+**Diagnosis:**
+
+- **401** means the bearer / cookie was missing or invalid. Check that you're sending `Authorization: Bearer <token>` (curl) or that the `wispralt_admin_token` cookie is set in your browser (visit `/admin/login` to set it).
+- **403** means the bearer is valid but the user's `role` is not `'admin'`. Open `/admin/users` (with an admin token) and confirm — only admin-role tokens can access the rest of the UI.
+
+**Fix:**
+
+- For 401 from a browser: visit `/admin/login`, paste the admin token, submit. The cookie is set with `max_age=8h`.
+- For 403: use the admin token, not an employee token. If you don't have an admin token in hand, the env-var `WISPRALT_API_KEY` from `server/.env` is the break-glass admin and resolves to the seeded admin row (or to the synthetic `User(id=-1)` if Postgres is unreachable).
+- If you see **503** instead of 401/403 with body "Admin UI unavailable: Postgres degraded.": the asyncpg pool is `None`. The break-glass path lets you authenticate to `/transcribe/*`, but the admin UI requires Postgres. Fix the DB URL, restart the agent.
+
+---
+
+### Browser shows "Not Secure" on /admin/login
+
+**Symptom:** Hitting `/admin/login` in a browser shows a "Not Secure" warning, or the login form posts but the cookie never appears in DevTools → Application → Cookies.
+
+**Diagnosis:** The session cookie is set with `secure=True`, which means browsers refuse to attach it unless the connection is HTTPS. If you're hitting `http://` (e.g. `http://localhost:8000/admin/login` for local dev), the cookie is silently dropped.
+
+**Fix:**
+
+- In production, the Cloudflare Tunnel (`https://transcribe.<your-domain>`) terminates HTTPS for you; the cookie works as long as you use the public URL, not `127.0.0.1`.
+- For local development against an HTTP-only server: edit `routes/admin_ui.py:login_submit` and temporarily set `secure=False`, or use the `Authorization: Bearer ...` header path (curl/Postman) instead of the cookie.
+
+---
+
 ## Multi-sentence dictation feels slow (3-5 seconds vs <1s for short clips)
 
 **Symptom:** A 1-2 word dictation feels instant; a multi-sentence dictation has a noticeable wait between FN-release and the text appearing.
