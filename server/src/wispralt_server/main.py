@@ -188,20 +188,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 8. SIGTERM handler (P5#5 + P5#ExitTimeOut).
     #    I2: Use loop.add_signal_handler so the handler runs safely in the asyncio
     #    event loop rather than interrupting arbitrary C-extension code via the raw
-    #    signal module.  sys.exit(0) is replaced with os._exit(0) which is safe
-    #    from an asyncio callback.
+    #    signal module.
+    #
+    #    The handler signals graceful shutdown via uvicorn's `should_exit` flag,
+    #    NOT `os._exit(0)`.  `os._exit` skips the lifespan teardown — which
+    #    means the usage-event drainer's final flush is lost and any queued
+    #    events are dropped.  We instead let uvicorn run its normal shutdown
+    #    path (which invokes our lifespan ``finally`` block) and trust
+    #    launchd's ExitTimeout=15 to bound the wait.
     def _sigterm_handler() -> None:
         logger.info("SIGTERM received — initiating graceful shutdown.")
         app.state.shutting_down = True
         try:
-            # M1: Use the JobStore public method rather than raw SQL.
             n = job_store.fail_running_jobs("server shutdown")
             if n:
                 logger.info("Marked %d running job(s) as failed on SIGTERM.", n)
-        except Exception as exc:  # noqa: BLE001 — best effort; don't block shutdown
+        except (OSError, RuntimeError) as exc:
             logger.warning("Could not mark running jobs failed on SIGTERM: %s", exc)
-        import os as _os
-        _os._exit(0)
+
+        # Trigger uvicorn graceful shutdown so the lifespan teardown runs
+        # (drainer cancel + usage flush + db.close_pool).  Fallback to raising
+        # SIGINT in the same loop if no uvicorn server is registered (e.g.
+        # tests running the app via TestClient).
+        server_obj = getattr(app.state, "uvicorn_server", None)
+        if server_obj is not None:
+            server_obj.should_exit = True
+            return
+        # Last-resort: re-raise as SIGINT so asyncio's default handler triggers
+        # KeyboardInterrupt → uvicorn shutdown.  Never call os._exit — that
+        # bypasses the lifespan teardown.
+        signal.raise_signal(signal.SIGINT)
 
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)

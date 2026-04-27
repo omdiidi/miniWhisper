@@ -161,24 +161,31 @@ async def require_api_key(request: Request) -> User:
 
     # 2. Postgres lookup.  The seeded break-glass row also lives here once
     #    the lifespan has run; this is the path 99% of break-glass calls
-    #    take.
+    #    take.  Track WHY user is None — "row missing" (token revoked or
+    #    invalid) must NOT fall through to break-glass; only "Postgres
+    #    errored" or "pool unavailable" should trigger that escape hatch.
     pool = getattr(request.app.state, "db_pool", None)
+    postgres_errored = False
     if pool is not None:
         try:
             user = await _store_mod.lookup(pool, th)
         except asyncpg.PostgresError:
-            logger.exception("Postgres lookup failed; trying break-glass")
+            logger.exception("Postgres lookup failed; falling through to break-glass")
             user = None
+            postgres_errored = True
         if user is not None:
             token_cache.put(th, user)
             request.state.user = user
             return user
+        if not postgres_errored:
+            # Postgres said "no row" — token is invalid OR was revoked.
+            # Do NOT consult break-glass: that would defeat revocation.
+            raise HTTPException(status_code=401, detail="Invalid bearer token")
 
-    # 3. Break-glass: pool is None OR Postgres errored OR row missing.
-    #    Env-var token still grants admin so the operator never locks
-    #    themselves out.  user.id = -1 is a sentinel; the observability
-    #    middleware skips usage-event enqueue for negative ids (no FK
-    #    violation against wispralt.usage_events).
+    # 3. Pool is None OR Postgres errored.  The env-var token grants admin
+    #    so the operator never locks themselves out.  user.id = -1 is a
+    #    sentinel; the observability middleware skips usage-event enqueue
+    #    for negative ids (no FK violation against wispralt.usage_events).
     bg_hash = getattr(request.app.state, "break_glass_token_hash", None)
     if bg_hash is not None and th == bg_hash:
         user = User(id=-1, label="break-glass-admin", role="admin")
@@ -186,9 +193,10 @@ async def require_api_key(request: Request) -> User:
         logger.warning("auth: break-glass admin path used (Postgres degraded)")
         return user
 
-    if pool is None:
-        raise HTTPException(status_code=503, detail="Auth temporarily unavailable")
-    raise HTTPException(status_code=401, detail="Invalid bearer token")
+    # No pool, no break-glass match → return 503 so legitimate clients
+    # know the service is degraded (NOT 401, which would suggest the
+    # token is wrong).
+    raise HTTPException(status_code=503, detail="Auth temporarily unavailable")
 
 
 def require_admin(user: User = Depends(require_api_key)) -> User:

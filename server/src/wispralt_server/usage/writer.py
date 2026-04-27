@@ -60,6 +60,24 @@ async def drain_loop(queue: UsageEventQueue, pool: asyncpg.Pool) -> None:
         except asyncio.TimeoutError:
             pass
         except asyncio.CancelledError:
+            # Drain whatever is still in the queue so we don't lose the last
+            # second's worth of events on shutdown. ``get_nowait`` is safe
+            # because we've been cancelled — no future producer can stall us
+            # waiting for an empty queue.
+            while True:
+                try:
+                    batch.append(queue._q.get_nowait())  # noqa: SLF001 — drain on shutdown
+                except asyncio.QueueEmpty:
+                    break
+                if len(batch) >= BATCH_MAX:
+                    try:
+                        await _flush(pool, batch)
+                    except (asyncpg.PostgresError, OSError):
+                        logger.exception(
+                            "usage_event final flush failed; dropping batch of %d",
+                            len(batch),
+                        )
+                    batch = []
             if batch:
                 try:
                     await _flush(pool, batch)
