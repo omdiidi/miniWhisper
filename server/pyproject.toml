@@ -32,6 +32,10 @@ dependencies = [
     "psutil>=6.0",
     # Implicit dep of pyannote.audio.utils.metric (imports matplotlib at module load)
     "matplotlib>=3.8",
+    # Postgres (Supabase) — multi-tenant auth + usage events
+    "asyncpg>=0.29,<0.31",
+    # Server-rendered admin UI templates
+    "jinja2>=3.1,<4",
 ]
 
 [project.optional-dependencies]
