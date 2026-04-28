@@ -24,6 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppDelegate.shared = self  // FIRST — before anything else accesses .shared
         Log.info("WisprAlt launching.", category: "app")
 
+        // Ask the user once for permission to post local notifications. Without
+        // this call every UNUserNotificationCenter request silently fails on
+        // macOS 13+ (secure-field skip notification, meeting cap warnings, …).
+        // Idempotent — macOS suppresses re-prompts after the first decision.
+        AppNotifications.requestAuthorization()
+
         // Defensive cleanup: an earlier build attempted to override the macOS
         // system default input device for meetings. We dropped that approach
         // in favor of WisprAlt-only mic selection. If a stale crash-recovery

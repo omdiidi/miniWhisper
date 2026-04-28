@@ -188,15 +188,36 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 ---
 
-### Text injection silently fails in Electron apps (VS Code, Slack, etc.)
+### Text injection in Electron apps, iMessages, and Pane (clipboard fallback by design)
 
-**Symptom:** Dictation completes successfully (status goes back to idle) but no text appears in the focused field in an Electron app.
+**Symptom:** Dictation completes successfully (status returns to idle) but the focused field initially looks unchanged in Electron apps (VS Code, Slack, Discord, Cursor, Notion, Figma, Linear, …) or in **Apple Messages** (`com.apple.MobileSMS`) and **Pane** (`com.dcouple.pane`).
 
-**Diagnosis:** `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` returns `.success` but Electron's AX layer does not actually insert the text. `AccessibilityInjector.tryInsert()` detects this by reading `kAXValueAttribute` before and after — if unchanged, it returns `false`.
+**Diagnosis:** These apps do not honour `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` — either they silently no-op the write or they don't expose a usable `kAXValueAttribute`. `AccessibilityInjector.tryInsertWith` detects this by reading `kAXValueAttribute` before and after the write; if both reads return the same value (or fail), the predicate `didInjectionLand(...)` returns `false` and `TextInjector` falls through to `ClipboardInjector.injectViaCmdV` which writes the text to `NSPasteboard.general`, synthesises ⌘V, and restores the original pasteboard 200 ms later. iMessages and Pane are expected to take this path — it's not a bug.
 
-**Fix:** The clipboard fallback (`ClipboardInjector`) should activate automatically. If it is not:
-1. Open **Console.app**, filter by `co.wispralt`, and look for `[inject]` log entries to see which path was taken.
+**Diagnostic log line format:**
+
+```
+[inject] inject: target_at_start=<bundleID>/pid=<n>/role=<r>/subrole=<s>
+[inject] Text injected via AX. target=…           ← AX path landed
+[inject] Text injected via Cmd+V. target=…        ← clipboard fallback path
+```
+
+Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should appear per dictation event. (Multiple `debug` lines are normal.)
+
+**Fix:** The clipboard fallback should activate automatically. If text still doesn't appear:
+1. Open **Console.app**, filter by `co.wispralt`, and look for `[inject]` entries to see which path was taken and against which `target_at_start`.
 2. Ensure Accessibility permission is granted (Step 1 of the permission wizard).
+3. Confirm the focused app accepts ⌘V from a synthetic `CGEvent`. A handful of niche apps (custom event loops) ignore it; record the bundle ID in an issue.
+
+**Honest caveat about clipboard managers (Maccy, Raycast Clipboard History, Paste.app, Alfred Clipboard).** These tools watch `NSPasteboard.general` and copy every change into their history. WisprAlt restores your original clipboard 200 ms after pasting, **but** if a clipboard manager wrote during that window the restore is skipped (we won't stomp something the user just copied) and your previous clipboard contents are lost. If you rely on clipboard history, avoid selecting items from it immediately after dictating into a clipboard-fallback app.
+
+**Web password caveat.** The native secure-field gate (next section) catches AppKit `NSSecureTextField` and SwiftUI `SecureField`, but **web password inputs** (Safari, Chrome, Electron `<input type="password">`) usually do **not** surface `kAXSubroleAttribute == AXSecureTextField`, so the gate cannot detect them. **Do not dictate web passwords** — they may transit the system pasteboard where any clipboard manager could capture them.
+
+**Known limitation: secure-field skip notification debounce.** When dictation is refused due to a secure field, you'll see one local notification "Dictation Skipped — `<bundleID>` is asking for a password. Type the value manually." Subsequent skips against the same focus within 60 seconds are logged but not re-notified, to avoid spamming Notification Center if the field stays focused (e.g. unlocking 1Password).
+
+**Known limitation: repeat dictation within 200 ms.** Two FN-tap dictations in rapid succession can interact with the clipboard restore window: the second snapshot captures the first dictation's text rather than your true original, so when both restores complete the clipboard ends up holding the first dictation's text. Avoid back-to-back dictations if your clipboard contents matter.
+
+**Known limitation: post-capture focus shift on the clipboard path.** The secure-field gate captures focus context once at the top of `TextInjector.inject` and uses it to decide whether to refuse and which AX element to write to. The synthesised ⌘V, however, goes to whatever app is focused at the moment the `CGEvent` posts — which is usually the same app, but if you click into a different field (especially a password field) during the brief window inside `inject(_:)` between focus capture and the synthesised ⌘V (typically sub-millisecond, up to a few hundred ms if the AX-attempt times out on a hung target), the paste will land in the new focus. The gate cannot prevent this. If you need to switch fields right after dictating, wait for the text to land first.
 
 ---
 
@@ -469,7 +490,7 @@ dictation/timing: inject_ms=18.7 total_ms=1873.5
 | `stop_ms` | Time to finalize the WAV after FN-release. Should be <50ms. |
 | `bytes` | Size of the upload payload. ~96 KB/sec at 48kHz Float32 mono. |
 | `net_total_ms` | Wall time of `DictationAPI.transcribe(wavData)` — covers multipart upload + Cloudflare Tunnel hop + server queue + Parakeet inference + response. |
-| `inject_ms` | Time inside `TextInjector.inject(text)` (AXUIElement set or Cmd+V fallback). Should be <50ms. |
+| `inject_ms` | Time inside `TextInjector.inject(text)`. Covers focused-context capture (system-wide AX → focused element → role/subrole), the secure-field gate, the AX `kAXSelectedTextAttribute` write with read-back verification, and (if AX is unverified) the clipboard `Cmd+V` fallback. Normal case <50 ms. Each AX call is bounded by a 250 ms messaging timeout, so worst case on a hung target is ~1.5 s. |
 | `total_ms` | Sum of all three. |
 
 **Diagnosis ladder:**

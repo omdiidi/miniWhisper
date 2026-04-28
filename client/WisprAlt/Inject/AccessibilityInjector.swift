@@ -1,51 +1,35 @@
 import ApplicationServices
+import WisprAltCore
 
-/// Injects text into the focused accessibility element using the `kAXSelectedTextAttribute`
-/// strategy.
+/// Injects text into a pre-captured focused accessibility element using the
+/// `kAXSelectedTextAttribute` strategy.
 ///
 /// Read-back verification: after setting `kAXSelectedTextAttribute`, we re-read
-/// `kAXValueAttribute`. If the value changed we know the injection succeeded.
-/// If it did not change (e.g. Electron apps that silently no-op), we return `false`
-/// so `TextInjector` can fall through to the clipboard strategy.
+/// `kAXValueAttribute`. We only return `true` if the value is observed to change.
+/// If the read fails or the value is unchanged (Electron, iMessages, and other apps
+/// that don't expose their value via AX or silently no-op the write), we return `false`
+/// so `TextInjector` falls through to the clipboard strategy.
 ///
-/// Special case: if the element's value was empty before injection AND the set call
-/// returned `.success`, we treat it as success — the app may not expose its value via AX
-/// but accepted the insert.
+/// The caller (`TextInjector`) is responsible for capturing the focused element
+/// and the surrounding `FocusContext`. Passing the element in (rather than
+/// re-walking system-wide focus here) closes the TOCTOU window between the
+/// security check and the AX write.
 enum AccessibilityInjector {
-    /// Attempts to insert `text` at the current cursor position of the focused element.
+    /// Insert `text` into a specific, pre-captured focused element.
     ///
-    /// - Parameter text: The string to inject.
-    /// - Returns: `true` if the text was verified to have been inserted (or best-effort
-    ///   heuristic passed); `false` if the element rejected the injection or could not
-    ///   be read back to verify.
+    /// - Parameters:
+    ///   - element: The focused `AXUIElement` captured by the caller.
+    ///   - text: The string to inject.
+    /// - Returns: `true` only if a read-back of `kAXValueAttribute` confirms the value
+    ///   changed; `false` otherwise. A `false` return triggers the clipboard fallback.
     @discardableResult
-    static func tryInsert(_ text: String) -> Bool {
-        // Bail immediately if the app lacks Accessibility permission.
-        guard AXIsProcessTrusted() else {
-            Log.warning("Accessibility permission not granted — cannot inject via AX.", category: "inject")
-            return false
-        }
-
-        // Find the system-wide focused element.
-        let systemElement = AXUIElementCreateSystemWide()
-        var focusedRef: CFTypeRef?
-        let focusResult = AXUIElementCopyAttributeValue(
-            systemElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedRef
-        )
-        guard focusResult == .success, let focused = focusedRef else {
-            Log.debug("No focused AX element found.", category: "inject")
-            return false
-        }
-        // Safe cast: AXUIElementCopyAttributeValue with kAXFocusedUIElementAttribute always
-        // returns an AXUIElement when it succeeds.
-        let element = focused as! AXUIElement // swiftlint:disable:this force_cast
+    static func tryInsertWith(element: AXUIElement, text: String) -> Bool {
+        // Bound stalling on hung target apps to 250 ms per AX call.
+        AXUIElementSetMessagingTimeout(element, 0.250)
 
         // Snapshot the current value so we can detect whether injection changed it.
         var beforeRef: CFTypeRef?
         AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &beforeRef)
-        let beforeValue = (beforeRef as? String) ?? ""
 
         // Attempt to inject via kAXSelectedTextAttribute (replaces current selection).
         let setResult = AXUIElementSetAttributeValue(
@@ -53,30 +37,23 @@ enum AccessibilityInjector {
             kAXSelectedTextAttribute as CFString,
             text as CFTypeRef
         )
-        guard setResult == .success else {
-            Log.debug("AXUIElementSetAttributeValue returned \(setResult.rawValue).", category: "inject")
-            return false
-        }
 
         // Read-back verification: confirm the value actually changed.
         var afterRef: CFTypeRef?
         AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &afterRef)
-        let afterValue = (afterRef as? String) ?? ""
 
-        if afterValue != beforeValue {
-            // Value changed — injection verified.
-            return true
+        let landed = didInjectionLand(
+            setSucceeded: setResult == .success,
+            beforeValue: beforeRef as? String,
+            afterValue: afterRef as? String
+        )
+
+        if !landed {
+            Log.debug(
+                "AX injection unverified (set=\(setResult.rawValue)) — falling through.",
+                category: "inject"
+            )
         }
-
-        // Value unchanged. If the element's value was empty before, apply best-effort
-        // heuristic: the set returned success, so accept it (app may not expose value via AX).
-        if beforeValue.isEmpty {
-            Log.debug("AX injection: value was empty before and set succeeded — accepting.", category: "inject")
-            return true
-        }
-
-        // Value unchanged and was non-empty before — silent no-op (Electron pattern).
-        Log.debug("AX injection produced no visible change — falling through to clipboard.", category: "inject")
-        return false
+        return landed
     }
 }

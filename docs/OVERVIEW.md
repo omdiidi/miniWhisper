@@ -103,9 +103,14 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Server/MeetingAPI.swift` | [API.md](API.md) — meeting submit/poll/download/delete |
 | `client/WisprAlt/Server/MeAPI.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — JSON `GET /me` + `PATCH /me` client wrapper for the Identity section |
 | `client/WisprAlt/Server/ServerError.swift` | [API.md](API.md) — typed errors |
-| `client/WisprAlt/Inject/TextInjector.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — injection strategy |
+| `client/WisprAlt/Inject/TextInjector.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — injection strategy (focused-context capture, secure-field gate, AX→clipboard fallback) |
 | `client/WisprAlt/Inject/AccessibilityInjector.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — AX injection with read-back |
 | `client/WisprAlt/Inject/ClipboardInjector.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — clipboard fallback |
+| `client/WisprAltCore/InjectionPredicate.swift` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — pure `didInjectionLand(...)` predicate (unit-tested) |
+| `client/WisprAltCore/FocusContext.swift` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — pure focus-context data type (bundleID/pid/role/subrole) |
+| `client/WisprAltCore/SecureFieldGate.swift` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — pure `shouldRefuseInjection(for:)` gate for native secure fields |
+| `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — 11-row truth table including the empty/empty/success regression pin |
+| `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — 5 cases pinning the `AXSecureTextField` refusal rule + the derived-`isSecureField` invariant |
 | `client/WisprAlt/Storage/Settings.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — UserDefaults keys |
 | `client/WisprAlt/Storage/KeychainHelper.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — API key in Keychain |
 | `client/WisprAlt/Storage/TranscriptStore.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — local file index, atomic rewrites |

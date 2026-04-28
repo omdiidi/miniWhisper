@@ -17,9 +17,22 @@ let package = Package(
         )
     ],
     targets: [
+        // Pure-Swift library of injection-decision predicates and focus context
+        // data. Intentionally has no AppKit / ApplicationServices / Sparkle /
+        // resource dependencies so it can be unit-tested with `swift test`
+        // without invoking actool or pulling Sparkle's framework into the test
+        // runner. See Task 8.6 in tmp/ready-plans/2026-04-28-fix-injection-imessages-pane.md.
+        .target(
+            name: "WisprAltCore",
+            path: "WisprAltCore",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
         .executableTarget(
             name: "WisprAlt",
             dependencies: [
+                "WisprAltCore",
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "WisprAlt",
@@ -43,6 +56,11 @@ let package = Package(
                     "-Xlinker", "@executable_path/../Frameworks"
                 ])
             ]
+        ),
+        .testTarget(
+            name: "WisprAltCoreTests",
+            dependencies: ["WisprAltCore"],
+            path: "Tests/WisprAltCoreTests"
         )
     ]
 )
