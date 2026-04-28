@@ -145,6 +145,17 @@ final class DictationRecorder {
     /// device change in the first 100 ms is vanishingly unlikely (a human can't
     /// hold FN, start dictating, AND swap mics that fast). Real device changes
     /// after the window still abort as before.
+    ///
+    /// Known limitation: notifications are dispatched on `.main`, so under heavy
+    /// main-thread pressure delivery latency can exceed 100 ms even for
+    /// in-session synthetic callbacks. In that case a real device change in
+    /// the first 100 ms WILL be ignored. We accept this because the alternative
+    /// (per-session AVAudioEngine reinstantiation, the only way to distinguish
+    /// stale-cross-session callbacks from in-session ones) carries a much
+    /// higher cost (audio graph rebuild on every FN press). The settling
+    /// window's worst-case false-negative is one missed mid-recording device
+    /// abort; the worst-case false-positive (no settling window) is every
+    /// recording randomly aborting on its second activation.
     private var sessionStartTime: TimeInterval = 0
     private static let configChangeSettleWindow: TimeInterval = 0.1
 

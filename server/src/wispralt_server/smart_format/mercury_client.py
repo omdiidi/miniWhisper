@@ -135,16 +135,20 @@ def _extract_text(field: object, _depth: int = 0) -> str:
         return field
     if isinstance(field, list):
         # Content-parts shape: [{"type":"text","text":"..."}, ...].
-        # We accept any element with a string "text" key; ignore image/tool parts.
+        # We accept any element whose `text` resolves to a string, ANY element
+        # whose `content` resolves to text (for nested-wrapper providers like
+        # `[{"content":[{"text":"..."}]}]`), or bare strings. Image/tool parts
+        # without a text-bearing field contribute "" and are skipped.
         chunks: list[str] = []
         for part in field:
             if isinstance(part, dict):
-                txt = part.get("text")
-                if isinstance(txt, str):
-                    chunks.append(txt)
-                else:
-                    # Could be a nested structure; recurse.
-                    chunks.append(_extract_text(txt, _depth + 1))
+                # Try `text` first, fall back to `content`. Recurse into both
+                # to handle nested wrappers; depth limit prevents stack blow-up.
+                resolved = _extract_text(part.get("text"), _depth + 1)
+                if not resolved:
+                    resolved = _extract_text(part.get("content"), _depth + 1)
+                if resolved:
+                    chunks.append(resolved)
             elif isinstance(part, str):
                 chunks.append(part)
         return "".join(chunks)
