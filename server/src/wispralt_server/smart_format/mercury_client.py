@@ -81,10 +81,11 @@ _CONTRACTION_EXPANSIONS = {
     "youd": "you'd",
     "theyd": "they'd",
     "thats": "that's",
-    "whats": "what's",
-    "wheres": "where's",
-    "heres": "here's",
-    "theres": "there's",
+    # whats/wheres/heres/theres DROPPED on round 3 — none of them are real English
+    # words by themselves, but they're close enough to inflected forms / informal
+    # plurals ("whats and whys") that we want belt-and-suspenders. The cleanup
+    # benefit of restoring these specific contractions is small compared to the
+    # safety value of a tighter whitelist.
 }
 
 
@@ -115,18 +116,21 @@ def _is_safe_cleanup(raw: str, cleaned: str) -> bool:
     return _canonicalize(_word_multiset(raw)) == _canonicalize(_word_multiset(cleaned))
 
 
-def _extract_text(field: object) -> str:
+def _extract_text(field: object, _depth: int = 0) -> str:
     """Extract a plain string from any OpenAI-compat content/reasoning shape.
 
-    Handles three documented shapes:
+    Handles all observed shapes:
       • plain string                              → returned as-is
       • list of content parts                     → text fields concatenated
-      • dict (e.g. structured reasoning object)   → joined `text` value if present
-    Anything else (None, unexpected nested type)  → empty string.
+      • dict with `text` or `content`             → recurse into the inner value
+    Anything else (None, unknown nested type)     → empty string.
 
-    Returning "" on unrecognized shapes lets the caller fall back to raw text
-    cleanly, instead of crashing in `.strip()` or silently dropping content.
+    Recursion is bounded to depth 4 so a malicious deeply-nested response can't
+    blow the stack. Returning "" on unrecognized shapes lets the caller fall
+    back to raw text cleanly, instead of crashing or silently dropping content.
     """
+    if _depth > 4:
+        return ""
     if isinstance(field, str):
         return field
     if isinstance(field, list):
@@ -138,13 +142,20 @@ def _extract_text(field: object) -> str:
                 txt = part.get("text")
                 if isinstance(txt, str):
                     chunks.append(txt)
+                else:
+                    # Could be a nested structure; recurse.
+                    chunks.append(_extract_text(txt, _depth + 1))
+            elif isinstance(part, str):
+                chunks.append(part)
         return "".join(chunks)
     if isinstance(field, dict):
-        # Some providers wrap reasoning in {"text": "..."} or {"content": "..."}
+        # Dict-wrapped: {"text": <maybe-nested>} or {"content": <maybe-nested>}.
+        # Recurse so a dict whose `content` is itself a parts-list still resolves.
         for key in ("text", "content"):
-            val = field.get(key)
-            if isinstance(val, str):
-                return val
+            if key in field:
+                resolved = _extract_text(field[key], _depth + 1)
+                if resolved:
+                    return resolved
     return ""
 
 

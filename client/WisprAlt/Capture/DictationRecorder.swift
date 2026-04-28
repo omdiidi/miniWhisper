@@ -139,8 +139,14 @@ final class DictationRecorder {
     /// to ignore configChange notifications that arrive within a small settling
     /// window after start() — these are almost always delayed AVAudioEngine
     /// callbacks from a previous session's device override that landed late.
+    ///
+    /// The window is 100 ms — long enough to cover the typical synthetic-callback
+    /// delay (observed 10–50 ms in practice), short enough that a user-initiated
+    /// device change in the first 100 ms is vanishingly unlikely (a human can't
+    /// hold FN, start dictating, AND swap mics that fast). Real device changes
+    /// after the window still abort as before.
     private var sessionStartTime: TimeInterval = 0
-    private static let configChangeSettleWindow: TimeInterval = 0.25
+    private static let configChangeSettleWindow: TimeInterval = 0.1
 
     // MARK: - Public API
 
@@ -309,10 +315,10 @@ final class DictationRecorder {
                 return
             }
             // Settling window: ignore configChange notifications that arrive
-            // within 250 ms of session start. Late callbacks from a previous
-            // session's device override sometimes land here even after stop()
-            // — without this guard they'd abort the new session as if a real
-            // mid-recording device change happened.
+            // within `configChangeSettleWindow` of session start. Late callbacks
+            // from a previous session's device override sometimes land here
+            // even after stop() — without this guard they'd abort the new
+            // session as if a real mid-recording device change happened.
             let elapsed = Date().timeIntervalSinceReferenceDate - self.sessionStartTime
             if elapsed < Self.configChangeSettleWindow {
                 Log.info(
