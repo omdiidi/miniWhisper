@@ -340,7 +340,7 @@ struct SettingsView: View {
                 let sysName = MicEnumerator.systemDefaultInputName() ?? "—"
                 Text("System Default (\(sysName))").tag(String?.none)
                 Divider()
-                ForEach(MicEnumerator.availableInputs(), id: \.uniqueID) { device in
+                ForEach(availableMics, id: \.uniqueID) { device in
                     Text(device.name).tag(Optional(device.uniqueID))
                 }
             }
@@ -348,7 +348,17 @@ struct SettingsView: View {
             .pickerStyle(.menu)
             .help("Choose which mic WisprAlt uses for dictation. Meeting recording always uses the macOS system default.")
         }
+        .onAppear {
+            availableMics = MicEnumerator.availableInputs()
+            MicEnumerator.startDeviceListListener()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .micDeviceListChanged)) { _ in
+            // CoreAudio HAL fired — refresh the picker so AirPods/etc appear live.
+            availableMics = MicEnumerator.availableInputs()
+        }
     }
+
+    @State private var availableMics: [MicEnumerator.InputDevice] = MicEnumerator.availableInputs()
 
     /// Two-way binding that maps the picker's `String?` selection to
     /// `Settings.shared.preferredInputDeviceUID`.

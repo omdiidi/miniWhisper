@@ -95,16 +95,22 @@ class MercuryClient:
                         {"role": "system", "content": _PROMPT_SYSTEM},
                         {"role": "user", "content": raw_text},
                     ],
-                    # Output is roughly the same word-count as input but with extra
-                    # punctuation. Allow ~2x input length in characters; convert to
-                    # tokens (~4 chars/token); cap at 2048 for safety.
                     "max_tokens": min(max(len(raw_text) // 2, 256), 2048),
                     "temperature": 0.0,
+                    # Mercury 2 routes ALL output through the `reasoning` channel by
+                    # default, leaving `content=null`. Explicitly disable reasoning
+                    # so the model returns the cleaned text in the standard `content`
+                    # field. Older Mercury models ignore this flag, so it's safe.
+                    "reasoning": {"enabled": False},
                 },
             )
             response.raise_for_status()
             data = response.json()
-            cleaned = data["choices"][0]["message"]["content"].strip()
+            # Some providers emit content=null and put text in `reasoning` instead;
+            # try both so the implementation is robust to provider quirks.
+            msg = data["choices"][0]["message"]
+            cleaned_raw = msg.get("content") or msg.get("reasoning") or ""
+            cleaned = cleaned_raw.strip()
             if not cleaned:
                 logger.warning("mercury returned empty content; falling back to raw")
                 return None

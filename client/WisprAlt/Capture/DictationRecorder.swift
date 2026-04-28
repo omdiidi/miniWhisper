@@ -128,6 +128,13 @@ final class DictationRecorder {
     /// Observer token for AVAudioEngineConfigurationChange notifications.
     private var configChangeObserver: NSObjectProtocol?
 
+    /// True while a programmatic device override is settling. macOS fires
+    /// `AVAudioEngineConfigurationChange` asynchronously after we set
+    /// `kAudioOutputUnitProperty_CurrentDevice`, so the configChange observer
+    /// would catch OUR OWN override and abort the recording. We swallow the
+    /// first such notification per recording session.
+    private var pendingDeviceOverride: Bool = false
+
     // MARK: - Public API
 
     /// Starts microphone capture.
@@ -170,8 +177,13 @@ final class DictationRecorder {
                     category: "audio"
                 )
             } else {
+                // macOS fires AVAudioEngineConfigurationChange async on the main
+                // queue after this property change settles. The observer below
+                // would catch it and abort the recording. Set the swallow flag
+                // BEFORE the observer is installed.
+                pendingDeviceOverride = true
                 Log.info(
-                    "DictationRecorder: input device set to UID \(preferredUID)",
+                    "DictationRecorder: input device set to UID \(preferredUID); next configChange will be swallowed.",
                     category: "audio"
                 )
             }
@@ -263,6 +275,18 @@ final class DictationRecorder {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            // Swallow the FIRST configChange after a programmatic device
+            // override — it's our own AudioUnitSetProperty settling, not a
+            // real device-change event. Subsequent notifications still abort
+            // (mid-recording AirPods plug, etc.).
+            if self.pendingDeviceOverride {
+                self.pendingDeviceOverride = false
+                Log.info(
+                    "DictationRecorder: swallowed configChange from programmatic device override.",
+                    category: "capture"
+                )
+                return
+            }
             Log.error(
                 "DictationRecorder: AVAudioEngineConfigurationChange fired — " +
                 "tap uninstalled. Aborting recording.",

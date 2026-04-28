@@ -302,6 +302,21 @@ final class MenuBarController: NSObject {
                 .environmentObject(Settings.shared)
                 .environmentObject(recordingState)
         )
+        // Belt-and-suspenders: NSPopover.behavior = .transient is supposed to
+        // auto-close on click-outside, but in LSUIElement (menubar-only) apps
+        // the popover sometimes stays open when the user clicks into another
+        // app because the WisprAlt process never had key focus to lose. Force
+        // close on any app-deactivation event.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            if self.popover.isShown {
+                self.popover.performClose(nil)
+            }
+        }
     }
 
     // MARK: - Icon update

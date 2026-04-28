@@ -1,11 +1,42 @@
 import AVFoundation
 import CoreAudio
+import Foundation
+
+extension Notification.Name {
+    /// Fired when CoreAudio reports a change in the device list (mic plugged in/out).
+    static let micDeviceListChanged = Notification.Name("co.wispralt.micDeviceListChanged")
+}
 
 enum MicEnumerator {
     struct InputDevice: Identifiable, Hashable {
         let uniqueID: String
         let name: String
         var id: String { uniqueID }
+    }
+
+    /// Process-wide HAL listener: posts `.micDeviceListChanged` when the system
+    /// audio device list mutates (AirPods plugged, USB mic disconnected, etc.).
+    /// Idempotent — safe to call multiple times.
+    private static var deviceListenerInstalled = false
+    static func startDeviceListListener() {
+        guard !deviceListenerInstalled else { return }
+        deviceListenerInstalled = true
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope:    kAudioObjectPropertyScopeGlobal,
+            mElement:  kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { _, _ in
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .micDeviceListChanged, object: nil)
+            }
+        }
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr,
+            DispatchQueue.global(qos: .utility),
+            block
+        )
     }
 
     /// macOS 14+ device discovery for audio inputs. Project deployment target
