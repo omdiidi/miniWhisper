@@ -132,30 +132,42 @@ final class DictationRecorder {
     /// `AVAudioEngineConfigurationChange` asynchronously after we set
     /// `kAudioOutputUnitProperty_CurrentDevice`, so the configChange observer
     /// would catch OUR OWN override and abort the recording. We swallow the
-    /// first such notification per recording session.
+    /// first such notification per recording session — but ONLY within a
+    /// short time window (`overrideSwallowWindow`) of when the override was
+    /// applied. Beyond that window the synthetic callback is presumed to have
+    /// been lost, and any subsequent configChange is treated as a real device
+    /// change (the safer default — better to abort one recording than to
+    /// silently capture audio from a now-disconnected device).
     private var pendingDeviceOverride: Bool = false
+    private var pendingDeviceOverrideSetAt: TimeInterval = 0
+    private static let overrideSwallowWindow: TimeInterval = 0.05
 
-    /// Mach time (seconds) when the current session's recording started. Used
-    /// to ignore configChange notifications that arrive within a small settling
-    /// window after start() — these are almost always delayed AVAudioEngine
-    /// callbacks from a previous session's device override that landed late.
+    /// Wall-clock time (`Date().timeIntervalSinceReferenceDate`) stamped at the
+    /// top of `start()`, BEFORE device override / observer install / engine
+    /// start. The settling window check (`configChangeSettleWindow`) is measured
+    /// from this stamp. Because the stamp lands before engine.start(), the
+    /// effective window from the user's perspective is shorter than
+    /// `configChangeSettleWindow` would suggest — typically 50–80 ms of
+    /// "real recording time" out of the 100 ms gross window.
     ///
-    /// The window is 100 ms — long enough to cover the typical synthetic-callback
-    /// delay (observed 10–50 ms in practice), short enough that a user-initiated
-    /// device change in the first 100 ms is vanishingly unlikely (a human can't
-    /// hold FN, start dictating, AND swap mics that fast). Real device changes
-    /// after the window still abort as before.
+    /// The window's purpose: drop AVAudioEngineConfigurationChange notifications
+    /// that arrive in the first 100 ms of a session. Those are almost always
+    /// stale cross-session callbacks from a previous session's device override
+    /// that landed after stop() returned (NotificationCenter doesn't guarantee
+    /// in-order delivery across observer registrations).
     ///
-    /// Known limitation: notifications are dispatched on `.main`, so under heavy
-    /// main-thread pressure delivery latency can exceed 100 ms even for
-    /// in-session synthetic callbacks. In that case a real device change in
-    /// the first 100 ms WILL be ignored. We accept this because the alternative
-    /// (per-session AVAudioEngine reinstantiation, the only way to distinguish
-    /// stale-cross-session callbacks from in-session ones) carries a much
-    /// higher cost (audio graph rebuild on every FN press). The settling
-    /// window's worst-case false-negative is one missed mid-recording device
-    /// abort; the worst-case false-positive (no settling window) is every
-    /// recording randomly aborting on its second activation.
+    /// Trade-off: under heavy main-thread pressure, an in-session synthetic
+    /// callback can also arrive past the window — in which case the next-arriving
+    /// real device change is treated as the swallow target instead. The
+    /// `pendingDeviceOverride` time-bound (50 ms from override-set time) limits
+    /// this failure mode further: even if the configChangeSettleWindow misses,
+    /// `pendingDeviceOverride` self-times-out and any real change after 50 ms
+    /// from the override correctly aborts.
+    ///
+    /// Alternative considered and rejected: per-session AVAudioEngine
+    /// reinstantiation (the only way to fully distinguish stale-cross-session
+    /// callbacks from in-session ones). Rejected because audio-graph rebuild on
+    /// every FN press is a much higher cost than the rare false-positive abort.
     private var sessionStartTime: TimeInterval = 0
     private static let configChangeSettleWindow: TimeInterval = 0.1
 
@@ -218,10 +230,14 @@ final class DictationRecorder {
                 // macOS fires AVAudioEngineConfigurationChange async on the main
                 // queue after this property change settles. The observer below
                 // would catch it and abort the recording. Set the swallow flag
-                // BEFORE the observer is installed.
+                // BEFORE the observer is installed, AND record when so the
+                // observer only swallows within `overrideSwallowWindow`. If the
+                // synthetic callback is lost or never fires, the flag self-times-
+                // out and a later real device change correctly aborts the session.
                 pendingDeviceOverride = true
+                pendingDeviceOverrideSetAt = Date().timeIntervalSinceReferenceDate
                 Log.info(
-                    "DictationRecorder: input device set to UID \(preferredUID); next configChange will be swallowed.",
+                    "DictationRecorder: input device set to UID \(preferredUID); next configChange within \(Int(Self.overrideSwallowWindow * 1000))ms will be swallowed.",
                     category: "audio"
                 )
             }
@@ -315,15 +331,28 @@ final class DictationRecorder {
             guard let self else { return }
             // Swallow the FIRST configChange after a programmatic device
             // override — it's our own AudioUnitSetProperty settling, not a
-            // real device-change event. Subsequent notifications still abort
-            // (mid-recording AirPods plug, etc.).
+            // real device-change event. BUT only within `overrideSwallowWindow`
+            // of when we set pendingDeviceOverride; if the synthetic callback
+            // never arrives in time, the flag self-times-out and a later real
+            // device change correctly aborts (better to abort one recording
+            // than to silently capture from a disconnected device).
             if self.pendingDeviceOverride {
+                let sinceOverride = Date().timeIntervalSinceReferenceDate - self.pendingDeviceOverrideSetAt
+                if sinceOverride <= Self.overrideSwallowWindow {
+                    self.pendingDeviceOverride = false
+                    Log.info(
+                        "DictationRecorder: swallowed configChange from programmatic device override (\(Int(sinceOverride * 1000))ms).",
+                        category: "capture"
+                    )
+                    return
+                }
+                // Fell out of the window — the synthetic callback was lost.
+                // Clear the flag and treat THIS event as a real device change.
                 self.pendingDeviceOverride = false
-                Log.info(
-                    "DictationRecorder: swallowed configChange from programmatic device override.",
+                Log.warning(
+                    "DictationRecorder: pendingDeviceOverride timed out (\(Int(sinceOverride * 1000))ms); treating configChange as real.",
                     category: "capture"
                 )
-                return
             }
             // Settling window: ignore configChange notifications that arrive
             // within `configChangeSettleWindow` of session start. Late callbacks
@@ -474,10 +503,12 @@ final class DictationRecorder {
 
         // Set isRecording=false as the LAST mutation so a re-entrant start()
         // can't observe partial cleanup. Also clear the device-override swallow
-        // flag — if it's still armed at stop() time the synthetic configChange
-        // never fired; leaving it true would leak into the next session.
+        // flag and its timestamp — if either is still armed at stop() time the
+        // synthetic configChange never fired; leaving them set would leak into
+        // the next session.
         defer {
             pendingDeviceOverride = false
+            pendingDeviceOverrideSetAt = 0
             isRecording = false
         }
 
