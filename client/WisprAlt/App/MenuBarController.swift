@@ -764,13 +764,25 @@ private enum MeetingProcessingError: Error, LocalizedError {
 
 extension MenuBarController: NSWindowDelegate {
     /// When the user closes the first-launch name window via the title-bar close
-    /// button, sync that intent back to the coordinator. Without this, the
-    /// coordinator's `isPresentingNameSheet` stays `true`, and `removeDuplicates()`
-    /// on the publisher subscription means a later `maybePresentNameSheet(true)`
-    /// won't re-emit — onboarding gets wedged until process restart.
-    func windowWillClose(_ notification: Notification) {
-        guard let closing = notification.object as? NSWindow,
-              closing === firstLaunchWindow else { return }
-        FirstLaunchCoordinator.shared.recordSkip()
+    /// button, sync that intent back to the coordinator (treat as Skip).
+    ///
+    /// `windowWillClose` ALSO fires on programmatic close — when the coordinator's
+    /// `recordSave()` or `recordSkip()` flips `isPresentingNameSheet` to false and
+    /// the Combine sink calls `window.close()`. In that case, the coordinator
+    /// already updated its state and we must NOT call `recordSkip()` again — that
+    /// would clobber the success path (overwriting the cleared skip flag with a
+    /// fresh 30-day suppression and re-classifying a successful save as a skip).
+    ///
+    /// Distinguish: if `isPresentingNameSheet == true` at close time, it's a
+    /// user-initiated title-bar dismiss. If already `false`, recordSkip/recordSave
+    /// already ran — leave coordinator state alone.
+    nonisolated func windowWillClose(_ notification: Notification) {
+        guard let closing = notification.object as? NSWindow else { return }
+        Task { @MainActor [weak self] in
+            guard let self, closing === self.firstLaunchWindow else { return }
+            if FirstLaunchCoordinator.shared.isPresentingNameSheet {
+                FirstLaunchCoordinator.shared.recordSkip()
+            }
+        }
     }
 }

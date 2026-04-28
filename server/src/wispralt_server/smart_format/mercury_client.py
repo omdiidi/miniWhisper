@@ -55,8 +55,9 @@ _WORD_RE = re.compile(r"[^a-zA-Z0-9']+")
 _CONTRACTION_EXPANSIONS = {
     "im": "i'm",
     "dont": "don't",
-    "cant": "can't",
-    "wont": "won't",
+    # cant/wont DROPPED — both are real English words ("cant" = tilt/jargon,
+    # "wont" = accustomed to). In rare prose those meanings are real and
+    # the safety check must reject the substitution.
     "isnt": "isn't",
     "arent": "aren't",
     "wasnt": "wasn't",
@@ -112,6 +113,39 @@ def _is_safe_cleanup(raw: str, cleaned: str) -> bool:
     contraction restoration. Rejects any added/removed/substituted word.
     """
     return _canonicalize(_word_multiset(raw)) == _canonicalize(_word_multiset(cleaned))
+
+
+def _extract_text(field: object) -> str:
+    """Extract a plain string from any OpenAI-compat content/reasoning shape.
+
+    Handles three documented shapes:
+      • plain string                              → returned as-is
+      • list of content parts                     → text fields concatenated
+      • dict (e.g. structured reasoning object)   → joined `text` value if present
+    Anything else (None, unexpected nested type)  → empty string.
+
+    Returning "" on unrecognized shapes lets the caller fall back to raw text
+    cleanly, instead of crashing in `.strip()` or silently dropping content.
+    """
+    if isinstance(field, str):
+        return field
+    if isinstance(field, list):
+        # Content-parts shape: [{"type":"text","text":"..."}, ...].
+        # We accept any element with a string "text" key; ignore image/tool parts.
+        chunks: list[str] = []
+        for part in field:
+            if isinstance(part, dict):
+                txt = part.get("text")
+                if isinstance(txt, str):
+                    chunks.append(txt)
+        return "".join(chunks)
+    if isinstance(field, dict):
+        # Some providers wrap reasoning in {"text": "..."} or {"content": "..."}
+        for key in ("text", "content"):
+            val = field.get(key)
+            if isinstance(val, str):
+                return val
+    return ""
 
 
 class MercuryClient:
@@ -178,20 +212,17 @@ class MercuryClient:
             # Some providers emit content=null and put text in `reasoning` instead;
             # try both so the implementation is robust to provider quirks.
             #
-            # Defensive type guard: OpenAI/OpenRouter may return content as a list of
-            # content parts (e.g. `[{"type": "text", "text": "..."}]`) instead of a
-            # bare string, and reasoning may be a structured object. We accept ONLY
-            # plain strings here; any other shape falls through to None (raw fallback)
-            # rather than throwing in `.strip()`.
+            # OpenAI-compat APIs may return `content` in three shapes:
+            #   1. plain string: "Hello world."
+            #   2. null + text in `reasoning` field (Mercury 2 default — even with
+            #      reasoning.enabled=false some providers still route here)
+            #   3. list of content parts: [{"type": "text", "text": "..."}, ...]
+            # `_extract_text` handles all three; anything unrecognized → "" → raw fallback.
             msg = data["choices"][0]["message"]
-            content_field = msg.get("content")
-            reasoning_field = msg.get("reasoning")
             cleaned_raw = (
-                content_field
-                if isinstance(content_field, str) and content_field
-                else reasoning_field
-                if isinstance(reasoning_field, str) and reasoning_field
-                else ""
+                _extract_text(msg.get("content"))
+                or _extract_text(msg.get("reasoning"))
+                or ""
             )
             cleaned = cleaned_raw.strip()
             if not cleaned:

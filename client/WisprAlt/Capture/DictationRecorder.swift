@@ -135,6 +135,13 @@ final class DictationRecorder {
     /// first such notification per recording session.
     private var pendingDeviceOverride: Bool = false
 
+    /// Mach time (seconds) when the current session's recording started. Used
+    /// to ignore configChange notifications that arrive within a small settling
+    /// window after start() — these are almost always delayed AVAudioEngine
+    /// callbacks from a previous session's device override that landed late.
+    private var sessionStartTime: TimeInterval = 0
+    private static let configChangeSettleWindow: TimeInterval = 0.25
+
     // MARK: - Public API
 
     /// Starts microphone capture.
@@ -158,6 +165,13 @@ final class DictationRecorder {
         // swallow a real device-change event mid-recording. Clear it before any
         // device-override logic runs below.
         pendingDeviceOverride = false
+
+        // Stamp session start so the observer can ignore configChange notifications
+        // that arrive within the settling window — those are nearly always late
+        // callbacks from a PREVIOUS session's device override that landed after
+        // stop() returned. Without this, a delayed notification could abort the
+        // current session as if a real mid-recording device change happened.
+        sessionStartTime = Date().timeIntervalSinceReferenceDate
 
         let inputNode = engine.inputNode
 
@@ -290,6 +304,19 @@ final class DictationRecorder {
                 self.pendingDeviceOverride = false
                 Log.info(
                     "DictationRecorder: swallowed configChange from programmatic device override.",
+                    category: "capture"
+                )
+                return
+            }
+            // Settling window: ignore configChange notifications that arrive
+            // within 250 ms of session start. Late callbacks from a previous
+            // session's device override sometimes land here even after stop()
+            // — without this guard they'd abort the new session as if a real
+            // mid-recording device change happened.
+            let elapsed = Date().timeIntervalSinceReferenceDate - self.sessionStartTime
+            if elapsed < Self.configChangeSettleWindow {
+                Log.info(
+                    "DictationRecorder: ignored configChange within settling window (\(Int(elapsed * 1000))ms after start).",
                     category: "capture"
                 )
                 return
