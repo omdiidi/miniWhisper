@@ -90,6 +90,12 @@ class MercuryClient:
         """
         if not raw_text or not raw_text.strip():
             return None
+        # Short-utterance guard: < 20 words isn't worth the LLM round-trip. The user's
+        # speech is already terse enough that Parakeet's inline punctuation is fine,
+        # and forcing a Mercury call here just adds latency without changing the output.
+        # sum(...) over the multiset counts total tokens, not unique tokens.
+        if sum(_word_multiset(raw_text).values()) < 20:
+            return None
         try:
             response = await self._client.post(
                 f"{self._base_url}/chat/completions",
