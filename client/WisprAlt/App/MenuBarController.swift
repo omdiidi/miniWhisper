@@ -95,6 +95,13 @@ final class MenuBarController: NSObject {
     /// Combine subscriptions; held for the controller's lifetime.
     private var cancellables: Set<AnyCancellable> = []
 
+    /// Token returned by the block-based `addObserver(forName:...)` for the
+    /// `NSApplication.didResignActiveNotification` popover-auto-close handler.
+    /// Held so we can remove it on deinit; otherwise a recreated controller
+    /// (in tests, previews, or future relaunch flows) would accumulate stale
+    /// observers with no cleanup path.
+    private var didResignActiveObserver: NSObjectProtocol?
+
     // MARK: - Init
 
     override init() {
@@ -142,6 +149,7 @@ final class MenuBarController: NSObject {
             win.title = "Welcome to WisprAlt"
             win.styleMask = [.titled, .closable]
             win.isReleasedWhenClosed = false
+            win.delegate = self  // sync window-close back to coordinator state
             win.center()
             win.level = .floating  // keep above other windows
             firstLaunchWindow = win
@@ -306,8 +314,9 @@ final class MenuBarController: NSObject {
         // auto-close on click-outside, but in LSUIElement (menubar-only) apps
         // the popover sometimes stays open when the user clicks into another
         // app because the WisprAlt process never had key focus to lose. Force
-        // close on any app-deactivation event.
-        NotificationCenter.default.addObserver(
+        // close on any app-deactivation event. Token is stored on the controller
+        // so deinit can remove it (matters if MenuBarController is ever recreated).
+        didResignActiveObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
             object: nil,
             queue: .main
@@ -316,6 +325,12 @@ final class MenuBarController: NSObject {
             if self.popover.isShown {
                 self.popover.performClose(nil)
             }
+        }
+    }
+
+    deinit {
+        if let token = didResignActiveObserver {
+            NotificationCenter.default.removeObserver(token)
         }
     }
 
@@ -742,5 +757,20 @@ private enum MeetingProcessingError: Error, LocalizedError {
         case .pollTimedOut:
             return "Server didn't respond in time; check /metrics for job status."
         }
+    }
+}
+
+// MARK: - NSWindowDelegate (first-launch name sheet)
+
+extension MenuBarController: NSWindowDelegate {
+    /// When the user closes the first-launch name window via the title-bar close
+    /// button, sync that intent back to the coordinator. Without this, the
+    /// coordinator's `isPresentingNameSheet` stays `true`, and `removeDuplicates()`
+    /// on the publisher subscription means a later `maybePresentNameSheet(true)`
+    /// won't re-emit — onboarding gets wedged until process restart.
+    func windowWillClose(_ notification: Notification) {
+        guard let closing = notification.object as? NSWindow,
+              closing === firstLaunchWindow else { return }
+        FirstLaunchCoordinator.shared.recordSkip()
     }
 }

@@ -16,11 +16,12 @@ enum MicEnumerator {
 
     /// Process-wide HAL listener: posts `.micDeviceListChanged` when the system
     /// audio device list mutates (AirPods plugged, USB mic disconnected, etc.).
-    /// Idempotent — safe to call multiple times.
+    /// Idempotent — safe to call multiple times. Only marks itself installed when
+    /// the HAL registration actually succeeds; a transient failure can therefore
+    /// be retried on the next call instead of permanently disabling live updates.
     private static var deviceListenerInstalled = false
     static func startDeviceListListener() {
         guard !deviceListenerInstalled else { return }
-        deviceListenerInstalled = true
         var addr = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope:    kAudioObjectPropertyScopeGlobal,
@@ -31,12 +32,20 @@ enum MicEnumerator {
                 NotificationCenter.default.post(name: .micDeviceListChanged, object: nil)
             }
         }
-        AudioObjectAddPropertyListenerBlock(
+        let status = AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject),
             &addr,
             DispatchQueue.global(qos: .utility),
             block
         )
+        if status == noErr {
+            deviceListenerInstalled = true
+        } else {
+            Log.warning(
+                "MicEnumerator: failed to install HAL device-list listener (OSStatus=\(status)); will retry on next call",
+                category: "audio"
+            )
+        }
     }
 
     /// macOS 14+ device discovery for audio inputs. Project deployment target

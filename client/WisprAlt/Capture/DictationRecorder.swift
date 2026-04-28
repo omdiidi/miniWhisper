@@ -152,6 +152,13 @@ final class DictationRecorder {
 
         guard !isRecording else { return true }
 
+        // Always start with a clean swallow flag. If a previous session armed it
+        // and the synthetic configChange never fired (or fired before the observer
+        // was installed), the flag would otherwise leak into THIS session and
+        // swallow a real device-change event mid-recording. Clear it before any
+        // device-override logic runs below.
+        pendingDeviceOverride = false
+
         let inputNode = engine.inputNode
 
         // === Apply preferred input device BEFORE format read & observer install.
@@ -422,8 +429,13 @@ final class DictationRecorder {
         }
 
         // Set isRecording=false as the LAST mutation so a re-entrant start()
-        // can't observe partial cleanup. defer runs after every return path.
-        defer { isRecording = false }
+        // can't observe partial cleanup. Also clear the device-override swallow
+        // flag — if it's still armed at stop() time the synthetic configChange
+        // never fired; leaving it true would leak into the next session.
+        defer {
+            pendingDeviceOverride = false
+            isRecording = false
+        }
 
         // (1) Fence: tap callback checks this and drops in-flight buffers.
         stopRequested.withLock { $0 = true }
