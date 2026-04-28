@@ -46,6 +46,9 @@ CLAUDE.local.md
 tmp/credentials.txt
 tmp/client-config.txt
 
+# /supabase-audit reports — operational signal, keep local-only
+tmp/db-audit/
+
 # Local debug screenshots (not part of the project)
 tmp/mac-mini-screen-*.png
 
