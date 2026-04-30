@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     dictate_rate_per_min: int = 60
     meeting_rate_per_hour: int = 4
 
+    # Idle-eviction for meeting models. After this many seconds with no meeting
+    # activity (no submission, no in-flight job), unload WhisperX + Pyannote to
+    # reclaim ~2-3 GB python RSS. Next meeting pays the cold-load cost again.
+    # Set to 0 to disable eviction (models stay warm forever — old behavior).
+    # Default 300s (5 min) — short enough to free RAM in idle workdays, long
+    # enough not to thrash mid-cluster of meetings.
+    meeting_idle_eviction_seconds: int = 300
+
     # Trust CF-Connecting-IP / X-Forwarded-For headers for rate-limit IP extraction.
     # Set to False if exposing FastAPI directly without Cloudflare Tunnel (e.g. LAN testing)
     # to avoid IP spoofing in rate limiting.

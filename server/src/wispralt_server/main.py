@@ -202,6 +202,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001 — never let re-enqueue crash startup
         logger.exception("Meeting reenqueue_pending failed; continuing startup")
 
+    # 7c. Idle-eviction background task. Every minute, ask the pipeline to
+    #     unload meeting models if they've been idle past the configured
+    #     threshold (default 300s). Skipped entirely when threshold is 0.
+    from wispralt_server.meeting import pipeline as meeting_pipeline
+
+    app.state.eviction_task = None
+    if settings.meeting_idle_eviction_seconds > 0:
+        async def _eviction_loop() -> None:
+            threshold = float(settings.meeting_idle_eviction_seconds)
+            while not getattr(app.state, "shutting_down", False):
+                try:
+                    await asyncio.sleep(60.0)
+                    if meeting_runner.active:
+                        continue
+                    evicted = await asyncio.to_thread(
+                        meeting_pipeline.evict_if_idle, threshold
+                    )
+                    if evicted:
+                        logger.info(
+                            "Idle eviction released meeting models (idle threshold %.0fs).",
+                            threshold,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.exception("Idle-eviction loop iteration failed")
+        app.state.eviction_task = asyncio.create_task(_eviction_loop())
+
     # 8. SIGTERM handler (P5#5 + P5#ExitTimeOut).
     #    I2: Use loop.add_signal_handler so the handler runs safely in the asyncio
     #    event loop rather than interrupting arbitrary C-extension code via the raw
@@ -270,6 +298,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # ── shutdown ──────────────────────────────────────────────────────────────
+    # Cancel the idle-eviction loop first so it stops emitting log noise.
+    eviction_task: asyncio.Task | None = getattr(app.state, "eviction_task", None)
+    if eviction_task is not None and not eviction_task.done():
+        eviction_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await eviction_task
+
     # Cancel the usage-event drainer so its CancelledError handler can
     # do the final flush of any pending events.  getattr is defensive —
     # the lifespan pre-sets the attr, so we only fall through if the

@@ -40,6 +40,7 @@ import datetime
 import gc
 import logging
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +77,12 @@ _load_lock = threading.RLock()
 # because RLock has no .locked() method (only Lock does). Set inside the
 # critical section, cleared in the finally so observers see a stable value.
 _loading_in_flight: bool = False
+# Monotonic timestamp of the last successful or failed transcribe_meeting()
+# return. Drives idle eviction. Initialised to the import time so a freshly
+# started server with no meetings doesn't think it's been idle since the
+# epoch and immediately try to evict (cold models can't be evicted, but the
+# log spam would be confusing).
+_last_meeting_finished_at: float = time.monotonic()
 
 
 # ── lazy load ──────────────────────────────────────────────────────────────────
@@ -146,6 +153,60 @@ def state() -> tuple[bool, bool]:
     warm = _meeting_models_ready
     loading = _loading_in_flight and not warm
     return warm, loading
+
+
+def idle_seconds() -> float:
+    """Seconds since the last meeting transcription completed (success or fail).
+
+    Returns 0.0 if no meeting has ever run on this process. Drives /metrics
+    meeting.idle_seconds and the idle-eviction background task.
+    """
+    if _last_meeting_finished_at == 0.0:
+        return 0.0
+    return time.monotonic() - _last_meeting_finished_at
+
+
+def evict_if_idle(idle_threshold_s: float) -> bool:
+    """If models are warm AND no meeting is in flight AND idle exceeds threshold,
+    unload WhisperX + Pyannote and return True. Otherwise return False.
+
+    Background task in main.py calls this every minute. Single-flight via the
+    same _load_lock used by _ensure_models_loaded — eviction will skip rather
+    than block if a meeting is currently loading or processing.
+
+    Failure mode: same best-effort RAM reclaim caveat as the partial-load path
+    (Python references dropped + gc.collect() hint; OS may hold slabs).
+    """
+    global _meeting_models_ready
+    if not _meeting_models_ready:
+        return False
+    if idle_seconds() < idle_threshold_s:
+        return False
+    if not _load_lock.acquire(blocking=False):
+        return False  # something is loading or another evict is running
+    try:
+        if not _meeting_models_ready:
+            return False
+        if _loading_in_flight:
+            return False
+        # Re-check idle under the lock — a meeting may have finished while we
+        # were waiting and reset the timer.
+        idle = idle_seconds()
+        if idle < idle_threshold_s:
+            return False
+        logger.info(
+            "Idle eviction: unloading meeting models after %.0fs idle "
+            "(threshold %.0fs).",
+            idle,
+            idle_threshold_s,
+        )
+        _wx_mod.reset()
+        _diarize_mod.reset()
+        gc.collect()
+        _meeting_models_ready = False
+        return True
+    finally:
+        _load_lock.release()
 
 
 # ── private helpers ────────────────────────────────────────────────────────────
@@ -256,9 +317,25 @@ def transcribe_meeting(
     RuntimeError
         If model load fails inside _ensure_models_loaded() on first call.
     """
+    global _last_meeting_finished_at
     _ensure_models_loaded()
     logger.info("[%s] Starting meeting transcription pipeline …", job_id)
+    try:
+        return _transcribe_meeting_inner(wav_path, output_dir, job_id, silence_threshold)
+    finally:
+        # Stamp the idle timer on every exit (success OR failure) so the
+        # background eviction task can correctly schedule unload.
+        _last_meeting_finished_at = time.monotonic()
 
+
+def _transcribe_meeting_inner(
+    wav_path: Path,
+    output_dir: Path,
+    job_id: str,
+    silence_threshold: float,
+) -> dict:
+    """Inner pipeline body. Extracted from transcribe_meeting() so the outer
+    function can wrap it in a try/finally that updates the idle timer."""
     # ── Step 1: Load channels ─────────────────────────────────────────────────
     ch1_raw, ch2_raw, src_sr = _load_channels(wav_path)
     logger.debug("[%s] Loaded WAV: sr=%d, duration=%.1fs", job_id, src_sr, len(ch1_raw) / src_sr)

@@ -229,6 +229,8 @@ async def metrics(request: Request) -> JSONResponse:
                 "current_eta_s": current_eta_s,
                 "models_warm": _meeting_warm,
                 "models_loading": _meeting_loading,
+                "idle_seconds": round(meeting_pipeline.idle_seconds(), 1),
+                "idle_eviction_threshold_s": settings.meeting_idle_eviction_seconds,
             },
             "memory": {
                 "rss_mb": proc_mem.rss // (1024 * 1024),

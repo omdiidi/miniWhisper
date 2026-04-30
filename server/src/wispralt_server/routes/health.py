@@ -103,6 +103,7 @@ async def readyz_meeting(request: Request) -> JSONResponse:
         "available_mb": available_bytes // (1024 * 1024),
         "models_warm": models_warm,
         "models_loading": models_loading,
+        "idle_seconds": round(meeting_pipeline.idle_seconds(), 1),
     }
 
     if available_bytes < _2GiB:

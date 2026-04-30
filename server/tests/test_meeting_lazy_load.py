@@ -21,8 +21,38 @@ from wispralt_server.meeting import pipeline as p
 def _reset_state() -> None:
     p._meeting_models_ready = False
     p._loading_in_flight = False
+    p._last_meeting_finished_at = 0.0
     p._wx_mod.reset()
     p._diarize_mod.reset()
+
+
+def test_evict_if_idle_skips_when_cold():
+    _reset_state()
+    assert p.evict_if_idle(0.0) is False
+    assert p.is_ready() is False
+
+
+def test_evict_if_idle_skips_below_threshold():
+    _reset_state()
+    p._meeting_models_ready = True
+    import time as _t
+    p._last_meeting_finished_at = _t.monotonic()
+    assert p.evict_if_idle(60.0) is False  # 0s elapsed, threshold 60
+    assert p.is_ready() is True  # still warm
+
+
+def test_evict_if_idle_unloads_when_above_threshold():
+    _reset_state()
+    p._meeting_models_ready = True
+    import time as _t
+    p._last_meeting_finished_at = _t.monotonic() - 600.0  # 10 min ago
+    with patch.object(p._wx_mod, "reset") as wx_reset, \
+         patch.object(p._diarize_mod, "reset") as di_reset:
+        result = p.evict_if_idle(300.0)  # threshold 5 min
+    assert result is True
+    assert p.is_ready() is False
+    wx_reset.assert_called_once()
+    di_reset.assert_called_once()
 
 
 def test_lazy_load_happy_path():
