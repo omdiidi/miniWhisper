@@ -20,6 +20,7 @@ from wispralt_server.meeting import pipeline as p
 
 def _reset_state() -> None:
     p._meeting_models_ready = False
+    p._loading_in_flight = False
     p._wx_mod.reset()
     p._diarize_mod.reset()
 
@@ -87,11 +88,12 @@ def test_lazy_load_single_flight_under_concurrency():
          patch.object(p._df_mod, "get_df"):
         t1 = threading.Thread(target=p._ensure_models_loaded)
         t1.start()
+        # RLock has no .locked(); poll the explicit in-flight flag instead.
         for _ in range(50):
-            if p._load_lock.locked():
+            if p._loading_in_flight:
                 break
             time.sleep(0.01)
-        assert p._load_lock.locked(), "thread A never acquired the lock"
+        assert p._loading_in_flight, "thread A never started loading"
 
         t2 = threading.Thread(target=b_target)
         t2.start()

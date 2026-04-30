@@ -72,6 +72,10 @@ _MODEL_META = {
 # Ready flag — set to True by _ensure_models_loaded(); queried by /readyz/meeting.
 _meeting_models_ready: bool = False
 _load_lock = threading.RLock()
+# In-flight flag for is_loading() observability. Cannot derive from RLock
+# because RLock has no .locked() method (only Lock does). Set inside the
+# critical section, cleared in the finally so observers see a stable value.
+_loading_in_flight: bool = False
 
 
 # ── lazy load ──────────────────────────────────────────────────────────────────
@@ -90,28 +94,29 @@ def _ensure_models_loaded() -> None:
     free immediately. Traceback frames also retain locals until they unwind.
     RSS may stay elevated until the next allocation reuses the freed slabs.
     """
-    global _meeting_models_ready
+    global _meeting_models_ready, _loading_in_flight
     if _meeting_models_ready:
         return
     with _load_lock:
         if _meeting_models_ready:
             return
-        logger.info("Lazy-loading meeting pipeline models (first meeting after start) …")
-        # Idempotent re-call — closes the long-window race where any module
-        # imported between startup install_compat_shims() and now may bind to
-        # un-shimmed torch.load / hf_hub_download. Cheap (one bool check).
-        install_compat_shims()
+        _loading_in_flight = True
         try:
-            _wx_mod.load()
-            _diarize_mod.load(settings.hf_token.get_secret_value())
-            _df_mod.get_df()
-        except Exception:
-            _wx_mod.reset()
-            _diarize_mod.reset()
-            gc.collect()
-            raise
-        _meeting_models_ready = True
-        logger.info("Meeting pipeline models loaded and resident.")
+            logger.info("Lazy-loading meeting pipeline models (first meeting after start) …")
+            install_compat_shims()
+            try:
+                _wx_mod.load()
+                _diarize_mod.load(settings.hf_token.get_secret_value())
+                _df_mod.get_df()
+            except Exception:
+                _wx_mod.reset()
+                _diarize_mod.reset()
+                gc.collect()
+                raise
+            _meeting_models_ready = True
+            logger.info("Meeting pipeline models loaded and resident.")
+        finally:
+            _loading_in_flight = False
 
 
 def is_ready() -> bool:
@@ -122,26 +127,24 @@ def is_ready() -> bool:
 def is_loading() -> bool:
     """True iff a lazy load is currently in flight.
 
-    NOTE: callers that need a coherent (warm, loading) snapshot must use state()
-    instead — reading is_ready() and is_loading() separately can observe
-    intermediate states between the flag-set and lock-release in
-    _ensure_models_loaded().
+    Backed by an explicit _loading_in_flight bool (RLock has no .locked()
+    method, only Lock does). Callers needing a coherent (warm, loading)
+    snapshot must use state() — both reads happen between GIL release points
+    so a racing flip from (loading=True, warm=False) to (loading=False, warm=True)
+    can briefly observe (False, False).
     """
-    return _load_lock.locked() and not _meeting_models_ready
+    return _loading_in_flight and not _meeting_models_ready
 
 
 def state() -> tuple[bool, bool]:
     """Best-effort coherent (warm, loading) snapshot for observability endpoints.
 
-    Reads _meeting_models_ready first, then derives loading from the lock. The
-    two reads happen between GIL release points, so a microsecond-scale racing
-    write can produce (False, False) while a load just completed. Acceptable
-    for an observability endpoint — the next poll will reflect reality. Do NOT
-    use this snapshot for control flow; use the per-call entry through
-    transcribe_meeting() which is properly serialized.
+    Acceptable for an observability endpoint — the next poll will reflect
+    reality. Do NOT use this snapshot for control flow; use the per-call entry
+    through transcribe_meeting() which is properly serialized.
     """
     warm = _meeting_models_ready
-    loading = _load_lock.locked() and not warm
+    loading = _loading_in_flight and not warm
     return warm, loading
 
 
