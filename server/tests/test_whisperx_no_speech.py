@@ -39,6 +39,17 @@ def test_empty_segments_skips_align():
     mock_wx.align.assert_not_called()
 
 
+def test_align_indexerror_returns_empty():
+    """If transcribe returns segments but align crashes on degenerate input,
+    fall back to empty rather than failing the meeting job."""
+    _seed_loaded()
+    wx._model.transcribe.return_value = {"segments": [{"start": 0.0, "end": 0.01, "text": ""}]}
+    with patch.object(wx, "whisperx") as mock_wx:
+        mock_wx.align.side_effect = IndexError("degenerate align")
+        out = wx.transcribe_channel(np.zeros(16_000, dtype=np.float32))
+    assert out == {"segments": []}
+
+
 def test_real_segments_still_align():
     _seed_loaded()
     wx._model.transcribe.return_value = {"segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}

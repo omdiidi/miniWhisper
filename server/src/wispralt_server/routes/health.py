@@ -64,6 +64,9 @@ async def readyz_dictation(request: Request) -> JSONResponse:
 
     meeting_runner = getattr(request.app.state, "meeting_runner", None)
     meeting_active: bool = meeting_runner.active if meeting_runner is not None else False
+    # Cold-load also competes for unified memory + CPU/MPS; flag dictation as
+    # degraded during the lazy-load window so callers can warn the user.
+    meeting_loading: bool = meeting_pipeline.is_loading()
 
     if not parakeet_service.ready:
         response = JSONResponse(
@@ -73,7 +76,7 @@ async def readyz_dictation(request: Request) -> JSONResponse:
     else:
         response = JSONResponse(content={"status": "ok"})
 
-    if meeting_active:
+    if meeting_active or meeting_loading:
         response.headers["X-Dictation-Degraded"] = "true"
 
     return response

@@ -107,22 +107,31 @@ def transcribe_channel(audio_16k: np.ndarray) -> dict:
     # underlying transformers pipeline tries inputs[0] on an empty list and
     # raises IndexError. Treat that as "channel has no speech" and return an
     # empty result so the meeting pipeline produces a valid (empty-segments)
-    # transcript instead of crashing the whole job.
+    # transcript instead of crashing the whole job. We narrow the catch to
+    # IndexError originating from transformers/whisperx (any IndexError here
+    # comes from the empty-VAD-output path; our own code can't raise it).
     try:
         result: dict = _model.transcribe(audio_16k, batch_size=8)  # type: ignore[union-attr]
     except IndexError:
-        logger.info("WhisperX VAD found no speech in channel; returning empty.")
+        logger.info("WhisperX VAD found no speech (transcribe); returning empty.")
         return {"segments": []}
 
     if not result.get("segments"):
         return {"segments": []}
 
-    aligned: dict = whisperx.align(
-        result["segments"],
-        _align_model,
-        _align_metadata,
-        audio_16k,
-        device=_DEVICE,
-        return_char_alignments=False,
-    )
+    # whisperx.align can also crash with IndexError on degenerate inputs
+    # (e.g. a single ultra-short VAD segment whose audio slice yields empty
+    # word arrays). Same treatment: degrade to empty rather than fail the job.
+    try:
+        aligned: dict = whisperx.align(
+            result["segments"],
+            _align_model,
+            _align_metadata,
+            audio_16k,
+            device=_DEVICE,
+            return_char_alignments=False,
+        )
+    except IndexError:
+        logger.info("WhisperX align failed on degenerate segments; returning empty.")
+        return {"segments": []}
     return aligned

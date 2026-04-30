@@ -23,8 +23,11 @@ RSS_BEFORE="$(curl -fsS --max-time 5 -H "Authorization: Bearer $KEY" \
 WAV="$(mktemp -t wispralt-smoke-XXXXXX).wav"
 SAY_WAV="$(mktemp -t wispralt-smoke-say-XXXXXX).wav"
 SAY_AIFF="$(mktemp -t wispralt-smoke-say-XXXXXX).aiff"
+command -v say >/dev/null 2>&1 || {
+  echo "smoke-meeting.sh requires macOS \`say\` (not on this host)."; exit 0; }
 say -o "$SAY_AIFF" \
   "Hello world. This is a smoke test of the WisprAlt meeting pipeline. Lazy-load is alive."
+[ -s "$SAY_AIFF" ] || { echo "say produced empty audio (no default voice?)"; exit 1; }
 afconvert -f WAVE -d LEI16@16000 -c 1 "$SAY_AIFF" "$SAY_WAV"
 python3 -c "
 import numpy as np, soundfile as sf, sys
