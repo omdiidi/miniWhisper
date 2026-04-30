@@ -80,49 +80,89 @@ enum MeetingAPI {
             throw ServerError.invalidServerURL
         }
 
-        // Compute Content-MD5 via streaming so we never load the entire WAV into RAM.
-        // Large meetings can be hundreds of MB; loading them whole causes peak-RSS spikes.
+        // Compute Content-MD5 over the raw WAV bytes (server compares to the
+        // post-multipart-parse file content, NOT the multipart envelope bytes).
+        // Streaming so we never load the entire WAV into RAM.
         var hasher = Insecure.MD5()
-        let handle = try FileHandle(forReadingFrom: wavURL)
-        defer { try? handle.close() }
+        let hashHandle = try FileHandle(forReadingFrom: wavURL)
+        defer { try? hashHandle.close() }
         while true {
-            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
+            guard let chunk = try hashHandle.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
             hasher.update(data: chunk)
         }
         let md5Base64 = Data(hasher.finalize()).base64EncodedString()
+        try? hashHandle.close()
 
-        // Determine file size separately (needed for Content-Length header).
-        let fileSize = try FileManager.default.attributesOfItem(atPath: wavURL.path)[.size] as? Int ?? 0
+        // Server endpoint declares ``file: UploadFile`` — that requires
+        // multipart/form-data, NOT a raw audio/wav body. Build the multipart
+        // envelope as a temp file so we keep streaming behavior (no full-WAV
+        // RAM load) and can still use uploadTask(fromFile:).
+        let boundary = "wispralt-" + UUID().uuidString
+        let prefix = (
+            "--\(boundary)\r\n" +
+            "Content-Disposition: form-data; name=\"file\"; filename=\"" +
+            wavURL.lastPathComponent + "\"\r\n" +
+            "Content-Type: audio/wav\r\n\r\n"
+        ).data(using: .utf8)!
+        let suffix = "\r\n--\(boundary)--\r\n".data(using: .utf8)!
+
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wispralt-upload-\(UUID().uuidString).tmp")
+        FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+        do {
+            let writer = try FileHandle(forWritingTo: tempURL)
+            try writer.write(contentsOf: prefix)
+            let reader = try FileHandle(forReadingFrom: wavURL)
+            defer { try? reader.close() }
+            while true {
+                guard let chunk = try reader.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
+                try writer.write(contentsOf: chunk)
+            }
+            try writer.write(contentsOf: suffix)
+            try writer.close()
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
+        }
+
+        let tempSize = (try FileManager.default.attributesOfItem(atPath: tempURL.path)[.size] as? Int) ?? 0
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.setValue(md5Base64, forHTTPHeaderField: "Content-MD5")
-        request.setValue(String(fileSize), forHTTPHeaderField: "Content-Length")
+        request.setValue(String(tempSize), forHTTPHeaderField: "Content-Length")
 
         if let apiKey = try? KeychainHelper.getAPIKey() {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
         // Perform upload with a dedicated session so we can set a per-upload delegate.
-        let (data, response) = try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>) in
+        let (data, response): (Data, HTTPURLResponse)
+        do {
+            (data, response) = try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>) in
 
-            let delegate = UploadSessionDelegate(
-                progressHandler: progress,
-                continuation: continuation
-            )
-            // Delegate-based session — the delegate receives progress + response callbacks.
-            let uploadSession = URLSession(
-                configuration: .default,
-                delegate: delegate,
-                delegateQueue: nil
-            )
-            delegate.session = uploadSession
+                let delegate = UploadSessionDelegate(
+                    progressHandler: progress,
+                    continuation: continuation
+                )
+                // Delegate-based session — the delegate receives progress + response callbacks.
+                let uploadSession = URLSession(
+                    configuration: .default,
+                    delegate: delegate,
+                    delegateQueue: nil
+                )
+                delegate.session = uploadSession
 
-            let task = uploadSession.uploadTask(with: request, fromFile: wavURL)
-            task.resume()
+                let task = uploadSession.uploadTask(with: request, fromFile: tempURL)
+                task.resume()
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
         }
+        try? FileManager.default.removeItem(at: tempURL)
 
         try ServerClient.shared.mapHTTPError(
             status: response.statusCode,
