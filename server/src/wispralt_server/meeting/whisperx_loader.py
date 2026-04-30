@@ -103,10 +103,20 @@ def transcribe_channel(audio_16k: np.ndarray) -> dict:
             "WhisperX models are not loaded. Call whisperx_loader.load() first."
         )
 
-    # Transcribe; batch_size=8 is a reasonable default for CPU int8.
-    result: dict = _model.transcribe(audio_16k, batch_size=8)  # type: ignore[union-attr]
+    # WhisperX runs VAD before transcription. When VAD detects no speech, the
+    # underlying transformers pipeline tries inputs[0] on an empty list and
+    # raises IndexError. Treat that as "channel has no speech" and return an
+    # empty result so the meeting pipeline produces a valid (empty-segments)
+    # transcript instead of crashing the whole job.
+    try:
+        result: dict = _model.transcribe(audio_16k, batch_size=8)  # type: ignore[union-attr]
+    except IndexError:
+        logger.info("WhisperX VAD found no speech in channel; returning empty.")
+        return {"segments": []}
 
-    # Align to get per-word timestamps.
+    if not result.get("segments"):
+        return {"segments": []}
+
     aligned: dict = whisperx.align(
         result["segments"],
         _align_model,

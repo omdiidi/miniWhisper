@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Smoke test: synthetic 2-ch WAV → upload → poll → download → assert RSS grew.
+# Smoke test: 2-ch WAV with real macOS-TTS speech on ch1 → upload → poll →
+# download JSON → assert non-empty transcript. Logs RSS delta (advisory).
 # Run against a live server (default: $WISPRALT_BASE_URL or transcribe.integrateapi.ai).
 
 set -euo pipefail
@@ -9,24 +10,33 @@ KEY="$(security find-generic-password -s co.wispralt -w 2>/dev/null \
        || echo "${WISPRALT_API_KEY:-}")"
 [ -z "$KEY" ] && { echo "No API key (Keychain or WISPRALT_API_KEY)"; exit 1; }
 
-# 0. Capture pre-meeting RSS via /admin/metrics (if reachable; skip if not).
+# 0. Capture pre-meeting RSS via /metrics (if reachable; skip if not).
 RSS_BEFORE="$(curl -fsS --max-time 5 -H "Authorization: Bearer $KEY" \
-  "$BASE_URL/admin/metrics" 2>/dev/null \
+  "$BASE_URL/metrics" 2>/dev/null \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["memory"]["rss_mb"])' \
   2>/dev/null || echo 0)"
 
-# 1. Generate a 5-second 2-channel 16kHz WAV with sine on ch1 (mic), silence on ch2.
+# 1. Generate a 2-channel 16kHz WAV with REAL speech on ch1 (via macOS `say`)
+#    and silence on ch2 (forces in-person mode). Real speech is required —
+#    pure-tone WAVs cause WhisperX to crash inside transformers when VAD
+#    finds no speech segments.
 WAV="$(mktemp -t wispralt-smoke-XXXXXX).wav"
+SAY_WAV="$(mktemp -t wispralt-smoke-say-XXXXXX).wav"
+SAY_AIFF="$(mktemp -t wispralt-smoke-say-XXXXXX).aiff"
+say -o "$SAY_AIFF" --data-format=LEI16@16000 \
+  "Hello world. This is a smoke test of the WisprAlt meeting pipeline. Lazy-load is alive."
+afconvert -f WAVE -d LEI16@16000 -c 1 "$SAY_AIFF" "$SAY_WAV"
 python3 -c "
 import numpy as np, soundfile as sf, sys
-sr, dur = 16000, 5.0
-t = np.arange(int(sr*dur)) / sr
-ch1 = (0.3 * np.sin(2*np.pi*440*t)).astype('float32')
+src, sr = sf.read(sys.argv[1], dtype='float32')
+if src.ndim > 1:
+    src = src[:, 0]
+ch1 = src
 ch2 = np.zeros_like(ch1)
-sf.write(sys.argv[1], np.stack([ch1, ch2], axis=1), sr, subtype='FLOAT')
-" "$WAV"
+sf.write(sys.argv[2], np.stack([ch1, ch2], axis=1), sr, subtype='FLOAT')
+" "$SAY_WAV" "$WAV"
 
-cleanup() { rm -f "$WAV"; }
+cleanup() { rm -f "$WAV" "$SAY_WAV" "$SAY_AIFF"; }
 trap cleanup EXIT
 
 # 2. Submit.
@@ -58,13 +68,19 @@ curl -fsS --max-time 30 -H "Authorization: Bearer $KEY" \
 import json, sys
 d = json.load(sys.stdin)
 assert "segments" in d and "speakers" in d, "missing fields"
-print(f"OK: mode={d[\"mode\"]} segments={len(d[\"segments\"])} duration={d[\"duration_s\"]}s")
+nseg = len(d["segments"])
+text = " ".join(s.get("text", "") for s in d["segments"]).strip()
+print(f"OK: mode={d[\"mode\"]} segments={nseg} duration={d[\"duration_s\"]}s")
+if nseg:
+    print(f"transcript: {text[:200]}")
+else:
+    print("transcript: (empty — no speech detected)")
 '
 
 # 5. RSS-delta check (optional — only if metrics were reachable in step 0).
 if [ "$RSS_BEFORE" != "0" ]; then
   RSS_AFTER="$(curl -fsS --max-time 5 -H "Authorization: Bearer $KEY" \
-    "$BASE_URL/admin/metrics" \
+    "$BASE_URL/metrics" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["memory"]["rss_mb"])')"
   DELTA=$(( RSS_AFTER - RSS_BEFORE ))
   echo "RSS: ${RSS_BEFORE} → ${RSS_AFTER} MB (Δ ${DELTA} MB)"
