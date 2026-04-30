@@ -162,6 +162,16 @@ final class ServerClient {
         case 413:
             throw ServerError.uploadTooLarge
         case 422:
+            // Surface the server's actual reason (e.g. "Dictation too long:
+            // 312.0s (max 300s)") instead of the canned "appears incomplete"
+            // string. Parses FastAPI's standard {"detail": "..."} envelope;
+            // falls back to .uploadTruncated when the body isn't decodable.
+            if let bodyData = bodyString?.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+               let detail = json["detail"] as? String, !detail.isEmpty
+            {
+                throw ServerError.server(status: 422, body: detail)
+            }
             throw ServerError.uploadTruncated
         case 429:
             // Distinguish "meeting in progress" from generic rate limit.

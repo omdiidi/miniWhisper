@@ -59,9 +59,15 @@ class Settings(BaseSettings):
     # activity (no submission, no in-flight job), unload WhisperX + Pyannote to
     # reclaim ~2-3 GB python RSS. Next meeting pays the cold-load cost again.
     # Set to 0 to disable eviction (models stay warm forever — old behavior).
-    # Default 300s (5 min) — short enough to free RAM in idle workdays, long
-    # enough not to thrash mid-cluster of meetings.
-    meeting_idle_eviction_seconds: int = 300
+    # Default 60s (1 min) — aggressive because meetings are infrequent on
+    # this deployment; raise to 300+ if you do meetings in clusters.
+    meeting_idle_eviction_seconds: int = 60
+
+    # Hard cap on dictation audio length. Defends against decode-amplification
+    # attacks (1KB body that decodes to many minutes) and single-thread executor
+    # starvation. Default 300s (5 min) — covers realistic long-form dictations
+    # without letting a runaway upload pin the executor.
+    dictation_max_duration_s: int = 300
 
     # Trust CF-Connecting-IP / X-Forwarded-For headers for rate-limit IP extraction.
     # Set to False if exposing FastAPI directly without Cloudflare Tunnel (e.g. LAN testing)

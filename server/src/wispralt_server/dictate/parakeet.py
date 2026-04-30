@@ -36,11 +36,14 @@ MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v2"
 TARGET_SR = 16_000
 # Minimum samples required for a meaningful transcription (100ms of audio at 16kHz)
 MIN_SAMPLES = 1_600
-# Hard cap on post-resample length: 60s at 16kHz. Dictation is a hold-FN gesture;
-# anything longer is either pathological encoding (ulaw amplification) or a
-# meeting upload sent to the wrong endpoint. Prevents single-thread executor
-# starvation by an attacker uploading a 1KB body that decodes to many minutes.
-MAX_SAMPLES = TARGET_SR * 60
+# Hard cap on post-resample length, configured via DICTATION_MAX_DURATION_S
+# (default 300s = 5 min). Dictation is a hold-FN gesture; previous default of
+# 60s wrongly rejected legitimate long-form dictations. The cap still defends
+# against decode-amplification (1KB body decoding to many minutes) and single-
+# thread executor starvation. Read once at import to avoid per-request settings
+# attribute lookup on the hot path.
+from wispralt_server.config import settings as _settings
+MAX_SAMPLES = TARGET_SR * _settings.dictation_max_duration_s
 
 
 class ParakeetService:
@@ -123,9 +126,12 @@ class ParakeetService:
         # to prevent ulaw/alaw or pathological-sr uploads decoding into multi-minute
         # arrays that block the single-thread executor.
         if len(audio_np) > MAX_SAMPLES:
+            # Specific message — clients map "too long" differently from a
+            # genuine corrupt-decode error.
             raise CorruptAudioError(
-                f"Decoded audio too long: {len(audio_np) / TARGET_SR:.1f}s "
-                f"(max {MAX_SAMPLES / TARGET_SR:.0f}s)"
+                f"Dictation too long: {len(audio_np) / TARGET_SR:.1f}s "
+                f"(max {MAX_SAMPLES / TARGET_SR:.0f}s). For longer audio, use "
+                f"meeting recording (FN-triple-tap)."
             )
 
         # Guard against too-short clips (silence or near-silence)
