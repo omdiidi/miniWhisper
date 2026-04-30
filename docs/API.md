@@ -469,8 +469,10 @@ Structured server observability snapshot.
     "models_loading": false
   },
   "memory": {
-    "rss_mb": 7482,
-    "available_mb": 8704
+    "rss_mb": 731,
+    "available_mb": 8704,
+    "mlx_active_mb": 1218,
+    "mlx_cache_mb": 0
   },
   "disk": {
     "free_gb": 42,
@@ -497,8 +499,10 @@ Structured server observability snapshot.
 | `meeting.current_eta_s` | Estimated seconds until active job completes, or `null` |
 | `meeting.models_warm` | `true` iff WhisperX + Pyannote are resident (lazy-loaded on first meeting). See [`/readyz/meeting`](#get-readyzmeeting). |
 | `meeting.models_loading` | `true` iff a lazy load is currently in flight. |
-| `memory.rss_mb` | Server process RSS in MiB |
+| `memory.rss_mb` | Server process RSS in MiB. **Does NOT include MLX/Metal allocations** on Apple Silicon — unified memory is tracked by Metal separately. Use `mlx_active_mb` + `mlx_cache_mb` to close the gap with what Activity Monitor's "Memory" column reports. |
 | `memory.available_mb` | System available RAM in MiB |
+| `memory.mlx_active_mb` | Bytes currently held by live MLX tensors (Parakeet weights ≈ 1218 MB warm, 0 if model not loaded). Returns 0 if MLX isn't initialized or the API is missing. |
+| `memory.mlx_cache_mb` | MLX's allocation pool. Grows during inference, returned to OS by `mx.metal.clear_cache()` after each Parakeet call. Should be ~0 between dictations; non-zero only mid-flight. |
 | `disk.free_gb` | Free disk on staging volume in GiB |
 | `disk.staging_count` | Number of staging WAV files currently on disk |
 | `requests_total` | Request counts keyed by `"route:status"` (last process lifetime) |
