@@ -9,6 +9,8 @@ This file is the single source of truth for which documentation file covers each
 | `README.md` | Top-level project pitch, architecture diagram, quickstart links |
 | `CLAUDE.md` | Claude Code project rules, slash command index, key conventions |
 | `CHANGELOG.md` | (it IS a doc — root index) — release-by-release list of notable changes |
+| `install.sh` | [INSTALL.md](INSTALL.md) — curl one-liner installer (downloads latest release DMG, verifies SHA256, mounts + copies app, seeds Keychain with API key, opens System Settings panes) |
+| `docs/INSTALL.md` | (it IS a doc — root index) — canonical employee install guide for the `install.sh` curl one-liner |
 | `docs/INTEGRATION-GUIDE.md` | (it IS a doc — root index) — third-party drop-in integration guide for the OpenAI-compatible `/v1` endpoint |
 | `.gitignore` | — (no separate doc) |
 | `.editorconfig` | — (no separate doc) |
@@ -166,9 +168,8 @@ This file is the single source of truth for which documentation file covers each
 
 ## User-scoped slash commands (`~/.claude-dotfiles/commands/`)
 
-Employee-facing slash commands that drive a clone-free install via `gh release download`. They live in the user's dotfiles, not in this repo.
+Developer-facing slash command for in-place updates. Lives in the user's dotfiles, not in this repo. (Fresh installs use the `install.sh` curl one-liner — see [INSTALL.md](INSTALL.md).)
 
 | File | Covered by |
 |---|---|
-| `~/.claude-dotfiles/commands/wispralt-setup.md` | [SETUP-CLIENT.md](SETUP-CLIENT.md), [DEPLOY-TEAM.md](DEPLOY-TEAM.md) — first-time install: `gh release download` + SHA256 verify + permissions wizard |
 | `~/.claude-dotfiles/commands/wispralt-update.md` | [SETUP-CLIENT.md](SETUP-CLIENT.md), [DEPLOY-TEAM.md](DEPLOY-TEAM.md) — pull-based update: diff installed vs latest tag, replace + TCC reset cycle if cdhash changed |

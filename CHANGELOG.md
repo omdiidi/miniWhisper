@@ -6,6 +6,14 @@ All notable changes to WisprAlt are documented here.
 
 ### Added
 
+#### Install
+
+- **`install.sh`** — curl-pipe-bash one-liner installer. Replaces the
+  `/wispralt-setup` Claude Code slash command. Pure bash + native macOS
+  tools; no homebrew, no `gh`, no sudo. Idempotent (re-runs serve as the
+  update path). See [docs/INSTALL.md](docs/INSTALL.md).
+- **`docs/INSTALL.md`** — canonical install guide for employees.
+
 #### Server
 
 - **OpenAI-compatible `/v1/audio/transcriptions` endpoint** (`server/src/wispralt_server/routes/v1_transcriptions.py`). Drop-in replacement for any client that talks to the OpenAI Audio API: set `OPENAI_BASE_URL=https://<your-server>/v1` and `OPENAI_API_KEY=<wispralt-token>` and existing OpenAI SDKs (Python, Node, curl) work without further changes. Sync, dictate-only, 25 MB cap, raw output (smart formatting deliberately not applied — third parties expect raw model output). Returns OpenAI-shaped error envelopes with `request_id` for support correlation. See `docs/INTEGRATION-GUIDE.md`.
@@ -32,6 +40,12 @@ All notable changes to WisprAlt are documented here.
 - **`ADMIN.md`** documents the `display_name (label)` admin UI rendering, the `OPENROUTER_API_KEY` env var, and how `v1_dictate` events fold into the existing per-user dictation tiles.
 - **`SETUP-CLIENT.md`** adds Smart formatting, Your Name, and App Icon subsections.
 - **`SETUP-SERVER.md`** adds `OPENROUTER_API_KEY` to the env table, a Postgres schema-migrations subsection covering v1 + v2, and an "Optional: enable smart formatting" step.
+
+### Removed
+
+- **`~/.claude-dotfiles/commands/wispralt-setup.md`** — obsolete; replaced
+  by `install.sh`. The `/wispralt-update` slash command remains as a
+  developer convenience.
 
 ### Changed
 

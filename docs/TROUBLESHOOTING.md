@@ -417,7 +417,7 @@ Then reopen WisprAlt and grant all four permissions. This happens at most once a
 
 ### API key rejected (employee install)
 
-**Symptom:** Employee runs `/wispralt-setup`, pastes the texted token into the WisprAlt Settings pane, and Test Connection returns `401 Invalid bearer token`. Or dictation worked previously and now starts returning 401.
+**Symptom:** Employee runs the `install.sh` curl one-liner (see [INSTALL.md](INSTALL.md)) with their texted token in `WISPRALT_API_KEY`, the app launches, and Test Connection returns `401 Invalid bearer token`. Or dictation worked previously and now starts returning 401.
 
 **Diagnosis ladder:**
 

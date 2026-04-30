@@ -137,11 +137,19 @@ either roll back the commit (`git reset --hard HEAD~1`) or bump VERSION.
    is never persisted in plaintext anywhere.
 3. Text the token to the employee via Signal / iMessage. **Never email**
    — keys-in-email is a hard "no" per the brief.
-4. Tell them to run `/wispralt-setup` in Claude Code. That slash command
-   (in `~/.claude-dotfiles/commands/`) downloads the latest signed DMG
-   from GitHub Releases, verifies the SHA256, copies the app to
-   `/Applications`, strips quarantine, opens the app, and prompts them
-   to paste the API key when WisprAlt's Settings pane appears.
+4. Tell them to run the `install.sh` curl one-liner from a Terminal,
+   substituting their token for `sk_xxx` (full guide in
+   [INSTALL.md](INSTALL.md)):
+
+   ```bash
+   WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai \
+     curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+   ```
+
+   The installer downloads the latest signed DMG from GitHub Releases,
+   verifies the SHA256, copies the app to `/Applications`, strips
+   quarantine, seeds the API key into the Keychain, and opens the
+   System Settings panes for the four required permissions.
 
 The employee's first dictation populates `wispralt.usage_events`; they
 appear on `/admin/users` with a non-null `last_seen_at`.

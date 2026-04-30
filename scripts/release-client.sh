@@ -107,4 +107,4 @@ gh release create "${TAG}" \
 
 echo ""
 echo "Release ${TAG} shipped."
-echo "Employees can now run /wispralt-setup or /wispralt-update."
+echo "Employees can install via the curl one-liner in docs/INSTALL.md or run /wispralt-update in Claude Code."

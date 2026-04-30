@@ -169,10 +169,17 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
    plaintext token.
 3. Copy the token. Text it to the employee via Signal / iMessage — it is
    shown **once** and never persisted in plaintext anywhere.
-4. The employee runs `/wispralt-setup` in Claude Code, which downloads
-   the latest signed DMG from GitHub Releases, copies it to
-   `/Applications`, walks them through the four macOS permission
-   prompts, and tells them to paste the token into the Settings pane.
+4. The employee runs the `install.sh` curl one-liner from a Terminal
+   (full guide in [INSTALL.md](INSTALL.md)):
+
+   ```bash
+   WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai \
+     curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+   ```
+
+   The installer downloads the latest signed DMG from GitHub Releases,
+   copies the app to `/Applications`, seeds the token into the Keychain,
+   and opens the System Settings panes for the four macOS permissions.
 5. Their first dictation populates `usage_events`; they appear on
    `/admin/users` with a non-null `last_seen_at`.
 

@@ -80,14 +80,22 @@ The script handles everything: Python venv, model downloads (~5.6 GB), API key g
 
 Full walkthrough: [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md)
 
-## Quickstart — Client
+## Quickstart — Client (employees)
 
-1. Download the latest signed DMG from [Releases](../../releases).
-2. Drag **WisprAlt.app** to `/Applications`.
-3. On first launch, complete the four-permission wizard: Accessibility → Input Monitoring → Microphone → Screen Recording. On macOS 14.4+, Input Monitoring requires a quit-and-reopen before the app can proceed.
-4. Paste the server config one-liner printed by `setup-server.sh`.
+Open Terminal on the Mac you want to dictate from, paste this, hit enter:
 
-Or build from source: see [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md).
+```bash
+WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai \
+  curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+```
+
+The app opens, walks you through 4 macOS permissions (Accessibility, Input Monitoring, Microphone, Screen Recording), and you're ready to dictate.
+
+Hold FN to dictate. Release to inject text at the cursor. Triple-tap FN quickly to start a meeting recording.
+
+See [docs/INSTALL.md](docs/INSTALL.md) for the full install guide and troubleshooting.
+
+Building from source (developers only): [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md).
 
 ## Docs
 

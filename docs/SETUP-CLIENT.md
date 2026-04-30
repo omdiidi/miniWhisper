@@ -311,39 +311,49 @@ and re-enable the user-facing update notifications.
 
 ## Employee install (recommended)
 
-This is the one-command install path for a teammate who has been given a
-WisprAlt API key. It lives in the user's `~/.claude-dotfiles/commands/` —
-it is **not** a project-scoped slash command — so it works on a fresh Mac
-without cloning this repo.
+The canonical install path is the curl one-liner — pure bash + native
+macOS tools. **No Claude Code, no Homebrew, no `gh`, no sudo, no auth.**
+Works on a fresh Mac without cloning this repo. See
+[INSTALL.md](INSTALL.md) for the full guide and troubleshooting.
 
 **Prerequisites:**
-- macOS 14.0 or later.
-- [Claude Code](https://claude.com/claude-code) installed.
-- `gh auth login` once (so the slash command can call `gh release
-  download` non-interactively).
+- macOS 14.0 or later (Sonoma+).
+- Apple Silicon (current builds are arm64-only).
+- Internet (anonymous; no GitHub auth needed since the repo is public).
+- Xcode Command Line Tools (or `python3` will trigger the install dialog
+  on first invocation — install ahead of time via `xcode-select --install`).
 
 **Install:**
-1. Open Claude Code.
-2. Run `/wispralt-setup`.
 
-What it does (full pseudocode in
-`~/.claude-dotfiles/commands/wispralt-setup.md`):
+```bash
+WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai \
+  curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+```
 
-1. Verifies macOS ≥ 14, installs Homebrew + `gh` if missing.
-2. Picks the latest GitHub Release tag for `omdiidi/miniWhisper`.
-3. Downloads the DMG and its `.sha256` sidecar.
-4. Verifies the SHA256.
-5. Mounts, copies `WisprAlt.app` to `/Applications`, unmounts, strips
-   quarantine.
-6. Opens the app — `PermissionGate.swift` walks four macOS permissions.
-7. Prints: "Now paste the API key Omid texted you in Settings → API Key."
+What `install.sh` does (full source at the repo root):
 
-**Update path:** later, run `/wispralt-update` to pull the next release.
-That command diffs the installed `CFBundleShortVersionString` against
-the latest tag, replaces the app if newer, and runs `tccutil reset` for
-all four permissions if the cdhash changed (Apple-Development-signed
-re-builds get a new cdhash and re-prompt for permissions on every
-install).
+1. Refuses to run as root or under sudo (Keychain + UserDefaults are user-scoped).
+2. Verifies macOS ≥ 14 and Apple Silicon; bails clearly otherwise.
+3. Fetches the latest GitHub Release JSON anonymously via the public API.
+4. Downloads the DMG and its `.sha256` sidecar; validates the DMG is real
+   via `hdiutil imageinfo` (catches captive-portal HTML); verifies SHA256.
+5. Mounts the DMG, replaces `/Applications/WisprAlt.app` cleanly (`rm -rf`
+   then `cp -R` — never nests), unmounts, strips `com.apple.quarantine`.
+6. On re-install, runs `tccutil reset All co.wispralt.WisprAlt` to clear
+   stale TCC entries (cdhash changes on every Apple-Development build).
+7. Writes the API key to the Keychain (`security add-generic-password
+   -s co.wispralt -a default -U`) and the server URL to UserDefaults
+   (`defaults write co.wispralt.WisprAlt serverURL ...`). Both are
+   skipped silently if the corresponding env var is unset.
+8. Flushes `cfprefsd` so the app reads the new defaults on first launch.
+9. Opens the app — `PermissionGate.swift` walks four macOS permissions.
+10. Polls (up to 10s) to confirm the app process actually started; warns
+    if it didn't (likely a Gatekeeper dialog needing right-click → Open).
+
+**Update path:** re-run the same curl one-liner. `install.sh` is
+idempotent and pulls the latest release each time. The Claude Code
+`/wispralt-update` slash command remains as a developer convenience for
+teammates who already use Claude Code; it's no longer the primary path.
 
 The build-from-source flow below is for **admin-grade** local builds
 (Omid's MacBook, contributor machines). Employees should not need it.

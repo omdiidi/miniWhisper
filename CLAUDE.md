@@ -21,7 +21,7 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 | `/update-models` | Re-run `download-models.sh` then reload `co.wispralt.server.plist` via launchctl |
 | `/verify-autostart` | Non-destructive reboot-survival smoke test for server, cloudflared, and client login-launch. |
 
-> Note: employee-facing slash commands `/wispralt-setup` and `/wispralt-update` live in the user's `~/.claude-dotfiles/commands/`, not in this project. They drive a clone-free install via `gh release download`.
+> Note: employee-facing install is the `install.sh` curl one-liner (see `docs/INSTALL.md`). The legacy `/wispralt-setup` slash command has been removed. The `/wispralt-update` slash command in `~/.claude-dotfiles/commands/` remains as a developer convenience for in-place updates.
 
 ## Key conventions
 
