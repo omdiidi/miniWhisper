@@ -80,6 +80,14 @@ class ParakeetService:
         mel = get_logmel(dummy, self.model.preprocessor_config)  # type: ignore[union-attr]
         result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
         mx.eval(result)
+        # Drop warmup tensors and release the pool so the post-load baseline
+        # reflects only persistent model weights (~1.2 GB for Parakeet 0.6B
+        # bf16) — not whatever transient peaks the warmup pass needed.
+        del result, mel, dummy
+        try:
+            mx.metal.clear_cache()
+        except AttributeError:
+            pass
 
         self.ready = True
         logger.info("Parakeet ready.")
@@ -149,6 +157,26 @@ class ParakeetService:
         mx.eval(result)
 
         text = self._extract_text(result)
+
+        # Drop refs before clearing the MLX pool so the cache release actually
+        # returns memory to the OS. Without explicit `del`, Python keeps the
+        # tensors alive until the next assignment and clear_cache() is a no-op
+        # for the bytes those tensors own.
+        del result, mel, audio_mlx
+        # Return MLX's unified-memory pool to the OS. MLX grows the pool to
+        # accommodate the largest working set seen so far (a 2-min dictation
+        # peaks several GB) and NEVER shrinks it on its own. Without this call
+        # the python process accumulates ~all-time-peak unified memory and the
+        # mini's "Memory" column climbs monotonically per dictation. Clearing
+        # adds ~10-30 ms to the next inference (re-allocating from OS) which
+        # is well below the dictation budget and dwarfed by the inference itself.
+        try:
+            mx.metal.clear_cache()
+        except AttributeError:
+            # Future MLX may move the API; don't crash dictation over a memory
+            # hygiene call.
+            pass
+
         duration_ms = (time.perf_counter() - t0) * 1_000.0
         self.recent_durations.append(duration_ms)
         return text, duration_ms

@@ -40,6 +40,24 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+def _mlx_memory_mb() -> dict[str, int]:
+    """Read MLX/Metal unified-memory counters and return them in MB.
+
+    `mlx.core.metal.get_active_memory()` is the bytes currently held by live
+    MLX tensors; `get_cache_memory()` is the bytes MLX is keeping around for
+    fast re-allocation. The sum is what Activity Monitor sees on top of plain
+    python RSS. Returns zeros if MLX isn't importable or the API has moved
+    (older / unreleased MLX builds) — observability must never crash /metrics.
+    """
+    try:
+        import mlx.core as _mx
+        active = int(_mx.metal.get_active_memory()) // (1024 * 1024)
+        cache = int(_mx.metal.get_cache_memory()) // (1024 * 1024)
+        return {"mlx_active_mb": active, "mlx_cache_mb": cache}
+    except Exception:
+        return {"mlx_active_mb": 0, "mlx_cache_mb": 0}
+
 # C10: Module-level lock prevents concurrent rotate-key requests from interleaving
 # rewrite_env_var and set_current_key, which would leave the in-memory key and
 # the on-disk key out of sync for a brief window.
@@ -235,6 +253,15 @@ async def metrics(request: Request) -> JSONResponse:
             "memory": {
                 "rss_mb": proc_mem.rss // (1024 * 1024),
                 "available_mb": mem.available // (1024 * 1024),
+                # MLX unified-memory accounting. RSS does NOT include MLX/Metal
+                # allocations on Apple Silicon (unified memory is tracked
+                # separately by Metal), so a python process can show 1 GB RSS
+                # while Activity Monitor's "Memory" column reports 11 GB. These
+                # two fields close that gap so /metrics matches what the OS
+                # reports and we can detect MLX pool growth in production.
+                # Both are 0 if MLX/Metal isn't initialized yet or the API is
+                # missing on this build.
+                **_mlx_memory_mb(),
             },
             "disk": {
                 "free_gb": free_gb,
