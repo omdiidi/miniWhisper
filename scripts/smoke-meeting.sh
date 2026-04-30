@@ -23,7 +23,7 @@ RSS_BEFORE="$(curl -fsS --max-time 5 -H "Authorization: Bearer $KEY" \
 WAV="$(mktemp -t wispralt-smoke-XXXXXX).wav"
 SAY_WAV="$(mktemp -t wispralt-smoke-say-XXXXXX).wav"
 SAY_AIFF="$(mktemp -t wispralt-smoke-say-XXXXXX).aiff"
-say -o "$SAY_AIFF" --data-format=LEI16@16000 \
+say -o "$SAY_AIFF" \
   "Hello world. This is a smoke test of the WisprAlt meeting pipeline. Lazy-load is alive."
 afconvert -f WAVE -d LEI16@16000 -c 1 "$SAY_AIFF" "$SAY_WAV"
 python3 -c "
@@ -68,13 +68,15 @@ curl -fsS --max-time 30 -H "Authorization: Bearer $KEY" \
 import json, sys
 d = json.load(sys.stdin)
 assert "segments" in d and "speakers" in d, "missing fields"
+mode = d["mode"]
 nseg = len(d["segments"])
+dur = d["duration_s"]
 text = " ".join(s.get("text", "") for s in d["segments"]).strip()
-print(f"OK: mode={d[\"mode\"]} segments={nseg} duration={d[\"duration_s\"]}s")
+print("OK: mode=" + mode + " segments=" + str(nseg) + " duration=" + str(dur) + "s")
 if nseg:
-    print(f"transcript: {text[:200]}")
+    print("transcript: " + text[:200])
 else:
-    print("transcript: (empty — no speech detected)")
+    print("transcript: (empty)")
 '
 
 # 5. RSS-delta check (optional — only if metrics were reachable in step 0).
