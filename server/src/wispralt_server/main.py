@@ -10,8 +10,8 @@ Startup sequence (Phase 2 / Task 13b)
     Log {"requeue": [...], "failed": [...]}.
 5.  Instantiate MeetingRunner; re-enqueue surviving pending jobs.
 6.  Instantiate ParakeetService and call .load() (loads weights + warmup JIT).
-7.  Bootstrap meeting pipeline models in a thread (heavy; ~7 GB load).
-    Sets app.state.meeting_models_ready = True when complete.
+7.  Install compat shims; re-enqueue pending jobs (meeting models load lazily
+    on first job, not at startup).
 8.  Register SIGTERM handler (P5#5): mark running jobs failed, set shutting_down,
     call sys.exit(0) so launchd ExitTimeOut=15 can observe a clean exit code.
 9.  Expose state on app.state for routes and health endpoints.
@@ -46,7 +46,6 @@ from wispralt_server.jobs.runner import MeetingRunner
 from wispralt_server.jobs.store import JobStore
 from wispralt_server.meeting import install_compat_shims
 from wispralt_server.meeting.output import sweep_stale_tmp
-from wispralt_server.meeting.pipeline import bootstrap_models
 from wispralt_server.middleware import openai_errors
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
 from wispralt_server.ops import staging
@@ -153,8 +152,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 5. Meeting runner — re-enqueue any pending jobs that survived the restart.
     meeting_runner = MeetingRunner(job_store)
     app.state.meeting_runner = meeting_runner
-    # meeting_models_ready starts False; set to True after bootstrap_models().
-    app.state.meeting_models_ready = False
     app.state.shutting_down = False
 
     # Re-enqueueing is deferred until after models load (done below via task).
@@ -192,27 +189,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("mercury_client not configured (OPENROUTER_API_KEY unset)")
 
-    # 7. Bootstrap meeting models in a thread (P4#3; ~7 GB load, CPU-heavy).
-    #    Install compat shims FIRST so torch.load & huggingface_hub kwarg
-    #    translation are in place before whisperx/pyannote start loading.
+    # 7. Install compat shims at startup so the deep-patch over sys.modules hits
+    #    whisperx/pyannote/torch references before any user code runs. The shim
+    #    is idempotent and re-invoked from pipeline._ensure_models_loaded() to
+    #    close the long window between startup and first meeting.
     install_compat_shims()
-    #    Fire bootstrap as an asyncio task so lifespan does not block the event loop.
-    async def _bootstrap_and_reenqueue() -> None:
-        hf_token = settings.hf_token.get_secret_value()
-        try:
-            await asyncio.to_thread(bootstrap_models, hf_token)
-            app.state.meeting_models_ready = True
-            logger.info("Meeting pipeline models ready.")
-            # Now that models are loaded, re-enqueue surviving pending jobs.
-            await meeting_runner.reenqueue_pending()
-        except Exception:  # noqa: BLE001 — we want the traceback in err.log
-            # Use logger.exception so the stack trace lands in server.error.log;
-            # bare logger.error("...: %s", exc) drops the traceback and defeats
-            # post-incident err-log scans.
-            logger.exception("Meeting model bootstrap failed")
 
-    # I3: Store the task so it can be cancelled cleanly during shutdown.
-    app.state.bootstrap_task = asyncio.create_task(_bootstrap_and_reenqueue())
+    # 7b. Re-enqueue any pending jobs from prior runs. The first one to execute
+    #     will lazy-load WhisperX + Pyannote inside the executor thread.
+    try:
+        await meeting_runner.reenqueue_pending()
+    except Exception:  # noqa: BLE001 — never let re-enqueue crash startup
+        logger.exception("Meeting reenqueue_pending failed; continuing startup")
 
     # 8. SIGTERM handler (P5#5 + P5#ExitTimeOut).
     #    I2: Use loop.add_signal_handler so the handler runs safely in the asyncio
@@ -282,13 +270,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # ── shutdown ──────────────────────────────────────────────────────────────
-    # I3: Cancel the bootstrap task if it is still running (e.g. models loading
-    # when a fast shutdown is triggered).
-    bootstrap_task: asyncio.Task | None = getattr(app.state, "bootstrap_task", None)
-    if bootstrap_task is not None and not bootstrap_task.done():
-        bootstrap_task.cancel()
-        await asyncio.gather(bootstrap_task, return_exceptions=True)
-
     # Cancel the usage-event drainer so its CancelledError handler can
     # do the final flush of any pending events.  getattr is defensive —
     # the lifespan pre-sets the attr, so we only fall through if the

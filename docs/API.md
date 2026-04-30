@@ -101,22 +101,41 @@ Readiness probe for the dictation (Parakeet) endpoint.
 
 **Auth:** None required.
 
-Readiness probe for the meeting pipeline.
+Readiness probe for the meeting pipeline. Meeting models (WhisperX + Pyannote) load lazily on the first meeting job — see [ARCHITECTURE.md → MeetingPipeline](ARCHITECTURE.md#components). This endpoint reports whether the load has happened yet, but **does not gate on it**: the server returns 200 as long as RAM is sufficient, because the lazy loader is wired and will succeed when invoked.
 
-**Response 200** — all models loaded and ≥ 2 GiB RAM available:
+**Contract change (2026-04-29):** previously this endpoint returned 503 until eager bootstrap completed. It now returns 200 from server start onward when RAM is sufficient regardless of whether models are warm. Any external monitor that gated on 503-until-warm must be updated.
+
+**Response body fields (always present, both on 200 and 503):**
+
+| Field | Type | Notes |
+|---|---|---|
+| `available_mb` | int | `psutil.virtual_memory().available` in MiB. |
+| `models_warm` | bool | `True` iff WhisperX + Pyannote are resident. False on cold start. |
+| `models_loading` | bool | `True` iff a lazy load is currently in flight (derived from `_load_lock.locked() and not models_warm`). |
+
+**Response 200** — RAM sufficient (≥ 2 GiB), models warm:
 ```json
-{ "status": "ok", "available_mb": 9216 }
+{ "status": "ok", "available_mb": 9216, "models_warm": true, "models_loading": false }
 ```
 
-**Response 503** — models not loaded:
+**Response 200** — RAM sufficient (≥ 2 GiB), models cold (server just started; first meeting will pay the 5–30s lazy-load cost):
 ```json
-{ "status": "not_ready", "detail": "Meeting pipeline models not loaded", "available_mb": 9216 }
+{ "status": "ok", "available_mb": 9216, "models_warm": false, "models_loading": false }
 ```
 
 **Response 503** — insufficient RAM (< 2 GiB available):
 ```json
-{ "status": "not_ready", "detail": "Insufficient available memory", "available_mb": 1800, "required_mb": 2048 }
+{ "status": "not_ready", "detail": "Insufficient available memory", "required_mb": 2048, "available_mb": 1800, "models_warm": false, "models_loading": false }
 ```
+
+**Interpretation matrix:**
+
+| `status` | `models_warm` | `available_mb` | What it means |
+|---|---|---|---|
+| 200 | true | ≥ 2048 | Steady state — submit and go. |
+| 200 | false | ≥ 2048 | Ready but cold — first meeting will pay 5–30s load. |
+| 503 | true | < 2048 | RAM tight — `runner.submit_or_429` will reject with 429 until RAM frees. |
+| 503 | false | < 2048 | Cold AND tight — first meeting will likely fail OOM guard before loading. Free RAM first. |
 
 ---
 
@@ -356,6 +375,8 @@ Poll job status. The client should poll every 5 seconds.
 
 **Retry policy:** Jobs that fail are automatically retried up to 3 times by the runner. After 3 failed attempts the job is marked `failed` with `error: "max retries exceeded"` and no further attempts are made.
 
+**Lazy model load on first meeting:** the very first meeting job after a server restart triggers `pipeline._ensure_models_loaded()` (5–30s to load WhisperX + Pyannote into RAM). During this window the job's `status` is `running` — the load wall-clock is included in the running duration, not surfaced as a separate state. Subsequent meetings see no extra latency. Clients can pre-flight via `GET /readyz/meeting` (`models_warm: true` means the next meeting will skip the load).
+
 **Response 404** — job not found.
 
 ---
@@ -443,7 +464,9 @@ Structured server observability snapshot.
     "active_job_id": null,
     "completed_24h": 3,
     "failed_24h": 0,
-    "current_eta_s": null
+    "current_eta_s": null,
+    "models_warm": true,
+    "models_loading": false
   },
   "memory": {
     "rss_mb": 7482,
@@ -472,6 +495,8 @@ Structured server observability snapshot.
 | `meeting.active_job_id` | UUID of the currently running job, or `null` |
 | `meeting.completed_24h` / `failed_24h` | Job counts from the last 24 hours |
 | `meeting.current_eta_s` | Estimated seconds until active job completes, or `null` |
+| `meeting.models_warm` | `true` iff WhisperX + Pyannote are resident (lazy-loaded on first meeting). See [`/readyz/meeting`](#get-readyzmeeting). |
+| `meeting.models_loading` | `true` iff a lazy load is currently in flight. |
 | `memory.rss_mb` | Server process RSS in MiB |
 | `memory.available_mb` | System available RAM in MiB |
 | `disk.free_gb` | Free disk on staging volume in GiB |

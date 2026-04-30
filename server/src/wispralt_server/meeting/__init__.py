@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
 # Module-level flag: True after install_compat_shims() runs.
 _compat_installed: bool = False
+_shim_install_lock = threading.Lock()
 _orig_torch_load: Callable[..., Any] | None = None
 _orig_torch_ser_load: Callable[..., Any] | None = None
 _orig_hf_hub_download: Callable[..., Any] | None = None
@@ -54,6 +56,13 @@ def install_compat_shims() -> None:
     Called once from the FastAPI lifespan, before any meeting-pipeline code
     imports torch checkpoints or pyannote pipelines.  Idempotent — safe to
     call multiple times; subsequent calls are no-ops.
+
+    Thread-safe via _shim_install_lock. Known residual race: another thread
+    can import a new module BETWEEN the sys.modules snapshot at line ~130 and
+    the per-module patch loop; that newly-imported module will hold un-shimmed
+    bound references. Mitigation: callers in long-window scenarios (e.g.,
+    meeting/pipeline._ensure_models_loaded) re-call this function before
+    performing loads.
     """
     global _compat_installed
     global _orig_torch_load, _orig_torch_ser_load
@@ -62,96 +71,100 @@ def install_compat_shims() -> None:
     if _compat_installed:
         return
 
-    import sys
-    import torch
-    import torch.serialization
-    import huggingface_hub
+    with _shim_install_lock:
+        if _compat_installed:
+            return
 
-    _orig_torch_load = torch.load
-    _orig_torch_ser_load = torch.serialization.load
-    _orig_hf_hub_download = huggingface_hub.hf_hub_download
-    _orig_snapshot_download = huggingface_hub.snapshot_download
+        import sys
+        import torch
+        import torch.serialization
+        import huggingface_hub
 
-    def _shimmed_torch_load(*args, **kwargs):  # type: ignore[no-untyped-def]
-        # ALWAYS force weights_only=False for the meeting bootstrap.  Pyannote
-        # 3.3.2 and WhisperX both pass `weights_only=True` explicitly inside
-        # their loaders, which would fail under torch 2.6's stricter
-        # safe-globals check (omegaconf.ListConfig is not in the allowlist).
-        # We trust the HF checkpoints we explicitly downloaded, so override.
-        # Trade-off vs the codex-review finding: we CHOOSE convenience here
-        # because the shim is now scoped (only installed during meeting
-        # bootstrap) — see install_compat_shims() lifecycle below.
-        kwargs["weights_only"] = False
-        assert _orig_torch_load is not None
-        return _orig_torch_load(*args, **kwargs)
+        _orig_torch_load = torch.load
+        _orig_torch_ser_load = torch.serialization.load
+        _orig_hf_hub_download = huggingface_hub.hf_hub_download
+        _orig_snapshot_download = huggingface_hub.snapshot_download
 
-    torch.load = _shimmed_torch_load  # type: ignore[assignment]
-    torch.serialization.load = _shimmed_torch_load  # type: ignore[assignment]
+        def _shimmed_torch_load(*args, **kwargs):  # type: ignore[no-untyped-def]
+            # ALWAYS force weights_only=False for the meeting bootstrap.  Pyannote
+            # 3.3.2 and WhisperX both pass `weights_only=True` explicitly inside
+            # their loaders, which would fail under torch 2.6's stricter
+            # safe-globals check (omegaconf.ListConfig is not in the allowlist).
+            # We trust the HF checkpoints we explicitly downloaded, so override.
+            # Trade-off vs the codex-review finding: we CHOOSE convenience here
+            # because the shim is now scoped (only installed during meeting
+            # bootstrap) — see install_compat_shims() lifecycle below.
+            kwargs["weights_only"] = False
+            assert _orig_torch_load is not None
+            return _orig_torch_load(*args, **kwargs)
 
-    # Belt-and-suspenders: register omegaconf containers as safe globals so
-    # any code path that calls torch.load with weights_only=True LITERALLY
-    # (bypassing our shim via a pre-bound reference) still survives.
-    try:
-        from omegaconf.listconfig import ListConfig
-        from omegaconf.dictconfig import DictConfig
-        from omegaconf.base import ContainerMetadata, Metadata
-        from omegaconf.nodes import AnyNode
-        torch.serialization.add_safe_globals([
-            ListConfig, DictConfig, ContainerMetadata, Metadata, AnyNode,
-        ])
-    except Exception:  # noqa: BLE001 — optional belt; primary patch is the shim above
-        logger.debug("omegaconf safe_globals registration skipped", exc_info=True)
+        torch.load = _shimmed_torch_load  # type: ignore[assignment]
+        torch.serialization.load = _shimmed_torch_load  # type: ignore[assignment]
 
-    def _shimmed_hf_hub_download(*args, **kwargs):  # type: ignore[no-untyped-def]
-        if "use_auth_token" in kwargs:
-            kwargs["token"] = kwargs.pop("use_auth_token")
-        assert _orig_hf_hub_download is not None
-        return _orig_hf_hub_download(*args, **kwargs)
-
-    def _shimmed_snapshot_download(*args, **kwargs):  # type: ignore[no-untyped-def]
-        if "use_auth_token" in kwargs:
-            kwargs["token"] = kwargs.pop("use_auth_token")
-        assert _orig_snapshot_download is not None
-        return _orig_snapshot_download(*args, **kwargs)
-
-    huggingface_hub.hf_hub_download = _shimmed_hf_hub_download  # type: ignore[assignment]
-    huggingface_hub.snapshot_download = _shimmed_snapshot_download  # type: ignore[assignment]
-
-    # Deep patch: third-party modules (whisperx, pyannote) imported these
-    # symbols by name BEFORE this shim was installed, so they hold bound
-    # references to the originals.  Walk sys.modules and rebind any matching
-    # attribute to our shim so those callers get the wrapped behavior too.
-    _deep_patch_targets = {
-        id(_orig_torch_load): _shimmed_torch_load,
-        id(_orig_torch_ser_load): _shimmed_torch_load,
-        id(_orig_hf_hub_download): _shimmed_hf_hub_download,
-        id(_orig_snapshot_download): _shimmed_snapshot_download,
-    }
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        # Skip ourselves and the modules we just patched directly.
-        if mod_name in ("torch", "torch.serialization", "huggingface_hub", __name__):
-            continue
+        # Belt-and-suspenders: register omegaconf containers as safe globals so
+        # any code path that calls torch.load with weights_only=True LITERALLY
+        # (bypassing our shim via a pre-bound reference) still survives.
         try:
-            mod_dict = vars(mod)
-        except TypeError:
-            continue
-        for attr_name, attr_val in list(mod_dict.items()):
-            try:
-                replacement = _deep_patch_targets.get(id(attr_val))
-            except Exception:  # noqa: BLE001
-                continue
-            if replacement is not None:
-                try:
-                    setattr(mod, attr_name, replacement)
-                except Exception:  # noqa: BLE001 — read-only attrs etc.
-                    continue
+            from omegaconf.listconfig import ListConfig
+            from omegaconf.dictconfig import DictConfig
+            from omegaconf.base import ContainerMetadata, Metadata
+            from omegaconf.nodes import AnyNode
+            torch.serialization.add_safe_globals([
+                ListConfig, DictConfig, ContainerMetadata, Metadata, AnyNode,
+            ])
+        except Exception:  # noqa: BLE001 — optional belt; primary patch is the shim above
+            logger.debug("omegaconf safe_globals registration skipped", exc_info=True)
 
-    _compat_installed = True
-    logger.info(
-        "meeting compat shims installed (torch.load weights_only=False; HF use_auth_token→token; deep-patched bound references)"
-    )
+        def _shimmed_hf_hub_download(*args, **kwargs):  # type: ignore[no-untyped-def]
+            if "use_auth_token" in kwargs:
+                kwargs["token"] = kwargs.pop("use_auth_token")
+            assert _orig_hf_hub_download is not None
+            return _orig_hf_hub_download(*args, **kwargs)
+
+        def _shimmed_snapshot_download(*args, **kwargs):  # type: ignore[no-untyped-def]
+            if "use_auth_token" in kwargs:
+                kwargs["token"] = kwargs.pop("use_auth_token")
+            assert _orig_snapshot_download is not None
+            return _orig_snapshot_download(*args, **kwargs)
+
+        huggingface_hub.hf_hub_download = _shimmed_hf_hub_download  # type: ignore[assignment]
+        huggingface_hub.snapshot_download = _shimmed_snapshot_download  # type: ignore[assignment]
+
+        # Deep patch: third-party modules (whisperx, pyannote) imported these
+        # symbols by name BEFORE this shim was installed, so they hold bound
+        # references to the originals.  Walk sys.modules and rebind any matching
+        # attribute to our shim so those callers get the wrapped behavior too.
+        _deep_patch_targets = {
+            id(_orig_torch_load): _shimmed_torch_load,
+            id(_orig_torch_ser_load): _shimmed_torch_load,
+            id(_orig_hf_hub_download): _shimmed_hf_hub_download,
+            id(_orig_snapshot_download): _shimmed_snapshot_download,
+        }
+        for mod_name, mod in list(sys.modules.items()):
+            if mod is None:
+                continue
+            # Skip ourselves and the modules we just patched directly.
+            if mod_name in ("torch", "torch.serialization", "huggingface_hub", __name__):
+                continue
+            try:
+                mod_dict = vars(mod)
+            except TypeError:
+                continue
+            for attr_name, attr_val in list(mod_dict.items()):
+                try:
+                    replacement = _deep_patch_targets.get(id(attr_val))
+                except Exception:  # noqa: BLE001
+                    continue
+                if replacement is not None:
+                    try:
+                        setattr(mod, attr_name, replacement)
+                    except Exception:  # noqa: BLE001 — read-only attrs etc.
+                        continue
+
+        _compat_installed = True
+        logger.info(
+            "meeting compat shims installed (torch.load weights_only=False; HF use_auth_token→token; deep-patched bound references)"
+        )
 
 
 def uninstall_compat_shims() -> None:

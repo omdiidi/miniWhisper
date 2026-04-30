@@ -27,7 +27,7 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 
 - Repository pattern: database queries in repository functions, business logic in services, validation at route boundaries only.
 - No generic `except Exception` — use typed errors.
-- No model loading per request — all models are resident at startup.
+- No model loading per dictation request; dictation models are resident at startup. Meeting models load lazily on the first meeting job (async batch — load cost is invisible).
 - No Redis — SQLite-only job store.
 - No server-side speaker rename — client-only, atomic local rewrite.
 - Cloudflared tunnel token: stored in `~/.config/wispralt/cloudflare-token` (mode 0600)

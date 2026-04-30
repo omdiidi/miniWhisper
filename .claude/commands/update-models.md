@@ -20,15 +20,17 @@ Update model weights and bounce the server cleanly.
    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/co.wispralt.server.plist
    ```
 
-3. **Wait for readiness** — poll `/readyz/meeting` up to 180s × 5s intervals:
-   ```bash
-   for i in $(seq 1 36); do
-     curl -fsS -H "Authorization: Bearer $WISPRALT_API_KEY" "$SERVER_URL/readyz/meeting" && break
-     sleep 5
-   done
-   ```
+3. **Wait for server health** — poll `/readyz/meeting` once (expect 200 immediately):
 
-4. **Confirm**: print the result of `curl /metrics` showing the new `meeting_models_ready: true` and the `last_inference_at: null` (cleared by the restart).
+       curl -fsS -H "Authorization: Bearer $WISPRALT_API_KEY" "$SERVER_URL/readyz/meeting"
+
+   Note: this returns 200 even when models are cold. To verify the new weights actually
+   load, run `scripts/smoke-meeting.sh` after the curl. Smoke uploads a 5s test WAV,
+   waits for transcription, and prints RSS delta — confirming the lazy load fires
+   against the new weights.
+
+4. **Confirm**: print the result of `curl /admin/metrics` showing `meeting.models_warm: true`
+   (set by smoke-meeting.sh) and the `last_inference_at` field freshly populated.
 
 ## Never
 
@@ -40,4 +42,8 @@ Update model weights and bounce the server cleanly.
 
 - If `download-models.sh` fails with HF 401: regenerate token, ensure terms are accepted on both pyannote pages.
 - If launchctl fails: check `~/Library/Logs/WisprAlt/server.err.log`.
-- If `/readyz/meeting` is 503 after 3 minutes: model load is unusually slow or memory pressure; check `/metrics` for `memory.available_mb`.
+- If `scripts/smoke-meeting.sh` fails (job stays "running" past 5 min, or "failed"):
+  the lazy load likely couldn't fetch/decode the new weights. Check `tail -200
+  ~/wispralt/logs/server.error.log` for HF token errors, missing model files, or
+  out-of-memory. Verify `HF_TOKEN` is set in `~/wispralt/server/.env` and that you
+  have ≥4 GB free RAM (`/admin/metrics` → `memory.available_mb`).

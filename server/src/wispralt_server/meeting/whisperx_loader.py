@@ -4,8 +4,8 @@ meeting/whisperx_loader.py — WhisperX + CrisperWhisper singleton loader.
 Design decisions (from plan + v3 deltas):
 - CTranslate2 has NO MPS backend; WhisperX MUST run on CPU.
   ``compute_type="int8"`` is used to fit within the memory budget.
-- Models are NOT loaded at import time.  ``load()`` is called once by the
-  FastAPI lifespan (via ``pipeline.bootstrap_models``) after env validation.
+- Models are NOT loaded at import time.  ``load()`` is called from the meeting
+  executor thread on first meeting job, via ``pipeline._ensure_models_loaded``.
 - ``transcribe_channel`` is a blocking function; call it via
   ``asyncio.to_thread`` or from the dedicated meeting ThreadPoolExecutor.
 """
@@ -33,8 +33,9 @@ _align_metadata: dict | None = None
 def load() -> None:
     """Load CrisperWhisper and the English word-alignment model.
 
-    Must be called exactly once, from the main thread (FastAPI lifespan),
-    before any call to ``transcribe_channel``.
+    Called from the meeting executor thread on first meeting job via
+    ``pipeline._ensure_models_loaded()``. Thread-safe: whisperx.load_model +
+    load_align_model are CPU-bound and safe to call off the event loop.
     """
     global _model, _align_model, _align_metadata
 
@@ -53,6 +54,16 @@ def load() -> None:
     )
 
     logger.info("WhisperX ready.")
+
+
+def reset() -> None:
+    """Drop singletons so the next load() starts clean. Used on partial-load failure
+    in pipeline._ensure_models_loaded(). Best-effort: drops Python references but
+    C-level PyTorch/CTranslate2 handles may not free immediately."""
+    global _model, _align_model, _align_metadata
+    _model = None
+    _align_model = None
+    _align_metadata = None
 
 
 def transcribe_channel(audio_16k: np.ndarray) -> dict:

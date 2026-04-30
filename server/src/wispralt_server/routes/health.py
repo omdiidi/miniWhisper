@@ -15,10 +15,10 @@ GET /readyz/dictation  (no auth)
     until Wave 1c wires it).
 
 GET /readyz/meeting  (no auth)
-    Returns 200 if:
-      - app.state.meeting_models_ready is True  AND
-      - psutil.virtual_memory().available > 2 GiB
-    Otherwise 503.
+    Returns 200 if available RAM ≥ 2 GiB. Always emits models_warm and
+    models_loading fields so operators can distinguish cold-but-ready
+    from warm. Meeting models load lazily on first meeting job — a 200
+    with models_warm=false means "wired, will load on demand."
 
 Auth note: readiness probes intentionally bypass bearer auth so that
 Kubernetes-style probes, Cloudflare health checks, and external monitoring
@@ -31,6 +31,8 @@ from __future__ import annotations
 import psutil
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+from wispralt_server.meeting import pipeline as meeting_pipeline
 
 router = APIRouter()
 
@@ -82,24 +84,23 @@ async def readyz_dictation(request: Request) -> JSONResponse:
     summary="Readiness probe for meeting pipeline — no auth required",
 )
 async def readyz_meeting(request: Request) -> JSONResponse:
-    """Return 200 if meeting models are loaded AND >= 2 GiB RAM is free.
+    """Return 200 if available RAM is sufficient.
 
-    ``meeting_models_ready`` is set to True in ``main.py`` lifespan once the
-    meeting pipeline models are loaded (Phase 2).  It defaults to False here
-    so Phase 1 deployments return a clean 503 rather than crashing.
+    Lazy-load era: meeting models load on the first meeting job, not at
+    startup. /readyz/meeting therefore returns 200 from server start onward
+    (when RAM is OK) — the lazy loader is wired and will succeed when invoked.
+    The response body distinguishes cold vs warm via ``models_warm`` so
+    operators can see model state at a glance.
     """
-    models_ready: bool = getattr(request.app.state, "meeting_models_ready", False)
+    del request  # unused; kept for API symmetry
     available_bytes: int = psutil.virtual_memory().available
+    models_warm, models_loading = meeting_pipeline.state()
 
-    if not models_ready:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "not_ready",
-                "detail": "Meeting pipeline models not loaded",
-                "available_mb": available_bytes // (1024 * 1024),
-            },
-        )
+    common_body = {
+        "available_mb": available_bytes // (1024 * 1024),
+        "models_warm": models_warm,
+        "models_loading": models_loading,
+    }
 
     if available_bytes < _2GiB:
         return JSONResponse(
@@ -107,14 +108,8 @@ async def readyz_meeting(request: Request) -> JSONResponse:
             content={
                 "status": "not_ready",
                 "detail": "Insufficient available memory",
-                "available_mb": available_bytes // (1024 * 1024),
                 "required_mb": _2GiB // (1024 * 1024),
+                **common_body,
             },
         )
-
-    return JSONResponse(
-        content={
-            "status": "ok",
-            "available_mb": available_bytes // (1024 * 1024),
-        }
-    )
+    return JSONResponse(content={"status": "ok", **common_body})

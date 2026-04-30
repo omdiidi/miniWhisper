@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse
 from .. import auth, observability
 from ..auth import require_admin, require_api_key
 from ..config import settings
+from ..meeting import pipeline as meeting_pipeline
 from ..ops import env_writer
 from ..ops.env_writer import find_env_path
 from ..users import store as users_store
@@ -199,6 +200,8 @@ async def metrics(request: Request) -> JSONResponse:
     current_eta_s: int | None = None
     last_inference_at: str | None = getattr(request.app.state, "parakeet_last_inference_at", None)
 
+    _meeting_warm, _meeting_loading = meeting_pipeline.state()
+
     # Staging count from filesystem
     staging_count_live: int
     try:
@@ -224,6 +227,8 @@ async def metrics(request: Request) -> JSONResponse:
                 "completed_24h": completed_24h,
                 "failed_24h": failed_24h,
                 "current_eta_s": current_eta_s,
+                "models_warm": _meeting_warm,
+                "models_loading": _meeting_loading,
             },
             "memory": {
                 "rss_mb": proc_mem.rss // (1024 * 1024),

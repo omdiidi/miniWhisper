@@ -2,7 +2,7 @@
 meeting/pipeline.py — Meeting transcription pipeline orchestration.
 
 This is the service layer for the meeting feature.  It owns:
-- ``bootstrap_models(hf_token)``  — called once by the FastAPI lifespan.
+- Models load lazily on first ``transcribe_meeting()`` call via ``_ensure_models_loaded()``.
 - ``transcribe_meeting(...)``     — blocking function run in the dedicated
   ThreadPoolExecutor by ``jobs/runner.py``.
 
@@ -37,15 +37,19 @@ Each segment has both ``speaker`` (display name) and ``speaker_raw``.
 from __future__ import annotations
 
 import datetime
+import gc
 import logging
+import threading
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import whisperx  # type: ignore[import-untyped]
 
+from wispralt_server.config import settings
 from wispralt_server.meeting import deepfilter as _df_mod
 from wispralt_server.meeting import diarize as _diarize_mod
+from wispralt_server.meeting import install_compat_shims
 from wispralt_server.meeting import whisperx_loader as _wx_mod
 from wispralt_server.meeting.merge import (
     build_speakers_table,
@@ -65,39 +69,80 @@ _MODEL_META = {
     "denoise": "deepfilternet-3",
 }
 
-# Ready flag — set to True by bootstrap_models(); queried by /readyz/meeting.
+# Ready flag — set to True by _ensure_models_loaded(); queried by /readyz/meeting.
 _meeting_models_ready: bool = False
+_load_lock = threading.RLock()
 
 
-# ── bootstrap ──────────────────────────────────────────────────────────────────
+# ── lazy load ──────────────────────────────────────────────────────────────────
 
 
-def bootstrap_models(hf_token: str) -> None:
-    """Load all meeting pipeline models.
+def _ensure_models_loaded() -> None:
+    """Load WhisperX + Pyannote on first invocation; no-op thereafter.
 
-    Called once during the FastAPI lifespan (after env validation) so that
-    models are warm before the first request arrives.
+    Called from transcribe_meeting() inside the meeting executor thread.
+    Single-flight via threading.RLock — defensive; the runner's max_workers=1
+    + Semaphore(1) already prevent concurrent calls today.
 
-    Parameters
-    ----------
-    hf_token:
-        HuggingFace token used to download the gated Pyannote model.
+    Failure handling: if any sub-load raises, we call each loader's reset()
+    helper to drop Python references, then gc.collect() as a hint. NOTE: this
+    is best-effort — PyTorch and CTranslate2 hold C-level handles that may not
+    free immediately. Traceback frames also retain locals until they unwind.
+    RSS may stay elevated until the next allocation reuses the freed slabs.
     """
     global _meeting_models_ready
-
-    logger.info("Bootstrapping meeting pipeline models …")
-
-    _wx_mod.load()
-    _diarize_mod.load(hf_token)
-    _df_mod.get_df()  # warm DeepFilterNet lazy init
-
-    _meeting_models_ready = True
-    logger.info("Meeting pipeline models ready.")
+    if _meeting_models_ready:
+        return
+    with _load_lock:
+        if _meeting_models_ready:
+            return
+        logger.info("Lazy-loading meeting pipeline models (first meeting after start) …")
+        # Idempotent re-call — closes the long-window race where any module
+        # imported between startup install_compat_shims() and now may bind to
+        # un-shimmed torch.load / hf_hub_download. Cheap (one bool check).
+        install_compat_shims()
+        try:
+            _wx_mod.load()
+            _diarize_mod.load(settings.hf_token.get_secret_value())
+            _df_mod.get_df()
+        except Exception:
+            _wx_mod.reset()
+            _diarize_mod.reset()
+            gc.collect()
+            raise
+        _meeting_models_ready = True
+        logger.info("Meeting pipeline models loaded and resident.")
 
 
 def is_ready() -> bool:
-    """Return True if all meeting models have been loaded."""
+    """True if models have been loaded.  Drives /readyz/meeting models_warm."""
     return _meeting_models_ready
+
+
+def is_loading() -> bool:
+    """True iff a lazy load is currently in flight.
+
+    NOTE: callers that need a coherent (warm, loading) snapshot must use state()
+    instead — reading is_ready() and is_loading() separately can observe
+    intermediate states between the flag-set and lock-release in
+    _ensure_models_loaded().
+    """
+    return _load_lock.locked() and not _meeting_models_ready
+
+
+def state() -> tuple[bool, bool]:
+    """Best-effort coherent (warm, loading) snapshot for observability endpoints.
+
+    Reads _meeting_models_ready first, then derives loading from the lock. The
+    two reads happen between GIL release points, so a microsecond-scale racing
+    write can produce (False, False) while a load just completed. Acceptable
+    for an observability endpoint — the next poll will reflect reality. Do NOT
+    use this snapshot for control flow; use the per-call entry through
+    transcribe_meeting() which is properly serialized.
+    """
+    warm = _meeting_models_ready
+    loading = _load_lock.locked() and not warm
+    return warm, loading
 
 
 # ── private helpers ────────────────────────────────────────────────────────────
@@ -206,8 +251,9 @@ def transcribe_meeting(
     DiskFullError
         If output writes fail with ENOSPC.
     RuntimeError
-        If models have not been loaded (bootstrap_models not called).
+        If model load fails inside _ensure_models_loaded() on first call.
     """
+    _ensure_models_loaded()
     logger.info("[%s] Starting meeting transcription pipeline …", job_id)
 
     # ── Step 1: Load channels ─────────────────────────────────────────────────

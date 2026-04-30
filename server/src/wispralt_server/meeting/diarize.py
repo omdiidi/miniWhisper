@@ -11,7 +11,8 @@ Key design decisions (from plan + v3 deltas):
 - ``use_auth_token`` is still the correct kwarg in pyannote 3.3.2
   (do NOT switch to ``token=``).
 - The pipeline singleton is loaded lazily via ``load(hf_token)`` called from
-  ``pipeline.bootstrap_models`` during the FastAPI lifespan.
+  ``pipeline._ensure_models_loaded`` on the first meeting job (inside the
+  meeting executor thread), not at FastAPI startup.
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ _pipeline: Pipeline | None = None
 
 def load(hf_token: str) -> None:
     """Load the Pyannote diarization pipeline and move it to MPS if available.
+
+    Called from the meeting executor thread on first meeting job via
+    ``pipeline._ensure_models_loaded()``. Thread-safe: Pipeline.from_pretrained
+    is CPU/IO-bound and safe to call off the event loop.
 
     Parameters
     ----------
@@ -63,6 +68,14 @@ def load(hf_token: str) -> None:
 
     _pipeline.to(device)
     logger.info("Pyannote ready.")
+
+
+def reset() -> None:
+    """Drop the pipeline singleton so the next load() starts clean. Used on partial-load
+    failure in pipeline._ensure_models_loaded(). Best-effort: drops Python reference but
+    C-level PyTorch handles may not free immediately."""
+    global _pipeline
+    _pipeline = None
 
 
 def annotation_to_df(annotation: object) -> pd.DataFrame:

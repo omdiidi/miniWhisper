@@ -8,15 +8,27 @@
 #   4. STAGING_DIR and MEETING_OUTPUT_DIR on same filesystem
 #   5. Poll /healthz until 200 or 401 (max 60s)
 #   6. Poll /readyz/dictation until 200 (max 60s × 5s intervals)
-#   7. Poll /readyz/meeting until 200 (max 180s × 5s intervals — heavy models)
+#   7. Poll /readyz/meeting once (200 expected immediately; reports models_warm
+#      from JSON body — cold is OK, models load lazily on first meeting)
 #   8. Generate test WAV via Python + POST to /transcribe/dictate
 #   9. GET /metrics and pretty-print JSON
 #
 # Exit code: 0 if all checks pass, 1 if any required check fails.
 #
-# Usage: ./scripts/doctor.sh
+# Usage: ./scripts/doctor.sh [--with-warmup]
+#   --with-warmup  After the standard checks, run scripts/smoke-meeting.sh to
+#                  trigger the lazy meeting-model load and verify end-to-end.
 
 set -euo pipefail
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+WITH_WARMUP=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-warmup) WITH_WARMUP=1 ;;
+        *) echo "Unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,6 +48,9 @@ info()  { echo -e "        $*"; }
 
 FAILURES=0
 
+# ── Resolve python (prefer server venv) ───────────────────────────────────────
+PYTHON_BIN="python3"
+
 # ── Source server/.env ────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
     echo -e "${RED}ERROR:${NC} $ENV_FILE not found." >&2
@@ -52,6 +67,10 @@ SERVER_URL="$(_read_env_var SERVER_URL)"
 WISPRALT_API_KEY="$(_read_env_var WISPRALT_API_KEY)"
 STAGING_DIR="$(_read_env_var STAGING_DIR)"
 MEETING_OUTPUT_DIR="$(_read_env_var MEETING_OUTPUT_DIR)"
+
+if [[ -f "$REPO_ROOT/server/.venv/bin/python" ]]; then
+    PYTHON_BIN="$REPO_ROOT/server/.venv/bin/python"
+fi
 
 echo ""
 echo -e "${BOLD}WisprAlt Doctor${NC} — $(date)"
@@ -180,30 +199,31 @@ else
         info "Logs: tail -50 $HOME/Library/Logs/WisprAlt/server.err.log"
     fi
 
-    # ── 7. Poll /readyz/meeting ───────────────────────────────────────────────
+    # ── 7. /readyz/meeting (single shot — lazy load) ──────────────────────────
     echo ""
-    echo "Check 7: /readyz/meeting (max 180s — WhisperX + Pyannote load)"
-    MEETING_OK=false
-    for i in $(seq 1 36); do
-        HTTP_CODE="$(curl -fsS -o /dev/null -w "%{http_code}" \
-            --connect-timeout 5 --max-time 10 \
-            -H "Authorization: Bearer $WISPRALT_API_KEY" \
-            "$SERVER_URL/readyz/meeting" 2>/dev/null || echo "000")"
-        if [[ "$HTTP_CODE" == "200" ]]; then
-            pass "/readyz/meeting returned 200 — meeting pipeline ready"
-            MEETING_OK=true
-            break
-        fi
-        if [[ "$i" -lt 36 ]]; then
-            info "  Attempt $i/36: HTTP $HTTP_CODE — waiting 5s (heavy models loading)..."
-            sleep 5
-        fi
-    done
-    if [[ "$MEETING_OK" != "true" ]]; then
-        fail "/readyz/meeting not ready within 180s"
-        info "WhisperX or Pyannote may still be downloading or loading."
+    echo "Check 7: /readyz/meeting (single poll — meeting models lazy-load on first job)"
+    MEETING_BODY="/tmp/wispralt_readyz_meeting_$$.json"
+    HTTP_CODE="$(curl -fsS -o "$MEETING_BODY" -w "%{http_code}" \
+        --connect-timeout 5 --max-time 10 \
+        -H "Authorization: Bearer $WISPRALT_API_KEY" \
+        "$SERVER_URL/readyz/meeting" 2>/dev/null || echo "000")"
+    if [[ "$HTTP_CODE" != "200" ]]; then
+        fail "/readyz/meeting returned HTTP $HTTP_CODE — expected 200"
+        info "Body: $(cat "$MEETING_BODY" 2>/dev/null || echo '<empty>')"
         info "Logs: tail -100 $HOME/Library/Logs/WisprAlt/server.err.log"
+    else
+        MODELS_WARM="$("$PYTHON_BIN" -c \
+            "import json,sys; d=json.load(open('$MEETING_BODY')); print('true' if d.get('models_warm') else 'false')" \
+            2>/dev/null || echo "unknown")"
+        if [[ "$MODELS_WARM" == "true" ]]; then
+            pass "/readyz/meeting returned 200 — models warm"
+        else
+            pass "/readyz/meeting returned 200 (models_warm=$MODELS_WARM)"
+            info "models cold — /readyz/meeting wired but lazy. First meeting will load (5–30s)."
+            info "For deploy verification, re-run with --with-warmup to chain scripts/smoke-meeting.sh."
+        fi
     fi
+    rm -f "$MEETING_BODY"
 fi
 
 # ── 8. WAV round-trip test ────────────────────────────────────────────────────
@@ -211,11 +231,6 @@ echo ""
 echo "Check 8: Dictation round-trip (generate WAV → POST /transcribe/dictate)"
 TEST_WAV="/tmp/wispralt_test_$$.wav"
 # P4#9 / validation-loop fallback: use Python+numpy+soundfile (works without ffmpeg)
-PYTHON_BIN="python3"
-if [[ -f "$REPO_ROOT/server/.venv/bin/python" ]]; then
-    PYTHON_BIN="$REPO_ROOT/server/.venv/bin/python"
-fi
-
 if "$PYTHON_BIN" -c \
     "import numpy as np, soundfile as sf; sf.write('$TEST_WAV', np.zeros(16000, dtype='float32'), 16000)" \
     2>/dev/null; then
@@ -256,6 +271,17 @@ else
         echo "$METRICS_RESP" | "$PYTHON_BIN" -m json.tool 2>/dev/null || echo "$METRICS_RESP"
     else
         warn "/metrics returned empty response (server may not yet support this endpoint)"
+    fi
+fi
+
+# ── Optional warmup ───────────────────────────────────────────────────────────
+if [ "${WITH_WARMUP:-0}" = "1" ]; then
+    echo
+    echo "Running scripts/smoke-meeting.sh (--with-warmup) …"
+    if "$(dirname "$0")/smoke-meeting.sh"; then
+        pass "smoke-meeting.sh succeeded"
+    else
+        fail "smoke-meeting.sh failed (exit $?)"
     fi
 fi
 

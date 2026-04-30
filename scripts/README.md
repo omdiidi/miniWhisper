@@ -67,7 +67,7 @@ Health-check suite. Checks:
 4. `STAGING_DIR` and `MEETING_OUTPUT_DIR` on the same filesystem
 5. `/healthz` — polls up to 60 s
 6. `/readyz/dictation` — polls up to 60 s (Parakeet model load)
-7. `/readyz/meeting` — polls up to 180 s (WhisperX + Pyannote load)
+7. `/readyz/meeting` — polls once; reports `models_warm` (cold is OK — first meeting will load lazily). Pass `--with-warmup` to chain smoke-meeting.sh for full E2E verification.
 8. Dictation round-trip: generates a silent WAV with Python + POSTs to `/transcribe/dictate`
 9. `/metrics` — pretty-prints JSON
 
