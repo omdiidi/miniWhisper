@@ -248,8 +248,14 @@ provision_credentials() {
 
         info "Storing API key in Keychain..."
         local keychain_err
+        # -T pre-authorizes WisprAlt.app to read the entry without an
+        # additional GUI prompt on first launch. The bundle is already
+        # at /Applications/WisprAlt.app at this point (install_bundle ran
+        # first in main()), so the path resolves and ACL applies.
         keychain_err="$(security add-generic-password \
-            -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$WISPRALT_API_KEY" -U 2>&1 1>/dev/null)" || true
+            -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$WISPRALT_API_KEY" -U \
+            -T /Applications/WisprAlt.app/Contents/MacOS/WisprAlt \
+            -T /usr/bin/security 2>&1 1>/dev/null)" || true
         if [[ -n "$keychain_err" ]]; then
             warn "Keychain write reported: $keychain_err"
         fi
