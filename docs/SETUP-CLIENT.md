@@ -167,10 +167,10 @@ In the popover → Show advanced settings → API Key Backup section, the **Copy
 
 ### Smart formatting
 
-The popover has a **Smart formatting** toggle in the Settings section. When ON, every dictation is sent to the server with the `X-Smart-Format: true` header; the server hands the raw Parakeet output to OpenRouter Mercury 2, which fixes punctuation and capitalization, and returns the cleaned text.
+The popover has a **Smart formatting** toggle in the Settings section. When ON, every dictation is sent to the server with the `X-Smart-Format: true` header; for dictations of at least 100 words, the server hands the raw Parakeet output to OpenRouter Mercury 2, which fixes punctuation and casing, removes obvious fillers ("um", "uh", repeated words), and adds bullet-list formatting where you're clearly enumerating items. Meaning is preserved — no rephrasing, no summarization. Below 100 words the call short-circuits and you get raw Parakeet output. The threshold targets long-form dictation (e.g. LLM prompts, notes) where the cleanup is actually visible.
 
 - **Default**: OFF. Raw Parakeet output is what gets injected.
-- **Latency cost**: ~250ms additional wall-clock per dictation (the Mercury call is fail-soft — a timeout or HTTP error returns the raw text and the response field `smart_formatted: false`).
+- **Latency cost**: ~250ms additional wall-clock per dictation when the cleanup runs (the Mercury call is fail-soft — a timeout or HTTP error returns the raw text and the response field `smart_formatted: false`).
 - **Server requirement**: the operator must have set `OPENROUTER_API_KEY` in `server/.env`. If the key is missing, every dictation comes back as raw text regardless of the toggle — there is no client-visible error, the toggle just silently does nothing. Ask your admin if cleaned output is what you expect but you keep getting raw output.
 - **Pricing**: per-cleanup is roughly $0.0001 against your operator's OpenRouter credit. Negligible for individual employees; visible in OpenRouter usage if you batch-dictate hundreds of clips.
 - **Privacy note**: smart formatting sends your raw transcript to OpenRouter (cloud). If you handle confidential material, leave the toggle OFF.

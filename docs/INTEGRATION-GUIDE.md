@@ -141,11 +141,13 @@ contacting your operator about a failed call.
 ## Smart formatting (WisprAlt-specific extension)
 
 The WisprAlt macOS client has a "Smart formatting" toggle that calls
-[OpenRouter Mercury 2](https://openrouter.ai/) on the server to clean up
-punctuation and casing. **We deliberately do NOT apply that on
-`/v1/audio/transcriptions`** — third-party API consumers expect raw model
-output, not opinionated post-processing. If you want cleanup in your own
-pipeline, do it yourself.
+[OpenRouter Mercury 2](https://openrouter.ai/) on the server to add punctuation
+and casing, remove obvious filler words, collapse repeats, and apply light
+list formatting on dictations of at least `SMART_FORMAT_MIN_WORDS` (default
+100) words. Meaning is preserved — no rephrasing, no summarization. **We
+deliberately do NOT apply that on `/v1/audio/transcriptions`** — third-party
+API consumers expect raw model output, not opinionated post-processing. If
+you want cleanup in your own pipeline, do it yourself.
 
 ### Need cleanup but not via the WisprAlt client?
 

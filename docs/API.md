@@ -155,7 +155,7 @@ Transcribe a short audio clip using the warm Parakeet model.
 
 | Header | Values | Default | Notes |
 |---|---|---|---|
-| `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized, the raw transcript is post-processed by OpenRouter Mercury 2 to fix punctuation/casing. Fail-soft: any timeout (250ms) or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. The native macOS client sets this header when the user toggles "Smart formatting" in Settings. The `/v1/audio/transcriptions` shim never sets it. |
+| `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized AND the raw transcript is at or above `SMART_FORMAT_MIN_WORDS` (default 100), the transcript is post-processed by OpenRouter Mercury 2: punctuation, casing, paragraph breaks, light filler removal ("um"/"uh"/repeats), and bullet-list formatting where the speaker is enumerating. Meaning is preserved (no rephrasing, no summarization, no new content). A length-window safety check (cleaned ∈ [0.7×, 1.10×] of raw word count) falls back to raw on suspicious output. Fail-soft: any timeout or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. The native macOS client sets this header when the user toggles "Smart formatting" in Settings. The `/v1/audio/transcriptions` shim never sets it. |
 
 **Audio format flexibility (server-side resampling):**
 

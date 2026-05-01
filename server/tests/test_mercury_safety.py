@@ -1,129 +1,153 @@
-"""
-test_mercury_safety.py — Regression tests for the smart-format Mercury client's
-two safety-critical helpers: `_is_safe_cleanup` (word-multiset guard) and
-`_extract_text` (provider-shape parser).
+"""test_mercury_safety.py — Regression tests for the smart-format Mercury client's
+three pure-function helpers: `_word_count`, `_is_within_length_window`
+(soft length-window safety rail), and `_extract_text` (provider-shape parser).
 
 These are pure-function tests — no network, no event loop, no fixtures. They
-pin the contracts that prevent Mercury from silently changing dictation
-content (`_is_safe_cleanup`) and that prevent unrecognized OpenAI-compat
-response shapes from crashing or silently dropping content (`_extract_text`).
+pin the contracts that:
+  - Gate the LLM round-trip (only above the configured min-words threshold).
+  - Catch hallucination/summarization at the safety rail (length window).
+  - Prevent unrecognized OpenAI-compat response shapes from crashing or
+    silently dropping content (`_extract_text`).
 
-Both helpers were progressively tightened across multiple codex-review rounds.
-Every accepted/rejected case below maps to a specific finding from those
-rounds; do NOT loosen these without re-running the review pipeline.
+Note: this module formerly tested a strict word-multiset equality check
+(`_is_safe_cleanup`) which has been replaced by `_is_within_length_window`.
+The new rail is intentionally looser to allow filler removal and light list
+formatting; the strong system prompt is now the primary guard.
 """
 
 from wispralt_server.smart_format.mercury_client import (
     _extract_text,
-    _is_safe_cleanup,
+    _is_within_length_window,
+    _word_count,
 )
 
 
-# ---- _is_safe_cleanup -------------------------------------------------------
+# ---- _word_count ------------------------------------------------------------
 
-class TestIsSafeCleanup:
-    """Guard must accept punctuation+casing+whitelisted contraction restoration,
-    and reject any added/removed/substituted word — including ambiguous pairs
-    where the no-apostrophe form is itself a real English word."""
 
-    # Positive: pure punctuation/casing.
-    def test_pure_punct_casing(self):
-        assert _is_safe_cleanup(
-            "hello world how are you",
-            "Hello, world! How are you?",
-        )
+class TestWordCount:
+    def test_empty_string(self):
+        assert _word_count("") == 0
 
-    # Positive: whitelisted contraction restorations.
-    def test_im_to_im_apostrophe(self):
-        assert _is_safe_cleanup("im going home", "I'm going home.")
+    def test_whitespace_only(self):
+        assert _word_count("   \n\t  ") == 0
 
-    def test_dont_to_dont_apostrophe(self):
-        assert _is_safe_cleanup("dont stop", "Don't stop.")
+    def test_single_word(self):
+        assert _word_count("hello") == 1
 
-    def test_youre_to_youre_apostrophe(self):
-        assert _is_safe_cleanup("youre right", "You're right.")
+    def test_paragraph(self):
+        text = "Okay so today I am going to be talking about a few things"
+        assert _word_count(text) == 13
 
-    def test_thats_to_thats_apostrophe(self):
-        assert _is_safe_cleanup("thats fine", "That's fine.")
+    def test_punctuation_tokens_count(self):
+        # Whitespace-bounded — "Hello," is one token, "world!" is another.
+        assert _word_count("Hello, world!") == 2
 
-    def test_curly_apostrophe_normalized(self):
-        # U+2019 right single quotation mark must compare equal to ASCII '.
-        # Use a whitelisted contraction (im → I'm) so the multisets compare
-        # equal regardless of which apostrophe character the cleaned text uses.
-        assert _is_safe_cleanup("im going home", "I’m going home.")
-        assert _is_safe_cleanup("im going home", "I'm going home.")
+    def test_bullet_glyphs_count(self):
+        # Bullets and dashes count as their own tokens; this is intentional —
+        # the length window is a ratio, and the same convention applies on
+        # both sides.
+        assert _word_count("• item one\n• item two") == 6
 
-    # Positive: full multi-sentence dictation cleanup.
-    def test_full_paragraph_cleanup(self):
+
+# ---- _is_within_length_window -----------------------------------------------
+
+
+class TestLengthWindow:
+    """Soft safety rail: cleaned word count must fall within 0.7×–1.10× of raw.
+
+    Floor 0.7×: allows ~30% shrinkage for filler removal / repeat collapse.
+    Ceiling 1.10×: allows minor token expansion — a long-form dictation
+    reformatted into bullet items adds one bullet glyph per item — while
+    still rejecting added-content hallucination.
+    """
+
+    def test_exact_match(self):
+        # Same word count = ratio 1.0 → accept.
+        assert _is_within_length_window("a b c d e", "a, b, c, d, e.")
+
+    def test_minor_punctuation_growth(self):
+        # 5-word raw, 5-word cleaned → ratio 1.0; cleaned has more chars but
+        # the safety check is on tokens, not chars.
+        raw = "the cat sat on the mat"
+        cleaned = "The cat sat on the mat."
+        assert _is_within_length_window(raw, cleaned)
+
+    def test_filler_removal_accepted(self):
+        # Filler removal that lands inside the 0.7× floor.
+        # 17-word raw → 12-word cleaned (ratio ≈ 0.71). Accept.
         raw = (
-            "okay so today im going to be talking about a few things "
-            "first the weather is really nice second i think we should "
-            "grab lunch later third dont forget to bring the documents"
+            "so I uh think we should you know go to the store and uh "
+            "buy some milk"
+        )
+        cleaned = "I think we should go to the store and buy some milk."
+        assert _is_within_length_window(raw, cleaned)
+
+    def test_repeat_collapse_accepted(self):
+        # 10-word raw, 7-word cleaned → ratio 0.7, exactly at floor. Accept.
+        raw = "I I went to to the the store yesterday morning"
+        cleaned = "I went to the store yesterday morning."
+        assert _is_within_length_window(raw, cleaned)
+
+    def test_summarization_rejected(self):
+        # 20-word raw → 6-word cleaned (ratio 0.3). Reject as summarization.
+        raw = (
+            "the weather today is really nice and I think we should go for "
+            "a long walk outside in the park"
+        )
+        cleaned = "Nice weather; let's walk."
+        assert not _is_within_length_window(raw, cleaned)
+
+    def test_hallucination_rejected(self):
+        # 10-word raw → 13-word cleaned (ratio 1.3). Reject as hallucination.
+        raw = "the meeting starts at three pm in the main room"
+        cleaned = (
+            "The important quarterly planning meeting starts promptly at "
+            "three pm in the main conference room near the lobby."
+        )
+        assert not _is_within_length_window(raw, cleaned)
+
+    def test_bullet_formatting_accepted(self):
+        # 30-word raw enumeration → 32-token cleaned with two bullet glyphs
+        # added (ratio ≈ 1.07). Sanity check that bullet-formatted output
+        # passes the rail. The ceiling itself is pinned by
+        # `test_just_inside_ceiling` / `test_just_outside_ceiling`; trailing
+        # punctuation like "milk." does not add a whitespace-bounded token.
+        raw = (
+            "first thing we should do is buy milk second thing we need to "
+            "do is pick up the mail third thing we should remember is to "
+            "feed the cat please"
         )
         cleaned = (
-            "Okay, so today I'm going to be talking about a few things. "
-            "First, the weather is really nice. Second, I think we should "
-            "grab lunch later. Third, don't forget to bring the documents."
+            "First thing we should do is buy milk.\n"
+            "• Second thing we need to do is pick up the mail.\n"
+            "• Third thing we should remember is to feed the cat please."
         )
-        assert _is_safe_cleanup(raw, cleaned)
+        assert _is_within_length_window(raw, cleaned)
 
-    # Negative: added word.
-    def test_reject_added_word(self):
-        assert not _is_safe_cleanup("hello world", "Hello, beautiful world.")
+    def test_empty_raw_rejected(self):
+        # Defensive: division by zero protection. Reject.
+        assert not _is_within_length_window("", "anything at all here")
 
-    # Negative: dropped word.
-    def test_reject_dropped_word(self):
-        assert not _is_safe_cleanup("hello big world", "Hello world.")
+    def test_empty_cleaned_rejected(self):
+        # Cleaned is empty → ratio 0 → far below floor. Reject.
+        assert not _is_within_length_window("hello world how are you", "")
 
-    # Negative: synonym substitution.
-    def test_reject_synonym_swap(self):
-        assert not _is_safe_cleanup(
-            "the weather is nice", "The climate is nice."
-        )
+    def test_just_inside_ceiling(self):
+        # 100-word raw → 110-word cleaned (ratio 1.10). Exactly at ceiling.
+        raw = " ".join(["word"] * 100)
+        cleaned = " ".join(["word"] * 110)
+        assert _is_within_length_window(raw, cleaned)
 
-    # Negative: ambiguous contractions where no-apostrophe form is a real word.
-    # ALL must be rejected — Mercury must not silently change meaning.
-    def test_reject_well_to_well_apostrophe(self):
-        assert not _is_safe_cleanup("well done", "we'll done.")
-
-    def test_reject_were_to_were_apostrophe(self):
-        assert not _is_safe_cleanup("we were going", "we we're going.")
-
-    def test_reject_shell_to_shell_apostrophe(self):
-        assert not _is_safe_cleanup(
-            "a shell on the beach", "a she'll on the beach."
-        )
-
-    def test_reject_ill_to_ill_apostrophe(self):
-        assert not _is_safe_cleanup(
-            "i feel ill today", "I feel i'll today."
-        )
-
-    def test_reject_its_to_its_apostrophe(self):
-        assert not _is_safe_cleanup(
-            "the dog wagged its tail", "The dog wagged it's tail."
-        )
-
-    def test_reject_cant_to_cant_apostrophe(self):
-        # "cant" = jargon/tilt; not in whitelist.
-        assert not _is_safe_cleanup(
-            "the cant of the roof", "The can't of the roof."
-        )
-
-    def test_reject_wont_to_wont_apostrophe(self):
-        # "wont" = accustomed to; not in whitelist.
-        assert not _is_safe_cleanup(
-            "his wont was to wake at dawn", "His won't was to wake at dawn."
-        )
-
-    def test_reject_whats_to_whats_apostrophe(self):
-        assert not _is_safe_cleanup("whats up", "What's up?")
-
-    def test_reject_theres_to_theres_apostrophe(self):
-        assert not _is_safe_cleanup("theres no time", "There's no time.")
+    def test_just_outside_ceiling(self):
+        # 100-word raw → 111-word cleaned (ratio 1.11). Reject.
+        raw = " ".join(["word"] * 100)
+        cleaned = " ".join(["word"] * 111)
+        assert not _is_within_length_window(raw, cleaned)
 
 
 # ---- _extract_text ----------------------------------------------------------
+
 
 class TestExtractText:
     """Helper must extract plain text from every observed OpenAI-compat

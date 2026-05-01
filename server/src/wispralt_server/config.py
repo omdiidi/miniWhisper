@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_app_title: str = "WisprAlt"
 
+    # Minimum dictation length (words) before smart-formatting is invoked. Below
+    # this, raw Parakeet output is returned unchanged — short utterances aren't
+    # worth the LLM round-trip and Parakeet's inline punctuation is good enough.
+    # Default 100 targets long-form dictations (e.g. LLM prompts) where the
+    # cleanup is actually visible.
+    smart_format_min_words: int = 100
+
 
 # Module-level singleton — import as ``from wispralt_server.config import settings``
 settings = Settings()

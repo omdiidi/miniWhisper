@@ -175,6 +175,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 base_url=settings.openrouter_base_url,
                 timeout_ms=settings.openrouter_timeout_ms,
                 app_title=settings.openrouter_app_title,
+                min_words=settings.smart_format_min_words,
             )
             logger.info(
                 "mercury_client initialized model=%s timeout_ms=%d",

@@ -229,7 +229,8 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 | `WISPRALT_API_KEY` | Yes | First-boot break-glass admin token; seeds the initial admin row in `wispralt.users` if the table is empty. |
 | `SUPABASE_DATABASE_URL` | Yes (multi-tenant) | Postgres connection string for the `wispralt` schema. Without it, multi-token auth and usage events both fall back to break-glass mode. |
 | `HF_TOKEN` | Yes | Pyannote gated-model access. |
-| `OPENROUTER_API_KEY` | No | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` are post-processed by Mercury 2 (~$0.0001/cleanup, ~250ms latency). When unset, the toggle is silently a no-op — the server returns raw text and `smart_formatted: false` regardless of the header. Get a key at https://openrouter.ai/keys. |
+| `OPENROUTER_API_KEY` | No | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` and at least `SMART_FORMAT_MIN_WORDS` words (default 100) are post-processed by Mercury 2 — punctuation, casing, filler removal, and light list formatting; meaning preserved. Below the threshold, the call short-circuits to raw. When unset, the toggle is silently a no-op — the server returns raw text and `smart_formatted: false` regardless of the header. Get a key at https://openrouter.ai/keys. |
+| `SMART_FORMAT_MIN_WORDS` | No | Minimum word count for smart-formatting to engage. Default 100. Below this, raw Parakeet output is returned unchanged — short utterances aren't worth the LLM round-trip. |
 
 ---
 

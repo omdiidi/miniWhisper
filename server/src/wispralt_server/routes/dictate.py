@@ -23,6 +23,7 @@ from ..audio import CorruptAudioError
 from ..auth import require_api_key
 from ..config import settings
 from ..dictate.parakeet import MODEL_ID
+from ..smart_format.mercury_client import _word_count
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +122,16 @@ async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse
     mercury_client = getattr(request.app.state, "mercury_client", None)
     applied_smart_format = False
     if smart_format_requested and mercury_client is not None:
+        raw_text = text
         cleaned = await mercury_client.clean_up(text)
         if cleaned is not None:
             text = cleaned
             applied_smart_format = True
+            logger.info(
+                "dictate: smart-format applied raw_words=%d cleaned_words=%d",
+                _word_count(raw_text),
+                _word_count(text),
+            )
 
     return JSONResponse(
         content={
