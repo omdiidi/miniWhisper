@@ -326,8 +326,8 @@ Works on a fresh Mac without cloning this repo. See
 **Install:**
 
 ```bash
-WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai \
-  curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+  | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
 ```
 
 What `install.sh` does (full source at the repo root):

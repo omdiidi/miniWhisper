@@ -7,8 +7,8 @@ Canonical install guide for the WisprAlt macOS client.
 Open Terminal on the Mac you want to dictate from and paste:
 
 ```bash
-WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai \
-  curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+  | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
 ```
 
 That's it. The script downloads the latest signed build, drops it in
@@ -88,8 +88,8 @@ This is the common case. Your admin generated a token for you and texted
 you a one-liner. Paste it into Terminal exactly as received:
 
 ```bash
-WISPRALT_API_KEY=sk_yourtoken WISPRALT_SERVER=https://transcribe.integrateapi.ai \
-  curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+  | WISPRALT_API_KEY=sk_yourtoken WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
 ```
 
 Then run the [history cleanup](#history-cleanup-recommended) above.

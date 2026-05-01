@@ -173,8 +173,8 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
    (full guide in [INSTALL.md](INSTALL.md)):
 
    ```bash
-   WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai \
-     curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+     | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
    ```
 
    The installer downloads the latest signed DMG from GitHub Releases,
