@@ -211,12 +211,31 @@ rm -f "$TAR_TMP"
 # ad-hoc / self-signed) or have `com.apple.security.cs.disable-library-validation`
 # in the entitlements. Local builds skip this — see build-client.sh for the
 # notarization-eligible path.
-codesign \
-    --force \
-    --deep \
-    --sign "$SIGN_IDENTITY" \
-    --entitlements "$CLIENT_DIR/WisprAlt/WisprAlt.entitlements" \
-    "$APP_PATH"
+#
+# Tahoe (26.x) re-tags com.apple.provenance on every FS event faster than
+# `xattr -d` can strip — even the tar-roundtrip workaround above can lose
+# the race. Retry the strip+sign in a tight loop. The `&&` chain ensures
+# xattr-clear and codesign happen in the same shell command with no
+# intervening process spawn for the OS to use.
+CODESIGN_OK=0
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if xattr -cr "$APP_PATH" && codesign --force --deep --sign "$SIGN_IDENTITY" \
+            --entitlements "$CLIENT_DIR/WisprAlt/WisprAlt.entitlements" \
+            "$APP_PATH" 2>/dev/null; then
+        echo "  Codesign succeeded on attempt $attempt"
+        CODESIGN_OK=1
+        break
+    fi
+    sleep 0.2
+done
+if [ "$CODESIGN_OK" -ne 1 ]; then
+    echo "ERROR: codesign failed after 10 attempts. Real error follows:" >&2
+    xattr -cr "$APP_PATH" 2>/dev/null
+    codesign --force --deep --sign "$SIGN_IDENTITY" \
+        --entitlements "$CLIENT_DIR/WisprAlt/WisprAlt.entitlements" \
+        "$APP_PATH"
+    exit 1
+fi
 
 # ── Step 4: Verify ────────────────────────────────────────────────────────────
 # Use plain --verify (NOT --strict). macOS Sequoia/Tahoe re-applies
