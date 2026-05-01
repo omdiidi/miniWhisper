@@ -2,52 +2,35 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Menubar-only app: no Dock icon -->
-    <key>LSUIElement</key>
-    <true/>
-
-    <!-- Bundle identity -->
-    <key>CFBundleIdentifier</key>
-    <string>co.wispralt.WisprAlt</string>
-    <key>CFBundleName</key>
-    <string>WisprAlt</string>
-    <key>CFBundleDisplayName</key>
-    <string>WisprAlt</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleExecutable</key>
-    <string>WisprAlt</string>
-
-    <!-- App icon (asset catalog) -->
-    <key>CFBundleIconName</key>
-    <string>AppIcon</string>
-
-    <!-- Minimum macOS version -->
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-
-    <!-- Privacy usage strings (required for App Store / notarization) -->
-    <key>NSMicrophoneUsageDescription</key>
-    <string>WisprAlt records your voice for dictation and meeting transcription.</string>
-    <key>NSAccessibilityUsageDescription</key>
-    <string>WisprAlt inserts transcribed text at your cursor.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>WisprAlt sends text to other applications.</string>
-
-    <!-- Sparkle auto-update is intentionally DISABLED until we ship a real
-         appcast + EdDSA public key (Tier 2 distribution). The Tier 1.5
-         path uses GitHub Releases via the /wispralt-update slash command,
-         not Sparkle. SUEnableAutomaticChecks=false stops the framework
-         from background-polling SUFeedURL and surfacing "Unable to Check
-         For Updates" dialogs. SparkleController.init() also passes
-         startingUpdater:false as belt-and-suspenders. -->
-    <key>SUEnableAutomaticChecks</key>
-    <false/>
-    <key>SUAutomaticallyUpdate</key>
-    <false/>
+	<key>CFBundleDisplayName</key>
+	<string>WisprAlt</string>
+	<key>CFBundleExecutable</key>
+	<string>WisprAlt</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>co.wispralt.WisprAlt</string>
+	<key>CFBundleName</key>
+	<string>WisprAlt</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>WisprAlt inserts transcribed text at your cursor.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>WisprAlt sends text to other applications.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>WisprAlt records your voice for dictation and meeting transcription.</string>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
 </dict>
 </plist>
