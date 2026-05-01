@@ -2,6 +2,39 @@
 
 All notable changes to WisprAlt are documented here.
 
+## [0.1.1] - 2026-05-01
+
+### Fixed
+
+- **install.sh** — pre-authorize `WisprAlt.app` and `security` CLI on
+  the Keychain entry via `-T <bundle> -T /usr/bin/security`. Without
+  this, the first time the app reads its API key from Keychain (different
+  process from `security` CLI), macOS prompts for the login keychain
+  password — a one-time-but-confusing UX paper cut. Caught during the
+  Phase 4 friend's-mini test on 2026-05-01.
+- **Docs** — env-var assignments in the curl one-liner now sit on the
+  bash side of the pipe (`curl ... | WISPRALT_API_KEY=... WISPRALT_SERVER=... bash`).
+  The previous form (`WISPRALT_API_KEY=... curl ... | bash`) put the env
+  vars in curl's environment; the bash on the right of the pipe did not
+  inherit them, so install.sh saw `WISPRALT_API_KEY` as unset and skipped
+  Keychain provisioning. Empirically verified during Phase 4. Affected
+  files: `README.md`, `docs/INSTALL.md`, `docs/SETUP-CLIENT.md`,
+  `docs/DEPLOY-TEAM.md`, `docs/ADMIN.md`.
+
+### Validated (Phase 4 friend's-mini test)
+
+- **Cross-Apple-ID Gatekeeper.** Apple Development cert (free Personal
+  Team, `Apple Development: zomid777@gmail.com`) launches on a
+  non-Omid Mac without notarization. `SMAppService.mainApp.register()`
+  Login Item registration succeeded — that operation requires Apple to
+  validate the signing identity, so success confirms Gatekeeper
+  acceptance. **No `$99/yr` Apple Developer Program enrollment needed
+  for v1 distribution.**
+- **`install.sh` end-to-end.** Preflight → release fetch → DMG download
+  + SHA verify → mount + cp → quarantine xattr strip → Keychain write
+  → UserDefaults write → app launch. All steps clean on macOS 26.4
+  Tahoe.
+
 ## [Unreleased]
 
 ### Added
