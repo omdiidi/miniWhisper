@@ -179,11 +179,13 @@ Transcribe a short audio clip using the warm Parakeet model.
 ```
 
 `duration_ms` is wall-clock Parakeet inference time (excludes queue wait).
-`smart_formatted` is `true` only when `X-Smart-Format` was truthy AND the
-Mercury cleanup actually replaced the text (i.e. OpenRouter responded within
-the 250ms budget without erroring). It's `false` for every other case,
-including header absent, header non-truthy, server missing
-`OPENROUTER_API_KEY`, Mercury timeout, or Mercury HTTP error.
+`smart_formatted` is `true` only when `X-Smart-Format` was truthy AND the raw
+transcript was at or above `SMART_FORMAT_MIN_WORDS` (default 100) AND the
+Mercury cleanup actually replaced the text (OpenRouter responded within the
+1500 ms budget, output passed the length-window safety check, no errors).
+It's `false` for every other case, including header absent, header non-truthy,
+raw word count below the threshold, server missing `OPENROUTER_API_KEY`,
+Mercury timeout, length-window safety check failed, or Mercury HTTP error.
 
 **Errors:**
 

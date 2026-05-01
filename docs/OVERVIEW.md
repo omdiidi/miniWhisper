@@ -59,7 +59,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/ops/env_writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — atomic .env rewrite, verify_env_perms, key rotation |
 | `server/src/wispralt_server/middleware/rate_limit.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [API.md](API.md) — per-IP rate limiting middleware |
 | `server/src/wispralt_server/middleware/openai_errors.py` | [API.md](API.md), [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md) — translates HTTPExceptions on `/v1/*` into the OpenAI error envelope |
-| `server/src/wispralt_server/smart_format/mercury_client.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — OpenRouter Mercury 2 cleanup client (header-gated, fail-soft 250ms timeout) |
+| `server/src/wispralt_server/smart_format/mercury_client.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — OpenRouter Mercury 2 cleanup client (header-gated, fail-soft 1500ms timeout, gated above `SMART_FORMAT_MIN_WORDS` default 100, soft length-window safety rail [0.7×, 1.10×]) |
 | `server/src/wispralt_server/constants.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — shared constants (`MAX_DISPLAY_NAME_LEN`, `OPENAI_COMPAT_SIZE_CAP`) |
 | `server/src/wispralt_server/observability.py` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — thread-safe counters, time-windowed latency histogram, `usage_queue` singleton, `process_started_at_monotonic` for uptime |
 | `server/src/wispralt_server/_errors.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — typed domain exceptions |

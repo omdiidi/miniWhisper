@@ -33,8 +33,9 @@ WisprAlt is a two-component system: a native macOS menubar client running on you
 │   /v1/audio/transcriptions ──▶ OpenAI-compat shim → ParakeetService          │
 │       (sync, dictate-only, 25 MB cap, never invokes Mercury)                  │
 │   /transcribe/dictate ──▶ ParakeetService (warm, single-thread executor)     │
-│       └─ optional X-Smart-Format: true ──▶ Mercury 2 (OpenRouter, 250ms,     │
-│             fail-soft → raw text on timeout/error)                           │
+│       └─ optional X-Smart-Format: true & raw_words ≥ 100 ──▶ Mercury 2       │
+│             (OpenRouter, 1500ms hard timeout, fail-soft → raw on timeout,    │
+│              error, or length-window safety check failure)                   │
 │   /transcribe/meeting ──▶ enqueue → JobStore (SQLite)                        │
 │                          ↓                                                    │
 │                    asyncio.to_thread(run_pipeline)                            │
