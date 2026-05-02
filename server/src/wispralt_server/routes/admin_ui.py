@@ -44,6 +44,7 @@ from jinja2 import select_autoescape
 
 from .. import auth as auth_mod
 from ..auth import require_admin, require_api_key
+from ..config import settings
 from ..users import store as users_store
 from ..users.store import User
 
@@ -255,6 +256,83 @@ async def users_list(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         "users.html.j2",
         {"request": request, "users": rows},
+    )
+
+
+_VALID_ROLES = {"admin", "employee"}
+_LABEL_MAX_LEN = 80
+
+
+def _validate_label(raw: str) -> tuple[str | None, str | None]:
+    """Trim *raw* and reject empty / too-long / control-char labels.
+
+    Returns ``(label, None)`` on success, ``(None, error)`` on failure.
+    """
+    if raw is None:
+        return None, "Label is required."
+    label = raw.strip()
+    if not label:
+        return None, "Label is required."
+    if len(label) > _LABEL_MAX_LEN:
+        return None, f"Label too long ({len(label)} chars; max {_LABEL_MAX_LEN})."
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in label):
+        return None, "Label contains control characters."
+    return label, None
+
+
+def _build_install_command(server_url: str, plaintext: str) -> str:
+    """Compose the curl one-liner. Env vars sit on the bash side of the pipe
+    (the curl-side form drops them — see CHANGELOG.md [0.1.1]).
+    """
+    return (
+        "curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \\\n"
+        f"  | WISPRALT_API_KEY={plaintext} WISPRALT_SERVER={server_url} bash"
+    )
+
+
+@authed_router.get("/users/new", response_class=HTMLResponse)
+async def users_add_form(request: Request) -> HTMLResponse:
+    """Render the add-employee form."""
+    return templates.TemplateResponse(
+        "add_employee.html.j2",
+        {"request": request, "form_label": "", "form_role": "employee"},
+    )
+
+
+@authed_router.post("/users/new", response_class=HTMLResponse)
+async def users_add_submit(
+    request: Request,
+    label: str = Form(...),
+    role: str = Form("employee"),
+) -> HTMLResponse:
+    """Create a new user, mint a token, and render the install one-liner."""
+    clean_label, err = _validate_label(label)
+    if err is not None or role not in _VALID_ROLES:
+        if err is None:
+            err = f"Invalid role: {role!r}."
+        return templates.TemplateResponse(
+            "add_employee.html.j2",
+            {
+                "request": request,
+                "error": err,
+                "form_label": label,
+                "form_role": role if role in _VALID_ROLES else "employee",
+            },
+            status_code=400,
+        )
+
+    pool = request.app.state.db_pool
+    user, plaintext = await users_store.mint(pool, label=clean_label, role=role)
+    return templates.TemplateResponse(
+        "employee_added.html.j2",
+        {
+            "request": request,
+            "user_id": user.id,
+            "label": user.label,
+            "role": user.role,
+            "plaintext": plaintext,
+            "install_command": _build_install_command(settings.server_url, plaintext),
+        },
     )
 
 

@@ -162,26 +162,33 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
 
 ## Adding a new employee
 
-1. `/admin/users` — find the placeholder row for the new employee, OR
-   ask Omid to insert one via Supabase Studio for now (the v1 admin UI
-   only rotates existing rows; "create user" is a planned addition).
-2. Click **Mint** on their row. The next page shows a 64-hex-char
-   plaintext token.
-3. Copy the token. Text it to the employee via Signal / iMessage — it is
-   shown **once** and never persisted in plaintext anywhere.
-4. The employee runs the `install.sh` curl one-liner from a Terminal
-   (full guide in [INSTALL.md](INSTALL.md)):
+1. Open `/admin/users` and click **+ Add employee** (top-right).
+2. Enter a `label` (1–80 chars, no control characters — e.g.
+   `nicholas`, `alex-laptop`, `contractor-q2`) and pick a role
+   (default `employee`). Submit.
+3. The result page shows the install one-liner pre-baked with the
+   freshly-minted token and the server URL from `settings.server_url`:
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-     | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
+     | WISPRALT_API_KEY=<token> WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
    ```
 
-   The installer downloads the latest signed DMG from GitHub Releases,
+   Click **Copy install command**, paste into Signal / iMessage. The
+   plaintext token is shown **once** — closing the page without copying
+   means rotating via **Mint new token** on the user's row.
+4. The employee pastes the command into Terminal on their Mac. The
+   installer downloads the latest signed DMG from GitHub Releases,
    copies the app to `/Applications`, seeds the token into the Keychain,
    and opens the System Settings panes for the four macOS permissions.
 5. Their first dictation populates `usage_events`; they appear on
    `/admin/users` with a non-null `last_seen_at`.
+
+The route handlers live at `routes/admin_ui.py:users_add_form` (GET) and
+`users_add_submit` (POST). Both are gated by `require_admin` +
+`_require_db_pool`; the latter calls `users_store.mint` and renders
+`employee_added.html.j2` with the install one-liner composed from
+`settings.server_url`.
 
 ## Revoking an employee
 

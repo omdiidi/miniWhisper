@@ -134,6 +134,125 @@ class TestAuthedOverviewRoute:
             app.state.db_pool = _stub_pool()
 
 
+class TestAddEmployeeRoute:
+    """``GET /admin/users/new`` (form) and ``POST /admin/users/new`` (mint)."""
+
+    @staticmethod
+    def _override_admin(app: FastAPI) -> None:
+        async def _admin(_request: Any = None) -> User:
+            return User(id=1, label="omid", role="admin")
+
+        app.dependency_overrides[require_api_key] = _admin
+
+    def test_form_get_returns_200_for_admin(self, app: FastAPI) -> None:
+        self._override_admin(app)
+        try:
+            resp = TestClient(app).get("/admin/users/new")
+            assert resp.status_code == 200
+            assert "Add employee" in resp.text
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_form_get_employee_returns_403(self, app: FastAPI) -> None:
+        async def _employee(_request: Any = None) -> User:
+            return User(id=42, label="alice", role="employee")
+
+        app.dependency_overrides[require_api_key] = _employee
+        try:
+            assert TestClient(app).get("/admin/users/new").status_code == 403
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_post_mints_and_renders_install_command(
+        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._override_admin(app)
+        captured: dict[str, Any] = {}
+
+        async def _fake_mint(_pool: Any, *, label: str, role: str) -> tuple[User, str]:
+            captured["label"] = label
+            captured["role"] = role
+            return User(id=99, label=label, role=role), "deadbeef" * 8
+
+        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
+        # _build_install_command reads settings.server_url at call time;
+        # patch the module-level reference admin_ui imported.
+        monkeypatch.setattr(admin_ui.settings, "server_url", "https://example.test")
+
+        try:
+            resp = TestClient(app).post(
+                "/admin/users/new",
+                data={"label": "  nicholas  ", "role": "employee"},
+            )
+            assert resp.status_code == 200
+            # Label is trimmed before mint
+            assert captured == {"label": "nicholas", "role": "employee"}
+            # The install command and plaintext both surface in the page
+            assert "deadbeef" * 8 in resp.text
+            assert "WISPRALT_API_KEY=" in resp.text
+            assert "WISPRALT_SERVER=https://example.test" in resp.text
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_post_rejects_empty_label(
+        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._override_admin(app)
+        called = {"n": 0}
+
+        async def _fake_mint(*_a: Any, **_kw: Any) -> Any:
+            called["n"] += 1
+            raise AssertionError("mint must not be called for invalid input")
+
+        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
+        try:
+            resp = TestClient(app).post(
+                "/admin/users/new", data={"label": "   ", "role": "employee"}
+            )
+            assert resp.status_code == 400
+            assert called["n"] == 0
+            assert "Label is required" in resp.text
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_post_rejects_invalid_role(
+        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._override_admin(app)
+
+        async def _fake_mint(*_a: Any, **_kw: Any) -> Any:
+            raise AssertionError("mint must not be called for invalid role")
+
+        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
+        try:
+            resp = TestClient(app).post(
+                "/admin/users/new", data={"label": "alex", "role": "superuser"}
+            )
+            assert resp.status_code == 400
+            assert "Invalid role" in resp.text
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_post_rejects_control_chars_in_label(
+        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._override_admin(app)
+
+        async def _fake_mint(*_a: Any, **_kw: Any) -> Any:
+            raise AssertionError("mint must not be called for invalid label")
+
+        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
+        try:
+            resp = TestClient(app).post(
+                "/admin/users/new",
+                data={"label": "alex\nadmin", "role": "employee"},
+            )
+            assert resp.status_code == 400
+            assert "control character" in resp.text
+        finally:
+            app.dependency_overrides.clear()
+
+
 class TestRequireAdminRoleEnforcement:
     """Direct unit-test of the role gate, independent of HTTP plumbing."""
 

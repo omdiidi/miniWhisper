@@ -37,7 +37,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/usage/queue.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — bounded `asyncio.Queue` with drop-oldest overflow |
 | `server/src/wispralt_server/usage/writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — drain loop, batch INSERT, FK-violation retry |
 | `server/src/wispralt_server/admin/__init__.py` | [ADMIN.md](ADMIN.md) — admin package marker (templates only) |
-| `server/src/wispralt_server/admin/templates/*.html.j2` | [ADMIN.md](ADMIN.md) — Jinja2 templates: base / login / overview / users / user_detail / usage / token_minted |
+| `server/src/wispralt_server/admin/templates/*.html.j2` | [ADMIN.md](ADMIN.md) — Jinja2 templates: base / login / overview / users / user_detail / usage / token_minted / add_employee / employee_added |
 | `server/src/wispralt_server/routes/dictate.py` | [API.md](API.md) — `/transcribe/dictate` endpoint (incl. `X-Smart-Format` header gating) |
 | `server/src/wispralt_server/routes/health.py` | [API.md](API.md) — `/healthz`, `/readyz/dictation`, `/readyz/meeting` |
 | `server/src/wispralt_server/routes/v1_transcriptions.py` | [API.md](API.md), [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md) — OpenAI-compatible `/v1/audio/transcriptions` |

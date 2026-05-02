@@ -1,7 +1,10 @@
 {% extends "base.html.j2" %}
 {% block title %}Users — Wispralt Admin{% endblock %}
 {% block content %}
-  <h2>Users</h2>
+  <div style="display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px;">
+    <h2 style="margin: 0;">Users</h2>
+    <a href="/admin/users/new" style="background: var(--accent); color: #fff; padding: 6px 12px; border-radius: 4px; font-size: 13px;">+ Add employee</a>
+  </div>
   <table>
     <thead>
       <tr>

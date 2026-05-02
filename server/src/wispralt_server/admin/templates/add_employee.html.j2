@@ -1,0 +1,35 @@
+{% extends "base.html.j2" %}
+{% block title %}Add employee — Wispralt Admin{% endblock %}
+{% block content %}
+  <h2>Add employee</h2>
+  <p class="muted" style="color: var(--muted); margin-top: -8px;">
+    Create a new user, mint a token, and get a ready-to-text install command.
+  </p>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <form method="post" action="/admin/users/new" style="max-width: 480px;">
+    <label for="label" style="display: block; margin: 12px 0 4px; font-size: 13px; color: var(--muted);">
+      Label <span style="color: var(--bad);">*</span>
+    </label>
+    <input id="label" name="label" type="text" required autofocus
+           value="{{ form_label or '' }}"
+           placeholder="e.g. nicholas, alex-laptop, contractor-q2"
+           style="width: 100%;"
+           maxlength="80">
+    <p class="muted" style="color: var(--muted); font-size: 12px; margin: 4px 0 0;">
+      Internal identifier shown in the user list. 1–80 chars, no control characters.
+    </p>
+
+    <label for="role" style="display: block; margin: 16px 0 4px; font-size: 13px; color: var(--muted);">Role</label>
+    <select id="role" name="role" style="width: 100%;">
+      <option value="employee" {% if form_role == "employee" or not form_role %}selected{% endif %}>employee</option>
+      <option value="admin" {% if form_role == "admin" %}selected{% endif %}>admin</option>
+    </select>
+
+    <div style="margin-top: 20px;">
+      <button type="submit" style="background: var(--accent); color: #fff; border-color: var(--accent);">
+        Create &amp; mint token
+      </button>
+      <a href="/admin/users" style="margin-left: 12px;">Cancel</a>
+    </div>
+  </form>
+{% endblock %}
