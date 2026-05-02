@@ -17,22 +17,35 @@ enum TextInjector {
     /// Injects `text` at the current cursor position in the focused application.
     ///
     /// Strategy order:
-    ///   1. Capture `(FocusContext, AXUIElement?)` once.
-    ///   2. If `shouldRefuseInjection` is true → log warning, debounced
+    ///   1. If `targetPID` is supplied, activate that app first so focus is
+    ///      restored to the window the user was looking at when they finished
+    ///      speaking — fixes the "I dictated but text landed in the wrong
+    ///      window" failure when the network round-trip is slow enough that
+    ///      the user switches apps mid-flight.
+    ///   2. Capture `(FocusContext, AXUIElement?)` once.
+    ///   3. If `shouldRefuseInjection` is true → log warning, debounced
     ///      notification, return without touching AX or clipboard.
-    ///   3. `AccessibilityInjector.tryInsertWith` — AX kAXSelectedTextAttribute
+    ///   4. `AccessibilityInjector.tryInsertWith` — AX kAXSelectedTextAttribute
     ///      with read-back verification. Returns true only if the value was
     ///      observed to change.
-    ///   4. `ClipboardInjector.injectViaCmdV` — writes text to pasteboard,
+    ///   5. `ClipboardInjector.injectViaCmdV` — writes text to pasteboard,
     ///      synthesises Cmd+V, then restores the original pasteboard contents
     ///      after 200 ms.
     ///
-    /// - Parameter text: The string to inject (typically transcription output).
-    static func inject(_ text: String) {
+    /// - Parameters:
+    ///   - text: The string to inject (typically transcription output).
+    ///   - targetPID: PID of the app that was frontmost when the user finished
+    ///     speaking. When non-nil and different from the current frontmost
+    ///     (and not WisprAlt itself), the inject path activates that app
+    ///     before resolving the AX element, so dictation lands where the user
+    ///     intended even if their focus drifted during the upload.
+    static func inject(_ text: String, targetPID: pid_t? = nil) async {
         guard !text.isEmpty else {
             Log.debug("TextInjector: empty string — skipping injection.", category: "inject")
             return
         }
+
+        await restoreTargetIfNeeded(targetPID)
 
         let (context, element) = captureFocus()
         Log.debug("inject: target_at_start=\(context.description)", category: "inject")
@@ -54,6 +67,42 @@ enum TextInjector {
         Log.debug("AX injection unverified — using Cmd+V fallback.", category: "inject")
         ClipboardInjector.injectViaCmdV(text)
         Log.info("Text injected via Cmd+V. target=\(context.description)", category: "inject")
+    }
+
+    // MARK: - Focus restoration (network-round-trip drift fix)
+
+    /// Activate the app identified by `pid` so subsequent AX/CGEvent calls
+    /// hit the user's intended target.
+    ///
+    /// No-op when:
+    ///   - `pid` is nil or non-positive
+    ///   - the target is already frontmost (no app switch happened)
+    ///   - the target is WisprAlt itself (paranoia — menubar app doesn't
+    ///     normally take focus, but defend against the edge case where the
+    ///     menubar dropdown caused a brief transition)
+    ///   - the target process is no longer running (user quit it)
+    ///
+    /// After issuing `activate()`, await ~120 ms — `NSRunningApplication.activate`
+    /// returns immediately but the frontmost flip happens on the next runloop
+    /// tick plus an XPC round-trip to LaunchServices. 120 ms is empirically
+    /// enough on Apple Silicon and is dwarfed by the network upload time
+    /// that motivated this fix in the first place.
+    private static func restoreTargetIfNeeded(_ pid: pid_t?) async {
+        guard let pid, pid > 0 else { return }
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        guard pid != myPID else { return }
+        let currentPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+        guard pid != currentPID else { return }
+        guard let target = NSRunningApplication(processIdentifier: pid) else {
+            Log.debug("inject: target pid=\(pid) no longer running — skipping activation.", category: "inject")
+            return
+        }
+        let activated = target.activate()
+        Log.debug(
+            "inject: activated target pid=\(pid) bundle=\(target.bundleIdentifier ?? "?") result=\(activated)",
+            category: "inject"
+        )
+        try? await Task.sleep(for: .milliseconds(120))
     }
 
     // MARK: - Focus capture

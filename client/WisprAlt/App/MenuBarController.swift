@@ -666,6 +666,13 @@ extension MenuBarController: FNKeyEventsDelegate {
         // Set idle immediately so the icon stops flashing.
         mode = .idle
 
+        // Capture the user's intended target window NOW — before the network
+        // round-trip (which can take 10-20s on slow uplinks) gives them time
+        // to switch focus. TextInjector activates this PID before resolving
+        // the AX element so dictation lands where they were when they
+        // finished speaking, not where focus drifts during the upload.
+        let targetPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier
+
         Task { @MainActor in
             // Latency breakdown timestamps — surfaces the ~3-5s multi-sentence
             // hunch by isolating network+upload+inference vs AX-inject. Filter
@@ -696,7 +703,7 @@ extension MenuBarController: FNKeyEventsDelegate {
                 )
 
                 let tInj = clock.now
-                TextInjector.inject(text)
+                await TextInjector.inject(text, targetPID: targetPID)
                 let injMs = (clock.now - tInj).milliseconds
                 let totalMs = (clock.now - tStopStart).milliseconds
                 Log.debug(
