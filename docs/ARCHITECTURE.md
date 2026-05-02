@@ -242,6 +242,7 @@ Key invariants:
 
 - **`request.state.user` is populated for every authenticated request.** The observability middleware reads it to attribute usage events; `routes/admin_ui.py:require_admin` reads it to gate role.
 - **The break-glass branch only fires when Postgres is unreachable** OR when the row genuinely is missing. On first boot the lifespan seeds a real `wispralt.users` row whose `token_hash` matches the env-var hash, so 99% of break-glass calls take the normal Postgres path and produce attributable usage events. The `id=-1` sentinel is reserved for the case where the pool is `None` (Postgres degraded).
+- **Pool watcher (added 2026-05-02).** The lifespan starts a background task that probes `app.state.db_pool` with `SELECT 1` (2s timeout) every 10 seconds. On failure it calls `db.recreate_pool()`, swaps `app.state.db_pool`, and restarts the usage drainer against the fresh pool. Without this, a transient Supabase blip leaves `db_pool=None` forever and every authenticated request returns 503 until a manual `launchctl kickstart` — the failure mode that bit production on 2026-05-02. Recovery latency is bounded by the 10s probe interval plus the asyncpg create_pool round-trip.
 - **Cookie fallback:** `_extract_bearer` falls back to the `wispralt_admin_token` cookie when no `Authorization` header is present. Set by `POST /admin/login` for browser navigation; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. CSRF is mitigated by `SameSite=Strict`.
 
 #### `wispralt.users` columns

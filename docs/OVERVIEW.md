@@ -26,7 +26,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/config.py` | [SETUP-SERVER.md](SETUP-SERVER.md) — configuration options |
 | `server/src/wispralt_server/auth.py` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — multi-token bearer auth, sha256→cache→Postgres→break-glass |
 | `server/src/wispralt_server/audio.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — audio decode/resample pipeline |
-| `server/src/wispralt_server/db.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — asyncpg pool factory, `PostgresUnavailable` typed error |
+| `server/src/wispralt_server/db.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — asyncpg pool factory, `PostgresUnavailable` typed error, `health_check`/`recreate_pool` for the lifespan watcher loop |
 | `server/src/wispralt_server/main.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — startup lifecycle, route mounting, `_seed_admin_if_empty`, drainer task wiring |
 | `server/src/wispralt_server/dictate/parakeet.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — Parakeet service, warm load, single-thread executor |
 | `server/src/wispralt_server/users/__init__.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — users package (auth-time identity + admin-UI rows) |
@@ -77,6 +77,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/tests/test_token_cache.py` | [ADMIN.md](ADMIN.md) — `TokenCache` LRU + 60s TTL behavior (no DB, no asyncio) |
 | `server/tests/test_usage_writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — `UsageEventQueue` overflow + drainer batch flush + FK-violation retry |
 | `server/tests/test_admin_routes_auth.py` | [ADMIN.md](ADMIN.md) — `/admin/*` 403 for employee role, 200 for admin role |
+| `server/tests/test_db_health.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — coverage for `db.health_check` + `db.recreate_pool` (the watcher's primitives) |
 | `server/tests/test_auth_break_glass.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — Postgres-unreachable + env-var bearer → admin path |
 | `.github/workflows/test-server.yml` | [CONTRIBUTING.md](CONTRIBUTING.md) — runs `pytest server/tests/` on PR + push to main |
 

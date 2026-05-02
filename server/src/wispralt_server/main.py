@@ -295,10 +295,61 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "Postgres unavailable at startup; only break-glass admin will work"
         )
 
+    # 9b. Pool watcher — every 10s, probe the pool with SELECT 1 and recreate
+    #     if dead. Without this, a transient Supabase blip leaves db_pool=None
+    #     forever and every authenticated request returns 503 until the
+    #     operator restarts the server. Triggered by a real outage 2026-05-02.
+    app.state.db_watcher_task = None
+
+    async def _db_watcher_loop() -> None:
+        while not getattr(app.state, "shutting_down", False):
+            try:
+                await asyncio.sleep(10.0)
+                pool = getattr(app.state, "db_pool", None)
+                healthy = pool is not None and await db.health_check(pool)
+                if healthy:
+                    continue
+                logger.warning(
+                    "db_watcher: pool unhealthy (pool=%s) — attempting rebuild",
+                    "None" if pool is None else "dead",
+                )
+                try:
+                    new_pool = await db.recreate_pool()
+                except (asyncpg.PostgresError, OSError, db.PostgresUnavailable):
+                    logger.exception("db_watcher: rebuild failed; will retry in 10s")
+                    continue
+                app.state.db_pool = new_pool
+                # Restart the usage drainer against the new pool. Cancel the
+                # old one (if any) — it's holding a reference to the dead pool
+                # and will throw on next acquire.
+                old_drainer = getattr(app.state, "usage_drainer", None)
+                if old_drainer is not None and not old_drainer.done():
+                    old_drainer.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await old_drainer
+                app.state.usage_drainer = asyncio.create_task(
+                    usage_writer.drain_loop(observability.usage_queue, new_pool)
+                )
+                logger.info("db_watcher: pool rebuilt; usage drainer restarted")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — watcher must never crash silently
+                logger.exception("db_watcher: unexpected error; continuing loop")
+
+    app.state.db_watcher_task = asyncio.create_task(_db_watcher_loop())
+
     # ── yield — server is live ─────────────────────────────────────────────────
     yield
 
     # ── shutdown ──────────────────────────────────────────────────────────────
+    # Cancel the db pool watcher first so it stops trying to probe / rebuild
+    # while the rest of shutdown is tearing the pool down.
+    db_watcher: asyncio.Task | None = getattr(app.state, "db_watcher_task", None)
+    if db_watcher is not None and not db_watcher.done():
+        db_watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await db_watcher
+
     # Cancel the idle-eviction loop first so it stops emitting log noise.
     eviction_task: asyncio.Task | None = getattr(app.state, "eviction_task", None)
     if eviction_task is not None and not eviction_task.done():
