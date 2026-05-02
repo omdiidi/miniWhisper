@@ -79,10 +79,15 @@ class Settings(BaseSettings):
     # (clients toggling the X-Smart-Format header on get raw text back).
     openrouter_api_key: str | None = None
     openrouter_model: str = "inception/mercury-2"
-    # 1500 ms (NOT 250 ms): cross-region OpenRouter calls + TLS handshake on cold
-    # connections regularly exceed 250 ms. 1500 ms is the practical upper bound to
-    # avoid silent fall-through to raw on cold connections.
-    openrouter_timeout_ms: int = 1500
+    # 600 ms ceiling for the Mercury cleanup (lowered from 1500 ms on
+    # 2026-05-02 after measuring 7-day production latency: dictate p95
+    # ran 5.4s with the old budget; this caps the disaster ceiling and
+    # keeps the path fail-soft). Cross-region OpenRouter on a warm TCP
+    # session is 200-400 ms; 600 ms preserves headroom while ruling out
+    # the "1.5s waiting on Mercury" failure mode in the long tail.
+    # If a deployment sees too many fail-overs to raw text, raise via env
+    # (OPENROUTER_TIMEOUT_MS=1000) and revisit.
+    openrouter_timeout_ms: int = 600
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_app_title: str = "WisprAlt"
 

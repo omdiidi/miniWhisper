@@ -80,8 +80,9 @@ async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse
             )
 
     # 3. Read body — enforce size limit while reading
-    queue_start = time.perf_counter()
+    body_start = time.perf_counter()
     audio_bytes = await file.read(settings.max_upload_bytes + 1)
+    body_read_ms = (time.perf_counter() - body_start) * 1_000.0
     if len(audio_bytes) > settings.max_upload_bytes:
         raise HTTPException(
             status_code=413,
@@ -94,7 +95,6 @@ async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse
     # 4. Dispatch to ParakeetService (runs in single-thread executor)
     parakeet_service = request.app.state.parakeet_service
     inference_start = time.perf_counter()
-    queue_wait_ms = (inference_start - queue_start) * 1_000.0
 
     try:
         text, inference_ms = await parakeet_service.transcribe(audio_bytes)
@@ -107,13 +107,6 @@ async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
     )
 
-    logger.info(
-        "dictate: queue_wait_ms=%.1f inference_ms=%.1f chars=%d",
-        queue_wait_ms,
-        inference_ms,
-        len(text),
-    )
-
     # Smart formatting: client-only opt-in via X-Smart-Format header.
     # /v1/audio/transcriptions never sets this header (raw output by contract).
     # Permissive value parsing: accept "true", "1", "yes" (case-insensitive).
@@ -121,17 +114,37 @@ async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse
     smart_format_requested = header_val in {"true", "1", "yes"}
     mercury_client = getattr(request.app.state, "mercury_client", None)
     applied_smart_format = False
+    smart_format_ms = 0.0
     if smart_format_requested and mercury_client is not None:
         raw_text = text
+        sf_start = time.perf_counter()
         cleaned = await mercury_client.clean_up(text)
+        smart_format_ms = (time.perf_counter() - sf_start) * 1_000.0
         if cleaned is not None:
             text = cleaned
             applied_smart_format = True
             logger.info(
-                "dictate: smart-format applied raw_words=%d cleaned_words=%d",
+                "dictate: smart-format applied raw_words=%d cleaned_words=%d ms=%.1f",
                 _word_count(raw_text),
                 _word_count(text),
+                smart_format_ms,
             )
+
+    # Single per-request timing line — the breakdown a future investigator
+    # needs to attribute latency to a stage without re-deriving it from
+    # request_id correlation. Order: how a request flows.
+    total_handler_ms = (time.perf_counter() - body_start) * 1_000.0
+    logger.info(
+        "dictate: body_read_ms=%.1f inference_ms=%.1f smart_format_ms=%.1f "
+        "total_handler_ms=%.1f bytes_in=%d chars=%d sf=%s",
+        body_read_ms,
+        inference_ms,
+        smart_format_ms,
+        total_handler_ms,
+        len(audio_bytes),
+        len(text),
+        applied_smart_format,
+    )
 
     return JSONResponse(
         content={
