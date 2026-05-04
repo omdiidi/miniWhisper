@@ -142,19 +142,29 @@ final class DictationRecorder {
     private var pendingDeviceOverrideSetAt: TimeInterval = 0
     private static let overrideSwallowWindow: TimeInterval = 0.05
 
-    /// Wall-clock time (`Date().timeIntervalSinceReferenceDate`) stamped at the
-    /// top of `start()`, BEFORE device override / observer install / engine
-    /// start. The settling window check (`configChangeSettleWindow`) is measured
-    /// from this stamp. Because the stamp lands before engine.start(), the
-    /// effective window from the user's perspective is shorter than
-    /// `configChangeSettleWindow` would suggest — typically 50–80 ms of
-    /// "real recording time" out of the 100 ms gross window.
+    /// Wall-clock time (`Date().timeIntervalSinceReferenceDate`) stamped
+    /// IMMEDIATELY after `engine.start()` returns successfully. The settling
+    /// window check (`configChangeSettleWindow`) is measured from this stamp.
+    ///
+    /// Why after engine.start() and not before: `engine.start()` blocks the
+    /// main thread for 50–200 ms on a cold input device while the audio HAL
+    /// negotiates sample rate / channel count. AVAudioEngine fires
+    /// `AVAudioEngineConfigurationChange` DURING that block as part of cold-
+    /// device renegotiation, but the observer block is queued to `.main` and
+    /// can't execute until `engine.start()` returns. If we stamped the start
+    /// time before the call, `elapsed` would already exceed the 100 ms window
+    /// by the time the observer runs — so the cold-start configChange leaks
+    /// through and aborts the session ("first hold doesn't record" symptom).
+    ///
+    /// Stamping after `engine.start()` returns means `elapsed ≈ 0` for any
+    /// configChange that was queued during the cold-start phase, and the
+    /// settling window correctly swallows it.
     ///
     /// The window's purpose: drop AVAudioEngineConfigurationChange notifications
-    /// that arrive in the first 100 ms of a session. Those are almost always
-    /// stale cross-session callbacks from a previous session's device override
-    /// that landed after stop() returned (NotificationCenter doesn't guarantee
-    /// in-order delivery across observer registrations).
+    /// that arrive in the first 100 ms of a session. Two sources:
+    ///   1. Cold-device renegotiation during engine.start() (the dominant case).
+    ///   2. Stale cross-session callbacks from a previous session's device
+    ///      override that landed after stop() returned.
     ///
     /// Trade-off: under heavy main-thread pressure, an in-session synthetic
     /// callback can also arrive past the window — in which case the next-arriving
@@ -195,12 +205,12 @@ final class DictationRecorder {
         // device-override logic runs below.
         pendingDeviceOverride = false
 
-        // Stamp session start so the observer can ignore configChange notifications
-        // that arrive within the settling window — those are nearly always late
-        // callbacks from a PREVIOUS session's device override that landed after
-        // stop() returned. Without this, a delayed notification could abort the
-        // current session as if a real mid-recording device change happened.
-        sessionStartTime = Date().timeIntervalSinceReferenceDate
+        // sessionStartTime is stamped AFTER engine.start() returns successfully
+        // (see the property's doc-comment for why). Until then, leave whatever
+        // value was there — if a configChange somehow fires before we stamp the
+        // new value, `elapsed = now - stale` is huge and the event is treated as
+        // a real device change (safe-abort default), which is correct behavior
+        // for any change that fires before the engine is even running.
 
         let inputNode = engine.inputNode
 
@@ -460,6 +470,14 @@ final class DictationRecorder {
             try? FileManager.default.removeItem(at: tempURL)
             throw DictationError.engineStartFailed(error)
         }
+
+        // Stamp NOW — same main-thread turn as the engine.start() return. Any
+        // AVAudioEngineConfigurationChange queued onto .main during the cold-
+        // start renegotiation will run only after this main turn completes, so
+        // its `elapsed = now - sessionStartTime` reads ~0 ms and the settling
+        // window correctly swallows it. See the property doc-comment for the
+        // full reasoning.
+        sessionStartTime = Date().timeIntervalSinceReferenceDate
 
         isRecording = true
         Log.info(
