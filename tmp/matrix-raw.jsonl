@@ -1,0 +1,6 @@
+{"name":"01-30s-file","mode":"file","audio_s":30,"wall_s":9,"ratio":"3.33","segs":5,"speakers":1,"status":"done","job_id":"1de8bfa1-2e73-413f-acbc-8119ae163da8"}
+{"name":"02-30s-meet-mono","mode":"meeting","audio_s":30,"wall_s":17,"ratio":"1.76","segs":0,"speakers":0,"status":"done","job_id":"c6dff6fe-74e1-4ad2-a246-4520f167b785"}
+{"name":"03-30s-meet-stereo","mode":"meeting","audio_s":30,"wall_s":17,"ratio":"1.76","segs":0,"speakers":0,"status":"done","job_id":"5a5b404d-5ae4-46e4-b92a-026e0f3f27c6"}
+{"name":"04-5m-file","mode":"file","audio_s":330,"wall_s":18,"ratio":"18.33","segs":42,"speakers":1,"status":"done","job_id":"d12b1195-e64e-4902-889e-d795c6a5fcc0"}
+{"name":"05-5m-meet-mono","mode":"meeting","audio_s":330,"wall_s":100,"ratio":"3.30","segs":0,"speakers":0,"status":"done","job_id":"9ebc149c-02ce-4fbd-915f-dcc2efa41fbc"}
+{"name":"08-30m-meet-mono","mode":"meeting","audio_s":1800,"wall_s":476,"ratio":"3.78","segs":0,"speakers":0,"status":"done","job_id":"696d6b8e-91a6-42a9-bc25-bd19f56a817e"}

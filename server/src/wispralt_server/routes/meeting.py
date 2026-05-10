@@ -21,10 +21,12 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import time
+
 from ..auth import require_api_key
 from ..config import settings
 from .._errors import MeetingInProgressError
-from ..jobs.runner import MeetingRunner
+from ..jobs.runner import PHASE_LABELS, MeetingRunner
 from ..ops import staging
 
 logger = logging.getLogger(__name__)
@@ -113,8 +115,34 @@ def poll_meeting(request: Request, job_id: str) -> JSONResponse:
     body: dict[str, object] = {"job_id": job.id, "status": job.status}
     if job.mode is not None:
         body["mode"] = job.mode
+    if job.request_mode is not None:
+        body["request_mode"] = job.request_mode
     if job.error is not None:
         body["error"] = job.error
+
+    # Phase 3: progress block + serverFinishing flag for client UI.
+    if job.status == "running":
+        phase = job.phase
+        progress: dict[str, object] = {
+            "phase": phase,
+            "phase_label": PHASE_LABELS.get(phase) if phase else None,
+            "chunk_index": job.chunk_index,
+            "total_chunks": job.total_chunks,
+        }
+        if job.phase_started_at is not None:
+            progress["phase_elapsed_s"] = round(
+                time.time() - float(job.phase_started_at), 2
+            )
+        if job.audio_duration_s is not None:
+            progress["audio_duration_s"] = job.audio_duration_s
+        body["progress"] = progress
+        # serverFinishing: the user requested cancellation but the executor
+        # is still running (advisory cancel for in-pipeline phases). The
+        # client uses this to render the "Previous job finishing on server"
+        # banner and to block new submissions client-side.
+        if job.cancel_requested:
+            body["serverFinishing"] = True
+
     if job.status == "done":
         # `formats` kept for backward compat; `outputs` is what the client expects.
         # Both fields carry the same set of available formats; `outputs` maps each

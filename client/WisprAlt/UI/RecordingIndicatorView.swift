@@ -33,6 +33,11 @@ struct RecordingIndicatorView: View {
 
     // MARK: - State
 
+    /// Server-driven per-phase progress (phase label + chunk index). Injected
+    /// from the popover root. Previews supply a stub via
+    /// `.environmentObject(RecordingState())`.
+    @EnvironmentObject private var recordingState: RecordingState
+
     /// Drives the elapsed timer for `.recording` and `.processing` states.
     @State private var now: Date = .now
     private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
@@ -109,7 +114,7 @@ struct RecordingIndicatorView: View {
                 .symbolEffect(.variableColor.iterative, isActive: true)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text("Processing")
+                Text(processingHeadline)
                     .font(.caption.bold())
                 HStack(spacing: 3) {
                     Text("Elapsed:")
@@ -122,6 +127,22 @@ struct RecordingIndicatorView: View {
             }
         }
         .padding(.vertical, 4)
+    }
+
+    /// Headline string for the processing row. Renders the friendly phase
+    /// label (server-provided when present, else the local map) and appends
+    /// `chunk i/n` ONLY while the server is in the `transcribe` phase with a
+    /// non-zero total. Falls back to "Processing" before any phase has been
+    /// observed.
+    private var processingHeadline: String {
+        guard let label = recordingState.phaseLabelDisplay else { return "Processing" }
+        if recordingState.phase == "transcribe",
+           let i = recordingState.chunkIndex,
+           let n = recordingState.totalChunks, n > 0
+        {
+            return "\(label) — chunk \(i)/\(n)"
+        }
+        return label
     }
 
     private var doneRow: some View {
@@ -151,28 +172,45 @@ struct RecordingIndicatorView: View {
     RecordingIndicatorView(phase: .idle)
         .padding()
         .frame(width: 260)
+        .environmentObject(RecordingState())
 }
 
 #Preview("Recording") {
     RecordingIndicatorView(phase: .recording(Date()))
         .padding()
         .frame(width: 260)
+        .environmentObject(RecordingState())
 }
 
 #Preview("Uploading 43%") {
     RecordingIndicatorView(phase: .uploading(0.43))
         .padding()
         .frame(width: 260)
+        .environmentObject(RecordingState())
 }
 
 #Preview("Processing") {
     RecordingIndicatorView(phase: .processing(Date()))
         .padding()
         .frame(width: 260)
+        .environmentObject(RecordingState())
+}
+
+#Preview("Processing — Transcribing chunks") {
+    let state = RecordingState()
+    state.phase = "transcribe"
+    state.phaseLabel = "Transcribing"
+    state.chunkIndex = 7
+    state.totalChunks = 21
+    return RecordingIndicatorView(phase: .processing(Date()))
+        .padding()
+        .frame(width: 260)
+        .environmentObject(state)
 }
 
 #Preview("Done") {
     RecordingIndicatorView(phase: .done)
         .padding()
         .frame(width: 260)
+        .environmentObject(RecordingState())
 }

@@ -42,13 +42,15 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/routes/health.py` | [API.md](API.md) — `/healthz`, `/readyz/dictation`, `/readyz/meeting` |
 | `server/src/wispralt_server/routes/v1_transcriptions.py` | [API.md](API.md), [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md) — OpenAI-compatible `/v1/audio/transcriptions` |
 | `server/src/wispralt_server/routes/me.py` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — JSON `GET /me` + `PATCH /me` for self-service display name |
-| `server/src/wispralt_server/routes/admin.py` | [API.md](API.md) — `/admin/rotate-key` (legacy single-key shim, retained for break-glass rotation when Postgres is down) |
+| `server/src/wispralt_server/routes/admin.py` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — `/admin/rotate-key` (legacy single-key shim) plus `GET /admin/active` (rich projection of the in-flight job) and `GET /admin/server-log/{job_id}` (100 lines bracketing the job in `settings.server_log_path`) |
+| `server/src/wispralt_server/routes/transcribe_file.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [API.md](API.md) — `POST /transcribe/file` with `mode: ProcessingMode = Form(ProcessingMode.FILE)`; pre-flight disk gate (free < `Content-Length` × 2 → 507) and RAM gate (available < 4 GiB → 503); streams to staging then hands off to `MeetingRunner.submit_source_or_429`. |
 | `server/src/wispralt_server/routes/admin_ui.py` | [ADMIN.md](ADMIN.md), [API.md](API.md) — Jinja2 admin UI under `/admin/*` (two-router pattern) |
 | `server/src/wispralt_server/routes/meeting.py` | [API.md](API.md) — meeting POST/GET/download/DELETE endpoints |
 | `server/src/wispralt_server/meeting/__init__.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — package init that runs torch.load + huggingface_hub compat shims (PyTorch 2.6 weights_only fix + pyannote use_auth_token→token translation) |
 | `server/src/wispralt_server/meeting/silence.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — in-person mode detection |
 | `server/src/wispralt_server/meeting/deepfilter.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — denoise no-op stub (DeepFilterNet was dropped due to numpy<2 conflict with parakeet-mlx) |
-| `server/src/wispralt_server/meeting/whisperx_loader.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — WhisperX/CrisperWhisper singleton |
+| `server/src/wispralt_server/meeting/whisperx_loader.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — WhisperX/CrisperWhisper singleton. **Deprecated by `mlx_whisper_loader.py`; retained through Phase 8 for revert-by-git-revert; deleted in Phase 10 after green matrix.** |
+| `server/src/wispralt_server/meeting/mlx_whisper_loader.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — `mlx-community/whisper-large-v3-turbo` singleton. `load()` warmup + idempotent flag; `transcribe_channel(audio_16k, *, word_timestamps, progress_cb, cancel_cb)` wraps `mlx_whisper.transcribe` with a `tqdm.auto.tqdm.update` monkeypatch (and 5 s wall-clock fallback) for chunk progress. |
 | `server/src/wispralt_server/meeting/diarize.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — Pyannote diarization, MPS device |
 | `server/src/wispralt_server/meeting/merge.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — segment merging, speaker labeling |
 | `server/src/wispralt_server/meeting/output.py` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — atomic output write, SRT/VTT/TXT formats |
@@ -93,7 +95,7 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/WisprAlt.entitlements` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — required entitlements |
 | `client/WisprAlt/WisprAltApp.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — SwiftUI App entry point, AppDelegate bridge |
 | `client/WisprAlt/App/AppDelegate.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — app lifecycle, AppDelegate.shared accessor, defensive cleanup of stale legacy mic-override key |
-| `client/WisprAlt/App/MenuBarController.swift` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — state machine, mic exclusion, composite REC NSImage, human-readable meeting filenames |
+| `client/WisprAlt/App/MenuBarController.swift` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — state machine, mic exclusion, composite REC NSImage, human-readable meeting filenames. Owns the **extended `RecordingState`** (`phase`, `chunkIndex`, `totalChunks`, `activeJobID` persisted to UserDefaults, `serverFinishingJobID`, `phaseLabel` computed property). `runFileTranscriptionJob(sourceURL:outputDirectory:stem:mode:)` is shared by meeting + custom upload paths; `cancelActiveTranscription()` invalidates the URLSession, calls `MeetingAPI.cancel`, and routes the row into `serverFinishingJobID` if the server-side cancel is advisory (mid-transcribe). |
 | `client/WisprAlt/Audio/MicEnumerator.swift` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-CLIENT.md](SETUP-CLIENT.md) — AVCaptureDevice + CoreAudio HAL bridge; powers the SettingsView Input Mic picker |
 | `client/WisprAlt/App/PermissionGate.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — 4-permission wizard, 14.4+ restart |
 | `client/WisprAlt/Hotkeys/FNKeyMonitor.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — FN key state machine |
@@ -105,7 +107,7 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Capture/AudioFormat.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — format conversion, CMSampleBuffer→AVAudioPCMBuffer |
 | `client/WisprAlt/Server/ServerClient.swift` | [API.md](API.md), [FALLBACK.md](FALLBACK.md) — URLSession, multipart upload, progress, `RequestAttempt` + `isOfflineSignature` classifier |
 | `client/WisprAlt/Server/DictationAPI.swift` | [API.md](API.md), [FALLBACK.md](FALLBACK.md) — dictation client + origin→retry→OpenRouter direct fallback |
-| `client/WisprAlt/Server/MeetingAPI.swift` | [API.md](API.md) — meeting submit/poll/download/delete |
+| `client/WisprAlt/Server/MeetingAPI.swift` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — meeting + file submit/poll/download/delete. `submitFile(_:mode:progress:)` POSTs to `/transcribe/file` (mode part before file part in multipart envelope). `ProgressInfo` Codable; `cancel(_:)` DELETEs the job (server sets `cancel_requested=1`); `fetchServerLog(_:)` GETs `/admin/server-log/{id}` for the popover sheet. `URLSessionConfiguration` uses `timeoutIntervalForRequest=300` + `request.timeoutInterval=6h` so 90-min uploads don't trip the default 60 s inactivity timeout. |
 | `client/WisprAlt/Server/MeAPI.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — JSON `GET /me` + `PATCH /me` client wrapper for the Identity section |
 | `client/WisprAlt/Server/ServerError.swift` | [API.md](API.md) — typed errors |
 | `client/WisprAlt/Inject/TextInjector.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — injection strategy (focused-context capture, secure-field gate, AX→clipboard fallback) |
@@ -123,14 +125,17 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Storage/TranscriptStore.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — local file index, atomic rewrites |
 | `client/WisprAlt/Storage/TranscriptDocument.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — JSON model, speaker rename |
 | `client/WisprAlt/Update/SparkleController.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — auto-update via Sparkle 2 |
-| `client/WisprAlt/UI/SettingsView.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — settings UI (Smart formatting toggle, Identity section) |
+| `client/WisprAlt/UI/SettingsView.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md), [ARCHITECTURE.md](ARCHITECTURE.md) — settings UI (Smart formatting toggle, Identity section). `QuickActionsSection` hosts: Transcribe file… picker, Open Custom Transcriptions, Copy last meeting / Copy last custom transcription, embedded `RecordingIndicatorView` while a job is in flight, **"Previous transcription still finishing on server" banner** (`recordingState.serverFinishingJobID != nil`) that blocks new file submissions with a tooltip, and a **View server log** button that opens a sheet polling `MeetingAPI.fetchServerLog` every 5 s. |
+| `client/WisprAlt/Storage/CustomTranscriptionsStore.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — per-job folder helpers under `~/Documents/WisprAlt/Custom Transcriptions/`; collision-safe stem naming. |
+| `client/WisprAlt/UI/LastTranscriptCaption.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — caption view-model behind the "Copy last meeting / Copy last custom transcription" buttons: DispatchSource folder watcher + 10 s timer + `Notification.Name.wisprAltTranscriptWritten` observer. |
+| `client/WisprAlt/Util/TranscriptNotifications.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — defines `Notification.Name.wisprAltTranscriptWritten` posted by the upload path on completion. |
 | `client/WisprAlt/UI/DisplayNameSheet.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — first-launch display-name entry sheet |
 | `client/WisprAlt/UI/FirstLaunchCoordinator.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — coordinates the first-launch display-name sheet (`/me` GET → present sheet if `display_name == null`) |
 | `client/WisprAlt/UI/PermissionsView.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — permissions UI |
 | `client/WisprAlt/Resources/Assets.xcassets/AppIcon.appiconset/` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — generated icon set (10 PNGs + `Contents.json`); produced by `scripts/build-icon.sh` |
 | `client/WisprAlt/UI/TranscriptListView.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — transcript list |
 | `client/WisprAlt/UI/TranscriptDetailView.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — rename UI, offline |
-| `client/WisprAlt/UI/RecordingIndicatorView.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — uploading/processing/done states |
+| `client/WisprAlt/UI/RecordingIndicatorView.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — uploading/processing/done states; reads `RecordingState` via `@EnvironmentObject` and renders `phaseLabel` (friendly map) plus `chunk i/n` only when `phase == "transcribe"`. |
 | `client/WisprAlt/Util/Logger.swift` | — (no separate doc) |
 | `client/WisprAlt/Util/Notifications.swift` | — (no separate doc) |
 
@@ -152,6 +157,9 @@ This file is the single source of truth for which documentation file covers each
 | `scripts/release-client.sh` | [DEPLOY-TEAM.md](DEPLOY-TEAM.md) — local-only release script: bump version, build signed `.app`, package DMG, compute SHA256, tag + push + `gh release create` |
 | `scripts/build-icon.sh` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — regenerate `AppIcon.appiconset` PNGs from the master SVG/PNG source |
 | `scripts/measure-dictation-latency.sh` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — placeholder; future helper that times `/transcribe/dictate` round-trips against a fixture WAV (not yet committed) |
+| `scripts/deploy-server.sh` | [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) — versioned server deploy: copies `server/` + `scripts/` to the mini, `uv sync`, prefetches the mlx-whisper model, kickstarts the LaunchAgent. Includes the `set -e` polling fix (`code=$(curl ... || echo "000")`) from the 2026-05-09 deploy bug. |
+| `server/scripts/prefetch-mlx-whisper.sh` | [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md), [SETUP-SERVER.md](SETUP-SERVER.md) — `huggingface_hub.snapshot_download` for `mlx-community/whisper-large-v3-turbo` at a pinned revision; `resume_download=True`; asserts `model.safetensors > 800 MB` post-download to catch a torn snapshot. |
+| `server/scripts/benchmark-mlx-whisper.py` | [TESTING.md](TESTING.md) — Phase 0 spike helper: separately times `ffmpeg_decode_s`, `transcribe_s`, `pyannote_s`; samples RSS every 2 s via psutil; emits `{audio_duration_s, ..., realtime_ratio, peak_rss_mb, segments_count, speakers_detected}` JSON. |
 
 ## CI / GitHub (`github/`)
 

@@ -181,7 +181,10 @@ final class PendingUploadsQueue {
                 case "wav":
                     _ = try await MeetingAPI.submit(item, progress: { _ in })
                 case "m4a":
-                    _ = try await MeetingAPI.submitFile(item, progress: { _ in })
+                    // Queue entries always originate from `MeetingRecorder`,
+                    // so the replayed `request_mode` is always "meeting" —
+                    // diarization + speaker labels must run on the server.
+                    _ = try await MeetingAPI.submitFile(item, mode: "meeting", progress: { _ in })
                 default:
                     // `pending()` filters by `supportedExtensions`, so
                     // anything else here is impossible in practice. Fail

@@ -18,17 +18,26 @@ import hashlib
 import logging
 import os
 import shutil
+import signal
 import struct
 import subprocess
 import time
 import uuid
 from pathlib import Path
+from typing import Callable, Optional
 
 from fastapi import HTTPException, UploadFile
 
 from .._errors import UploadTruncatedError
 
 logger = logging.getLogger(__name__)
+
+
+class StagingCancelled(Exception):
+    """Raised by ``transcode_to_canonical_wav`` when the caller's ``cancel_cb``
+    returns True mid-decode. The ffmpeg subprocess is SIGTERM'd and the
+    ``.partial`` file is removed in the ``finally`` block so the caller can
+    treat this as a clean cancellation rather than an error."""
 
 # Number of bytes to read for WAV header probe (RIFF____WAVE = 12 bytes)
 _WAV_HEADER_PROBE_BYTES = 12
@@ -377,11 +386,49 @@ def ffprobe_channel_count(source: Path) -> int:
         raise HTTPException(422, f"Unexpected ffprobe output: {result.stdout!r}")
 
 
+def ffprobe_duration(source: Path) -> float:
+    """Return the audio duration of *source* (seconds) via ffprobe.
+
+    Mirror of :func:`ffprobe_channel_count` but for the format-level duration,
+    used by the runner to size per-phase budgets that scale with audio length.
+
+    Raises
+    ------
+    RuntimeError
+        ffprobe missing on PATH (caught by the startup sanity check normally).
+    HTTPException 422
+        Output unparseable / no duration available.
+    """
+    if shutil.which("ffprobe") is None:
+        raise RuntimeError("ffprobe not found on PATH — installed alongside ffmpeg")
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(source),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, timeout=30,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        stderr_tail = "\n".join(result.stderr.splitlines()[-3:])
+        raise HTTPException(
+            422, f"Could not probe duration: {stderr_tail or 'no duration'}"
+        )
+    try:
+        return float(result.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        raise HTTPException(422, f"Unexpected ffprobe duration output: {result.stdout!r}")
+
+
 def transcode_to_canonical_wav(
     source: Path,
     *,
     target_channels: int,
     sample_rate: int = 16_000,
+    cancel_cb: Optional[Callable[[], bool]] = None,
+    pad_mono_to_stereo_silent: bool = False,
 ) -> Path:
     """Run ffmpeg to convert *source* → canonical 16 kHz PCM WAV.
 
@@ -394,6 +441,17 @@ def transcode_to_canonical_wav(
     point at the canonical WAV — otherwise a crash between rename and row
     update would orphan the canonical WAV while leaving the row pointing at
     a deleted source.
+
+    Parameters
+    ----------
+    pad_mono_to_stereo_silent
+        When True AND target_channels=2, applies an ffmpeg pan filter that
+        copies the source mono channel into ch0 and explicitly zeros ch1.
+        Caller is responsible for verifying the source IS mono via ffprobe
+        — passing this for a stereo source would silence the right channel.
+        Used by the meeting-mode + mono-source path so the pipeline's
+        in-person branch (gated on `is_silent_robust(ch2)`) fires and runs
+        pyannote-on-ch1, producing per-speaker labels instead of "You"/"Other".
 
     Raises
     ------
@@ -423,32 +481,98 @@ def transcode_to_canonical_wav(
         "-i", str(source),
         "-map", "0:a:0",         # explicit: same audio track ffprobe inspected
         "-vn",
-        "-ac", str(target_channels),
+    ]
+    if pad_mono_to_stereo_silent and target_channels == 2:
+        # Pan filter: ch0 = source ch0, ch1 = explicit silence (0 * source ch0).
+        # This is what `is_silent_robust(ch2)` in the pipeline expects so the
+        # in-person branch fires for mono meeting recordings.
+        cmd += ["-af", "pan=stereo|c0=c0|c1=0*c0"]
+    else:
+        # Standard channel up/down-mix (ffmpeg duplicates mono to both
+        # channels when going 1→2; sums L+R when going 2→1).
+        cmd += ["-ac", str(target_channels)]
+    cmd += [
         "-ar", str(sample_rate),
         "-acodec", "pcm_s16le",
         "-f", "wav",
         str(temp_target),
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False,
-        timeout=30 * 60,  # ceiling per single transcode
-    )
-    if result.returncode != 0:
-        temp_target.unlink(missing_ok=True)
-        stderr_tail = "\n".join(result.stderr.splitlines()[-5:])
-        logger.error("ffmpeg transcode failed (rc=%d): %s", result.returncode, stderr_tail)
-        raise HTTPException(422, f"Audio transcode failed: {stderr_tail}")
-    if not temp_target.exists() or temp_target.stat().st_size < 100:
-        temp_target.unlink(missing_ok=True)
-        raise HTTPException(422, "Audio transcode produced empty/no output")
 
-    # Atomic publish.
-    os.replace(temp_target, target)
-    logger.info(
-        "ffmpeg transcoded %s → %s (%d bytes)",
-        source.name, target.name, target.stat().st_size,
+    # 30-minute ceiling shared with the previous subprocess.run timeout.
+    deadline = time.monotonic() + 30 * 60
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    return target
+    cancelled = False
+    timed_out = False
+    try:
+        # 500ms poll loop: check ffmpeg exit, caller's cancel flag, and the
+        # overall transcode deadline. We do NOT read stderr concurrently
+        # (ffmpeg's stderr buffer is small but tractable for our 30-min
+        # ceiling at default verbosity).
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if cancel_cb is not None:
+                try:
+                    if cancel_cb():
+                        cancelled = True
+                        break
+                except Exception:  # noqa: BLE001 — cancel_cb must never crash decode
+                    logger.exception("cancel_cb raised during transcode; ignoring")
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            time.sleep(0.5)
+
+        if cancelled or timed_out:
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            if cancelled:
+                raise StagingCancelled("cancelled mid-decode")
+            raise HTTPException(422, "Audio transcode timed out (>30 min)")
+
+        # Drain remaining stderr for diagnostics.
+        _, stderr = proc.communicate(timeout=5)
+        if proc.returncode != 0:
+            stderr_tail = "\n".join((stderr or "").splitlines()[-5:])
+            logger.error(
+                "ffmpeg transcode failed (rc=%d): %s",
+                proc.returncode, stderr_tail,
+            )
+            raise HTTPException(422, f"Audio transcode failed: {stderr_tail}")
+        if not temp_target.exists() or temp_target.stat().st_size < 100:
+            raise HTTPException(422, "Audio transcode produced empty/no output")
+
+        # Atomic publish.
+        os.replace(temp_target, target)
+        logger.info(
+            "ffmpeg transcoded %s → %s (%d bytes)",
+            source.name, target.name, target.stat().st_size,
+        )
+        return target
+    finally:
+        # Uniform cleanup of the .partial file for both cancel + error paths.
+        # On the success path, os.replace already moved it → unlink is a no-op.
+        try:
+            temp_target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        # Make sure we never leak a child process.
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 def assert_same_filesystem(a: Path, b: Path) -> None:

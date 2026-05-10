@@ -26,11 +26,12 @@ from pathlib import Path
 
 import psutil
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .. import auth, observability
 from ..auth import require_admin, require_api_key
 from ..config import settings
+from ..jobs.runner import PHASE_LABELS
 from ..meeting import pipeline as meeting_pipeline
 from ..ops import env_writer
 from ..ops.env_writer import find_env_path
@@ -280,6 +281,114 @@ async def metrics(request: Request) -> JSONResponse:
 # M4: _find_env_path removed — use ops.env_writer.find_env_path() instead.
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/admin/active",
+    dependencies=[Depends(require_api_key)],
+    summary="List active (pending or running) jobs with rich phase projection",
+)
+async def admin_active(request: Request) -> JSONResponse:
+    """Return all non-terminal jobs with phase + progress detail.
+
+    Helps the operator (and the client UI) diagnose hangs: see which phase
+    a job is stuck in, how long it has been stuck, what fraction of chunks
+    have been processed, and whether the user has requested cancellation.
+    """
+    store = getattr(request.app.state, "job_store", None)
+    if store is None:
+        return JSONResponse({"jobs": []})
+
+    now = time.time()
+    proc = psutil.Process(os.getpid())
+    current_rss_mb = proc.memory_info().rss // (1024 * 1024)
+
+    jobs_payload: list[dict[str, object]] = []
+    for job in store.list_active_jobs():
+        phase = job.phase
+        phase_label = PHASE_LABELS.get(phase) if phase else None
+        phase_elapsed_s: float | None = None
+        if job.phase_started_at is not None:
+            phase_elapsed_s = round(now - float(job.phase_started_at), 2)
+        jobs_payload.append({
+            "id": job.id,
+            "status": job.status,
+            "request_mode": job.request_mode,
+            "mode": job.mode,
+            "phase": phase,
+            "phase_label": phase_label,
+            "phase_elapsed_s": phase_elapsed_s,
+            "chunk_index": job.chunk_index,
+            "total_chunks": job.total_chunks,
+            "started_at": job.started_at,
+            "wav_path": job.wav_path,
+            "audio_duration_s": job.audio_duration_s,
+            "attempts": job.attempts,
+            "cancel_requested": bool(job.cancel_requested),
+            "current_rss_mb": current_rss_mb,
+        })
+
+    return JSONResponse({"jobs": jobs_payload})
+
+
+# Resolved once per import. Settings has no explicit ``server_log_path``
+# field (Phase 3 deliberately keeps the path uncongifurable for now); the
+# launchd plist points stdout/stderr at this path on macOS.
+_DEFAULT_SERVER_LOG_PATH = Path.home() / "Library" / "Logs" / "WisprAlt" / "server.log"
+
+
+@router.get(
+    "/admin/server-log/{job_id}",
+    dependencies=[Depends(require_api_key)],
+    summary="Return the slice of server.log bracketing a job_id's appearances",
+)
+async def admin_server_log(request: Request, job_id: str) -> PlainTextResponse:
+    """Return up to ~100 log lines bracketing the job_id's first and last
+    appearance in ``server.log``.
+
+    Includes inter-id lines (ffmpeg stderr, pyannote warnings, etc.) that
+    fall in that range so the operator sees the full neighborhood. Plain
+    text response — the client renders it as monospace in the View Server
+    Log sheet.
+    """
+    log_path = getattr(
+        settings, "server_log_path", _DEFAULT_SERVER_LOG_PATH,
+    )
+    log_path = Path(log_path)
+    if not log_path.exists():
+        raise HTTPException(404, f"Server log not found at {log_path}")
+
+    # Read up to a reasonable cap so a multi-GB log doesn't OOM the server.
+    # 50 MiB is enough to reach back hours of output at info-level.
+    _MAX_BYTES = 50 * 1024 * 1024
+    try:
+        size = log_path.stat().st_size
+        with open(log_path, "rb") as fh:
+            if size > _MAX_BYTES:
+                fh.seek(size - _MAX_BYTES)
+                # Drop partial first line so we start at a line boundary.
+                fh.readline()
+            data = fh.read()
+    except OSError as exc:
+        raise HTTPException(500, f"Could not read server log: {exc}") from exc
+
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+
+    # Find indices where the job_id appears.
+    indices = [i for i, line in enumerate(lines) if job_id in line]
+    if not indices:
+        return PlainTextResponse(
+            f"(no log lines found for job_id={job_id} in {log_path})",
+            media_type="text/plain",
+        )
+
+    first, last = indices[0], indices[-1]
+    # 100-line window: 50 before first appearance, 50 after last.
+    start = max(0, first - 50)
+    end = min(len(lines), last + 50 + 1)
+    selected = lines[start:end]
+    return PlainTextResponse("\n".join(selected) + "\n", media_type="text/plain")
 
 
 def _write_secure_file(path: Path, content: str) -> None:

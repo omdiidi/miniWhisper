@@ -598,6 +598,27 @@ struct SettingsView: View {
 /// in `.onDisappear`. No FD leaks across popover open/close cycles.
 private struct QuickActionsSection: View {
     @EnvironmentObject private var settings: Settings
+    @EnvironmentObject private var recordingState: RecordingState
+
+    /// Controls presentation of the server-log sheet. Bound to a Bool so the
+    /// SwiftUI `.sheet(isPresented:)` lifecycle drives the fetch.
+    @State private var showingServerLogSheet: Bool = false
+
+    /// True while the current activeJobID indicates a transcription is in
+    /// flight (post-upload, post-cancel-with-server-still-finishing, or
+    /// resumed-from-launch). Used to gate Cancel + View-server-log controls.
+    private var hasInFlightJob: Bool {
+        recordingState.activeJobID != nil
+            || recordingState.serverFinishingJobID != nil
+            || recordingState.uploadFraction > 0
+    }
+
+    /// Id used by the View-server-log sheet. Prefers the active job, falls
+    /// back to the finishing-on-server id when the user has cancelled but
+    /// the executor is still grinding.
+    private var serverLogJobID: String? {
+        recordingState.activeJobID ?? recordingState.serverFinishingJobID
+    }
 
     // Known limitation: the watcher folder URLs below are captured ONCE at
     // struct-init time. If the user changes `Settings.shared.meetingsPath`
@@ -630,10 +651,24 @@ private struct QuickActionsSection: View {
 
     var body: some View {
         Section {
+            // Active-job banner / indicator row. Embedded at the top of the
+            // section so progress is the first thing the user sees when they
+            // open the popover during a transcription. Only visible when an
+            // in-flight job is observable on `recordingState`.
+            if hasInFlightJob {
+                inFlightSection
+                Divider()
+            }
+
             Button("Transcribe file…", systemImage: "waveform.badge.plus") {
                 MenuBarController.shared?.transcribePickedFile()
             }
-            .help("Pick any audio or video file. WisprAlt transcodes it locally and runs it through the meeting pipeline.")
+            .disabled(recordingState.serverFinishingJobID != nil)
+            .help(
+                recordingState.serverFinishingJobID != nil
+                    ? "A previous transcription is still finishing on the server. New uploads are blocked until it completes."
+                    : "Pick any audio or video file. WisprAlt transcodes it locally and runs it through the meeting pipeline."
+            )
 
             Button("Open Custom Transcriptions", systemImage: "folder.badge.questionmark") {
                 let url = CustomTranscriptionsStore.directoryURL
@@ -709,6 +744,63 @@ private struct QuickActionsSection: View {
             meetingViewModel.stop()
             customViewModel.stop()
         }
+        .sheet(isPresented: $showingServerLogSheet) {
+            ServerLogSheet(jobIDProvider: { serverLogJobID })
+        }
+    }
+
+    /// "Previous job finishing" banner + Cancel button + View-server-log
+    /// button. Rendered only when `hasInFlightJob` is true.
+    @ViewBuilder
+    private var inFlightSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if recordingState.serverFinishingJobID != nil {
+                Label(
+                    "Previous transcription still finishing on server. New uploads will queue.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            } else if let label = recordingState.phaseLabelDisplay {
+                Text(transcriptionStatusLine(label: label))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if recordingState.uploadFraction > 0 {
+                Text("Uploading… \(Int(recordingState.uploadFraction * 100))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button("Cancel", systemImage: "xmark.circle") {
+                    Task { await MenuBarController.shared?.cancelActiveTranscription() }
+                }
+                .disabled(recordingState.serverFinishingJobID != nil
+                          && recordingState.activeJobID == nil)
+                .help(
+                    recordingState.serverFinishingJobID != nil
+                        ? "Cancel was already requested. The server-side executor will finish naturally."
+                        : "Cancel the upload (clean) or the in-flight transcription (advisory — server may keep running)."
+                )
+
+                Button("View server log", systemImage: "doc.text.magnifyingglass") {
+                    showingServerLogSheet = true
+                }
+                .disabled(serverLogJobID == nil)
+                .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func transcriptionStatusLine(label: String) -> String {
+        if recordingState.phase == "transcribe",
+           let i = recordingState.chunkIndex,
+           let n = recordingState.totalChunks, n > 0
+        {
+            return "\(label) — chunk \(i)/\(n)"
+        }
+        return label
     }
 
     private func performCopy(button: String, source: () -> URL?) {
@@ -725,6 +817,73 @@ private struct QuickActionsSection: View {
             if copyToast?.button == button {
                 copyToast = nil
             }
+        }
+    }
+}
+
+// MARK: - ServerLogSheet
+
+/// Modal sheet rendering `MeetingAPI.fetchServerLog(_:)` output for an
+/// in-flight (or recently-cancelled) job. The job id is fetched lazily
+/// through `jobIDProvider` so the sheet can re-read it on Refresh and after
+/// `recordingState.activeJobID` flips to `serverFinishingJobID`.
+private struct ServerLogSheet: View {
+    let jobIDProvider: () -> String?
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var logText: String = ""
+    @State private var loadError: String? = nil
+    @State private var isLoading: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Server log")
+                    .font(.headline)
+                Spacer()
+                Button("Refresh", systemImage: "arrow.clockwise") {
+                    Task { await reload() }
+                }
+                .disabled(isLoading || jobIDProvider() == nil)
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+
+            if let err = loadError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            ScrollView {
+                Text(logText.isEmpty && isLoading ? "Loading…" : logText)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(8)
+            }
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .padding()
+        .frame(minWidth: 640, minHeight: 480)
+        .task { await reload() }
+    }
+
+    @MainActor
+    private func reload() async {
+        guard let raw = jobIDProvider() else {
+            loadError = "No active job to fetch logs for."
+            return
+        }
+        isLoading = true
+        loadError = nil
+        defer { isLoading = false }
+        do {
+            logText = try await MeetingAPI.fetchServerLog(JobID(raw: raw))
+        } catch {
+            loadError = "Failed to fetch log: \(error.localizedDescription)"
+            Log.warning("ServerLogSheet fetch failed: \(error)", category: "ui")
         }
     }
 }

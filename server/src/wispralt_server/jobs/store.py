@@ -31,7 +31,7 @@ from wispralt_server.ops.staging import validate_wav_completeness
 class Job:
     id: str
     status: str            # pending | running | done | failed
-    mode: Optional[str]    # remote | in_person | None until done
+    mode: Optional[str]    # remote | in_person | None until done (set on done)
     created_at: float
     started_at: Optional[float]
     finished_at: Optional[float]
@@ -42,28 +42,44 @@ class Job:
     # File-job flag: when the source upload was mono (custom transcription),
     # the meeting pipeline runs its single-channel branch instead of the
     # stereo mic/system one. Defaulted to 0 in SQL via in-place ALTER.
-    # APPENDED LAST so positional `Job(*row)` unpacks still work.
     force_single_channel: bool = False
+    # NEW (Phase 3) — observability + intent. All idempotent ALTERs in __init__.
+    # request_mode: file | meeting (set at submit time; distinct from `mode`
+    # which is set on completion to remote | in_person | None).
+    request_mode: Optional[str] = None
+    phase: Optional[str] = None
+    phase_started_at: Optional[float] = None
+    chunk_index: int = 0
+    total_chunks: int = 0
+    cancel_requested: bool = False
+    audio_duration_s: Optional[float] = None
 
 
-def _row_to_job(row: tuple) -> Job:
-    """Construct a Job from a SELECT row, coercing the SQLite int → bool."""
-    (
-        jid, status, mode, created_at, started_at, finished_at,
-        error, output_dir, wav_path, attempts, force_single_channel,
-    ) = row
+def _row_to_job(row: tuple, cursor: sqlite3.Cursor) -> Job:
+    """Construct a Job from a SELECT * row, dict-unpacked from cursor.description.
+
+    Order-independent: future ALTERs need not match the dataclass field order.
+    """
+    d = dict(zip([c[0] for c in cursor.description], row))
     return Job(
-        id=jid,
-        status=status,
-        mode=mode,
-        created_at=created_at,
-        started_at=started_at,
-        finished_at=finished_at,
-        error=error,
-        output_dir=output_dir,
-        wav_path=wav_path,
-        attempts=attempts or 0,
-        force_single_channel=bool(force_single_channel),
+        id=d["id"],
+        status=d["status"],
+        mode=d.get("mode"),
+        created_at=d["created_at"],
+        started_at=d.get("started_at"),
+        finished_at=d.get("finished_at"),
+        error=d.get("error"),
+        output_dir=d.get("output_dir"),
+        wav_path=d["wav_path"],
+        attempts=int(d.get("attempts") or 0),
+        force_single_channel=bool(d.get("force_single_channel") or 0),
+        request_mode=d.get("request_mode"),
+        phase=d.get("phase"),
+        phase_started_at=d.get("phase_started_at"),
+        chunk_index=int(d.get("chunk_index") or 0),
+        total_chunks=int(d.get("total_chunks") or 0),
+        cancel_requested=bool(d.get("cancel_requested") or 0),
+        audio_duration_s=d.get("audio_duration_s"),
     )
 
 
@@ -125,6 +141,24 @@ class JobStore:
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # Phase 3: observability + intent columns. Idempotent ALTERs that match
+        # the existing pattern. `request_mode` (file | meeting) is the explicit
+        # intent at submit time; do NOT confuse with the existing `mode` column
+        # (remote | in_person | None) which is set on done by the pipeline.
+        for _alter in (
+            "ALTER TABLE jobs ADD COLUMN request_mode TEXT",
+            "ALTER TABLE jobs ADD COLUMN phase TEXT",
+            "ALTER TABLE jobs ADD COLUMN phase_started_at REAL",
+            "ALTER TABLE jobs ADD COLUMN chunk_index INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN audio_duration_s REAL",
+        ):
+            try:
+                self.con.execute(_alter)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
     # ── private ───────────────────────────────────────────────────────────────
 
     def _exec(self, sql: str, *params: object) -> sqlite3.Cursor:
@@ -134,15 +168,24 @@ class JobStore:
 
     # ── write operations ──────────────────────────────────────────────────────
 
-    def create(self, wav_path: str) -> str:
-        """Insert a new pending job and return its UUID."""
+    def create(self, wav_path: str, *, request_mode: str = "meeting") -> str:
+        """Insert a new pending job and return its UUID.
+
+        ``request_mode`` encodes the caller's intent (``file`` or ``meeting``)
+        and is the source of truth for diarization routing in
+        :class:`MeetingRunner._run_source`. Defaulted to ``meeting`` so the
+        legacy ``submit_or_429`` path (called only by /transcribe/meeting POST)
+        keeps working without an explicit flag.
+        """
         jid = str(uuid.uuid4())
         self._exec(
-            "INSERT INTO jobs(id, status, created_at, wav_path) VALUES(?,?,?,?)",
+            "INSERT INTO jobs(id, status, created_at, wav_path, request_mode)"
+            " VALUES(?,?,?,?,?)",
             jid,
             "pending",
             time.time(),
             wav_path,
+            request_mode,
         )
         return jid
 
@@ -201,16 +244,11 @@ class JobStore:
 
     def get(self, jid: str) -> Optional[Job]:
         """Return a Job by id, or None if not found."""
-        cur = self._exec(
-            "SELECT id, status, mode, created_at, started_at, finished_at,"
-            " error, output_dir, wav_path, attempts, force_single_channel"
-            " FROM jobs WHERE id=?",
-            jid,
-        )
+        cur = self._exec("SELECT * FROM jobs WHERE id=?", jid)
         row = cur.fetchone()
         if row is None:
             return None
-        return _row_to_job(row)
+        return _row_to_job(row, cur)
 
     def count_24h(self, status: str) -> int:
         """Return the count of finished jobs with *status* in the last 24 hours."""
@@ -225,16 +263,73 @@ class JobStore:
     def list_active_jobs(self) -> list[Job]:
         """Return all non-terminal jobs (pending or running)."""
         cur = self._exec(
-            "SELECT id, status, mode, created_at, started_at, finished_at,"
-            " error, output_dir, wav_path, attempts, force_single_channel"
-            " FROM jobs WHERE status IN ('pending','running')"
+            "SELECT * FROM jobs WHERE status IN ('pending','running')"
         )
-        return [_row_to_job(row) for row in cur.fetchall()]
+        rows = cur.fetchall()
+        return [_row_to_job(row, cur) for row in rows]
 
     def list_pending_ids(self) -> list[str]:
         """Return the IDs of all pending jobs. Used by MeetingRunner.reenqueue_pending."""
         cur = self._exec("SELECT id FROM jobs WHERE status='pending'")
         return [row[0] for row in cur.fetchall()]
+
+    def list_pending_ids_with_mode(self) -> list[tuple[str, str, Optional[str]]]:
+        """Return ``(id, wav_path, request_mode)`` for every pending job.
+
+        Used by :meth:`MeetingRunner.reenqueue_pending` to route on both the
+        file extension AND the explicit submit-time intent. ``request_mode``
+        may be ``None`` for rows created before Phase 3.
+        """
+        cur = self._exec(
+            "SELECT id, wav_path, request_mode FROM jobs"
+            " WHERE status='pending' ORDER BY created_at"
+        )
+        return [(row[0], row[1], row[2]) for row in cur.fetchall()]
+
+    # ── Phase 3 observability helpers ────────────────────────────────────────
+
+    def update_phase(self, jid: str, phase: str) -> None:
+        """Persist current phase + freshen ``phase_started_at`` for the watchdog."""
+        self._exec(
+            "UPDATE jobs SET phase=?, phase_started_at=? WHERE id=?",
+            phase,
+            time.time(),
+            jid,
+        )
+
+    def update_chunk(self, jid: str, idx: int, total: int) -> None:
+        """Persist progress within a chunked phase (e.g. ``transcribe``)."""
+        self._exec(
+            "UPDATE jobs SET chunk_index=?, total_chunks=? WHERE id=?",
+            int(idx),
+            int(total),
+            jid,
+        )
+
+    def set_cancel_requested(self, jid: str) -> None:
+        """Flag the job for cooperative cancellation. Cancel mid-ffmpeg is
+        honored by ``transcode_to_canonical_wav``'s ``cancel_cb`` poll;
+        cancel mid-transcribe/diarize is advisory (the executor cannot be
+        interrupted). The UI uses this flag to show a 'finishing on server'
+        banner."""
+        self._exec("UPDATE jobs SET cancel_requested=1 WHERE id=?", jid)
+
+    def check_cancel_requested(self, jid: str) -> bool:
+        """Return True iff ``set_cancel_requested`` was called for *jid*."""
+        cur = self._exec(
+            "SELECT cancel_requested FROM jobs WHERE id=?", jid
+        )
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+
+    def update_audio_duration(self, jid: str, seconds: float) -> None:
+        """Persist the ffprobed audio duration so the watchdog can scale
+        per-phase budgets to the actual content."""
+        self._exec(
+            "UPDATE jobs SET audio_duration_s=? WHERE id=?",
+            float(seconds),
+            jid,
+        )
 
     def fail_running_jobs(self, reason: str) -> int:
         """Mark all currently running jobs as failed with *reason*.
@@ -267,11 +362,47 @@ class JobStore:
         so the caller can log the outcome.
         """
         with self._lock:
+            # Log the last-known phase + chunk progress for jobs that were
+            # mid-flight when the server died — helps post-mortem diagnosis.
+            try:
+                running_cur = self.con.execute(
+                    "SELECT id, phase, chunk_index, total_chunks"
+                    " FROM jobs WHERE status='running'"
+                )
+                for jid, phase, ci, tc in running_cur.fetchall():
+                    import logging as _l  # local import to avoid header churn
+                    _l.getLogger(__name__).warning(
+                        "[%s] recover_orphans: crashed mid-job"
+                        " phase=%s chunk_index=%s total_chunks=%s",
+                        jid, phase, ci, tc,
+                    )
+            except sqlite3.OperationalError:
+                # phase/chunk_index columns absent → very old DB; skip log.
+                pass
+
             # All running jobs are dead after a restart
             self.con.execute(
                 "UPDATE jobs SET status='failed', error='server restart'"
                 " WHERE status='running'"
             )
+
+            # Backfill request_mode for legacy rows so the runner's mode-aware
+            # routing has a value to consult. Derivation rule matches the
+            # previous file-extension-based routing in reenqueue_pending:
+            #   .wav → meeting (legacy /transcribe/meeting POST)
+            #   any other extension → file (/transcribe/file source upload)
+            try:
+                self.con.execute(
+                    "UPDATE jobs SET request_mode='meeting'"
+                    " WHERE request_mode IS NULL"
+                    " AND lower(substr(wav_path, -4)) = '.wav'"
+                )
+                self.con.execute(
+                    "UPDATE jobs SET request_mode='file'"
+                    " WHERE request_mode IS NULL"
+                )
+            except sqlite3.OperationalError:
+                pass
 
             # Pending jobs: check WAV still on disk
             cur = self.con.execute(

@@ -9,12 +9,39 @@ struct JobID: Hashable, CustomStringConvertible {
     var description: String { raw }
 }
 
+/// Optional per-phase progress block emitted by the server while the job runs.
+///
+/// All fields are optional — the server only attaches a `progress` block when
+/// `status == "running"`, and even then some fields may be absent (e.g.
+/// `chunkIndex` is only non-zero during the `transcribe` phase).
+struct ProgressInfo: Codable {
+    let phase: String?
+    let phaseLabel: String?
+    let phaseStartedAt: Double?
+    let chunkIndex: Int?
+    let totalChunks: Int?
+    let phaseElapsedS: Double?
+    let audioDurationS: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case phase
+        case phaseLabel = "phase_label"
+        case phaseStartedAt = "phase_started_at"
+        case chunkIndex = "chunk_index"
+        case totalChunks = "total_chunks"
+        case phaseElapsedS = "phase_elapsed_s"
+        case audioDurationS = "audio_duration_s"
+    }
+}
+
 /// The state of a server-side transcription job as reported by `GET /transcribe/meeting/{id}`.
 enum JobStatus {
     /// Job created but processing hasn't started yet.
     case pending
-    /// Processing is actively running.
-    case running
+    /// Processing is actively running. Carries optional progress block and a
+    /// `serverFinishing` flag — true when the user requested cancel but the
+    /// executor thread is still running (advisory-cancel semantics).
+    case running(ProgressInfo?, Bool)
     /// Processing completed. `outputs` maps format name (e.g. `"json"`, `"srt"`) to a
     /// download URL fragment. Use `MeetingAPI.download(_:format:)` to fetch each file.
     case done(outputs: [String: String])
@@ -41,6 +68,8 @@ enum MeetingAPI {
         let outputs: [String: String]?
         let error: String?
         let eta_s: Double?
+        let progress: ProgressInfo?
+        let serverFinishing: Bool?
     }
 
     // MARK: - Submit
@@ -211,6 +240,7 @@ enum MeetingAPI {
     /// - Throws: `ServerError` on any HTTP or transport failure.
     static func submitFile(
         _ sourceURL: URL,
+        mode: String = "file",
         progress: @escaping (Double) -> Void
     ) async throws -> JobID {
         guard let baseURL = Settings.shared.serverURL else {
@@ -235,8 +265,19 @@ enum MeetingAPI {
 
         // Build the multipart envelope as a temp file so we keep streaming
         // behavior (no full-file RAM load) and can use uploadTask(fromFile:).
+        //
+        // The `mode` form part is emitted BEFORE the `file` part so the
+        // server's multipart parser sees the discriminator value as soon as
+        // it begins reading — FastAPI binds Form fields independently of part
+        // order, but ordering mode-first keeps the wire format readable when
+        // tracing requests.
         let boundary = "wispralt-" + UUID().uuidString
-        let prefix = (
+        let modePart = (
+            "--\(boundary)\r\n" +
+            "Content-Disposition: form-data; name=\"mode\"\r\n\r\n" +
+            mode + "\r\n"
+        ).data(using: .utf8)!
+        let filePartHeader = (
             "--\(boundary)\r\n" +
             "Content-Disposition: form-data; name=\"file\"; filename=\"" +
             sourceURL.lastPathComponent + "\"\r\n" +
@@ -249,7 +290,8 @@ enum MeetingAPI {
         FileManager.default.createFile(atPath: tempURL.path, contents: nil)
         do {
             let writer = try FileHandle(forWritingTo: tempURL)
-            try writer.write(contentsOf: prefix)
+            try writer.write(contentsOf: modePart)
+            try writer.write(contentsOf: filePartHeader)
             let reader = try FileHandle(forReadingFrom: sourceURL)
             defer { try? reader.close() }
             while true {
@@ -375,6 +417,46 @@ enum MeetingAPI {
         Log.info("Server-side job \(id.raw) deleted.", category: "meeting")
     }
 
+    // MARK: - Cancel
+
+    /// Request server-side cancellation of an in-flight transcription via
+    /// `DELETE /transcribe/meeting/{id}`. The server sets `cancel_requested=1`
+    /// on the job row, which:
+    ///   - aborts cleanly if the job is still in `ffprobe` / `ffmpeg_decode`
+    ///     (those phases poll the cancel flag every 500 ms);
+    ///   - is advisory-only for in-pipeline phases (`transcribe`, `diarize`,
+    ///     `merge`) — the executor thread keeps running until it finishes,
+    ///     but the poll response will carry `serverFinishing: true` so the
+    ///     client can render the "Previous job finishing" banner.
+    ///
+    /// - Parameter id: Job identifier returned by `submit` / `submitFile`.
+    /// - Throws: `ServerError` on HTTP or transport failure.
+    static func cancel(_ id: JobID) async throws {
+        let request = try ServerClient.shared.buildRequest(
+            path: "/transcribe/meeting/\(id.raw)",
+            method: "DELETE"
+        )
+        _ = try await ServerClient.shared.execute(request)
+        Log.info("Cancel requested for job \(id.raw).", category: "meeting")
+    }
+
+    // MARK: - Server log
+
+    /// Fetch the bracketed server-log slice for a given job via
+    /// `GET /admin/server-log/{id}`. Returns the response body as a plain UTF-8
+    /// string suitable for rendering in a monospace SwiftUI sheet. Empty
+    /// string if the body could not be decoded as UTF-8.
+    ///
+    /// - Parameter id: Job identifier.
+    /// - Throws: `ServerError` on HTTP or transport failure.
+    static func fetchServerLog(_ id: JobID) async throws -> String {
+        let request = try ServerClient.shared.buildRequest(
+            path: "/admin/server-log/\(id.raw)"
+        )
+        let (data, _) = try await ServerClient.shared.execute(request)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     // MARK: - Private helpers
 
     private static func mapStatus(_ response: PollResponse) -> JobStatus {
@@ -382,7 +464,7 @@ enum MeetingAPI {
         case "pending":
             return .pending
         case "running":
-            return .running
+            return .running(response.progress, response.serverFinishing ?? false)
         case "done":
             return .done(outputs: response.outputs ?? [:])
         case "failed":

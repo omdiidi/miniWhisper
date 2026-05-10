@@ -42,6 +42,63 @@ This document captures the issues actually encountered the first time someone bo
 
 **Fix applied:** the script now invokes `huggingface-cli download` only when that binary is on PATH; otherwise falls back to the new `hf download` CLI. Both are documented at <https://huggingface.co/docs/huggingface_hub>.
 
+## MLX Whisper dependency + model cache
+
+The meeting/file transcription path uses [`mlx-community/whisper-large-v3-turbo`](https://huggingface.co/mlx-community/whisper-large-v3-turbo) on Apple Neural Engine via `mlx_whisper`. Both the Python dependency and the on-disk model cache have version footguns.
+
+**Pinned dependencies in `server/pyproject.toml`:**
+
+| Package | Pin | Why |
+|---|---|---|
+| `mlx-whisper` | `==0.4.2` | Hard pin — the tqdm-monkeypatch shape in `mlx_whisper_loader.py` is verified against this exact source. A minor bump can move `tqdm.auto.tqdm.update` and silently break the chunk-progress callback (UI shows no progress; transcription still works). |
+| `huggingface-hub` | `>=1.12.0,<1.13` | Upper-bounded because `pyannote.audio==3.3.2` still calls the removed-in-2.0 `use_auth_token=` kwarg. The compat shim in `meeting/__init__.py install_compat_shims` translates `use_auth_token=` → `token=` at import time, and that shim is verified against the 1.12 surface. Bumping past 1.13 needs a fresh audit of the shim and the pyannote release notes. |
+
+**Model cache:** Hugging Face stores snapshots under `~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo/`. Disk footprint is **~1.6 GB** (the `model.safetensors` weight file alone is ~1.5 GB; tokenizer + config + generation config make up the rest). The prefetch script asserts `model.safetensors > 800 MB` as a sanity check — see the recovery section below.
+
+**Prefetch step:** run `server/scripts/prefetch-mlx-whisper.sh` once at deploy time. It calls `huggingface_hub.snapshot_download(repo_id=..., revision=..., resume_download=True)` then asserts the size of `model.safetensors`. Idempotent — re-running on a healthy cache is a no-op.
+
+## `scripts/deploy-server.sh`
+
+Versioned deploy script for the mini. Contract:
+
+1. Reads server code from the dev box, tarballs it (excludes `__pycache__`, `.venv`, `*.log`), transfers to the mini via the `/macmini paste` skill's gist-transport mechanism.
+2. On the mini: creates `.wf-deploy-backup-<epoch>/` (using `mkdir -p` first — BSD `cp -r src1 src2 dst` requires `dst` to be an existing dir), then `cp -r server scripts "$BACKUP/"`, then overwrites with the new tree.
+3. Runs `uv sync` to install/upgrade pinned deps.
+4. Runs `server/scripts/prefetch-mlx-whisper.sh` (idempotent).
+5. `launchctl kickstart -k gui/$UID/co.wispralt.server`.
+6. Polls `/healthz` for up to 60 s.
+
+**`set -e` polling bug fix.** Earlier iterations of the deploy script wrote `code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/healthz)` inside the poll loop with `set -e` at the top. The first poll iteration runs while the server is still binding the port — `curl` exits with code 7 (connect refused) — and `set -e` aborts the entire deploy script. The deploy actually succeeded (the server came up seconds later), but the script falsely reported FAILED. **Fix:** always pair the poll with `|| echo "000"`:
+
+```bash
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/healthz || echo "000")
+```
+
+Idempotency: the script is safe to re-run. The backup directory is timestamped per invocation; old backups accumulate and should be hand-pruned every few months.
+
+## Recovery from corrupt mlx-whisper prefetch
+
+**Signs of a torn snapshot:**
+
+- `model.safetensors` smaller than ~800 MB (full file is ~1.5 GB).
+- `mlx_whisper.transcribe` raises a safetensors deserialization error on the first call.
+- `mlx_whisper_loader.load()` hangs or crashes during the silence-warmup pass.
+
+**Manual recovery:**
+
+```bash
+# 1. Remove the bad snapshot
+rm -rf ~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo
+
+# 2. Re-run the prefetch (asserts > 800 MB on completion)
+bash server/scripts/prefetch-mlx-whisper.sh
+
+# 3. Kickstart the server to force the loader to re-load on first job
+launchctl kickstart -k gui/$UID/co.wispralt.server
+```
+
+The prefetch script uses `resume_download=True`, so a network blip mid-download recovers on re-run without redownloading completed shards. If `resume_download` itself is broken (it has been flaky in past `huggingface_hub` releases), nuke the directory and start clean as above.
+
 ## Cloudflare Tunnel
 
 This was the most painful part of the install. The flow that **actually works** on macOS in late 2025/2026:

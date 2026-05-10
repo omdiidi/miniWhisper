@@ -238,6 +238,114 @@ def merge_two_channels(
     return merged
 
 
+def assign_speakers_segments(
+    transcribe_result: dict,
+    diar_df: object,
+) -> list[dict]:
+    """Map each transcribed segment to a pyannote speaker label.
+
+    Replaces ``whisperx.assign_word_speakers`` after the mlx-whisper swap
+    (Phase 1). Two strategies:
+
+    1. **Word-aware split** when ``word_timestamps=True`` (meeting mode):
+       group consecutive words by their assigned speaker, emit one segment
+       per speaker run with start/end clipped to the word boundaries.
+    2. **Largest-overlap fallback** when no word timestamps are present
+       (file mode never reaches this code path, but kept for safety):
+       assign the dominant pyannote speaker (largest temporal overlap)
+       and do not split.
+
+    The returned segments are **raw** — they still carry pyannote
+    "SPEAKER_NN" labels in the ``speaker`` field. The caller
+    (``relabel_in_person`` or ``label_others``) maps those to display
+    names. To keep that contract the output dict mirrors mlx-whisper's
+    segment dict shape (``start``, ``end``, ``text``, ``speaker``,
+    ``words``).
+
+    Parameters
+    ----------
+    transcribe_result:
+        mlx-whisper result dict with ``segments``. Each segment may carry
+        a ``words`` list when ``word_timestamps=True``.
+    diar_df:
+        pandas DataFrame from pyannote diarization. Required columns:
+        ``start`` (float), ``end`` (float), ``speaker`` (str).
+
+    Returns
+    -------
+    list[dict]
+        Segment dicts shaped like mlx-whisper segments with an added
+        ``speaker`` key (raw pyannote label, e.g. "SPEAKER_00", or
+        "Unknown" if no overlap was found).
+    """
+    out_segments: list[dict] = []
+    for seg in transcribe_result.get("segments", []):
+        words = seg.get("words", []) or []
+        if words:
+            # Word-aware split: group consecutive words by assigned speaker.
+            assigned: list[tuple[dict, str]] = []
+            for w in words:
+                t = (float(w["start"]) + float(w["end"])) / 2
+                matched = diar_df[
+                    (diar_df["start"] <= t) & (diar_df["end"] >= t)
+                ]
+                if len(matched):
+                    speaker = str(matched["speaker"].iloc[0])
+                else:
+                    speaker = "Unknown"
+                assigned.append((w, speaker))
+
+            if not assigned:
+                continue
+
+            current: list[tuple[dict, str]] = [assigned[0]]
+            for w, sp in assigned[1:]:
+                if sp == current[-1][1]:
+                    current.append((w, sp))
+                else:
+                    out_segments.append(
+                        {
+                            "start": float(current[0][0]["start"]),
+                            "end": float(current[-1][0]["end"]),
+                            "text": " ".join(
+                                str(item[0].get("word", "")) for item in current
+                            ).strip(),
+                            "speaker": current[0][1],
+                            "words": [item[0] for item in current],
+                        }
+                    )
+                    current = [(w, sp)]
+            # Flush last group
+            out_segments.append(
+                {
+                    "start": float(current[0][0]["start"]),
+                    "end": float(current[-1][0]["end"]),
+                    "text": " ".join(
+                        str(item[0].get("word", "")) for item in current
+                    ).strip(),
+                    "speaker": current[0][1],
+                    "words": [item[0] for item in current],
+                }
+            )
+        else:
+            # Largest-overlap, no splitting.
+            best_speaker = "Unknown"
+            best_overlap = 0.0
+            seg_start = float(seg.get("start", 0.0))
+            seg_end = float(seg.get("end", 0.0))
+            for _, row in diar_df.iterrows():
+                ov = max(
+                    0.0,
+                    min(seg_end, float(row["end"]))
+                    - max(seg_start, float(row["start"])),
+                )
+                if ov > best_overlap:
+                    best_overlap = ov
+                    best_speaker = str(row["speaker"])
+            out_segments.append({**seg, "speaker": best_speaker})
+    return out_segments
+
+
 def build_speakers_table(segments: list[dict]) -> dict[str, dict]:
     """Build the ``speakers`` table (keyed by ``speaker_raw``) from a segment list.
 

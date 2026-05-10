@@ -9,6 +9,9 @@ dependencies = [
     "mlx>=0.22.1,<0.32.0",
     # ML — meeting pipeline
     "whisperx==3.4.0",
+    # mlx-whisper swap (Phase 1): kept whisperx through Phase 8 for rollback;
+    # deleted in Phase 10 after green matrix.
+    "mlx-whisper==0.4.2",
     "pyannote.audio==3.3.2",
     # torch pinned: torchaudio 2.7+ removes AudioMetaData and breaks pyannote
     "torch==2.6.0",
@@ -26,8 +29,12 @@ dependencies = [
     "librosa>=0.11.0,<0.12.0",
     # numpy 2.x required by parakeet-mlx; <2.3 for compatibility ceiling
     "numpy>=2.0,<2.3",
-    # HuggingFace — model download + gated-repo validation
-    "huggingface_hub>=0.30.2",
+    # HuggingFace — model download + gated-repo validation.
+    # PINNED FLOOR/CEILING: pyannote-3.1 still calls hf_hub_download(use_auth_token=...)
+    # which was removed in hf_hub 1.13. transformers needs is_offline_mode which is
+    # only in hf_hub >=0.31. So pin to the 1.12.x line. Bump pyannote first if
+    # you want to relax this.
+    "huggingface_hub>=1.12.0,<1.13",
     # OOM guard (v3 delta)
     "psutil>=6.0",
     # Implicit dep of pyannote.audio.utils.metric (imports matplotlib at module load)

@@ -84,6 +84,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Instantiate the menubar controller first so the status item is visible immediately.
         menuBarController = MenuBarController()
 
+        // If the last process exit left a transcription in flight on the
+        // server, resume polling it. No-op when no `activeJobID` key is
+        // present in UserDefaults.
+        Task { @MainActor in
+            menuBarController.resumeInFlightJobIfNeeded()
+        }
+
         // Sparkle auto-update controller (honours meeting-guard gate).
         sparkleController = SparkleController()
         sparkleController.menuBarController = menuBarController
