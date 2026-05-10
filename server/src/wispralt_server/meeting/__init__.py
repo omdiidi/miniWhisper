@@ -6,7 +6,7 @@ import time:
 
 1. ``torch.load`` / ``torch.serialization.load`` → ``weights_only=False``
    (PyTorch 2.6 flipped the default to True, which blocks omegaconf and
-   other pickled objects in pyannote/whisperx checkpoints).
+   other pickled objects in pyannote checkpoints).
 2. ``huggingface_hub.{hf_hub_download, snapshot_download}`` →
    translate the removed ``use_auth_token=`` kwarg to ``token=``
    (pyannote.audio 3.3.2 still calls the old name).
@@ -29,7 +29,7 @@ Or, for one-shot scoped use::
 
     from wispralt_server.meeting import trusted_load_context
     with trusted_load_context():
-        model = whisperx.load_model(...)
+        # ... pyannote / mlx-whisper checkpoint load happens here
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ def install_compat_shims() -> None:
         huggingface_hub.hf_hub_download = _shimmed_hf_hub_download  # type: ignore[assignment]
         huggingface_hub.snapshot_download = _shimmed_snapshot_download  # type: ignore[assignment]
 
-        # Deep patch: third-party modules (whisperx, pyannote) imported these
+        # Deep patch: third-party modules (pyannote) imported these
         # symbols by name BEFORE this shim was installed, so they hold bound
         # references to the originals.  Walk sys.modules and rebind any matching
         # attribute to our shim so those callers get the wrapped behavior too.

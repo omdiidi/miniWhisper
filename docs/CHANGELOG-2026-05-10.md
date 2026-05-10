@@ -263,3 +263,53 @@ curl -H "Authorization: Bearer $API_KEY" https://transcribe.integrateapi.ai/metr
 # Pull the server log for a specific job:
 curl -H "Authorization: Bearer $API_KEY" "https://transcribe.integrateapi.ai/admin/server-log/<job-id>"
 ```
+
+---
+
+## Phase 10 — WhisperX removal + MLX RAM reclaim (2026-05-10 PM)
+
+Follow-up patch after a 24h soak of the MLX-Whisper swap.
+
+### Part A — WhisperX deletion
+
+- Deleted `server/src/wispralt_server/meeting/whisperx_loader.py`.
+- Deleted `server/tests/test_whisperx_no_speech.py` (orphan after the swap).
+- Removed `whisperx==3.4.0` from `server/pyproject.toml`. `ctranslate2` and `faster-whisper` were transitive only — they prune automatically on next `pip install -e .`.
+- KEPT `huggingface_hub>=1.12.0,<1.13` pin. Pyannote-3.1 still calls `hf_hub_download(use_auth_token=...)` which was removed in 1.13. The compat shim in `meeting/__init__.py` translates the kwarg.
+- KEPT `meeting/__init__.py install_compat_shims()` — still required by pyannote-3.1, only cosmetic docstring scrub.
+- Mini-side `.venv` retains the whisperx package after deploy (pip won't auto-uninstall). Manual cleanup: `~/wispralt/server/.venv/bin/pip uninstall -y whisperx ctranslate2 faster-whisper` after the redeploy lands.
+
+### Part B — MLX RAM reclaim
+
+Why: idle RSS sat at 6.5–9 GB after a meeting job because `_mlx_mod.reset()` only drops the Python ref. Apple's unified-memory pool keeps the MLX backing pages cached for the next load. Without an explicit `mx.metal.clear_cache()` call, those pages stay resident.
+
+Fix: two new calls in `server/src/wispralt_server/meeting/pipeline.py`:
+
+1. **`evict_if_idle()`** — after `_mlx_mod.reset()` + `_diarize_mod.reset()` + `gc.collect()`, call `mx.metal.clear_cache()` + `mx.metal.reset_peak_memory()`. The reset_peak call gives `/metrics` a clean high-water mark per idle cycle.
+2. **`transcribe_meeting()` finally:** — call `mx.metal.clear_cache()` (no reset_peak) at the end of every job so back-to-back jobs don't compound activation cache.
+
+Both wrapped in try/except logging at DEBUG. `mx.metal.reset_peak_memory()` may not exist in all mlx versions; the try/except absorbs that case.
+
+### Expected RAM after this patch
+
+| State | Before | After |
+|---|---|---|
+| Idle (no job yet) | ~3 GB | ~3 GB |
+| Mid-job peak | ~7-8 GB | ~7-8 GB |
+| Idle post-job (60s) | 6.5-9 GB | ~3 GB |
+
+### Side effect
+
+First chunk of the NEXT job after a cache clear is ~2-3s slower (Metal kernel recompile). Acceptable.
+
+### Validation gates run before commit
+
+- `grep -rn "import whisperx\|from whisperx\|whisperx_loader" server/src` → empty (no real imports; one docstring history reference inside `mlx_whisper_loader.py` is intentional).
+- Files deleted: `whisperx_loader.py`, `test_whisperx_no_speech.py`.
+
+### Validation pending (on the mini, post-deploy)
+
+- `python -c "import mlx.core as mx; mx.metal.clear_cache(); mx.metal.reset_peak_memory(); print('ok')"` from the venv.
+- `python -c "from wispralt_server.meeting import pipeline; print('ok')"` from the venv.
+- Smoke: `SKIP_ROWS="2,3,5,6,7,8,9,10,11,12" ./scripts/run-matrix-local.sh` from MacBook — rows 1 (30s file) + 4 (5m file) must complete green.
+- RAM measurement before/after job — capture `ps -o rss=` numbers and append to this changelog.

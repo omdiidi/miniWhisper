@@ -8,9 +8,6 @@ dependencies = [
     "parakeet-mlx==0.5.1",
     "mlx>=0.22.1,<0.32.0",
     # ML — meeting pipeline
-    "whisperx==3.4.0",
-    # mlx-whisper swap (Phase 1): kept whisperx through Phase 8 for rollback;
-    # deleted in Phase 10 after green matrix.
     "mlx-whisper==0.4.2",
     "pyannote.audio==3.3.2",
     # torch pinned: torchaudio 2.7+ removes AudioMetaData and breaks pyannote

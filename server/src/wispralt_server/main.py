@@ -208,13 +208,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("mercury_client not configured (OPENROUTER_API_KEY unset)")
 
     # 7. Install compat shims at startup so the deep-patch over sys.modules hits
-    #    whisperx/pyannote/torch references before any user code runs. The shim
+    #    pyannote/torch references before any user code runs. The shim
     #    is idempotent and re-invoked from pipeline._ensure_models_loaded() to
     #    close the long window between startup and first meeting.
     install_compat_shims()
 
     # 7b. Re-enqueue any pending jobs from prior runs. The first one to execute
-    #     will lazy-load WhisperX + Pyannote inside the executor thread.
+    #     will lazy-load mlx-whisper + Pyannote inside the executor thread.
     try:
         await meeting_runner.reenqueue_pending()
     except Exception:  # noqa: BLE001 — never let re-enqueue crash startup
@@ -501,7 +501,7 @@ def create_app() -> FastAPI:
         description=(
             "Self-hosted dictation and meeting-transcription server. "
             "Parakeet TDT 0.6B v2 (MLX) for dictation; "
-            "WhisperX + Pyannote + DeepFilterNet for meeting transcription."
+            "mlx-whisper + Pyannote + DeepFilterNet for meeting transcription."
         ),
         lifespan=lifespan,
         # Disable OpenAPI docs in production — no route leakage via /docs.
