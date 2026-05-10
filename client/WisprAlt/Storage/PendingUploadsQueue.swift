@@ -4,10 +4,18 @@ import Darwin
 /// Filesystem-backed queue for meeting recordings whose upload failed because
 /// the Mac mini origin was offline. Items live at:
 ///
-///     ~/Library/Application Support/co.wispralt/pending-uploads/<uuid>.wav
+///     ~/Library/Application Support/co.wispralt/pending-uploads/<uuid>.<ext>
 ///
-/// On `enqueue`, the WAV is copied atomically (write `.tmp`, fsync file, rename,
-/// fsync parent directory) so a crash mid-enqueue can never produce a torn file.
+/// where `<ext>` is the source recording's extension — `.m4a` for new
+/// post-Task-9 meetings (uploaded via `MeetingAPI.submitFile` →
+/// `/transcribe/file`) and `.wav` for legacy entries queued by an older client
+/// before the Task-9 cutover (replayed via `MeetingAPI.submit` →
+/// `/transcribe/meeting` until `/transcribe/meeting`'s POST is removed in
+/// Task 12).
+///
+/// On `enqueue`, the source is copied atomically (write `.tmp`, fsync file,
+/// rename, fsync parent directory) so a crash mid-enqueue can never produce a
+/// torn file.
 ///
 /// Drain triggers (any one fires `drain()`):
 ///   - successful dictation (MenuBarController.dictationStop)
@@ -49,10 +57,31 @@ final class PendingUploadsQueue {
         case copyFailed(Error)
     }
 
+    /// Recording source extensions we know how to replay. Enqueue refuses
+    /// anything else so `drainOnce` never has to ignore a stranded file.
+    /// `m4a` is the post-Task-9 format; `wav` is the legacy format kept for
+    /// the dual-replay migration window.
+    private static let supportedExtensions: Set<String> = ["m4a", "wav"]
+
     /// Atomically copies `source` into the pending-uploads directory.
-    /// The recording pipeline must have already fsync'd the source WAV
+    /// The recording pipeline must have already fsync'd the source file
     /// (see `MeetingRecorder.stop()`) — copying does not propagate sync.
+    ///
+    /// The source's extension is preserved so `drainOnce` can route the
+    /// replay to the correct upload endpoint (`.m4a` → `/transcribe/file`,
+    /// `.wav` → `/transcribe/meeting`).
     func enqueue(wav source: URL) throws {
+        let ext = source.pathExtension.lowercased()
+        guard Self.supportedExtensions.contains(ext) else {
+            throw QueueError.copyFailed(
+                NSError(
+                    domain: "PendingUploadsQueue",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Unsupported source extension '\(ext)'"]
+                )
+            )
+        }
+
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: dir.path),
            let free = attrs[.systemFreeSize] as? Int64,
@@ -62,8 +91,8 @@ final class PendingUploadsQueue {
         }
 
         let id = UUID().uuidString
-        let dest = dir.appendingPathComponent("\(id).wav")
-        let tmp = dir.appendingPathComponent("\(id).wav.tmp")
+        let dest = dir.appendingPathComponent("\(id).\(ext)")
+        let tmp = dir.appendingPathComponent("\(id).\(ext).tmp")
 
         do {
             try? FileManager.default.removeItem(at: tmp)
@@ -86,17 +115,19 @@ final class PendingUploadsQueue {
         }
     }
 
-    /// Number of `.wav` items currently queued (excludes `failed/`).
+    /// Number of queued items currently awaiting upload (excludes `failed/`).
+    /// Counts both `.m4a` (current) and `.wav` (legacy pre-Task-9) entries.
     func count() -> Int {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: dir,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         ) else { return 0 }
-        return entries.filter { $0.pathExtension == "wav" }.count
+        return entries.filter { Self.supportedExtensions.contains($0.pathExtension.lowercased()) }.count
     }
 
     /// Sorted oldest-first so the user-visible drain order matches recording order.
+    /// Returns both `.m4a` and `.wav` entries; `drainOnce` routes by extension.
     func pending() -> [URL] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: dir,
@@ -104,7 +135,7 @@ final class PendingUploadsQueue {
             options: [.skipsHiddenFiles]
         ) else { return [] }
         return entries
-            .filter { $0.pathExtension == "wav" }
+            .filter { Self.supportedExtensions.contains($0.pathExtension.lowercased()) }
             .sorted { a, b in
                 let am = (try? a.resourceValues(forKeys: [.contentModificationDateKey])
                     .contentModificationDate) ?? .distantPast
@@ -130,22 +161,44 @@ final class PendingUploadsQueue {
         guard !items.isEmpty else { return }
         var attempts = readAttemptCounts()
 
-        for wav in items {
-            let id = wav.deletingPathExtension().lastPathComponent
+        for item in items {
+            let id = item.deletingPathExtension().lastPathComponent
             if (attempts[id] ?? 0) >= Self.maxAttempts {
-                moveToFailed(wav: wav)
+                moveToFailed(wav: item)
                 attempts.removeValue(forKey: id)
                 continue
             }
             do {
-                _ = try await MeetingAPI.submit(wav, progress: { _ in })
-                try? FileManager.default.removeItem(at: wav)
+                // Route by extension: legacy `.wav` entries (queued by a
+                // pre-Task-9 client before the m4a cutover) replay through
+                // the legacy `MeetingAPI.submit` → `/transcribe/meeting`
+                // path so existing offline meetings are not silently
+                // dropped. New `.m4a` entries replay through
+                // `MeetingAPI.submitFile` → `/transcribe/file`. Both paths
+                // are kept until Task 12 retires the legacy endpoint.
+                let ext = item.pathExtension.lowercased()
+                switch ext {
+                case "wav":
+                    _ = try await MeetingAPI.submit(item, progress: { _ in })
+                case "m4a":
+                    _ = try await MeetingAPI.submitFile(item, progress: { _ in })
+                default:
+                    // `pending()` filters by `supportedExtensions`, so
+                    // anything else here is impossible in practice. Fail
+                    // loudly rather than silently drop the file.
+                    Log.warning(
+                        "PendingUploadsQueue: \(item.lastPathComponent) has unsupported extension '\(ext)'; leaving in place",
+                        category: "fallback"
+                    )
+                    continue
+                }
+                try? FileManager.default.removeItem(at: item)
                 attempts.removeValue(forKey: id)
-                Log.info("PendingUploadsQueue: drained \(wav.lastPathComponent)", category: "fallback")
+                Log.info("PendingUploadsQueue: drained \(item.lastPathComponent)", category: "fallback")
             } catch {
                 attempts[id, default: 0] += 1
                 Log.info(
-                    "PendingUploadsQueue: \(wav.lastPathComponent) failed (attempt \(attempts[id]!)); will retry",
+                    "PendingUploadsQueue: \(item.lastPathComponent) failed (attempt \(attempts[id]!)); will retry",
                     category: "fallback"
                 )
                 // Continue rather than break — a different item may still succeed.

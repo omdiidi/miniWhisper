@@ -19,6 +19,10 @@ enum MeetingRecorderError: Error, LocalizedError {
     case noDisplayAvailable
     case alreadyRunning
     case notRunning
+    /// AVAssetWriter failed to start, append, or finalize. Inner `Error?` is
+    /// `AVAssetWriter.error` at the moment of failure (may be nil if the writer
+    /// reported `.failed` without populating `.error`).
+    case writerFailed(Error?)
 
     var errorDescription: String? {
         switch self {
@@ -28,6 +32,11 @@ enum MeetingRecorderError: Error, LocalizedError {
             return "Meeting recording is already in progress."
         case .notRunning:
             return "Meeting recording is not running."
+        case .writerFailed(let inner):
+            if let inner {
+                return "Meeting recorder writer failed: \(inner.localizedDescription)"
+            }
+            return "Meeting recorder writer failed."
         }
     }
 }
@@ -98,9 +107,25 @@ final class MeetingRecorder: NSObject {
 
     private var aligned = AlignedRingBuffer()
 
-    // MARK: - AVAudioFile — written exclusively from ioQueue (v3 P5#8)
+    // MARK: - AVAssetWriter — written exclusively from ioQueue (v3 P5#8)
+    //
+    // Replaces the previous `AVAudioFile` raw-PCM-WAV sink. The downstream
+    // contract from AlignedRingBuffer is unchanged (it still emits 16 kHz
+    // Float32 stereo non-interleaved PCMBuffers via `flushAligned`); the
+    // new path interleaves those into a packed stereo Float32 CMSampleBuffer
+    // and feeds them to `audioInput.append(_:)` for AAC encoding.
 
-    private var stereoFile: AVAudioFile?
+    private var assetWriter: AVAssetWriter?
+    private var audioInput: AVAssetWriterInput?
+
+    /// Cached CMAudioFormatDescription describing the 16 kHz stereo Float32
+    /// interleaved PCM source format. Built once on `start()`; reused for every
+    /// CMSampleBuffer assembled in `drainToFile`.
+    private var sourceFormatDescription: CMAudioFormatDescription?
+
+    /// Monotonic count of source PCM frames already appended. Drives the
+    /// presentationTimeStamp of each new CMSampleBuffer at `timescale = 16_000`.
+    private var samplesAppended: Int64 = 0
 
     // MARK: - Serial I/O queue
     //
@@ -190,6 +215,7 @@ final class MeetingRecorder: NSObject {
         micConverter = CMSampleBufferConverter()
         sysConverter = CMSampleBufferConverter()
         outputURL = url
+        samplesAppended = 0
 
         // Configure SCStream.
         let cfg = SCStreamConfiguration()
@@ -224,13 +250,82 @@ final class MeetingRecorder: NSObject {
             try stream?.addStreamOutput(self, type: .microphone, sampleHandlerQueue: ioQueue)
         }
 
-        // Open the output AVAudioFile.
-        stereoFile = try AVAudioFile(
-            forWriting: url,
-            settings: AudioFormat.canonical16kFloat32Stereo.settings,
-            commonFormat: .pcmFormatFloat32,
-            interleaved: false
+        // Open the output AVAssetWriter (AAC stereo m4a, 16 kHz, 96 kbps).
+        //
+        // - File extension MUST be `.m4a` to match `AVFileType.m4a`. Mismatch
+        //   silently produces an unplayable file.
+        // - `kAudioFormatMPEG4AAC` is `UInt32`; cast to `Int` for the dict.
+        // - `AVChannelLayoutKey` requires a serialized `AudioChannelLayout`
+        //   struct (NOT just the tag UInt32). Wrong type silently truncates
+        //   to mono.
+        // - `expectsMediaDataInRealTime = true` keeps the encoder from
+        //   starving live capture sources.
+        // - `startWriting()` MUST be called BEFORE `startSession(atSourceTime:)`
+        //   BEFORE the first `append(_:)`. Wrong order silently produces a
+        //   0-byte file.
+        let writer = try AVAssetWriter(outputURL: url, fileType: .m4a)
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+        let layoutData = Data(bytes: &layout, count: MemoryLayout<AudioChannelLayout>.size)
+        // Sample rate: 16 kHz, NOT 48 kHz. AlignedRingBuffer already produces a
+        // 16 kHz interleaved stereo Float32 stream (its own internal resampling
+        // happens upstream in the SCStream→ring-buffer path). The server's
+        // ffmpeg pipeline downsamples to 16 kHz mono regardless. Encoding AAC at
+        // 16 kHz here avoids a needless intermediate upsample. Don't "fix" this
+        // back to 48 kHz without first verifying the ring-buffer rate.
+        let outputSettings: [String: Any] = [
+            AVFormatIDKey:         Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey:       16_000,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey:   96_000,
+            AVChannelLayoutKey:    layoutData,
+        ]
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
+        input.expectsMediaDataInRealTime = true
+        guard writer.canAdd(input) else {
+            throw MeetingRecorderError.writerFailed(writer.error)
+        }
+        writer.add(input)
+
+        guard writer.startWriting() else {
+            throw MeetingRecorderError.writerFailed(writer.error)
+        }
+        guard writer.status == .writing else {
+            throw MeetingRecorderError.writerFailed(writer.error)
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        // Build the source-format description once: 16 kHz stereo Float32
+        // interleaved (8 bytes/frame). Reused for every CMSampleBuffer.
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate:       16_000,
+            mFormatID:         kAudioFormatLinearPCM,
+            mFormatFlags:      kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsPacked,
+            mBytesPerPacket:   8,    // 2 ch × 4 bytes (Float32) interleaved
+            mFramesPerPacket:  1,
+            mBytesPerFrame:    8,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel:   32,
+            mReserved:         0
         )
+        var fmtDesc: CMAudioFormatDescription?
+        let fmtStatus = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            asbd: &asbd,
+            layoutSize: 0,
+            layout: nil,
+            magicCookieSize: 0,
+            magicCookie: nil,
+            extensions: nil,
+            formatDescriptionOut: &fmtDesc
+        )
+        guard fmtStatus == noErr, let fmtDesc else {
+            throw MeetingRecorderError.writerFailed(writer.error)
+        }
+
+        self.assetWriter = writer
+        self.audioInput = input
+        self.sourceFormatDescription = fmtDesc
 
         // Snapshot the output URL as soon as we know the path so the abort
         // handler can clean up a partial WAV even if SCStream's didStopWithError
@@ -346,12 +441,63 @@ final class MeetingRecorder: NSObject {
         try? await stream?.stopCapture()
         stream = nil
 
-        // Final alignment: pad any lagging channel with silence up to the longest tail.
-        // Drain may be a no-op if stereoFile was already nilled by a prior path.
+        // Final alignment: pad any lagging channel with silence up to the
+        // longest tail, drain whatever remains through the AAC encoder, then
+        // capture + clear the writer references INSIDE the ioQueue so any
+        // in-flight `appendSample` handler block (which reads `assetWriter`
+        // and `audioInput`) has fully completed before we nil them. Doing
+        // the nils outside the queue allowed a TOCTOU read race after
+        // `stopFlushTimer()` — see R2#3.
+        var writerToFinish: AVAssetWriter?
+        var inputToFinish: AVAssetWriterInput?
+        var samplesAppendedSnapshot: Int64 = 0
         ioQueue.sync {
             self.aligned.padMissing(toEnd: true)
             self.drainToFile(forceFlush: true)
-            self.stereoFile = nil
+
+            writerToFinish = self.assetWriter
+            inputToFinish = self.audioInput
+            samplesAppendedSnapshot = self.samplesAppended
+
+            self.assetWriter = nil
+            self.audioInput = nil
+            self.sourceFormatDescription = nil
+            self.samplesAppended = 0
+        }
+
+        if let writer = writerToFinish {
+            inputToFinish?.markAsFinished()
+
+            // R2#3 follow-up: empty-track guard. If no PCM frames were
+            // ever appended (e.g. user FN-tapped twice in rapid
+            // succession), `finishWriting` would still produce a 0-sample
+            // m4a that the server can't decode. Surface as
+            // `.writerFailed(nil)` so the caller's catch path treats it as
+            // a recording failure instead of a successful empty upload.
+            guard samplesAppendedSnapshot > 0 else {
+                Log.warning(
+                    "MeetingRecorder: zero samples appended; skipping finishWriting",
+                    category: "capture"
+                )
+                let wasActive = isActive
+                setActive(false)
+                guard wasActive else { throw MeetingRecorderError.notRunning }
+                throw MeetingRecorderError.writerFailed(nil)
+            }
+
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                writer.finishWriting { cont.resume() }
+            }
+            if writer.status != .completed {
+                // Surface the writer error AFTER cleanup so the caller's catch
+                // path doesn't leave anything dangling. .notRunning still wins
+                // if the session was never started; we only throw .writerFailed
+                // when we actually had a writer.
+                let wasActive = isActive
+                setActive(false)
+                guard wasActive else { throw MeetingRecorderError.notRunning }
+                throw MeetingRecorderError.writerFailed(writer.error)
+            }
         }
 
         // Resolve the final URL state. If the session was never started or already
@@ -365,17 +511,133 @@ final class MeetingRecorder: NSObject {
         return url
     }
 
-    // MARK: - Private: flush aligned buffer to file
+    // MARK: - Private: flush aligned buffer to AVAssetWriter
 
-    /// Drains all available aligned frames from the ring buffer and writes them to
-    /// `stereoFile`. Must be called on `ioQueue`.
+    /// Drains all available aligned frames from the ring buffer and feeds them
+    /// to the AAC encoder via `audioInput.append(_:)`. Must be called on
+    /// `ioQueue`.
+    ///
+    /// AlignedRingBuffer emits non-interleaved 16 kHz stereo Float32
+    /// PCMBuffers (ch[0] = mic, ch[1] = system). We interleave them into a
+    /// packed stereo buffer, wrap that in a CMBlockBuffer + CMSampleBuffer
+    /// stamped with a monotonic PTS at `timescale = 16_000`, and append.
     private func drainToFile(forceFlush: Bool = false) {
         while let frame = aligned.flushAligned(forceFlush: forceFlush) {
-            do {
-                try stereoFile?.write(from: frame)
-            } catch {
-                Log.error("MeetingRecorder: AVAudioFile write error: \(error)", category: "capture")
+            guard let sample = makeSampleBuffer(from: frame) else { continue }
+            appendSample(sample)
+        }
+    }
+
+    /// Builds a CMSampleBuffer containing interleaved Float32 stereo PCM at
+    /// 16 kHz from the non-interleaved planar `frame` produced by
+    /// AlignedRingBuffer. `presentationTimeStamp` uses the monotonic
+    /// `samplesAppended` counter so successive buffers stay strictly ordered.
+    private func makeSampleBuffer(from frame: AVAudioPCMBuffer) -> CMSampleBuffer? {
+        guard let fmtDesc = sourceFormatDescription else { return nil }
+        let frameCount = Int(frame.frameLength)
+        guard frameCount > 0,
+              let ch0 = frame.floatChannelData?[0],
+              let ch1 = frame.floatChannelData?[1] else { return nil }
+
+        // Allocate a CMBlockBuffer-owned interleaved Float32 stereo block.
+        let bytesPerFrame = 8 // 2ch × Float32
+        let dataSize = frameCount * bytesPerFrame
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,            // ask CoreMedia to allocate
+            blockLength: dataSize,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: dataSize,
+            flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &blockBuffer
+        )
+        guard blockStatus == kCMBlockBufferNoErr, let blockBuffer else { return nil }
+
+        // Interleave: dst[2i+0] = mic[i], dst[2i+1] = sys[i].
+        var dataPointer: UnsafeMutablePointer<CChar>?
+        let accessStatus = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: nil,
+            totalLengthOut: nil,
+            dataPointerOut: &dataPointer
+        )
+        guard accessStatus == kCMBlockBufferNoErr, let raw = dataPointer else { return nil }
+        raw.withMemoryRebound(to: Float.self, capacity: frameCount * 2) { dst in
+            for i in 0..<frameCount {
+                dst[2 * i + 0] = ch0[i]
+                dst[2 * i + 1] = ch1[i]
             }
+        }
+
+        let pts = CMTime(value: samplesAppended, timescale: 16_000)
+        var sampleBuffer: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 16_000),
+            presentationTimeStamp: pts,
+            decodeTimeStamp: .invalid
+        )
+        var sampleSize = bytesPerFrame
+        let sampleStatus = CMSampleBufferCreate(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: fmtDesc,
+            sampleCount: CMItemCount(frameCount),
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sampleStatus == noErr, let sampleBuffer else { return nil }
+
+        samplesAppended += Int64(frameCount)
+        return sampleBuffer
+    }
+
+    /// Appends a CMSampleBuffer to the audio input. Surfaces writer-failure
+    /// state via a single error log per occurrence.
+    ///
+    /// **Back-pressure contract (Apple-documented):** calling `input.append(_:)`
+    /// while `input.isReadyForMoreMediaData == false` causes samples to be
+    /// silently dropped — manifests as audible cut-out / glitching in the
+    /// resulting m4a. `expectsMediaDataInRealTime = true` ADVISES the encoder
+    /// to keep up but does NOT remove the contract. We MUST wait until the
+    /// input reports ready before each append. Brief spin-wait is acceptable
+    /// here because we're on `ioQueue` (serial); back-pressure naturally
+    /// propagates to the next aligned-ring-buffer drain.
+    private func appendSample(_ sample: CMSampleBuffer) {
+        guard let input = audioInput, let writer = assetWriter else { return }
+        var spinTicks = 0
+        while !input.isReadyForMoreMediaData {
+            // 1 ms tick. Cap diagnostic warning at 100 ms to surface chronic
+            // back-pressure (suggests encoder is genuinely overloaded).
+            Thread.sleep(forTimeInterval: 0.001)
+            spinTicks += 1
+            if spinTicks == 100 {
+                Log.warning(
+                    "MeetingRecorder: AVAssetWriterInput back-pressure >100ms — encoder may be falling behind",
+                    category: "capture"
+                )
+            }
+            // Hard ceiling: if the encoder is stuck for >2s, give up on this
+            // sample rather than block the io queue forever. Better to drop one
+            // chunk than freeze capture.
+            if spinTicks >= 2_000 { return }
+            // Guard against the writer transitioning to .failed while we wait.
+            if writer.status == .failed { return }
+        }
+        if !input.append(sample) {
+            Log.error(
+                "MeetingRecorder: AVAssetWriterInput.append failed — status=\(writer.status.rawValue) error=\(String(describing: writer.error))",
+                category: "capture"
+            )
         }
     }
 

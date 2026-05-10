@@ -189,6 +189,137 @@ enum MeetingAPI {
         }
     }
 
+    // MARK: - Submit (file — original container, server-side decode)
+
+    /// Uploads any audio/video container to `POST /transcribe/file`.
+    ///
+    /// The server runs ffmpeg to transcode the upload to a canonical WAV before
+    /// queuing the job, then ffprobes the source to detect channel count
+    /// (mono → single, stereo → stereo). The client does NOT specify a `mode`
+    /// form field — channel detection is server-side.
+    ///
+    /// Mirrors `submit(_:)`: same multipart envelope, same Content-MD5 header,
+    /// same `UploadSessionDelegate` for progress, same long-upload session
+    /// configuration (300 s inactivity, 6 h wall clock, 6 h request timeout).
+    /// The only differences are the target URL and that the bytes uploaded are
+    /// the user's source container as-is — no client-side transcoding.
+    ///
+    /// - Parameters:
+    ///   - sourceURL: Local file URL of the source container (m4a, mp3, mp4, …).
+    ///   - progress: Called on the main queue with upload fraction as data is sent.
+    /// - Returns: A `JobID` for use with `poll`, `download`, and `delete`.
+    /// - Throws: `ServerError` on any HTTP or transport failure.
+    static func submitFile(
+        _ sourceURL: URL,
+        progress: @escaping (Double) -> Void
+    ) async throws -> JobID {
+        guard let baseURL = Settings.shared.serverURL else {
+            throw ServerError.missingConfiguration
+        }
+        guard let url = URL(string: "/transcribe/file", relativeTo: baseURL)?.absoluteURL else {
+            throw ServerError.invalidServerURL
+        }
+
+        // Content-MD5 over the original container bytes (server compares to the
+        // post-multipart-parse file content). Streaming so we never load the
+        // entire file into RAM.
+        var hasher = Insecure.MD5()
+        let hashHandle = try FileHandle(forReadingFrom: sourceURL)
+        defer { try? hashHandle.close() }
+        while true {
+            guard let chunk = try hashHandle.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+        }
+        let md5Base64 = Data(hasher.finalize()).base64EncodedString()
+        try? hashHandle.close()
+
+        // Build the multipart envelope as a temp file so we keep streaming
+        // behavior (no full-file RAM load) and can use uploadTask(fromFile:).
+        let boundary = "wispralt-" + UUID().uuidString
+        let prefix = (
+            "--\(boundary)\r\n" +
+            "Content-Disposition: form-data; name=\"file\"; filename=\"" +
+            sourceURL.lastPathComponent + "\"\r\n" +
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).data(using: .utf8)!
+        let suffix = "\r\n--\(boundary)--\r\n".data(using: .utf8)!
+
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wispralt-upload-\(UUID().uuidString).tmp")
+        FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+        do {
+            let writer = try FileHandle(forWritingTo: tempURL)
+            try writer.write(contentsOf: prefix)
+            let reader = try FileHandle(forReadingFrom: sourceURL)
+            defer { try? reader.close() }
+            while true {
+                guard let chunk = try reader.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
+                try writer.write(contentsOf: chunk)
+            }
+            try writer.write(contentsOf: suffix)
+            try writer.close()
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
+        }
+
+        let tempSize = (try FileManager.default.attributesOfItem(atPath: tempURL.path)[.size] as? Int) ?? 0
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue(md5Base64, forHTTPHeaderField: "Content-MD5")
+        request.setValue(String(tempSize), forHTTPHeaderField: "Content-Length")
+        // Wall-clock cap for the whole upload — see `submit(_:)` rationale.
+        request.timeoutInterval = 6 * 60 * 60
+
+        if let apiKey = try? KeychainHelper.getAPIKey() {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response): (Data, HTTPURLResponse)
+        do {
+            (data, response) = try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>) in
+
+                let delegate = UploadSessionDelegate(
+                    progressHandler: progress,
+                    continuation: continuation
+                )
+                let uploadConfig = URLSessionConfiguration.default
+                uploadConfig.timeoutIntervalForRequest = 300       // 5 min inactivity
+                uploadConfig.timeoutIntervalForResource = 6 * 60 * 60  // 6 h wall clock
+                let uploadSession = URLSession(
+                    configuration: uploadConfig,
+                    delegate: delegate,
+                    delegateQueue: nil
+                )
+                delegate.session = uploadSession
+
+                let task = uploadSession.uploadTask(with: request, fromFile: tempURL)
+                task.resume()
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
+        }
+        try? FileManager.default.removeItem(at: tempURL)
+
+        try ServerClient.shared.mapHTTPError(
+            status: response.statusCode,
+            response: response,
+            body: data
+        )
+
+        do {
+            let decoded = try JSONDecoder().decode(SubmitResponse.self, from: data)
+            Log.info("File submitted — job_id: \(decoded.job_id)", category: "meeting")
+            return JobID(raw: decoded.job_id)
+        } catch {
+            throw ServerError.decoding(error)
+        }
+    }
+
     // MARK: - Poll
 
     /// Polls `GET /transcribe/meeting/{id}` for the current job status.

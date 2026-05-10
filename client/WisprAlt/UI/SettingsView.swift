@@ -77,23 +77,10 @@ struct SettingsView: View {
     // MARK: - Sections
 
     /// Top of the popover: the actions a daily user actually reaches for.
+    /// Delegates to `QuickActionsSection` so the file-watcher view-models can
+    /// be `@StateObject`-owned (which is impossible inside a computed `var`).
     private var quickActionsSection: some View {
-        Section {
-            Button("Open Portal", systemImage: "safari") {
-                openPortal()
-            }
-            .disabled(settings.serverURL == nil)
-            .help(
-                settings.serverURL == nil
-                    ? "Set a Server URL under Advanced first."
-                    : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
-            )
-
-            Button("Open Meetings Folder", systemImage: "folder") {
-                openMeetingsFolder()
-            }
-            .help("Opens \(settings.meetingsPath.path) in Finder.")
-        }
+        QuickActionsSection()
     }
 
     private var advancedToggleSection: some View {
@@ -598,5 +585,146 @@ struct SettingsView: View {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         NSWorkspace.shared.open(url)
         Log.info("Opened meetings folder: \(url.path)", category: "settings")
+    }
+}
+
+// MARK: - QuickActionsSection
+
+/// Top-of-popover Section. Owns two `LastTranscriptCaptionViewModel` instances
+/// (meetings + custom transcriptions) so they can be `@StateObject`-bound,
+/// which is impossible inside `SettingsView`'s computed `quickActionsSection`.
+///
+/// Lifetime mirrors the popover: watchers `start()` in `.onAppear`, `stop()`
+/// in `.onDisappear`. No FD leaks across popover open/close cycles.
+private struct QuickActionsSection: View {
+    @EnvironmentObject private var settings: Settings
+
+    // Known limitation: the watcher folder URLs below are captured ONCE at
+    // struct-init time. If the user changes `Settings.shared.meetingsPath`
+    // mid-session, the watchers keep pointing at the OLD URL until the popover
+    // is destroyed and recreated. Acceptable: meetings-path changes are rare
+    // and the popover is `.transient`, so reopening it picks up the new path.
+    @StateObject private var meetingViewModel = LastTranscriptCaptionViewModel(
+        folderURL: Settings.shared.meetingsPath,
+        lookup: {
+            CustomTranscriptionsStore.newestMeetingTranscript().flatMap {
+                try? $0.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate
+            }
+        }
+    )
+
+    @StateObject private var customViewModel = LastTranscriptCaptionViewModel(
+        folderURL: CustomTranscriptionsStore.directoryURL,
+        lookup: {
+            CustomTranscriptionsStore.newestCustomTranscript().flatMap {
+                try? $0.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate
+            }
+        }
+    )
+
+    /// Inline "Copied — N chars" toast. `button` identifies which copy button
+    /// fired so the toast renders directly beneath the right one.
+    @State private var copyToast: (button: String, message: String)?
+
+    var body: some View {
+        Section {
+            Button("Transcribe file…", systemImage: "waveform.badge.plus") {
+                MenuBarController.shared?.transcribePickedFile()
+            }
+            .help("Pick any audio or video file. WisprAlt transcodes it locally and runs it through the meeting pipeline.")
+
+            Button("Open Custom Transcriptions", systemImage: "folder.badge.questionmark") {
+                let url = CustomTranscriptionsStore.directoryURL
+                try? FileManager.default.createDirectory(
+                    at: url,
+                    withIntermediateDirectories: true
+                )
+                NSWorkspace.shared.open(url)
+                Log.info("Opened custom transcriptions folder: \(url.path)", category: "settings")
+            }
+            .help("Opens the Custom Transcriptions folder in Finder.")
+
+            Divider()
+
+            Button("Copy last meeting", systemImage: "doc.on.clipboard") {
+                performCopy(button: "meeting", source: CustomTranscriptionsStore.newestMeetingTranscript)
+            }
+            .disabled(meetingViewModel.lastModified == nil)
+            .help(meetingViewModel.lastModified == nil
+                  ? "No meeting transcripts yet."
+                  : "Copy the most recent meeting transcript to the clipboard.")
+            LastTranscriptCaption(viewModel: meetingViewModel)
+            if let toast = copyToast, toast.button == "meeting" {
+                Text(toast.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
+
+            Button("Copy last custom transcription", systemImage: "doc.on.clipboard.fill") {
+                performCopy(button: "custom", source: CustomTranscriptionsStore.newestCustomTranscript)
+            }
+            .disabled(customViewModel.lastModified == nil)
+            .help(customViewModel.lastModified == nil
+                  ? "No custom transcriptions yet."
+                  : "Copy the most recent custom transcription to the clipboard.")
+            LastTranscriptCaption(viewModel: customViewModel)
+            if let toast = copyToast, toast.button == "custom" {
+                Text(toast.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
+
+            Divider()
+
+            Button("Open Portal", systemImage: "safari") {
+                guard let base = settings.serverURL else { return }
+                let url = base.appendingPathComponent("admin/login")
+                NSWorkspace.shared.open(url)
+                Log.info("Opened portal: \(url.absoluteString)", category: "settings")
+            }
+            .disabled(settings.serverURL == nil)
+            .help(
+                settings.serverURL == nil
+                    ? "Set a Server URL under Advanced first."
+                    : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
+            )
+
+            Button("Open Meetings Folder", systemImage: "folder") {
+                let url = settings.meetingsPath
+                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                NSWorkspace.shared.open(url)
+                Log.info("Opened meetings folder: \(url.path)", category: "settings")
+            }
+            .help("Opens \(settings.meetingsPath.path) in Finder.")
+        }
+        .onAppear {
+            meetingViewModel.start()
+            customViewModel.start()
+        }
+        .onDisappear {
+            meetingViewModel.stop()
+            customViewModel.stop()
+        }
+    }
+
+    private func performCopy(button: String, source: () -> URL?) {
+        guard let url = source() else { return }
+        do {
+            let count = try CustomTranscriptionsStore.copyToPasteboard(url)
+            copyToast = (button, "Copied — \(count.formatted(.number)) chars")
+        } catch {
+            Log.warning("copyToPasteboard failed for \(url.path): \(error)", category: "settings")
+            copyToast = (button, "Copy failed: \(error.localizedDescription)")
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if copyToast?.button == button {
+                copyToast = nil
+            }
+        }
     }
 }

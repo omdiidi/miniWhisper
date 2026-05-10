@@ -561,7 +561,13 @@ final class MenuBarController: NSObject {
         }
     }
 
-    /// Uploads, polls, downloads, and finalises a completed meeting WAV.
+    /// Uploads, polls, downloads, and finalises a completed meeting m4a.
+    ///
+    /// Post-Task-10: meetings are now AAC m4a containers and route through
+    /// `POST /transcribe/file` via `runFileTranscriptionJob`. The legacy
+    /// `/transcribe/meeting` POST is reserved for `PendingUploadsQueue`'s
+    /// dual-replay of any pre-Task-9 `.wav` entries that are still queued
+    /// from before the upgrade.
     @MainActor
     private func processMeetingUpload(wavURL: URL) async {
         let baseName = wavURL.deletingPathExtension().lastPathComponent
@@ -571,13 +577,9 @@ final class MenuBarController: NSObject {
         // catch branch fires.
         let uploadStartedAt = Date()
 
-        // Meeting recorder writes 2-ch 16 kHz Float32 PCM = 128 kB/s.
-        let meetingBytesPerSecond: Double = 2 * 16_000 * 4
-
         do {
-            try await runMeetingTranscriptionJob(
-                wavURL: wavURL,
-                bytesPerSecond: meetingBytesPerSecond,
+            try await runFileTranscriptionJob(
+                sourceURL: wavURL,
                 outputDirectory: Settings.shared.meetingsPath,
                 stem: baseName
             )
@@ -628,46 +630,39 @@ final class MenuBarController: NSObject {
         }
     }
 
-    /// Submit a WAV, poll until done or deadline, download every reported
+    /// Submit an original-container source file via `POST /transcribe/file`,
+    /// poll until done or a flat 600 s deadline, download every reported
     /// format to `<outputDirectory>/<stem>.<fmt>`, delete the server-side job.
     /// Throws on failure; never enqueues for offline retry — caller decides.
     ///
-    /// `bytesPerSecond` is supplied by the caller (meeting recorder = Float32
-    /// → 128 kB/s; custom transcoder = Int16 → 64 kB/s) so this helper does
-    /// not need to parse the WAV header to compute the poll deadline.
+    /// Deadline is a flat 600 s because container size doesn't tell us audio
+    /// duration (a 50 MB AAC file may decode to 90 minutes; a 50 MB WAV to
+    /// ~5 minutes). The server processes in seconds-of-audio time, so 600 s
+    /// covers realistic jobs. Used by both the meeting upload path
+    /// (`processMeetingUpload`) and the custom-transcription path
+    /// (`processCustomTranscriptionUpload`).
     @MainActor
-    private func runMeetingTranscriptionJob(
-        wavURL: URL,
-        bytesPerSecond: Double,
+    private func runFileTranscriptionJob(
+        sourceURL: URL,
         outputDirectory: URL,
         stem: String
     ) async throws {
         // --- Upload ---
-        // Estimate recording duration from file size + caller-supplied
-        // bytes/sec for the format. Used only to size the poll deadline.
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: wavURL.path)[.size] as? Int) ?? 0
-        let estimatedDurationSeconds = Double(fileSize) / bytesPerSecond
-
-        let jobID = try await MeetingAPI.submit(wavURL) { [weak self] fraction in
+        let jobID = try await MeetingAPI.submitFile(sourceURL) { [weak self] fraction in
             guard let self else { return }
             self.recordingState.uploadFraction = fraction
         }
 
         // --- Processing ---
         mode = .processing
-        Log.info("Meeting uploaded — job_id: \(jobID), polling for completion.", category: "meeting")
+        Log.info("File uploaded — job_id: \(jobID), polling for completion.", category: "transcribe")
 
-        // C11: compute a deadline — allow at least 2× the recording duration or 600s,
-        // whichever is larger. If the deadline expires, give up and surface error.
-        let pollDeadline = Date(timeIntervalSinceNow: max(2 * estimatedDurationSeconds, 600))
+        let pollDeadline = Date(timeIntervalSinceNow: 600)
 
-        // Poll every 5 seconds until done, failed, or deadline exceeded.
-        // Capture the `outputs` map from the done response for format-aware downloads.
         var outputFormats: [String] = []
         pollLoop: while true {
             if Date() > pollDeadline {
-                // Server did not respond in time; clean up and surface error.
-                Log.error("Meeting poll timed out for job \(jobID) — deadline exceeded.", category: "meeting")
+                Log.error("File poll timed out for job \(jobID) — deadline exceeded.", category: "transcribe")
                 try? await MeetingAPI.delete(jobID)
                 throw MeetingProcessingError.pollTimedOut
             }
@@ -685,9 +680,6 @@ final class MenuBarController: NSObject {
         }
 
         // --- Download all formats ---
-        // Use the server-supplied `outputs` keys (sorted for deterministic ordering)
-        // so future server-side format additions are tracked automatically.
-        // Fall back to the hardcoded list if the server returned an empty outputs map.
         let formatsToDownload: [String]
         if !outputFormats.isEmpty {
             formatsToDownload = outputFormats.sorted()
@@ -763,46 +755,43 @@ final class MenuBarController: NSObject {
             return
         }
 
-        let wavDestination = subdir.appendingPathComponent("\(stem)__2ch16k.wav")
-
+        // Copy the picked file as-is into the per-job folder. The server now
+        // ffmpeg-decodes the original container; no client-side transcoding.
+        let originalDestination = subdir.appendingPathComponent(picked.lastPathComponent)
         do {
-            try await MediaTranscoder.toMeetingWAV(picked, destination: wavDestination)
+            try FileManager.default.copyItem(at: picked, to: originalDestination)
         } catch {
             let message = formatTranscriptionError(error)
-            Log.error("Custom transcription: toMeetingWAV failed: \(message)", category: "transcribe")
+            Log.error("Custom transcription: copy source file failed: \(message)", category: "transcribe")
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)
-            // Clean up the orphan job folder — the WAV failed, no point keeping it.
             try? FileManager.default.removeItem(at: subdir)
             mode = .idle
             return
         }
 
         await processCustomTranscriptionUpload(
-            wavURL: wavDestination,
+            sourceURL: originalDestination,
             outputDirectory: subdir,
             stem: stem
         )
     }
 
-    /// Uploads a transcoded custom-transcription WAV via the meeting pipeline.
-    /// Mirrors `processMeetingUpload` but skips the offline-queue path: custom
+    /// Uploads a custom-transcription source file (original container, no
+    /// client-side transcoding) via `POST /transcribe/file`. Mirrors
+    /// `processMeetingUpload` but skips the offline-queue path: custom
     /// transcriptions are always user-initiated and don't get retried later.
     @MainActor
     private func processCustomTranscriptionUpload(
-        wavURL: URL,
+        sourceURL: URL,
         outputDirectory: URL,
         stem: String
     ) async {
         mode = .uploading
         recordingState.uploadFraction = 0
 
-        // Custom-transcription WAVs are Int16 2ch 16kHz = 64 kB/s.
-        let customBytesPerSecond: Double = 2 * 16_000 * 2
-
         do {
-            try await runMeetingTranscriptionJob(
-                wavURL: wavURL,
-                bytesPerSecond: customBytesPerSecond,
+            try await runFileTranscriptionJob(
+                sourceURL: sourceURL,
                 outputDirectory: outputDirectory,
                 stem: stem
             )
@@ -931,7 +920,9 @@ final class MenuBarController: NSObject {
         }
 
         // Collision guard: check the base name against ALL sidecar extensions.
-        let exts = ["wav", "json", "srt", "vtt", "txt"]
+        // `wav` is kept in the collision list (alongside `m4a`) so a fresh m4a
+        // recording does not stomp legacy WAV meetings sharing the same minute.
+        let exts = ["m4a", "wav", "json", "srt", "vtt", "txt"]
         func anyExists(_ baseName: String) -> Bool {
             for ext in exts {
                 if FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(baseName).\(ext)").path) {
@@ -946,7 +937,7 @@ final class MenuBarController: NSObject {
             name = "\(base) (\(i))"
             i += 1
         }
-        return "\(name).wav"
+        return "\(name).m4a"
     }
 
     // MARK: - Toast helper
