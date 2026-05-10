@@ -188,6 +188,80 @@ final class ServerClient {
         }
     }
 
+    // MARK: - Offline-signature classifier (shared with fallback path)
+
+    /// First-attempt elapsed-time threshold before a `URLError.timedOut`
+    /// counts as "mini is offline" rather than "user is on bad wifi but
+    /// the connection is still alive." Mirrors brief constraint #4.
+    static let miniHealthWindowSec: TimeInterval = 30
+
+    /// Maximum age of the most-recent body-byte ACK (when observable, e.g.
+    /// from `MeetingAPI`'s `UploadSessionDelegate.didSendBodyData`) for a
+    /// `URLError.timedOut` to be treated as "no connectivity" instead of
+    /// "throttled but progressing."
+    static let byteACKMaxAgeSec: TimeInterval = 5
+
+    /// Records the result of one HTTP attempt for classification.
+    /// Either `.success(response, body)` (status was returned by the server)
+    /// or `.failure(error)` (transport-level failure before any response).
+    struct RequestAttempt {
+        let startedAt: Date
+        let finishedAt: Date
+        /// Most-recent body-byte ACK time, when the call site can observe
+        /// it (multipart upload via delegate). `nil` for plain
+        /// `session.data(for:)` paths — those use elapsed-time only.
+        let lastByteSentAt: Date?
+        let outcome: Outcome
+
+        enum Outcome {
+            case response(HTTPURLResponse)
+            case error(Error)
+        }
+
+        var elapsedSec: TimeInterval {
+            finishedAt.timeIntervalSince(startedAt)
+        }
+    }
+
+    /// Returns true ONLY when the failure pattern is "tunnel can't reach
+    /// origin" or "first attempt clearly hung past the mini-health window."
+    /// Conservative on purpose: NEVER trips on auth failures, validation
+    /// errors, rate-limit responses, or origin 5xx (FastAPI middleware
+    /// stamps every origin response with `X-Request-Id`).
+    func isOfflineSignature(_ attempt: RequestAttempt) -> Bool {
+        switch attempt.outcome {
+        case .error(let err):
+            guard let urlErr = err as? URLError else { return false }
+            switch urlErr.code {
+            case .cannotConnectToHost,
+                 .dnsLookupFailed,
+                 .cannotFindHost,
+                 .networkConnectionLost:
+                return true
+            case .timedOut:
+                let bytesQuiet: Bool
+                if let lastByte = attempt.lastByteSentAt {
+                    bytesQuiet = attempt.finishedAt.timeIntervalSince(lastByte) > Self.byteACKMaxAgeSec
+                } else {
+                    // No byte-progress signal available. Fall back to the
+                    // elapsed-time gate alone — sufficient for the small
+                    // dictation payloads served by the data(for:) path.
+                    bytesQuiet = true
+                }
+                return bytesQuiet && attempt.elapsedSec > Self.miniHealthWindowSec
+            default:
+                return false
+            }
+        case .response(let resp):
+            // Cloudflare-layer 5xx have CF-Ray but no X-Request-Id (origin
+            // never responded). Origin 5xx ALWAYS carry X-Request-Id — never
+            // fall back on those; the existing pool watcher will recover.
+            let cfLayer = resp.value(forHTTPHeaderField: "CF-Ray") != nil
+                       && resp.value(forHTTPHeaderField: "X-Request-Id") == nil
+            return cfLayer && [502, 522, 523, 524].contains(resp.statusCode)
+        }
+    }
+
     // MARK: - Health / readiness
 
     /// Calls `/healthz` (no auth required). Returns true if the server is reachable.

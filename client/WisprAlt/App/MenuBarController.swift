@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 private extension Duration {
     /// Convert a `Duration` (returned by `ContinuousClock` arithmetic) into
@@ -40,6 +41,7 @@ final class MenuBarController: NSObject {
         case idle
         case dictating
         case meetingRecording
+        case converting
         case uploading
         case processing
         case done
@@ -102,18 +104,113 @@ final class MenuBarController: NSObject {
     /// observers with no cleanup path.
     private var didResignActiveObserver: NSObjectProtocol?
 
+    // MARK: - Pending-uploads drain triggers
+
+    /// Process-local last-shown timestamp for debounced toasts. 10-min window
+    /// per kind so flapping connectivity doesn't spam the user.
+    private enum ToastKind: String {
+        case meetingOffline
+        case fallbackUnavailable
+    }
+    private var lastToastShown: [ToastKind: Date] = [:]
+    private static let toastDebounceSec: TimeInterval = 600
+
+    /// Held so the timer survives across foreground/background transitions.
+    private var pendingUploadsDrainTimer: Timer?
+    /// Held to remove the foreground observer on deinit.
+    private var didBecomeActiveObserver: NSObjectProtocol?
+
     // MARK: - Init
+
+    /// Process-wide weak reference so SwiftUI views (which receive only
+    /// `@EnvironmentObject` injections of `Settings` / `RecordingState`) can
+    /// reach the controller for entry points like `transcribePickedFile()`.
+    /// Set in `init`; cleared automatically when the controller deallocates.
+    static weak var shared: MenuBarController?
 
     override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
+        MenuBarController.shared = self
 
         configureStatusItem()
         configurePopover()
         updateIcon()
         configureMeetingCapObservers()
         configureFirstLaunchObserver()
+        configurePendingUploadsDrainTriggers()
     }
+
+    /// Wire up the three automatic drain triggers for `PendingUploadsQueue`:
+    ///   - app foreground (`NSApplication.didBecomeActiveNotification`)
+    ///   - 120s repeating timer
+    ///   (the third trigger is "successful dictation" — fired inline from
+    ///    `dictationStop()` after the inject lands.)
+    ///
+    /// All three coalesce inside `PendingUploadsQueue.drain()` via the
+    /// drain coordinator so concurrent triggers don't stack up.
+    private func configurePendingUploadsDrainTriggers() {
+        // Foreground trigger.
+        didBecomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task.detached(priority: .utility) {
+                await PendingUploadsQueue.shared.drain()
+            }
+        }
+
+        // 120s timer trigger. `Timer.scheduledTimer` adds itself to the
+        // current run loop in `.common` mode so it survives event-tracking
+        // (e.g. user holding down a menu).
+        pendingUploadsDrainTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { _ in
+            Task.detached(priority: .utility) {
+                await PendingUploadsQueue.shared.drain()
+            }
+        }
+        if let timer = pendingUploadsDrainTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    /// Fire the meeting-offline toast, debounced per-kind (10 min cooldown).
+    /// Wording is the brief's locked phrasing.
+    @MainActor
+    fileprivate func showOfflineMeetingToast() {
+        guard shouldShowToast(.meetingOffline) else { return }
+        AppNotifications.notify(
+            title: "WisprAlt — Server Offline",
+            body: "Meeting will upload when it's back. Recording is saved locally."
+        )
+    }
+
+    /// Fire the dictation-fallback-unavailable toast (Worker also down).
+    @MainActor
+    fileprivate func showFallbackUnavailableToast() {
+        guard shouldShowToast(.fallbackUnavailable) else { return }
+        AppNotifications.notify(
+            title: "WisprAlt",
+            body: "Transcription temporarily unavailable."
+        )
+    }
+
+    private func shouldShowToast(_ kind: ToastKind) -> Bool {
+        let now = Date()
+        if let last = lastToastShown[kind],
+           now.timeIntervalSince(last) < Self.toastDebounceSec
+        {
+            return false
+        }
+        lastToastShown[kind] = now
+        return true
+    }
+
+    /// Hook reserved for a future menubar `(N pending)` indicator. Currently
+    /// a no-op — the status item uses a transient popover, not a menu, so
+    /// surfacing per-state badges requires a popover-side overhaul outside
+    /// the scope of the offline-fallback feature.
+    fileprivate func refreshPendingMenu() {}
 
     /// Subscribe to `FirstLaunchCoordinator.shared.$isPresentingNameSheet` so the
     /// standalone NSWindow shows/hides in lockstep with the coordinator's state.
@@ -354,6 +451,7 @@ final class MenuBarController: NSObject {
                 switch mode {
                 case .idle:             return ("mic", "WisprAlt — Idle")
                 case .dictating:        return ("mic.fill", "WisprAlt — Dictating")
+                case .converting:       return ("arrow.triangle.2.circlepath", "WisprAlt — Converting…")
                 case .uploading:        return ("icloud.and.arrow.up", "WisprAlt — Uploading")
                 case .processing:       return ("waveform", "WisprAlt — Processing")
                 case .done:             return ("checkmark.circle", "WisprAlt — Done")
@@ -464,70 +562,28 @@ final class MenuBarController: NSObject {
     }
 
     /// Uploads, polls, downloads, and finalises a completed meeting WAV.
+    @MainActor
     private func processMeetingUpload(wavURL: URL) async {
         let baseName = wavURL.deletingPathExtension().lastPathComponent
-        let baseURL = Settings.shared.meetingsPath.appendingPathComponent(baseName)
+
+        // Record the upload-attempt start so the offline-signature classifier
+        // can compute elapsed time on the failure path. Used only when the
+        // catch branch fires.
+        let uploadStartedAt = Date()
+
+        // Meeting recorder writes 2-ch 16 kHz Float32 PCM = 128 kB/s.
+        let meetingBytesPerSecond: Double = 2 * 16_000 * 4
 
         do {
-            // --- Upload ---
-            // Estimate recording duration from file size (2-ch 16kHz Float32 = 128 kB/s).
-            let fileSize = (try? FileManager.default.attributesOfItem(atPath: wavURL.path)[.size] as? Int) ?? 0
-            let estimatedDurationSeconds = Double(fileSize) / (2 * 16_000 * 4)  // 2ch * 16kHz * 4 bytes
+            try await runMeetingTranscriptionJob(
+                wavURL: wavURL,
+                bytesPerSecond: meetingBytesPerSecond,
+                outputDirectory: Settings.shared.meetingsPath,
+                stem: baseName
+            )
 
-            let jobID = try await MeetingAPI.submit(wavURL) { [weak self] fraction in
-                guard let self else { return }
-                self.recordingState.uploadFraction = fraction
-            }
-
-            // --- Processing ---
-            mode = .processing
-            Log.info("Meeting uploaded — job_id: \(jobID), polling for completion.", category: "meeting")
-
-            // C11: compute a deadline — allow at least 2× the recording duration or 600s,
-            // whichever is larger. If the deadline expires, give up and notify the user.
-            let pollDeadline = Date(timeIntervalSinceNow: max(2 * estimatedDurationSeconds, 600))
-
-            // Poll every 5 seconds until done, failed, or deadline exceeded.
-            // Capture the `outputs` map from the done response for format-aware downloads.
-            var outputFormats: [String] = []
-            pollLoop: while true {
-                if Date() > pollDeadline {
-                    // Server did not respond in time; clean up and surface error.
-                    Log.error("Meeting poll timed out for job \(jobID) — deadline exceeded.", category: "meeting")
-                    try? await MeetingAPI.delete(jobID)
-                    throw MeetingProcessingError.pollTimedOut
-                }
-                try await Task.sleep(nanoseconds: 5_000_000_000)
-                let status = try await MeetingAPI.poll(jobID)
-                switch status {
-                case .done(let outputs):
-                    outputFormats = Array(outputs.keys)
-                    break pollLoop
-                case .failed(let reason):
-                    throw MeetingProcessingError.serverFailed(reason)
-                case .pending, .running:
-                    continue
-                }
-            }
-
-            // --- Download all formats ---
-            // Use the server-supplied `outputs` keys (sorted for deterministic ordering)
-            // so future server-side format additions are tracked automatically.
-            // Fall back to the hardcoded list if the server returned an empty outputs map.
-            let formatsToDownload: [String]
-            if !outputFormats.isEmpty {
-                formatsToDownload = outputFormats.sorted()
-            } else {
-                formatsToDownload = ["json", "srt", "vtt", "txt"]
-            }
-            for fmt in formatsToDownload {
-                let data = try await MeetingAPI.download(jobID, format: fmt)
-                try data.write(to: baseURL.appendingPathExtension(fmt), options: .atomic)
-            }
-
-            // --- Cleanup ---
-            try await MeetingAPI.delete(jobID)
             TranscriptStore.shared.refresh()
+            NotificationCenter.default.post(name: .wisprAltTranscriptWritten, object: nil)
 
             AppNotifications.notify(title: "Meeting transcribed", body: baseName)
             Log.info("Meeting transcription complete — \(baseName)", category: "meeting")
@@ -538,15 +594,274 @@ final class MenuBarController: NSObject {
 
         } catch {
             mode = .idle
-            let message: String
-            if case ServerError.unauthorized = error {
-                message = "Authentication failed — re-paste your API key in Settings."
-            } else {
-                message = error.localizedDescription
+
+            // Offline-signature check: when the mini is unreachable we queue
+            // the recording locally for later retry rather than surfacing a
+            // generic "transcription failed" error. Diarization can't run on
+            // the cloud fallback, so meetings never proxy to OpenRouter.
+            let attempt = Self.buildMeetingAttempt(error: error, startedAt: uploadStartedAt)
+            if ServerClient.shared.isOfflineSignature(attempt) {
+                do {
+                    try PendingUploadsQueue.shared.enqueue(wav: wavURL)
+                    showOfflineMeetingToast()
+                    refreshPendingMenu()
+                    Log.warning(
+                        "Meeting upload offline-signature confirmed — queued \(baseName) locally.",
+                        category: "fallback"
+                    )
+                } catch {
+                    Log.error(
+                        "Meeting offline AND queue.enqueue failed: \(error.localizedDescription)",
+                        category: "fallback"
+                    )
+                    AppNotifications.notify(
+                        title: "Meeting Save Failed",
+                        body: "Server offline and could not save recording locally."
+                    )
+                }
+                return
             }
+
+            let message = formatTranscriptionError(error)
             Log.error("Meeting processing failed: \(message)", category: "meeting")
             AppNotifications.notify(title: "Meeting Transcription Failed", body: message)
         }
+    }
+
+    /// Submit a WAV, poll until done or deadline, download every reported
+    /// format to `<outputDirectory>/<stem>.<fmt>`, delete the server-side job.
+    /// Throws on failure; never enqueues for offline retry — caller decides.
+    ///
+    /// `bytesPerSecond` is supplied by the caller (meeting recorder = Float32
+    /// → 128 kB/s; custom transcoder = Int16 → 64 kB/s) so this helper does
+    /// not need to parse the WAV header to compute the poll deadline.
+    @MainActor
+    private func runMeetingTranscriptionJob(
+        wavURL: URL,
+        bytesPerSecond: Double,
+        outputDirectory: URL,
+        stem: String
+    ) async throws {
+        // --- Upload ---
+        // Estimate recording duration from file size + caller-supplied
+        // bytes/sec for the format. Used only to size the poll deadline.
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: wavURL.path)[.size] as? Int) ?? 0
+        let estimatedDurationSeconds = Double(fileSize) / bytesPerSecond
+
+        let jobID = try await MeetingAPI.submit(wavURL) { [weak self] fraction in
+            guard let self else { return }
+            self.recordingState.uploadFraction = fraction
+        }
+
+        // --- Processing ---
+        mode = .processing
+        Log.info("Meeting uploaded — job_id: \(jobID), polling for completion.", category: "meeting")
+
+        // C11: compute a deadline — allow at least 2× the recording duration or 600s,
+        // whichever is larger. If the deadline expires, give up and surface error.
+        let pollDeadline = Date(timeIntervalSinceNow: max(2 * estimatedDurationSeconds, 600))
+
+        // Poll every 5 seconds until done, failed, or deadline exceeded.
+        // Capture the `outputs` map from the done response for format-aware downloads.
+        var outputFormats: [String] = []
+        pollLoop: while true {
+            if Date() > pollDeadline {
+                // Server did not respond in time; clean up and surface error.
+                Log.error("Meeting poll timed out for job \(jobID) — deadline exceeded.", category: "meeting")
+                try? await MeetingAPI.delete(jobID)
+                throw MeetingProcessingError.pollTimedOut
+            }
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            let status = try await MeetingAPI.poll(jobID)
+            switch status {
+            case .done(let outputs):
+                outputFormats = Array(outputs.keys)
+                break pollLoop
+            case .failed(let reason):
+                throw MeetingProcessingError.serverFailed(reason)
+            case .pending, .running:
+                continue
+            }
+        }
+
+        // --- Download all formats ---
+        // Use the server-supplied `outputs` keys (sorted for deterministic ordering)
+        // so future server-side format additions are tracked automatically.
+        // Fall back to the hardcoded list if the server returned an empty outputs map.
+        let formatsToDownload: [String]
+        if !outputFormats.isEmpty {
+            formatsToDownload = outputFormats.sorted()
+        } else {
+            formatsToDownload = ["json", "srt", "vtt", "txt"]
+        }
+        let baseURL = outputDirectory.appendingPathComponent(stem)
+        for fmt in formatsToDownload {
+            let data = try await MeetingAPI.download(jobID, format: fmt)
+            try data.write(to: baseURL.appendingPathExtension(fmt), options: .atomic)
+        }
+
+        // --- Cleanup ---
+        try await MeetingAPI.delete(jobID)
+    }
+
+    /// Map a thrown transcription error to a user-facing message. Shared
+    /// between the meeting and custom-transcription catch paths so
+    /// `ServerError.unauthorized` always surfaces the same actionable hint.
+    @MainActor
+    private func formatTranscriptionError(_ error: Error) -> String {
+        if case ServerError.unauthorized = error {
+            return "Authentication failed — re-paste your API key in Settings."
+        }
+        return error.localizedDescription
+    }
+
+    // MARK: - Custom transcription (file-pick) flow
+
+    /// Public entry point invoked from the SwiftUI "Transcribe file…" button.
+    /// Activates the app, presents an `NSOpenPanel`, and on user selection
+    /// hands off to the async pipeline.
+    @MainActor
+    func transcribePickedFile() {
+        // Bring the app to front so the modal sheet appears reliably above
+        // the menubar popover (which is .transient and will dismiss).
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        let exts = ["mp3", "m4a", "wav", "aac", "mp4", "mov", "m4v", "caf", "aiff", "flac"]
+        let extTypes = exts.compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = [.audio, .movie] + extTypes
+        panel.title = "Choose audio or video to transcribe"
+        panel.prompt = "Transcribe"
+
+        guard panel.runModal() == .OK, let picked = panel.url else { return }
+
+        // Decouple the panel cleanup from the async pipeline.
+        Task { @MainActor [weak self] in
+            await self?.handlePickedFile(picked)
+        }
+    }
+
+    /// Drives transcode → upload for a picked audio/video file. Sets `mode`
+    /// transitions and surfaces any failure as a notification.
+    @MainActor
+    private func handlePickedFile(_ picked: URL) async {
+        let stem = picked.deletingPathExtension().lastPathComponent
+
+        mode = .converting
+
+        let subdir: URL
+        do {
+            subdir = try CustomTranscriptionsStore.makeJobDirectory(forStem: stem)
+        } catch {
+            let message = formatTranscriptionError(error)
+            Log.error("Custom transcription: makeJobDirectory failed: \(message)", category: "transcribe")
+            AppNotifications.notify(title: "Custom Transcription Failed", body: message)
+            mode = .idle
+            return
+        }
+
+        let wavDestination = subdir.appendingPathComponent("\(stem)__2ch16k.wav")
+
+        do {
+            try await MediaTranscoder.toMeetingWAV(picked, destination: wavDestination)
+        } catch {
+            let message = formatTranscriptionError(error)
+            Log.error("Custom transcription: toMeetingWAV failed: \(message)", category: "transcribe")
+            AppNotifications.notify(title: "Custom Transcription Failed", body: message)
+            // Clean up the orphan job folder — the WAV failed, no point keeping it.
+            try? FileManager.default.removeItem(at: subdir)
+            mode = .idle
+            return
+        }
+
+        await processCustomTranscriptionUpload(
+            wavURL: wavDestination,
+            outputDirectory: subdir,
+            stem: stem
+        )
+    }
+
+    /// Uploads a transcoded custom-transcription WAV via the meeting pipeline.
+    /// Mirrors `processMeetingUpload` but skips the offline-queue path: custom
+    /// transcriptions are always user-initiated and don't get retried later.
+    @MainActor
+    private func processCustomTranscriptionUpload(
+        wavURL: URL,
+        outputDirectory: URL,
+        stem: String
+    ) async {
+        mode = .uploading
+        recordingState.uploadFraction = 0
+
+        // Custom-transcription WAVs are Int16 2ch 16kHz = 64 kB/s.
+        let customBytesPerSecond: Double = 2 * 16_000 * 2
+
+        do {
+            try await runMeetingTranscriptionJob(
+                wavURL: wavURL,
+                bytesPerSecond: customBytesPerSecond,
+                outputDirectory: outputDirectory,
+                stem: stem
+            )
+
+            // Harmless even though custom transcripts live in subfolders the
+            // store doesn't index — keeps consistency with the meeting path.
+            TranscriptStore.shared.refresh()
+            NotificationCenter.default.post(name: .wisprAltTranscriptWritten, object: nil)
+
+            AppNotifications.notify(title: "Custom Transcription Complete", body: stem)
+            Log.info("Custom transcription complete — \(stem)", category: "transcribe")
+
+            mode = .done
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            mode = .idle
+        } catch {
+            let message = formatTranscriptionError(error)
+            Log.error("Custom transcription failed: \(message)", category: "transcribe")
+            AppNotifications.notify(title: "Custom Transcription Failed", body: message)
+            mode = .idle
+        }
+    }
+
+    /// Build a `ServerClient.RequestAttempt` from a thrown meeting-upload
+    /// error so the offline-signature classifier can run on the catch path.
+    /// `MeetingAPI.submit` builds its own URLSession, so it doesn't go
+    /// through `ServerClient.execute` — we synthesize the attempt here.
+    private static func buildMeetingAttempt(
+        error: Error,
+        startedAt: Date
+    ) -> ServerClient.RequestAttempt {
+        let finishedAt = Date()
+        let outcome: ServerClient.RequestAttempt.Outcome
+        if let urlErr = error as? URLError {
+            outcome = .error(urlErr)
+        } else if case ServerError.transport(let underlying) = error {
+            outcome = .error(underlying)
+        } else if case ServerError.server(let status, _) = error,
+                  let url = Settings.shared.serverURL,
+                  let synthetic = HTTPURLResponse(
+                      url: url,
+                      statusCode: status,
+                      httpVersion: "HTTP/1.1",
+                      headerFields: ["X-Request-Id": "synthetic"]
+                  )
+        {
+            // Synthetic origin response — has X-Request-Id, so classifier
+            // refuses to fall back. That's correct: an origin 4xx/5xx is
+            // not a tunnel-level failure.
+            outcome = .response(synthetic)
+        } else {
+            outcome = .error(error)
+        }
+        return ServerClient.RequestAttempt(
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            lastByteSentAt: nil,
+            outcome: outcome
+        )
     }
 
     // MARK: - Composite REC icon
@@ -712,6 +1027,14 @@ extension MenuBarController: FNKeyEventsDelegate {
                 )
                 Log.info("Dictation injected: \"\(text.prefix(60))\"", category: "dictation")
 
+                // Successful dictation is one of the four PendingUploadsQueue
+                // drain triggers. Detached + utility priority so it doesn't
+                // contend with the next dictation if the user FN-holds again
+                // immediately.
+                Task.detached(priority: .utility) {
+                    await PendingUploadsQueue.shared.drain()
+                }
+
             } catch ServerError.unauthorized {
                 Log.error("Dictation failed — unauthorized. Re-paste API key in Settings.", category: "dictation")
                 AppNotifications.notify(
@@ -735,6 +1058,13 @@ extension MenuBarController: FNKeyEventsDelegate {
                     body: "A meeting is recording — release the meeting first."
                 )
             } catch {
+                // When the fallback path itself fails (mini AND Worker
+                // unreachable, or Worker rate-limited / budget-exhausted),
+                // surface a debounced "transcription temporarily unavailable"
+                // toast instead of a noisy localized-description.
+                if case ServerError.server = error {
+                    showFallbackUnavailableToast()
+                }
                 Log.error("Dictation failed: \(error.localizedDescription)", category: "dictation")
                 AppNotifications.notify(title: "Dictation Failed", body: error.localizedDescription)
             }

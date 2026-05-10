@@ -56,19 +56,19 @@ enum MeetingAPI {
     /// invalidated after the upload completes.
     ///
     /// Meetings are NEVER retried on transport error — the file is too large for a
-    /// transparent retry to be acceptable.
-    ///
-    /// TODO (G3): Add resumable upload support.  On transport error, persist the WAV
-    /// path to `~/Library/Application Support/co.wispralt/pending-uploads/<uuid>.path`
-    /// so the user can resubmit on next launch without re-recording.  A background
-    /// URLSession with resume-data capture from the delegate is the full solution.
+    /// transparent retry to be acceptable. They also never fall back to the cloud
+    /// Worker (no diarization there). Offline detection in
+    /// `MenuBarController.processMeetingUpload` enqueues the WAV to
+    /// `PendingUploadsQueue` instead.
     ///
     /// - Parameters:
     ///   - wavURL: Local file URL of the 2-channel 16 kHz WAV to upload.
     ///   - progress: Called on the main queue with upload fraction as data is sent.
     /// - Returns: A `JobID` for use with `poll`, `download`, and `delete`.
     /// - Throws: `ServerError` on any HTTP or transport failure, including
-    ///   `.meetingInProgress` (HTTP 429) when the server is already busy.
+    ///   `.meetingInProgress` (HTTP 429) when the server is already busy. The
+    ///   underlying error is wrapped in `MeetingUploadError.transport` so callers
+    ///   can recover the offline-classification attempt for fallback decisions.
     static func submit(
         _ wavURL: URL,
         progress: @escaping (Double) -> Void
@@ -132,6 +132,10 @@ enum MeetingAPI {
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.setValue(md5Base64, forHTTPHeaderField: "Content-MD5")
         request.setValue(String(tempSize), forHTTPHeaderField: "Content-Length")
+        // Wall-clock cap for the whole upload. Default URLRequest.timeoutInterval is 60s,
+        // which kills any upload from a slow uplink (Custom Transcriptions can be hundreds
+        // of MB at ~15 KB/s home upload = hours). Six hours covers a realistic worst case.
+        request.timeoutInterval = 6 * 60 * 60
 
         if let apiKey = try? KeychainHelper.getAPIKey() {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -148,8 +152,14 @@ enum MeetingAPI {
                     continuation: continuation
                 )
                 // Delegate-based session — the delegate receives progress + response callbacks.
+                // Bumped timeouts so long uploads on a slow uplink don't trip the default
+                // 60s inactivity timer. Inactivity = no bytes flow either direction; 5 min
+                // is generous but still catches an actually-dead connection.
+                let uploadConfig = URLSessionConfiguration.default
+                uploadConfig.timeoutIntervalForRequest = 300       // 5 min inactivity
+                uploadConfig.timeoutIntervalForResource = 6 * 60 * 60  // 6 h wall clock
                 let uploadSession = URLSession(
-                    configuration: .default,
+                    configuration: uploadConfig,
                     delegate: delegate,
                     delegateQueue: nil
                 )

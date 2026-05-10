@@ -65,6 +65,8 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/_errors.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — typed domain exceptions |
 | `server/migrations/2026-04-27-v1-wispralt-schema.sql` | [DEPLOY-TEAM.md](DEPLOY-TEAM.md) — v1 Postgres schema (wispralt.users + wispralt.usage_events + wispralt.schema_version) |
 | `server/migrations/2026-04-27-v2-display-name.sql` | [ARCHITECTURE.md](ARCHITECTURE.md), [ADMIN.md](ADMIN.md) — v2 migration: add `display_name` column to `wispralt.users` |
+| `server/migrations/2026-05-05-v3-fallback-events.sql` | [FALLBACK.md](FALLBACK.md) — v3 migration (applied but UNUSED by the simplified fallback design — table + RPCs sit dormant; no code inserts because no Worker holds the role JWT). Safe to leave; drop later via v4 if cleanup is desired. |
+| `server/src/wispralt_server/routes/dev_faults.py` | [FALLBACK.md](FALLBACK.md) — dev-only `?fault=503` injection (only mounted with `WISPRALT_DEV_FAULTS=1` on a non-prod host) |
 
 ## Tests (`server/tests/`)
 
@@ -101,8 +103,8 @@ This file is the single source of truth for which documentation file covers each
 | `client/WisprAlt/Capture/AudioDeviceListener.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — CoreAudio HAL listener for default-input-device changes; posts `.meetingConfigChanged` for MenuBarController to abort cleanly |
 | `client/WisprAlt/Capture/AlignedRingBuffer.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — sample-aligned ring buffer |
 | `client/WisprAlt/Capture/AudioFormat.swift` | [ARCHITECTURE.md](ARCHITECTURE.md) — format conversion, CMSampleBuffer→AVAudioPCMBuffer |
-| `client/WisprAlt/Server/ServerClient.swift` | [API.md](API.md) — URLSession, multipart upload, progress |
-| `client/WisprAlt/Server/DictationAPI.swift` | [API.md](API.md) — dictation client |
+| `client/WisprAlt/Server/ServerClient.swift` | [API.md](API.md), [FALLBACK.md](FALLBACK.md) — URLSession, multipart upload, progress, `RequestAttempt` + `isOfflineSignature` classifier |
+| `client/WisprAlt/Server/DictationAPI.swift` | [API.md](API.md), [FALLBACK.md](FALLBACK.md) — dictation client + origin→retry→OpenRouter direct fallback |
 | `client/WisprAlt/Server/MeetingAPI.swift` | [API.md](API.md) — meeting submit/poll/download/delete |
 | `client/WisprAlt/Server/MeAPI.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — JSON `GET /me` + `PATCH /me` client wrapper for the Identity section |
 | `client/WisprAlt/Server/ServerError.swift` | [API.md](API.md) — typed errors |
@@ -115,6 +117,8 @@ This file is the single source of truth for which documentation file covers each
 | `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — 11-row truth table including the empty/empty/success regression pin |
 | `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — 5 cases pinning the `AXSecureTextField` refusal rule + the derived-`isSecureField` invariant |
 | `client/WisprAlt/Storage/Settings.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — UserDefaults keys |
+| `client/WisprAlt/Storage/KeychainHelper.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md), [FALLBACK.md](FALLBACK.md) — API key in Keychain (`co.wispralt`); plus optional OpenRouter fallback key (`co.wispralt.openrouter`) |
+| `client/WisprAlt/Storage/PendingUploadsQueue.swift` | [FALLBACK.md](FALLBACK.md) — FS-backed retry queue for meeting uploads when the mini is offline (atomic enqueue, drain coordinator actor, 4 drain triggers) |
 | `client/WisprAlt/Storage/KeychainHelper.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — API key in Keychain |
 | `client/WisprAlt/Storage/TranscriptStore.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — local file index, atomic rewrites |
 | `client/WisprAlt/Storage/TranscriptDocument.swift` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — JSON model, speaker rename |

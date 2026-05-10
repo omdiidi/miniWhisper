@@ -35,6 +35,17 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
   committed, never logged. The legacy `sudo cloudflared service install` flow is
   abandoned because its plist is broken on macOS 14/15. Rotation: see
   docs/DEPLOYMENT-NOTES.md.
+- Cloud fallback: when the Mac mini is offline, dictation falls back
+  directly to OpenRouter's `openai/whisper-large-v3-turbo` from the
+  Swift client. No server, no Worker. Each install holds the OpenRouter
+  API key in the Keychain at `co.wispralt.openrouter`. If the key is
+  not set, the client surfaces the existing dictation error toast and
+  the rest of WisprAlt keeps working. Per-spend protection lives in
+  the OpenRouter dashboard's monthly-cap setting. Setup + threat model:
+  [docs/FALLBACK.md](docs/FALLBACK.md). Dev-only `?fault=503` injection
+  lives in `server/src/wispralt_server/routes/dev_faults.py` and is
+  mounted only when `WISPRALT_DEV_FAULTS=1` AND the host is not the
+  configured prod-mini hostname.
 - Secrets: `HF_TOKEN` and `WISPRALT_API_KEY` in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
 
 @CLAUDE.local.md

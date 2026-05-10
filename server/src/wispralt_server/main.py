@@ -27,7 +27,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shutil
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -50,9 +52,10 @@ from wispralt_server.middleware import openai_errors
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
 from wispralt_server.ops import staging
 from wispralt_server.ops.env_writer import find_env_path
-from wispralt_server.routes import admin, admin_ui, dictate, health
+from wispralt_server.routes import admin, admin_ui, dev_faults, dictate, health
 from wispralt_server.routes import me as me_routes
 from wispralt_server.routes import meeting as meeting_routes
+from wispralt_server.routes import transcribe_file as transcribe_file_routes
 from wispralt_server.routes import v1_transcriptions
 from wispralt_server.smart_format.mercury_client import MercuryClient
 from wispralt_server.usage import writer as usage_writer
@@ -117,6 +120,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except RuntimeError as exc:
         # Log as ERROR — server can still start, but atomicity is compromised.
         logger.error("Filesystem check failed: %s", exc)
+
+    # 2b. ffmpeg/ffprobe presence — required by the /transcribe/file endpoint
+    #     to decode arbitrary audio/video containers into a canonical WAV.
+    #     Fail fast at startup rather than producing an opaque 500 on first
+    #     request.
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise RuntimeError(
+            "ffmpeg/ffprobe not found on PATH — required for /transcribe/file. "
+            "Install via 'brew install ffmpeg'."
+        )
+    logger.info(
+        "ffmpeg/ffprobe available: %s",
+        subprocess.check_output(["ffmpeg", "-version"], text=True).splitlines()[0],
+    )
 
     # 3. Job store + orphan recovery (P4#4 WAL, P5#2 policy).
     #    recover_orphans MUST run BEFORE sweep_old so that pending jobs whose
@@ -386,7 +403,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 # client may hammer every few seconds.  /transcribe/meeting POST creates a
 # job; /transcribe/meeting/{id} GET is the poll path — exclude it by also
 # filtering on request.method.
-TRACKED_ROUTES = frozenset(["transcribe/dictate", "transcribe/meeting", "v1/audio"])
+TRACKED_ROUTES = frozenset([
+    "transcribe/dictate",
+    "transcribe/meeting",
+    "transcribe/file",
+    "v1/audio",
+])
 TRACKED_METHODS = frozenset({"POST"})
 
 # Map a tracked route key to the canonical ``kind`` recorded on usage_events.
@@ -394,6 +416,7 @@ TRACKED_METHODS = frozenset({"POST"})
 _KIND_MAP = {
     "transcribe/dictate": "dictate",
     "transcribe/meeting": "meeting",
+    "transcribe/file": "file",
     "v1/audio": "v1_dictate",
 }
 
@@ -523,10 +546,22 @@ def create_app() -> FastAPI:
     app.include_router(admin_ui.authed_router)
     # /transcribe/meeting — Phase 2 meeting endpoints.
     app.include_router(meeting_routes.router)
+    # /transcribe/file — container-agnostic submission (ffmpeg-transcoded).
+    app.include_router(transcribe_file_routes.router)
     # /me — JSON identity self-management (any authenticated role).
     app.include_router(me_routes.router)
     # /v1/audio/transcriptions — OpenAI-compat shim.
     app.include_router(v1_transcriptions.router)
+
+    # Dev-only fault injection. Mounted ONLY when WISPRALT_DEV_FAULTS=1 AND
+    # the host is non-prod. Used to verify the Swift client's offline-signature
+    # classifier never trips on origin 5xx-with-X-Request-Id.
+    if dev_faults.is_dev_faults_enabled():
+        logger.warning(
+            "Mounting dev_faults router (WISPRALT_DEV_FAULTS=1). "
+            "MUST NOT be enabled on prod-mini."
+        )
+        app.include_router(dev_faults.router)
 
     # Re-shape errors on /v1/* paths to OpenAI envelope. Native routes keep their
     # default {"detail": ...} shape. Must run AFTER include_router calls.

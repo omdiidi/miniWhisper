@@ -33,6 +33,12 @@ enum KeychainHelper {
     static let service = "co.wispralt"
     private static let account = "default"
 
+    /// Service identifier for the OpenRouter API key used by the cloud
+    /// fallback path (`DictationAPI` calls when the Mac mini origin is
+    /// unreachable). Stored in a separate Keychain item so rotating it
+    /// doesn't touch the WisprAlt bearer.
+    private static let openRouterService = "co.wispralt.openrouter"
+
     // MARK: - Public API
 
     /// Stores (or updates) the API key in the Keychain.
@@ -100,6 +106,63 @@ enum KeychainHelper {
         default:
             throw KeychainError.unexpectedStatus(status)
         }
+    }
+
+    // MARK: - OpenRouter API key (cloud fallback)
+
+    /// Stores (or updates) the OpenRouter API key used by the cloud fallback
+    /// path. Optional — when absent, dictation simply errors out when the
+    /// mini is offline instead of falling back.
+    static func setOpenRouterAPIKey(_ key: String) throws {
+        guard let data = key.data(using: .utf8) else { throw KeychainError.encodingFailed }
+
+        let query = openRouterBaseQuery()
+        let attributes: [CFString: Any] = [kSecValueData: data]
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+
+        switch updateStatus {
+        case errSecSuccess:
+            Log.debug("OpenRouter API key updated in Keychain.", category: "keychain")
+        case errSecItemNotFound:
+            var addQuery = openRouterBaseQuery() as [CFString: Any]
+            addQuery[kSecValueData] = data
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            guard addStatus == errSecSuccess else { throw KeychainError.unexpectedStatus(addStatus) }
+            Log.debug("OpenRouter API key added to Keychain.", category: "keychain")
+        default:
+            throw KeychainError.unexpectedStatus(updateStatus)
+        }
+    }
+
+    /// Retrieves the OpenRouter API key. Returns nil when not set, which
+    /// disables the cloud fallback path.
+    static func getOpenRouterAPIKey() throws -> String? {
+        var query = openRouterBaseQuery() as [CFString: Any]
+        query[kSecReturnData] = kCFBooleanTrue
+        query[kSecMatchLimit] = kSecMatchLimitOne
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data,
+                  let key = String(data: data, encoding: .utf8)
+            else { return nil }
+            return key
+        case errSecItemNotFound:
+            return nil
+        default:
+            throw KeychainError.unexpectedStatus(status)
+        }
+    }
+
+    private static func openRouterBaseQuery() -> [CFString: Any] {
+        [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: openRouterService,
+            kSecAttrAccount: account,
+        ]
     }
 
     // MARK: - Export / Import

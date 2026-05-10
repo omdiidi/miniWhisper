@@ -96,6 +96,12 @@ The Cloudflare Tunnel maps `transcribe.<user-domain>` → `http://127.0.0.1:8000
 
 Tunnel latency overhead: ~50–200ms same-region. The Cloudflare free tier has a community-reported body limit of approximately 100 MB; the server enforces `MAX_UPLOAD_BYTES` (default 2 GiB) at the application layer. A 90-minute 2-channel 16kHz Float32 WAV is approximately 460 MB; clients warn the user at 60 minutes.
 
+### Cloud Fallback (dictation only)
+
+When the Mac mini is offline, the Swift client falls back **directly** to OpenRouter's `openai/whisper-large-v3-turbo` (chat-completions audio) using an OpenRouter API key stored in the Keychain at `co.wispralt.openrouter`. No Worker, no proxy, no server-side code in the fallback path. The classifier (`ServerClient.isOfflineSignature`) trips ONLY on connect-refused errors, `URLError.networkConnectionLost`, `dnsLookupFailed`, `cannotFindHost`, or Cloudflare 502/522/523/524 with `CF-Ray` AND no `X-Request-Id`. Origin 5xx (FastAPI sets `X-Request-Id`) never trigger fallback. Meetings are queued locally instead — Whisper-only output cannot replace the mini's Pyannote diarization.
+
+Spend protection lives in the OpenRouter dashboard's monthly cap (set per account, not per employee). If no OpenRouter key is set in the Keychain, the client surfaces the existing 503 dictation error toast — the rest of WisprAlt keeps working. Setup + threat model: [FALLBACK.md](FALLBACK.md).
+
 ---
 
 ## Latency Budget (Dictation)
