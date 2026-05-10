@@ -245,6 +245,33 @@ def _load_channels(wav_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
     return ch1, ch2, int(sr)
 
 
+def _load_mono(wav_path: Path) -> tuple[np.ndarray, int]:
+    """Read a WAV (any channel count) and collapse to a single mono stream.
+
+    Used by the single-channel branch (custom transcriptions / mono uploads).
+    Multi-channel inputs are averaged across channels.
+
+    Raises
+    ------
+    wispralt_server._errors.CorruptAudioError
+        If soundfile cannot decode the file.
+    """
+    from wispralt_server._errors import CorruptAudioError
+
+    try:
+        audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+    except (sf.LibsndfileError, OSError, EOFError, ValueError, MemoryError) as exc:
+        raise CorruptAudioError(f"Cannot decode WAV: {exc}") from exc
+    if not isinstance(sr, int) or sr <= 0 or sr > 192_000:
+        raise CorruptAudioError(f"Invalid sample rate: {sr}")
+
+    if audio.shape[1] > 1:
+        mono = audio.mean(axis=1)
+    else:
+        mono = audio[:, 0]
+    return mono, int(sr)
+
+
 def _resample_to_16k(audio: np.ndarray, src_sr: int) -> np.ndarray:
     """Resample *audio* to 16 kHz if not already at 16 kHz.
 
@@ -285,6 +312,8 @@ def transcribe_meeting(
     output_dir: Path,
     job_id: str,
     silence_threshold: float,
+    *,
+    force_single_channel: bool = False,
 ) -> dict:
     """Run the full meeting transcription pipeline and write output files.
 
@@ -321,7 +350,13 @@ def transcribe_meeting(
     _ensure_models_loaded()
     logger.info("[%s] Starting meeting transcription pipeline …", job_id)
     try:
-        return _transcribe_meeting_inner(wav_path, output_dir, job_id, silence_threshold)
+        return _transcribe_meeting_inner(
+            wav_path,
+            output_dir,
+            job_id,
+            silence_threshold,
+            force_single_channel=force_single_channel,
+        )
     finally:
         # Stamp the idle timer on every exit (success OR failure) so the
         # background eviction task can correctly schedule unload.
@@ -333,9 +368,53 @@ def _transcribe_meeting_inner(
     output_dir: Path,
     job_id: str,
     silence_threshold: float,
+    *,
+    force_single_channel: bool = False,
 ) -> dict:
     """Inner pipeline body. Extracted from transcribe_meeting() so the outer
     function can wrap it in a try/finally that updates the idle timer."""
+    # /transcribe/file mono branch — collapse to one stream and run the
+    # pipeline with a single speaker dimension. Skips the in-person/remote
+    # mode detection entirely (the source is conceptually a voice memo /
+    # interview / lecture, not a 2-party meeting).
+    if force_single_channel:
+        mono_raw, src_sr = _load_mono(wav_path)
+        logger.debug(
+            "[%s] Loaded mono WAV: sr=%d, duration=%.1fs",
+            job_id, src_sr, len(mono_raw) / src_sr,
+        )
+        mono_16k = _resample_to_16k(mono_raw, src_sr)
+
+        logger.debug("[%s] Denoising mono stream …", job_id)
+        mono_clean = _df_mod.deepfilter(mono_16k, src_sr=16_000)
+
+        logger.debug("[%s] Transcribing mono stream …", job_id)
+        mono_result = _wx_mod.transcribe_channel(mono_clean)
+
+        # Default for single-channel: NO diarization. Typical inputs are
+        # one-speaker (voice memo / dictation / lecture). Reuse the existing
+        # `label_all` helper from merge.py for the single-speaker labelling.
+        mono_segments = label_all(
+            mono_result,
+            display_name="Speaker 1",
+            channel=None,
+            raw_speakers=["mic"],
+        )
+
+        transcript = _build_transcript(
+            job_id=job_id,
+            mode="single",
+            segments=mono_segments,
+            audio_16k=mono_16k,
+        )
+        logger.debug("[%s] Writing single-channel output files to %s …", job_id, output_dir)
+        write_outputs_atomic(transcript, output_dir, job_id)
+        logger.info(
+            "[%s] Pipeline complete: mode=single, segments=%d",
+            job_id, len(mono_segments),
+        )
+        return transcript
+
     # ── Step 1: Load channels ─────────────────────────────────────────────────
     ch1_raw, ch2_raw, src_sr = _load_channels(wav_path)
     logger.debug("[%s] Loaded WAV: sr=%d, duration=%.1fs", job_id, src_sr, len(ch1_raw) / src_sr)
@@ -348,10 +427,13 @@ def _transcribe_meeting_inner(
     # I9: _load_channels returns a zero ch2 array when the WAV is mono.  Detect
     # this by checking the on-disk channel count and add a warnings entry so the
     # client/user can see why dual-channel features are absent.
+    # Gated behind `not force_single_channel` so the mono-warning path doesn't
+    # fire confusingly on the new dedicated single-channel branch above (which
+    # has already returned by this point — kept for defensive symmetry).
     _mono_warnings: list[str] = []
     with sf.SoundFile(str(wav_path)) as _probe:
         _on_disk_channels = _probe.channels
-    if _on_disk_channels == 1:
+    if _on_disk_channels == 1 and not force_single_channel:
         logger.warning("[%s] Input WAV is mono — dual-channel mode unavailable.", job_id)
         _mono_warnings.append("mono input — dual-channel mode unavailable")
 

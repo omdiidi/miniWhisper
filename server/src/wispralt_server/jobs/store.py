@@ -39,6 +39,32 @@ class Job:
     output_dir: Optional[str]
     wav_path: str
     attempts: int = 0      # C9: incremented each time the job is set to running
+    # File-job flag: when the source upload was mono (custom transcription),
+    # the meeting pipeline runs its single-channel branch instead of the
+    # stereo mic/system one. Defaulted to 0 in SQL via in-place ALTER.
+    # APPENDED LAST so positional `Job(*row)` unpacks still work.
+    force_single_channel: bool = False
+
+
+def _row_to_job(row: tuple) -> Job:
+    """Construct a Job from a SELECT row, coercing the SQLite int → bool."""
+    (
+        jid, status, mode, created_at, started_at, finished_at,
+        error, output_dir, wav_path, attempts, force_single_channel,
+    ) = row
+    return Job(
+        id=jid,
+        status=status,
+        mode=mode,
+        created_at=created_at,
+        started_at=started_at,
+        finished_at=finished_at,
+        error=error,
+        output_dir=output_dir,
+        wav_path=wav_path,
+        attempts=attempts or 0,
+        force_single_channel=bool(force_single_channel),
+    )
 
 
 class JobStore:
@@ -84,6 +110,18 @@ class JobStore:
         # C9: add `attempts` column to existing DBs that were created without it.
         try:
             self.con.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # /transcribe/file: track whether the canonical WAV should run through
+        # the pipeline's single-channel branch. NO discriminator `kind` column —
+        # the file extension of `wav_path` is the only discriminator
+        # (.wav → already-transcoded → _run_pipeline; non-.wav → pre-transcode
+        # source → _run_source).
+        try:
+            self.con.execute(
+                "ALTER TABLE jobs ADD COLUMN force_single_channel INTEGER NOT NULL DEFAULT 0"
+            )
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -139,19 +177,40 @@ class JobStore:
         """Hard-delete a job row (called after client confirms download)."""
         self._exec("DELETE FROM jobs WHERE id=?", jid)
 
+    def update_after_transcode(
+        self,
+        jid: str,
+        *,
+        wav_path: str,
+        force_single_channel: bool,
+    ) -> None:
+        """Persist the canonical-WAV path + single-channel flag.
+
+        Durability boundary for /transcribe/file: once committed, the original
+        source upload may be safely deleted because the row now points at the
+        ffmpeg-produced canonical WAV.
+        """
+        self._exec(
+            "UPDATE jobs SET wav_path=?, force_single_channel=? WHERE id=?",
+            wav_path,
+            1 if force_single_channel else 0,
+            jid,
+        )
+
     # ── read operations ───────────────────────────────────────────────────────
 
     def get(self, jid: str) -> Optional[Job]:
         """Return a Job by id, or None if not found."""
         cur = self._exec(
             "SELECT id, status, mode, created_at, started_at, finished_at,"
-            " error, output_dir, wav_path, attempts FROM jobs WHERE id=?",
+            " error, output_dir, wav_path, attempts, force_single_channel"
+            " FROM jobs WHERE id=?",
             jid,
         )
         row = cur.fetchone()
         if row is None:
             return None
-        return Job(*row)
+        return _row_to_job(row)
 
     def count_24h(self, status: str) -> int:
         """Return the count of finished jobs with *status* in the last 24 hours."""
@@ -167,9 +226,10 @@ class JobStore:
         """Return all non-terminal jobs (pending or running)."""
         cur = self._exec(
             "SELECT id, status, mode, created_at, started_at, finished_at,"
-            " error, output_dir, wav_path, attempts FROM jobs WHERE status IN ('pending','running')"
+            " error, output_dir, wav_path, attempts, force_single_channel"
+            " FROM jobs WHERE status IN ('pending','running')"
         )
-        return [Job(*row) for row in cur.fetchall()]
+        return [_row_to_job(row) for row in cur.fetchall()]
 
     def list_pending_ids(self) -> list[str]:
         """Return the IDs of all pending jobs. Used by MeetingRunner.reenqueue_pending."""
@@ -231,6 +291,16 @@ class JobStore:
                         (jid,),
                     )
                     failed.append(jid)
+                    continue
+
+                # /transcribe/file: a pre-transcode source (non-.wav extension)
+                # cannot be WAV-validated — skip the check and just re-queue;
+                # the runner's _run_source will (re)run ffprobe + ffmpeg.
+                # Without this branch, m4a/mp3/etc. orphans would always crash
+                # validate_wav_completeness and be marked failed on every
+                # restart.
+                if wav.suffix.lower() != ".wav":
+                    requeue.append(jid)
                     continue
 
                 # C14: Validate WAV completeness before re-queuing. A truncated

@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import shutil
 import struct
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -26,10 +28,20 @@ from fastapi import HTTPException, UploadFile
 
 from .._errors import UploadTruncatedError
 
+logger = logging.getLogger(__name__)
+
 # Number of bytes to read for WAV header probe (RIFF____WAVE = 12 bytes)
 _WAV_HEADER_PROBE_BYTES = 12
 # Chunk size for streaming to disk: 1 MiB
 _CHUNK_SIZE = 1 << 20
+
+# Source-container extensions accepted by /transcribe/file. Anything outside
+# this set returns 415. Kept narrow to surface user typos / wrong drag-drops
+# instead of handing arbitrary bytes to ffmpeg.
+_ALLOWED_EXTENSIONS = frozenset({
+    ".m4a", ".mp3", ".mp4", ".mov", ".m4v", ".wav", ".aac",
+    ".flac", ".opus", ".ogg", ".webm", ".caf", ".aiff",
+})
 
 
 async def stream_to_staging(
@@ -264,6 +276,179 @@ def validate_wav_completeness(path: Path) -> None:
         raise UploadTruncatedError("WAV file missing required 'fmt ' sub-chunk")
     if not found_data:
         raise UploadTruncatedError("WAV file missing required 'data' sub-chunk")
+
+
+async def stream_to_staging_raw(
+    file: UploadFile,
+    max_bytes: int,
+    staging_dir: Path,
+) -> Path:
+    """Stream *file* to *staging_dir* WITHOUT WAV header validation.
+
+    Companion to :func:`stream_to_staging` for the /transcribe/file endpoint —
+    we accept any audio/video container and let ffmpeg sniff the format on the
+    canonical-WAV transcode step. The source extension is preserved so ffmpeg
+    has a hint when probing.
+
+    Returns
+    -------
+    Path
+        Absolute path of the written file in *staging_dir* with the source
+        extension preserved (``<uuid>.<ext>``).
+
+    Raises
+    ------
+    HTTPException 415  Unsupported source extension.
+    HTTPException 413  Upload exceeds *max_bytes*.
+    HTTPException 507  Insufficient storage on the staging filesystem.
+    """
+    ext = Path(file.filename or "upload.bin").suffix.lower()
+    if ext not in _ALLOWED_EXTENSIONS:
+        raise HTTPException(415, f"Unsupported file extension: {ext}")
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # Disk pre-check, mirroring stream_to_staging (above): require 1.5x the
+    # declared max free so the canonical-WAV transcode has room beside the
+    # source.
+    free_before = shutil.disk_usage(str(staging_dir)).free
+    if free_before < max_bytes * 1.5:
+        raise HTTPException(507, "Insufficient storage")
+
+    out_path = staging_dir / f"{uuid.uuid4().hex}{ext}"
+    bytes_written = 0
+    chunk_count = 0
+    try:
+        # Mirror stream_to_staging's sync open inside async function pattern —
+        # repo does not depend on aiofiles.
+        with open(out_path, "wb") as fh:
+            while True:
+                chunk = await file.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > max_bytes:
+                    raise HTTPException(413, "Upload too large")
+                chunk_count += 1
+                if chunk_count % 64 == 0:
+                    if shutil.disk_usage(str(staging_dir)).free < _CHUNK_SIZE * 4:
+                        raise HTTPException(507, "Disk full during upload")
+                fh.write(chunk)
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
+
+    return out_path
+
+
+def ffprobe_channel_count(source: Path) -> int:
+    """Return the audio channel count of *source* via ffprobe.
+
+    Used by the /transcribe/file worker to decide between mono (custom
+    transcription) and stereo (meeting) pipelines.
+
+    Raises
+    ------
+    RuntimeError
+        ffprobe missing on PATH (caught by the startup sanity check normally).
+    HTTPException 422
+        File has no audio stream or output is unparseable.
+    """
+    if shutil.which("ffprobe") is None:
+        raise RuntimeError("ffprobe not found on PATH — installed alongside ffmpeg")
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=channels",
+        "-of", "default=nw=1:nk=1",
+        str(source),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, timeout=30,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        stderr_tail = "\n".join(result.stderr.splitlines()[-3:])
+        raise HTTPException(
+            422, f"Could not probe audio: {stderr_tail or 'no audio stream'}"
+        )
+    try:
+        return int(result.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        raise HTTPException(422, f"Unexpected ffprobe output: {result.stdout!r}")
+
+
+def transcode_to_canonical_wav(
+    source: Path,
+    *,
+    target_channels: int,
+    sample_rate: int = 16_000,
+) -> Path:
+    """Run ffmpeg to convert *source* → canonical 16 kHz PCM WAV.
+
+    Writes to a ``.partial`` temp name and atomically renames on success so a
+    crash mid-ffmpeg never leaves a half-transcoded WAV that orphan-recovery
+    would later flag as truncated.
+
+    NOTE: this helper does NOT unlink *source* on success. The caller is
+    responsible for deleting the source AFTER the row has been updated to
+    point at the canonical WAV — otherwise a crash between rename and row
+    update would orphan the canonical WAV while leaving the row pointing at
+    a deleted source.
+
+    Raises
+    ------
+    RuntimeError
+        ffmpeg missing on PATH (caught by the startup sanity check normally).
+    ValueError
+        *target_channels* is not 1 or 2.
+    HTTPException 422
+        ffmpeg failed (stderr tail surfaced in detail) or produced an empty
+        output.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found on PATH — install via 'brew install ffmpeg'")
+    if target_channels not in (1, 2):
+        raise ValueError(f"target_channels must be 1 or 2, got {target_channels}")
+
+    target = source.with_suffix(".wav")
+    if target == source:
+        # Source already ends in .wav — pick a sibling name so we never
+        # overwrite the source from under ourselves.
+        target = source.with_name(f"{source.stem}_canonical.wav")
+    temp_target = target.with_suffix(target.suffix + ".partial")
+
+    cmd = [
+        "ffmpeg",
+        "-y", "-nostdin",
+        "-i", str(source),
+        "-map", "0:a:0",         # explicit: same audio track ffprobe inspected
+        "-vn",
+        "-ac", str(target_channels),
+        "-ar", str(sample_rate),
+        "-acodec", "pcm_s16le",
+        "-f", "wav",
+        str(temp_target),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False,
+        timeout=30 * 60,  # ceiling per single transcode
+    )
+    if result.returncode != 0:
+        temp_target.unlink(missing_ok=True)
+        stderr_tail = "\n".join(result.stderr.splitlines()[-5:])
+        logger.error("ffmpeg transcode failed (rc=%d): %s", result.returncode, stderr_tail)
+        raise HTTPException(422, f"Audio transcode failed: {stderr_tail}")
+    if not temp_target.exists() or temp_target.stat().st_size < 100:
+        temp_target.unlink(missing_ok=True)
+        raise HTTPException(422, "Audio transcode produced empty/no output")
+
+    # Atomic publish.
+    os.replace(temp_target, target)
+    logger.info(
+        "ffmpeg transcoded %s → %s (%d bytes)",
+        source.name, target.name, target.stat().st_size,
+    )
+    return target
 
 
 def assert_same_filesystem(a: Path, b: Path) -> None:
