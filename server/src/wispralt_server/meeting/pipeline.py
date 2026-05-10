@@ -213,11 +213,13 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
         # above only drops the Python ref; Apple unified memory keeps the
         # backing pool cached unless we explicitly clear. Without this call,
         # idle RSS stays at 6.5-9 GB after a 105m job. With it, ~3 GB.
+        # Note: mx.clear_cache() and mx.reset_peak_memory() are the modern
+        # API (mx.metal.* are deprecated and emit a warning).
         try:
-            mx.metal.clear_cache()
-            mx.metal.reset_peak_memory()
+            mx.clear_cache()
+            mx.reset_peak_memory()
         except Exception:  # noqa: BLE001 — best-effort; clear_cache is non-critical
-            logger.debug("mx.metal.clear_cache() failed during eviction", exc_info=True)
+            logger.debug("mx.clear_cache() failed during eviction", exc_info=True)
         _meeting_models_ready = False
         return True
     finally:
@@ -408,9 +410,9 @@ def transcribe_meeting(
         # weights, which evict_if_idle handles). Without this, peak RSS
         # compounds across back-to-back jobs.
         try:
-            mx.metal.clear_cache()
+            mx.clear_cache()
         except Exception:  # noqa: BLE001
-            logger.debug("post-job mx.metal.clear_cache() failed", exc_info=True)
+            logger.debug("post-job mx.clear_cache() failed", exc_info=True)
 
 
 def _transcribe_meeting_inner(
