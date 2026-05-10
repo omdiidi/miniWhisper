@@ -10,7 +10,7 @@ Algorithm (pseudocode 5 from the plan):
 1. Read the 2-channel WAV, split into ch1 (mic) and ch2 (system audio).
 2. Detect "in-person mode": frame-based RMS silence check on ch2.
 3. Denoise ch1 with DeepFilterNet.
-4. Transcribe ch1 with WhisperX CrisperWhisper (CPU int8).
+4. Transcribe ch1 with mlx-whisper turbo (Apple Silicon GPU).
 5a. In-person mode:
     - Diarise ch1 with Pyannote (MPS).
     - If diarization is empty → label all segments "Speaker 1".
@@ -44,6 +44,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import mlx.core as mx
 import numpy as np
 import soundfile as sf
 
@@ -208,6 +209,15 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
         _mlx_mod.reset()
         _diarize_mod.reset()
         gc.collect()
+        # Actually return MLX's unified-memory pages to the OS. _mlx_mod.reset()
+        # above only drops the Python ref; Apple unified memory keeps the
+        # backing pool cached unless we explicitly clear. Without this call,
+        # idle RSS stays at 6.5-9 GB after a 105m job. With it, ~3 GB.
+        try:
+            mx.metal.clear_cache()
+            mx.metal.reset_peak_memory()
+        except Exception:  # noqa: BLE001 — best-effort; clear_cache is non-critical
+            logger.debug("mx.metal.clear_cache() failed during eviction", exc_info=True)
         _meeting_models_ready = False
         return True
     finally:
@@ -394,6 +404,13 @@ def transcribe_meeting(
         # Stamp the idle timer on every exit (success OR failure) so the
         # background eviction task can correctly schedule unload.
         _last_meeting_finished_at = time.monotonic()
+        # Reclaim per-job MLX activation cache (separate from the model
+        # weights, which evict_if_idle handles). Without this, peak RSS
+        # compounds across back-to-back jobs.
+        try:
+            mx.metal.clear_cache()
+        except Exception:  # noqa: BLE001
+            logger.debug("post-job mx.metal.clear_cache() failed", exc_info=True)
 
 
 def _transcribe_meeting_inner(

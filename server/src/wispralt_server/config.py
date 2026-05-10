@@ -56,8 +56,10 @@ class Settings(BaseSettings):
     meeting_rate_per_hour: int = 4
 
     # Idle-eviction for meeting models. After this many seconds with no meeting
-    # activity (no submission, no in-flight job), unload WhisperX + Pyannote to
-    # reclaim ~2-3 GB python RSS. Next meeting pays the cold-load cost again.
+    # activity (no submission, no in-flight job), unload mlx-whisper + Pyannote
+    # AND call mx.metal.clear_cache() to actually return MLX's unified-memory
+    # pool to the OS (drops RSS from ~6-9 GB to ~3 GB). Next meeting pays the
+    # cold-load cost again (~3s kernel recompile + weight load).
     # Set to 0 to disable eviction (models stay warm forever — old behavior).
     # Default 60s (1 min) — aggressive because meetings are infrequent on
     # this deployment; raise to 300+ if you do meetings in clusters.
