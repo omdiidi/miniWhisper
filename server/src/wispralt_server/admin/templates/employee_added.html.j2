@@ -2,6 +2,13 @@
 {% block title %}Employee added — Wispralt Admin{% endblock %}
 {% block content %}
   <h2>Employee added: {{ label }} <span class="muted" style="color: var(--muted); font-weight: 400;">(#{{ user_id }}, {{ role }})</span></h2>
+  {% if display_name %}
+    <p class="muted" style="color: var(--muted); margin-top: -4px; font-size: 13px;">
+      Display name: <strong>{{ display_name }}</strong>
+      &nbsp;·&nbsp;
+      <span>Employee will skip the name-prompt on first launch.</span>
+    </p>
+  {% endif %}
   <p class="warn">
     <strong>Copy the install command now.</strong> The plaintext token is shown only once;
     the server stores only its sha256 hash. If you close this page without copying, the

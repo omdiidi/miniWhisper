@@ -19,6 +19,19 @@
       Internal identifier shown in the user list. 1–80 chars, no control characters.
     </p>
 
+    <label for="display_name" style="display: block; margin: 16px 0 4px; font-size: 13px; color: var(--muted);">
+      Display name
+    </label>
+    <input id="display_name" name="display_name" type="text"
+           value="{{ form_display_name or '' }}"
+           placeholder="e.g. Sarah Chen"
+           style="width: 100%;"
+           maxlength="40">
+    <p class="muted" style="color: var(--muted); font-size: 12px; margin: 4px 0 0;">
+      Optional. Shown alongside the label in admin views. Employee can change it
+      later via /me. Leave blank to let the employee set it themselves on first launch.
+    </p>
+
     <label for="role" style="display: block; margin: 16px 0 4px; font-size: 13px; color: var(--muted);">Role</label>
     <select id="role" name="role" style="width: 100%;">
       <option value="employee" {% if form_role == "employee" or not form_role %}selected{% endif %}>employee</option>

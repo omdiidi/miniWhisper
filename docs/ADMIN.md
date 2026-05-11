@@ -97,11 +97,15 @@ Single-CTE dashboard (`_OVERVIEW_SQL` in `routes/admin_ui.py`). Tiles:
 Lists every row in `wispralt.users` (most-recently-created first). The
 displayed identifier is `display_name (label)` when both are populated
 (e.g. `Alice (alice@example.com)`), or just `label` when
-`display_name IS NULL`. Employees self-manage their own `display_name`
-via the macOS client's Settings → Identity section, which calls
-`PATCH /me` (see [API.md](API.md)). Admins cannot edit another
-employee's `display_name` from the admin UI today — it's deliberately
-self-service so the operator never has to ask "what name should I show?".
+`display_name IS NULL`. Admins can **optionally pre-set** the
+`display_name` at create-time via the add-employee form (see "Adding a
+new employee" below); when provided, the employee's
+`FirstLaunchCoordinator` skips its name-prompt sheet. Employees can
+still self-manage their own `display_name` after the fact via the macOS
+client's Settings → Identity section, which calls `PATCH /me` (see
+[API.md](API.md)). There is no admin UI to edit another employee's
+`display_name` after creation — post-create edits are intentionally
+self-service.
 
 Per-row controls:
 
@@ -164,8 +168,10 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
 
 1. Open `/admin/users` and click **+ Add employee** (top-right).
 2. Enter a `label` (1–80 chars, no control characters — e.g.
-   `nicholas`, `alex-laptop`, `contractor-q2`) and pick a role
-   (default `employee`). Submit.
+   `nicholas`, `alex-laptop`, `contractor-q2`), optionally enter a
+   `display_name` (1–40 chars, no control characters — e.g. `Sarah Chen`;
+   leaving it blank lets the employee set it themselves on first launch),
+   and pick a role (default `employee`). Submit.
 3. The result page shows the install one-liner pre-baked with the
    freshly-minted token and the server URL from `settings.server_url`:
 

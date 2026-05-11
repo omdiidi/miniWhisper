@@ -86,21 +86,33 @@ async def lookup_by_id(pool: asyncpg.Pool, user_id: int) -> User | None:
     return User(id=row["id"], label=row["label"], role=row["role"])
 
 
-async def mint(pool: asyncpg.Pool, *, label: str, role: str) -> tuple[User, str]:
+async def mint(
+    pool: asyncpg.Pool,
+    *,
+    label: str,
+    role: str,
+    display_name: str | None = None,
+) -> tuple[User, str]:
     """Create a new user with a freshly-generated 64-hex-char token.
 
     Returns the new :class:`User` plus the **plaintext** token — the only
     time the plaintext is ever known to the server.  The caller must
     surface it to the operator exactly once.
+
+    ``display_name`` is optional. When None, the column stays NULL and the
+    employee can set it later via PATCH /me. When provided, the caller is
+    responsible for validating length / control chars (same rules as
+    :func:`update_display_name`).
     """
     plaintext = secrets.token_hex(32)  # 64 hex chars
     th = hash_token(plaintext)
     row = await pool.fetchrow(
-        "INSERT INTO wispralt.users (label, token_hash, role) "
-        "VALUES ($1, $2, $3) RETURNING id, label, role",
+        "INSERT INTO wispralt.users (label, token_hash, role, display_name) "
+        "VALUES ($1, $2, $3, $4) RETURNING id, label, role, display_name",
         label,
         th,
         role,
+        display_name,
     )
     return User(id=row["id"], label=row["label"], role=row["role"]), plaintext
 

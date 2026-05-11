@@ -45,6 +45,7 @@ from jinja2 import select_autoescape
 from .. import auth as auth_mod
 from ..auth import require_admin, require_api_key
 from ..config import settings
+from ..constants import MAX_DISPLAY_NAME_LEN
 from ..users import store as users_store
 from ..users.store import User
 
@@ -280,6 +281,27 @@ def _validate_label(raw: str) -> tuple[str | None, str | None]:
     return label, None
 
 
+def _validate_optional_display_name(raw: str) -> tuple[str | None, str | None]:
+    """Trim *raw*; treat empty as None (admin opted out). Otherwise apply the
+    same rules as ``routes/me.py:PatchMeRequest.validate_display_name`` —
+    length 1..MAX_DISPLAY_NAME_LEN, no control characters. Returns
+    ``(cleaned_or_None, None)`` on success, ``(None, error)`` on failure.
+    """
+    if raw is None:
+        return None, None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None, None
+    if len(cleaned) > MAX_DISPLAY_NAME_LEN:
+        return None, (
+            f"Display name too long ({len(cleaned)} chars; "
+            f"max {MAX_DISPLAY_NAME_LEN})."
+        )
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in cleaned):
+        return None, "Display name contains control characters."
+    return cleaned, None
+
+
 def _build_install_command(server_url: str, plaintext: str) -> str:
     """Compose the curl one-liner. Env vars sit on the bash side of the pipe
     (the curl-side form drops them — see CHANGELOG.md [0.1.1]).
@@ -295,7 +317,12 @@ async def users_add_form(request: Request) -> HTMLResponse:
     """Render the add-employee form."""
     return templates.TemplateResponse(
         "add_employee.html.j2",
-        {"request": request, "form_label": "", "form_role": "employee"},
+        {
+            "request": request,
+            "form_label": "",
+            "form_role": "employee",
+            "form_display_name": "",
+        },
     )
 
 
@@ -304,9 +331,17 @@ async def users_add_submit(
     request: Request,
     label: str = Form(...),
     role: str = Form("employee"),
+    display_name: str = Form(""),
 ) -> HTMLResponse:
-    """Create a new user, mint a token, and render the install one-liner."""
+    """Create a new user, mint a token, and render the install one-liner.
+
+    ``display_name`` is optional. When provided, it is pre-set on the row so
+    the employee's :class:`FirstLaunchCoordinator` skips its name-sheet prompt.
+    """
     clean_label, err = _validate_label(label)
+    clean_display_name, dn_err = _validate_optional_display_name(display_name)
+    if err is None and dn_err is not None:
+        err = dn_err
     if err is not None or role not in _VALID_ROLES:
         if err is None:
             err = f"Invalid role: {role!r}."
@@ -317,12 +352,18 @@ async def users_add_submit(
                 "error": err,
                 "form_label": label,
                 "form_role": role if role in _VALID_ROLES else "employee",
+                "form_display_name": display_name,
             },
             status_code=400,
         )
 
     pool = request.app.state.db_pool
-    user, plaintext = await users_store.mint(pool, label=clean_label, role=role)
+    user, plaintext = await users_store.mint(
+        pool,
+        label=clean_label,
+        role=role,
+        display_name=clean_display_name,
+    )
     return templates.TemplateResponse(
         "employee_added.html.j2",
         {
@@ -330,6 +371,7 @@ async def users_add_submit(
             "user_id": user.id,
             "label": user.label,
             "role": user.role,
+            "display_name": clean_display_name,
             "plaintext": plaintext,
             "install_command": _build_install_command(settings.server_url, plaintext),
         },
