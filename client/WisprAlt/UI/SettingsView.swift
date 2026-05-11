@@ -690,7 +690,7 @@ private struct QuickActionsSection: View {
                     : "Pick any audio or video file. WisprAlt transcodes it locally and runs it through the meeting pipeline."
             )
 
-            Button("Open Custom Transcriptions", systemImage: "folder.badge.questionmark") {
+            Button("Open File Transcriptions", systemImage: "folder.badge.questionmark") {
                 let url = CustomTranscriptionsStore.directoryURL
                 try? FileManager.default.createDirectory(
                     at: url,
@@ -700,7 +700,7 @@ private struct QuickActionsSection: View {
                 Log.info("Opened custom transcriptions folder: \(url.path)", category: "settings")
             }
             .buttonStyle(.bordered)
-            .help("Opens the Custom Transcriptions folder in Finder.")
+            .help("Opens the File Transcriptions folder in Finder.")
 
             // Last-meeting copy + age on one row.
             HStack(spacing: 6) {
