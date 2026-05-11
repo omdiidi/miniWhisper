@@ -30,8 +30,7 @@ the client.
 - Pre-flight: requires ≥ 8 GB free on `$HOME`
 - Validates `HF_TOKEN` with 3-retry / 5s backoff (distinguishes HTTP 401 from 429)
 - Probes gated Pyannote repos for terms acceptance; prints exact accept URL on failure
-- Downloads: Parakeet (~1.2 GB), faster_CrisperWhisper (~3.1 GB), wav2vec2 alignment
-  (~360 MB), Pyannote 3.1 + segmentation-3.0 (~800 MB), DeepFilterNet 3 (~100 MB)
+- Downloads: Parakeet (~1.2 GB), mlx-whisper large-v3-turbo (~1.6 GB), Pyannote 3.1 + segmentation-3.0 (~800 MB)
 - Reports total HF cache size after completion
 
 ### `generate-api-key.sh`

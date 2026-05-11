@@ -4,6 +4,8 @@ This document captures the issues actually encountered the first time someone bo
 
 ## Server bootstrap (`scripts/setup-server.sh`)
 
+> **Historical context (resolved by Phase 10, 2026-05-10).** The dependency failures below were hit during the WhisperX-era install and have been resolved by the WhisperX → mlx-whisper swap. Both `whisperx` and `ctranslate2` were removed from `pyproject.toml` in Phase 10; DeepFilterNet remains stubbed (see note). These notes are retained as institutional memory for future toolchain bumps. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md).
+
 ### Dependency conflict: `numpy` ranges between MLX, WhisperX, and DeepFilterNet
 
 **Symptom:** `uv sync` resolves to no candidate version because `parakeet-mlx==0.5.1` wants `numpy<=2.5`, `deepfilternet==0.5.6` wants `numpy<2.5`, and `whisperx>=3.8.5` indirectly pulls a different range.

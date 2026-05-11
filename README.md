@@ -1,6 +1,6 @@
 # WisprAlt
 
-A self-hosted, privacy-first replacement for Wispr Flow. Sub-400ms dictation and speaker-diarized meeting transcription running entirely on hardware you own — no cloud subscription, no audio leaving your network. Powered by Parakeet TDT 0.6B v2 (MLX) for dictation and WhisperX + Pyannote 3.1 for meetings.
+A self-hosted, privacy-first replacement for Wispr Flow. Sub-400ms dictation and speaker-diarized meeting transcription running entirely on hardware you own — no cloud subscription, no audio leaving your network. Powered by Parakeet TDT 0.6B v2 (MLX) for dictation and mlx-whisper large-v3-turbo + Pyannote 3.1 for meetings.
 
 ![Demo](docs/demo.gif)
 
@@ -8,7 +8,7 @@ A self-hosted, privacy-first replacement for Wispr Flow. Sub-400ms dictation and
 
 WisprAlt is a two-component system:
 
-- **Server** (`server/`): A FastAPI service you run on your always-on Mac mini. It exposes two transcription endpoints: a low-latency dictation endpoint powered by Parakeet TDT 0.6B v2 (MLX, ~80–200ms warm inference) and a meeting transcription endpoint that runs DeepFilterNet noise reduction, WhisperX with CrisperWhisper, and Pyannote 3.1 speaker diarization. The server is reachable from anywhere via a Cloudflare Tunnel — no port forwarding, no inbound firewall rules, no cloud subscription.
+- **Server** (`server/`): A FastAPI service you run on your always-on Mac mini. It exposes two transcription endpoints: a low-latency dictation endpoint powered by Parakeet TDT 0.6B v2 (MLX, ~80–200ms warm inference) and a meeting transcription endpoint that runs mlx-whisper large-v3-turbo (Apple Silicon GPU) and Pyannote 3.1 speaker diarization. The server is reachable from anywhere via a Cloudflare Tunnel — no port forwarding, no inbound firewall rules, no cloud subscription. See [docs/CHANGELOG-2026-05-10.md](docs/CHANGELOG-2026-05-10.md) for the WhisperX → mlx-whisper swap history.
 
 - **Client** (`client/`): A native macOS menubar app (signed, notarized) that listens for your FN key. Hold FN to dictate; release to inject the transcribed text at the cursor. Triple-tap FN within 400ms to start or stop a dual-channel meeting recording that captures both your microphone and system audio. Speaker rename happens entirely on-device — no server round-trip, works offline.
 
@@ -27,7 +27,7 @@ MacBook (client) ──FN 3-tap─▶ Meeting Recorder (SCStream dual-channel)
                                         │ 2-ch 16kHz WAV
                                /transcribe/meeting ──▶ JobStore (SQLite)
                                         │
-                              DeepFilterNet → WhisperX (CPU) → Pyannote (MPS)
+                              ffmpeg → mlx-whisper turbo (MLX) → Pyannote (MPS)
                                         │
                               JSON + SRT + VTT + TXT ──▶ client download + local rename
 ```
@@ -40,11 +40,10 @@ For the full architecture diagram and latency budget, see [docs/ARCHITECTURE.md]
 
 - **Sub-400ms dictation** — hold FN, speak, release; text injected at cursor
 - **Dual-channel meeting recording** — triple-tap FN to capture mic + system audio simultaneously via SCStream
-- **Speaker diarization** — Pyannote 3.1 with WhisperX word alignment; "You" / "Other" labels in remote mode; "Speaker N" labels in in-person mode
+- **Speaker diarization** — Pyannote 3.1 with mlx-whisper word timestamps; "You" / "Other" labels in remote mode; "Speaker N" labels in in-person mode
 - **In-person mode auto-detection** — frame-based RMS silence check on system audio channel
 - **Offline speaker rename** — rename speakers locally without any server round-trip; atomic file rewrite
 - **Four output formats** — JSON (with word-level timestamps), SRT, VTT, TXT
-- **Noise reduction** — DeepFilterNet 3 applied before transcription
 - **Privacy-first** — your audio goes to your own Mac mini, not a cloud API
 - **Free** — all models are open-source; no per-minute API fees
 - **Auto-updates** — Sparkle 2 EdDSA-signed appcast; never during an active meeting

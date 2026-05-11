@@ -1,10 +1,10 @@
 # Testing
 
-This file documents the regression suites run before merge / release. Unit tests live under `server/tests/` and `client/Tests/WisprAltCoreTests/` and are wired into CI by `.github/workflows/test-server.yml`. This document is the source of truth for the **end-to-end transcription matrix** that gates the MLX-Whisper swap (Phase 10 — WhisperX deletion).
+This file documents the regression suites run before merge / release. Unit tests live under `server/tests/` and `client/Tests/WisprAltCoreTests/` and are wired into CI by `.github/workflows/test-server.yml`. The **end-to-end transcription matrix** below was the gating regression suite for the MLX-Whisper swap and Phase 10 deletion of WhisperX; it now serves as the standing regression matrix for any future transcription-stack changes. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md) for the historical swap.
 
 ## 12-Run Transcription Matrix
 
-The matrix exercises every combination of request mode + input shape + length that an employee can plausibly produce. It is the regression suite the [MLX swap plan](../tmp/done-plans/) gates Phase 10 on (delete WhisperX only after a clean matrix).
+The matrix exercises every combination of request mode + input shape + length that an employee can plausibly produce. It was originally the regression suite that gated Phase 10 of the [MLX swap plan](../tmp/done-plans/) (Phase 10 shipped on 2026-05-10; WhisperX is deleted). It remains the standing transcription-stack regression matrix.
 
 ### Spike baseline
 
@@ -65,7 +65,7 @@ This is the only test that intentionally exercises the **honest limitation** doc
 File mode (`request_mode=file`) emits segments **without a `words[]` array** — `mlx_whisper.transcribe` is called with `word_timestamps=False` for performance. The output formatters in `server/src/wispralt_server/meeting/output.py` must never index `seg["words"]` in the SRT/VTT/TXT branches. To pin this:
 
 1. Run row #4 (5-min file mode).
-2. Diff the SRT, VTT, and TXT outputs against the pre-swap golden (recorded from the last WhisperX run on the same input).
+2. Diff the SRT, VTT, and TXT outputs against the post-swap golden (recorded from a known-good mlx-whisper run on the same input; the original goldens were captured from the last WhisperX run before Phase 10).
 
 Pass: byte-identical SRT, VTT, TXT. Any drift means a formatter started consuming word-level data.
 
@@ -74,11 +74,11 @@ Pass: byte-identical SRT, VTT, TXT. Any drift means a formatter started consumin
 - **Wall-budget warning** (single row exceeded budget by < 25%): record the measured ratio, continue.
 - **Wall-budget failure** (single row exceeded budget by ≥ 25%): record, continue; gate-blocking only on rows 10–12.
 - **Output-criteria failure** on any row: STOP, investigate before proceeding.
-- After all 12 rows: build the summary table (measured vs budget, segments, speakers, peak RSS). Required artifact for the Phase 10 manual gate (delete WhisperX).
+- After all 12 rows: build the summary table (measured vs budget, segments, speakers, peak RSS). This was the required artifact for the Phase 10 manual gate (delete WhisperX); for future stack changes it is the standing acceptance artifact.
 
-### Rollback path
+### Rollback path (historical)
 
-The matrix is designed to be runnable while **WhisperX is still in the dependency tree** (kept through Phase 8 of the swap plan). If any row 10–12 fails the wall budget by > 25%, or any row produces empty output, or peak RSS crosses 14 GB, the rollback is a single `git revert <swap-commit>` followed by `uv sync` + redeploy. Phase 10 (deletion of `whisperx_loader.py`, removal of `whisperx`/`ctranslate2`/`faster-whisper` from `pyproject.toml`) is intentionally a separate commit so the revert window stays open.
+This section describes the rollback strategy that was in place during Phases 1–9 of the MLX swap. Phase 10 has shipped (2026-05-10): WhisperX, ctranslate2, and faster-whisper are removed from `pyproject.toml` and `whisperx_loader.py` is deleted. Rolling back today requires a `git revert` of the Phase 10 commit in addition to the swap commit, plus a `pip install -e .` to restore the deps. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md) "Roll-back plan" for the original procedure.
 
 ## Unit / integration tests
 
@@ -92,7 +92,6 @@ The matrix is designed to be runnable while **WhisperX is still in the dependenc
 | `server/tests/test_admin_routes_auth.py` | `/admin/*` 403 employee / 200 admin |
 | `server/tests/test_db_health.py` | `db.health_check` + `db.recreate_pool` |
 | `server/tests/test_auth_break_glass.py` | Postgres-unreachable → env-var bearer → admin path |
-| `server/tests/test_whisperx_no_speech.py` | WhisperX no-speech segment handling (**deleted in Phase 10**) |
 | `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | 11-row injection truth table |
 | `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | 5-case secure-field refusal pin |
 

@@ -16,9 +16,8 @@ The following schema is the canonical contract between server output and client 
   "duration_s": "number",
   "language": "en",
   "model": {
-    "transcription": "nyrahealth/faster_CrisperWhisper",
-    "diarization": "pyannote/speaker-diarization-3.1",
-    "denoise": "deepfilternet-3"
+    "transcription": "mlx-community/whisper-large-v3-turbo",
+    "diarization": "pyannote/speaker-diarization-3.1"
   },
   "segments": [
     {

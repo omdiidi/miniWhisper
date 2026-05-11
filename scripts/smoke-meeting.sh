@@ -17,9 +17,10 @@ RSS_BEFORE="$(curl -fsS --max-time 5 -H "Authorization: Bearer $KEY" \
   2>/dev/null || echo 0)"
 
 # 1. Generate a 2-channel 16kHz WAV with REAL speech on ch1 (via macOS `say`)
-#    and silence on ch2 (forces in-person mode). Real speech is required —
-#    pure-tone WAVs cause WhisperX to crash inside transformers when VAD
-#    finds no speech segments.
+#    and silence on ch2 (forces in-person mode). Real speech is preferred —
+#    pure-tone WAVs historically crashed WhisperX inside transformers when VAD
+#    found no speech segments. The current mlx-whisper path handles
+#    no-speech audio gracefully, but real speech keeps the test meaningful.
 WAV="$(mktemp -t wispralt-smoke-XXXXXX).wav"
 SAY_WAV="$(mktemp -t wispralt-smoke-say-XXXXXX).wav"
 SAY_AIFF="$(mktemp -t wispralt-smoke-say-XXXXXX).aiff"
