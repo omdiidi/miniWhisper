@@ -2,6 +2,26 @@ import SwiftUI
 import ServiceManagement
 import AppKit
 
+/// Lightweight Apple-glass card used for the active-job indicator and other
+/// emphasis surfaces inside the popover. Kept private + inline because the
+/// classic-style `WisprAlt.xcodeproj` PBXFileReference tables would otherwise
+/// need an edit to include a new .swift file.
+private struct GlassCard<Content: View>: View {
+    @ViewBuilder let content: Content
+    var body: some View {
+        content
+            .padding(12)
+            .background(
+                .thinMaterial,
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+            )
+    }
+}
+
 /// Main settings panel hosted in the menubar popover.
 ///
 /// Layout is user-priority ordered:
@@ -54,9 +74,8 @@ struct SettingsView: View {
     var body: some View {
         Form {
             quickActionsSection
-            identitySection
-            inputMicSection
             connectionSection
+            inputMicSection
             smartFormattingSection
             hotkeySection
             launchAtLoginSection
@@ -67,10 +86,10 @@ struct SettingsView: View {
                 apiKeySection
                 apiKeyExportImportSection
             }
+            identitySection
         }
         .formStyle(.grouped)
-        .padding()
-        .frame(width: 420)
+        .frame(width: 360)
         .onAppear(perform: loadCurrentValues)
     }
 
@@ -271,7 +290,7 @@ struct SettingsView: View {
                     Text("Your name")
                     Spacer()
                     TextField(
-                        Settings.shared.displayName ?? "Set your name",
+                        "Set your name",
                         text: nameBinding
                     )
                     .multilineTextAlignment(.trailing)
@@ -657,12 +676,13 @@ private struct QuickActionsSection: View {
             // in-flight job is observable on `recordingState`.
             if hasInFlightJob {
                 inFlightSection
-                Divider()
             }
 
             Button("Transcribe file…", systemImage: "waveform.badge.plus") {
                 MenuBarController.shared?.transcribePickedFile()
             }
+            .buttonStyle(.borderedProminent)
+            .tint(.accentColor)
             .disabled(recordingState.serverFinishingJobID != nil)
             .help(
                 recordingState.serverFinishingJobID != nil
@@ -679,18 +699,22 @@ private struct QuickActionsSection: View {
                 NSWorkspace.shared.open(url)
                 Log.info("Opened custom transcriptions folder: \(url.path)", category: "settings")
             }
+            .buttonStyle(.bordered)
             .help("Opens the Custom Transcriptions folder in Finder.")
 
-            Divider()
-
-            Button("Copy last meeting", systemImage: "doc.on.clipboard") {
-                performCopy(button: "meeting", source: CustomTranscriptionsStore.newestMeetingTranscript)
+            // Last-meeting copy + age on one row.
+            HStack(spacing: 6) {
+                Button("Copy last meeting", systemImage: "doc.on.clipboard") {
+                    performCopy(button: "meeting", source: CustomTranscriptionsStore.newestMeetingTranscript)
+                }
+                .buttonStyle(.bordered)
+                .disabled(meetingViewModel.lastModified == nil)
+                .help(meetingViewModel.lastModified == nil
+                      ? "No meeting transcripts yet."
+                      : "Copy the most recent meeting transcript to the clipboard.")
+                Spacer(minLength: 8)
+                LastTranscriptCaption(viewModel: meetingViewModel)
             }
-            .disabled(meetingViewModel.lastModified == nil)
-            .help(meetingViewModel.lastModified == nil
-                  ? "No meeting transcripts yet."
-                  : "Copy the most recent meeting transcript to the clipboard.")
-            LastTranscriptCaption(viewModel: meetingViewModel)
             if let toast = copyToast, toast.button == "meeting" {
                 Text(toast.message)
                     .font(.caption)
@@ -698,14 +722,19 @@ private struct QuickActionsSection: View {
                     .transition(.opacity)
             }
 
-            Button("Copy last custom transcription", systemImage: "doc.on.clipboard.fill") {
-                performCopy(button: "custom", source: CustomTranscriptionsStore.newestCustomTranscript)
+            // Last-custom copy + age on one row.
+            HStack(spacing: 6) {
+                Button("Copy last custom transcription", systemImage: "doc.on.clipboard.fill") {
+                    performCopy(button: "custom", source: CustomTranscriptionsStore.newestCustomTranscript)
+                }
+                .buttonStyle(.bordered)
+                .disabled(customViewModel.lastModified == nil)
+                .help(customViewModel.lastModified == nil
+                      ? "No custom transcriptions yet."
+                      : "Copy the most recent custom transcription to the clipboard.")
+                Spacer(minLength: 8)
+                LastTranscriptCaption(viewModel: customViewModel)
             }
-            .disabled(customViewModel.lastModified == nil)
-            .help(customViewModel.lastModified == nil
-                  ? "No custom transcriptions yet."
-                  : "Copy the most recent custom transcription to the clipboard.")
-            LastTranscriptCaption(viewModel: customViewModel)
             if let toast = copyToast, toast.button == "custom" {
                 Text(toast.message)
                     .font(.caption)
@@ -713,14 +742,13 @@ private struct QuickActionsSection: View {
                     .transition(.opacity)
             }
 
-            Divider()
-
             Button("Open Portal", systemImage: "safari") {
                 guard let base = settings.serverURL else { return }
                 let url = base.appendingPathComponent("admin/login")
                 NSWorkspace.shared.open(url)
                 Log.info("Opened portal: \(url.absoluteString)", category: "settings")
             }
+            .buttonStyle(.bordered)
             .disabled(settings.serverURL == nil)
             .help(
                 settings.serverURL == nil
@@ -734,6 +762,7 @@ private struct QuickActionsSection: View {
                 NSWorkspace.shared.open(url)
                 Log.info("Opened meetings folder: \(url.path)", category: "settings")
             }
+            .buttonStyle(.bordered)
             .help("Opens \(settings.meetingsPath.path) in Finder.")
         }
         .onAppear {
@@ -749,48 +778,114 @@ private struct QuickActionsSection: View {
         }
     }
 
-    /// "Previous job finishing" banner + Cancel button + View-server-log
-    /// button. Rendered only when `hasInFlightJob` is true.
+    /// Active-job glass card: animated headline, real progress (chunked
+    /// transcribe or upload fraction), and Cancel + View-server-log controls.
+    /// Rendered only when `hasInFlightJob` is true.
     @ViewBuilder
     private var inFlightSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if recordingState.serverFinishingJobID != nil {
-                Label(
-                    "Previous transcription still finishing on server. New uploads will queue.",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-            } else if let label = recordingState.phaseLabelDisplay {
-                Text(transcriptionStatusLine(label: label))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else if recordingState.uploadFraction > 0 {
-                Text("Uploading… \(Int(recordingState.uploadFraction * 100))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 8) {
-                Button("Cancel", systemImage: "xmark.circle") {
-                    Task { await MenuBarController.shared?.cancelActiveTranscription() }
+        GlassCard {
+            VStack(alignment: .leading, spacing: 10) {
+                // Headline row
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(.tint)
+                        .symbolEffect(.variableColor.iterative, isActive: true)
+                    Text(headlineText)
+                        .font(.body.weight(.medium))
+                    Spacer(minLength: 8)
+                    if let elapsed = recordingState.phaseElapsedS {
+                        Text(formatElapsed(elapsed))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                .disabled(recordingState.serverFinishingJobID != nil
-                          && recordingState.activeJobID == nil)
-                .help(
-                    recordingState.serverFinishingJobID != nil
-                        ? "Cancel was already requested. The server-side executor will finish naturally."
-                        : "Cancel the upload (clean) or the in-flight transcription (advisory — server may keep running)."
-                )
 
-                Button("View server log", systemImage: "doc.text.magnifyingglass") {
-                    showingServerLogSheet = true
+                // Progress
+                if recordingState.serverFinishingJobID != nil
+                    && recordingState.activeJobID == nil {
+                    // Cancelled-but-server-still-finishing: indeterminate.
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(.orange)
+                    Text("Previous transcription still finishing on server. New uploads will queue.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if recordingState.phase == "transcribe",
+                          let idx = recordingState.chunkIndex,
+                          let total = recordingState.totalChunks, total > 0 {
+                    ProgressView(value: Double(idx), total: Double(total))
+                        .progressViewStyle(.linear)
+                        .tint(.accentColor)
+                    Text("Chunk \(idx) of \(total)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else if recordingState.uploadFraction > 0 && recordingState.uploadFraction < 1 {
+                    ProgressView(value: recordingState.uploadFraction)
+                        .progressViewStyle(.linear)
+                        .tint(.blue)
+                    Text("Uploading — \(Int(recordingState.uploadFraction * 100))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(.accentColor)
                 }
-                .disabled(serverLogJobID == nil)
-                .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
+
+                // Actions
+                HStack(spacing: 8) {
+                    Button(role: .destructive) {
+                        Task { await MenuBarController.shared?.cancelActiveTranscription() }
+                    } label: {
+                        Label("Cancel", systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .disabled(recordingState.serverFinishingJobID != nil
+                              && recordingState.activeJobID == nil)
+                    .help(
+                        recordingState.serverFinishingJobID != nil
+                            ? "Cancel was already requested. The server-side executor will finish naturally."
+                            : "Cancel the upload (clean) or the in-flight transcription (advisory — server may keep running)."
+                    )
+
+                    Button {
+                        showingServerLogSheet = true
+                    } label: {
+                        Label("Log", systemImage: "doc.text.magnifyingglass")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(serverLogJobID == nil)
+                    .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
+                }
             }
         }
         .padding(.vertical, 4)
+    }
+
+    /// Headline shown in the glass card. Falls back through the same priority
+    /// ladder the old caption row used.
+    private var headlineText: String {
+        if recordingState.serverFinishingJobID != nil
+            && recordingState.activeJobID == nil {
+            return "Finishing previous job"
+        }
+        if let label = recordingState.phaseLabelDisplay {
+            return label
+        }
+        if recordingState.uploadFraction > 0 && recordingState.uploadFraction < 1 {
+            return "Uploading"
+        }
+        return "Processing"
+    }
+
+    /// Format elapsed seconds as `m:ss` (or `s` when under a minute).
+    private func formatElapsed(_ seconds: Double) -> String {
+        let s = Int(seconds.rounded())
+        if s < 60 { return "\(s)s" }
+        let m = s / 60
+        let r = s % 60
+        return String(format: "%d:%02d", m, r)
     }
 
     private func transcriptionStatusLine(label: String) -> String {

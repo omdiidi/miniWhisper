@@ -770,6 +770,7 @@ final class MenuBarController: NSObject {
 
         // --- Processing ---
         self.mode = .processing
+        self.recordingState.uploadFraction = 0  // clear so "Uploading 100%" stops showing
         Log.info("File uploaded — job_id: \(jobID), polling for completion.", category: "transcribe")
 
         let pollDeadline = Date(timeIntervalSinceNow: deadlineSeconds)
@@ -937,6 +938,7 @@ final class MenuBarController: NSObject {
         Log.info("Resuming polling for in-flight job: \(raw)", category: "transcribe")
         recordingState.activeJobID = raw
         self.mode = .processing
+        self.recordingState.uploadFraction = 0  // clear so "Uploading 100%" stops showing
         activeJobTask = Task { @MainActor [weak self] in
             await self?.resumePollingForJob(JobID(raw: raw))
         }
