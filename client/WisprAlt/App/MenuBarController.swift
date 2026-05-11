@@ -477,13 +477,21 @@ final class MenuBarController: NSObject {
         }
     }
 
-    private func configurePopover() {
-        popover.behavior = .transient
-        popover.contentViewController = NSHostingController(
+    /// Build a fresh hosting controller for the popover's root view. Called
+    /// every time the popover is shown so SwiftUI state (scroll position,
+    /// expanded sections, focus) resets to its default. Reusing a single
+    /// NSHostingController across opens persists that state — undesired here.
+    private func makePopoverRootViewController() -> NSViewController {
+        NSHostingController(
             rootView: SettingsView()
                 .environmentObject(Settings.shared)
                 .environmentObject(recordingState)
         )
+    }
+
+    private func configurePopover() {
+        popover.behavior = .transient
+        popover.contentViewController = makePopoverRootViewController()
         // Belt-and-suspenders: NSPopover.behavior = .transient is supposed to
         // auto-close on click-outside, but in LSUIElement (menubar-only) apps
         // the popover sometimes stays open when the user clicks into another
@@ -555,6 +563,11 @@ final class MenuBarController: NSObject {
         if popover.isShown {
             popover.performClose(sender)
         } else if let button = statusItem.button {
+            // Replace the hosting controller on every open so SwiftUI state
+            // (scroll position, expanded sections, focus) resets to its
+            // initial values. Any in-flight sheet on the prior controller
+            // closes — that is the intended reset behavior.
+            popover.contentViewController = makePopoverRootViewController()
             popover.show(
                 relativeTo: button.bounds,
                 of: button,
