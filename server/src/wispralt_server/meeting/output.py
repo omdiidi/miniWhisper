@@ -127,21 +127,31 @@ def write_json(transcript: dict, dest: Path) -> None:
 def write_srt(transcript: dict, dest: Path) -> None:
     """Write the transcript as an SRT subtitle file.
 
-    Each segment becomes one SRT cue::
+    Meeting cue::
 
         1
         00:00:00,000 --> 00:00:03,420
-        Speaker: text
+        Speaker 1: text
+
+    File-mode cue (single speaker — speaker prefix omitted)::
+
+        1
+        00:00:00,000 --> 00:00:03,420
+        text
     """
+    is_single_speaker = transcript.get("mode") == "single"
     lines: list[str] = []
     for i, seg in enumerate(transcript.get("segments", []), start=1):
         start_tc = _seconds_to_srt(float(seg.get("start", 0.0)))
         end_tc = _seconds_to_srt(float(seg.get("end", 0.0)))
-        speaker = seg.get("speaker", "")
         text = seg.get("text", "").strip()
         lines.append(str(i))
         lines.append(f"{start_tc} --> {end_tc}")
-        lines.append(f"{speaker}: {text}")
+        if is_single_speaker:
+            lines.append(text)
+        else:
+            speaker = seg.get("speaker", "")
+            lines.append(f"{speaker}: {text}")
         lines.append("")  # blank line between cues
 
     content = "\n".join(lines).encode("utf-8")
@@ -151,19 +161,28 @@ def write_srt(transcript: dict, dest: Path) -> None:
 def write_vtt(transcript: dict, dest: Path) -> None:
     """Write the transcript as a WebVTT file using voice tags.
 
-    Each segment becomes one VTT cue::
+    Meeting cue::
 
         00:00:00.000 --> 00:00:03.420
-        <v Speaker>text</v>
+        <v Speaker 1>text</v>
+
+    File-mode cue (single speaker — voice tag omitted)::
+
+        00:00:00.000 --> 00:00:03.420
+        text
     """
+    is_single_speaker = transcript.get("mode") == "single"
     lines: list[str] = ["WEBVTT", ""]
     for seg in transcript.get("segments", []):
         start_tc = _seconds_to_vtt(float(seg.get("start", 0.0)))
         end_tc = _seconds_to_vtt(float(seg.get("end", 0.0)))
-        speaker = seg.get("speaker", "")
         text = seg.get("text", "").strip()
         lines.append(f"{start_tc} --> {end_tc}")
-        lines.append(f"<v {speaker}>{text}</v>")
+        if is_single_speaker:
+            lines.append(text)
+        else:
+            speaker = seg.get("speaker", "")
+            lines.append(f"<v {speaker}>{text}</v>")
         lines.append("")  # blank line between cues
 
     content = "\n".join(lines).encode("utf-8")
@@ -173,15 +192,29 @@ def write_vtt(transcript: dict, dest: Path) -> None:
 def write_txt(transcript: dict, dest: Path) -> None:
     """Write the transcript as a plain-text file.
 
-    One line per segment::
+    One line per segment. File mode (``transcript["mode"] == "single"``)
+    omits the speaker prefix entirely since there is exactly one speaker
+    by construction — the bracket adds noise and misleads readers into
+    treating monologue as quoted speech. Meeting mode keeps the prefix
+    so each line is attributable.
 
-        [Speaker] text
+    Meeting line format::
+
+        [Speaker 1] text
+
+    File-mode line format::
+
+        text
     """
+    is_single_speaker = transcript.get("mode") == "single"
     lines: list[str] = []
     for seg in transcript.get("segments", []):
-        speaker = seg.get("speaker", "")
         text = seg.get("text", "").strip()
-        lines.append(f"[{speaker}] {text}")
+        if is_single_speaker:
+            lines.append(text)
+        else:
+            speaker = seg.get("speaker", "")
+            lines.append(f"[{speaker}] {text}")
 
     content = "\n".join(lines).encode("utf-8")
     _atomic_write(content, dest)
