@@ -49,7 +49,6 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/meeting/__init__.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — package init that runs torch.load + huggingface_hub compat shims (PyTorch 2.6 weights_only fix + pyannote use_auth_token→token translation) |
 | `server/src/wispralt_server/meeting/silence.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — in-person mode detection |
 | `server/src/wispralt_server/meeting/deepfilter.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — denoise no-op stub (DeepFilterNet was dropped due to numpy<2 conflict with parakeet-mlx) |
-| `server/src/wispralt_server/meeting/whisperx_loader.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — WhisperX/CrisperWhisper singleton. **Deprecated by `mlx_whisper_loader.py`; retained through Phase 8 for revert-by-git-revert; deleted in Phase 10 after green matrix.** |
 | `server/src/wispralt_server/meeting/mlx_whisper_loader.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — `mlx-community/whisper-large-v3-turbo` singleton. `load()` warmup + idempotent flag; `transcribe_channel(audio_16k, *, word_timestamps, progress_cb, cancel_cb)` wraps `mlx_whisper.transcribe` with a `tqdm.auto.tqdm.update` monkeypatch (and 5 s wall-clock fallback) for chunk progress. |
 | `server/src/wispralt_server/meeting/diarize.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — Pyannote diarization, MPS device |
 | `server/src/wispralt_server/meeting/merge.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — segment merging, speaker labeling |

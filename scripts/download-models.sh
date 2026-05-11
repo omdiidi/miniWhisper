@@ -135,27 +135,11 @@ hf_download "mlx-community/parakeet-tdt-0.6b-v2"
 echo "Parakeet: done"
 echo ""
 
-echo "--- faster_CrisperWhisper (~3.1 GB) ---"
-hf_download "nyrahealth/faster_CrisperWhisper"
-echo "faster_CrisperWhisper: done"
-echo ""
-
-# wav2vec2 alignment model is loaded by whisperx at runtime (not a standalone HF repo download).
-echo "--- wav2vec2-base-960h alignment model (~360 MB) ---"
-echo "  This model is fetched by whisperx on first use."
-echo "  Triggering download now via Python..."
-# Run inside the server venv if present; fall back to system python3
-PYTHON_BIN="python3"
-if [[ -f "$REPO_ROOT/server/.venv/bin/python" ]]; then
-    PYTHON_BIN="$REPO_ROOT/server/.venv/bin/python"
-fi
-HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" "$PYTHON_BIN" -c \
-    "import whisperx; whisperx.load_align_model(language_code='en', device='cpu')" \
-    2>&1 || {
-    echo "  WARNING: wav2vec2 align download failed. It will be retried on first meeting job." >&2
-    echo "  This is non-fatal — proceeding." >&2
-}
-echo "wav2vec2 alignment model: done (or deferred)"
+echo "--- mlx-community/whisper-large-v3-turbo (~1.5 GB) ---"
+# mlx-whisper turbo replaces faster_CrisperWhisper + wav2vec2 alignment.
+# Word timestamps come from mlx-whisper's own pass (no CT2/wav2vec2 needed).
+hf_download "mlx-community/whisper-large-v3-turbo"
+echo "mlx-whisper turbo: done"
 echo ""
 
 echo "--- Pyannote speaker-diarization-3.1 (~800 MB combined with segmentation-3.0) ---"

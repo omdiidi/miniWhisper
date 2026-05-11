@@ -175,7 +175,7 @@ The popover has a **Smart formatting** toggle in the Settings section. When ON, 
 - **Pricing**: per-cleanup is roughly $0.0001 against your operator's OpenRouter credit. Negligible for individual employees; visible in OpenRouter usage if you batch-dictate hundreds of clips.
 - **Privacy note**: smart formatting sends your raw transcript to OpenRouter (cloud). If you handle confidential material, leave the toggle OFF.
 
-The toggle does NOT affect meeting recordings — those run through WhisperX server-side and are never routed through Mercury.
+The toggle does NOT affect meeting recordings — those run through mlx-whisper server-side and are never routed through Mercury.
 
 ### Your name
 

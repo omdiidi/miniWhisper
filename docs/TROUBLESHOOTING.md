@@ -25,9 +25,9 @@ Each entry follows the format: **Symptom → Diagnosis → Fix**.
 
 ---
 
-### CTranslate2 wheel build fails
+### Native wheel build fails (Xcode tools)
 
-**Symptom:** `uv sync` fails with a build error mentioning `CTranslate2`, `ctranslate2`, or missing C++ headers.
+**Symptom:** `uv sync` fails with a build error mentioning missing C++ headers, missing compiler, or `clang` not found. (Historically also triggered by `CTranslate2`; that dep was removed in Phase 10 but the symptom can still surface for other native wheels like `torch` or `pyannote`.)
 
 **Diagnosis:** Xcode Command Line Tools are missing or outdated.
 

@@ -207,7 +207,7 @@ For server-side debugging see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 - No streaming (yet).
 
 For diarization + multi-speaker meetings, use the native `/transcribe/meeting`
-async API, which does WhisperX + Pyannote with full speaker attribution.
+async API, which does mlx-whisper + Pyannote with full speaker attribution.
 
 ---
 
