@@ -630,6 +630,7 @@ private struct QuickActionsSection: View {
         recordingState.activeJobID != nil
             || recordingState.serverFinishingJobID != nil
             || recordingState.uploadFraction > 0
+            || recordingState.uploadError != nil
     }
 
     /// Id used by the View-server-log sheet. Prefers the active job, falls
@@ -785,6 +786,30 @@ private struct QuickActionsSection: View {
     private var inFlightSection: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 10) {
+                // Upload-error banner. Rendered when the stall watchdog (or
+                // any future upload-failure surface) sets
+                // `recordingState.uploadError`. Tapping the dismiss button
+                // clears it so the row collapses.
+                if let uploadError = recordingState.uploadError {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                        Text(uploadError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 4)
+                        Button {
+                            recordingState.uploadError = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Dismiss")
+                    }
+                }
+
                 // Headline row
                 HStack(spacing: 8) {
                     Image(systemName: "waveform")

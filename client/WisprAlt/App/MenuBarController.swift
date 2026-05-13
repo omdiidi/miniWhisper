@@ -22,6 +22,17 @@ final class RecordingState: ObservableObject {
     /// Upload fraction in [0.0, 1.0]. Drives `RecordingIndicatorView(.uploading(_))`.
     @Published var uploadFraction: Double = 0
 
+    /// Timestamp of the most recent upload-progress callback. Updated every
+    /// time `uploadFraction` advances; read by the stall watchdog in
+    /// `MenuBarController.startUploadWatchdog()`. Nil between uploads.
+    @Published var lastUploadProgressAt: Date? = nil
+
+    /// User-visible upload error, set by the stall watchdog when a wedged
+    /// upload is aborted. The popover renders this as a red banner inside
+    /// `inFlightSection`. Cleared by `MenuBarController` at the start of
+    /// every new upload and by the user dismissing the banner.
+    @Published var uploadError: String? = nil
+
     // MARK: - Per-phase progress (server-driven)
 
     /// Raw phase name from the server (`ffprobe`, `transcribe`, `diarize`, …).
@@ -50,6 +61,8 @@ final class RecordingState: ObservableObject {
     /// state so it can be called from contexts that shouldn't write defaults.
     func reset() {
         uploadFraction = 0
+        lastUploadProgressAt = nil
+        uploadError = nil
         phase = nil
         phaseLabel = nil
         chunkIndex = nil
@@ -191,6 +204,11 @@ final class MenuBarController: NSObject {
     /// abort an upload mid-flight (the network bytes are dropped immediately;
     /// no server-side state is created until the upload completes).
     private var activeUploadSession: URLSession? = nil
+
+    /// Watchdog task that polls `recordingState.lastUploadProgressAt` every
+    /// 5 seconds and aborts the upload if no progress has been seen for 30
+    /// seconds. See `startUploadWatchdog()`. Nil between uploads.
+    private var uploadWatchdogTask: Task<Void, Never>? = nil
 
     /// UserDefaults key for the persisted in-flight job id. Read in
     /// `resumeInFlightJobIfNeeded()` on app launch so a process restart can
@@ -772,12 +790,18 @@ final class MenuBarController: NSObject {
         }
 
         // --- Upload ---
+        // Reset stall-watchdog state before bytes start flowing and arm the
+        // 30-second no-progress abort.
+        recordingState.uploadError = nil
+        recordingState.lastUploadProgressAt = Date()
+        startUploadWatchdog()
         let jobID = try await MeetingAPI.submitFile(
             sourceURL,
             mode: mode,
             progress: { [weak self] fraction in
                 guard let self else { return }
                 self.recordingState.uploadFraction = fraction
+                self.recordingState.lastUploadProgressAt = Date()
             },
             sessionRegistered: { [weak self] session in
                 // The continuation closure that creates the URLSession is
@@ -788,9 +812,12 @@ final class MenuBarController: NSObject {
                 }
             }
         )
-        // Upload finished cleanly — drop the session reference. Cancel paths
-        // also clear this in `cancelActiveTranscription()`.
+        // Upload finished cleanly — drop the session reference + watchdog.
+        // Cancel paths also clear these in `cancelActiveTranscription()`.
+        uploadWatchdogTask?.cancel()
+        uploadWatchdogTask = nil
         activeUploadSession = nil
+        recordingState.lastUploadProgressAt = nil
         // Make the job id observable + persistent so a process restart can
         // resume polling and the UI can render Cancel + View-server-log.
         recordingState.activeJobID = jobID.raw
@@ -893,6 +920,40 @@ final class MenuBarController: NSObject {
         throw lastError ?? ServerError.transport(URLError(.unknown))
     }
 
+    // MARK: - Upload stall watchdog
+
+    /// Poll `recordingState.lastUploadProgressAt` every 5s; if it hasn't
+    /// advanced in 30s while an upload is in-flight (`mode == .uploading`
+    /// and `uploadFraction < 1.0`), abort the upload via
+    /// `cancelActiveTranscription()` and surface a user-visible error on
+    /// `recordingState.uploadError`. The watchdog self-terminates after
+    /// firing, when cancelled, or when the upload completes (caller clears it).
+    @MainActor
+    private func startUploadWatchdog() {
+        uploadWatchdogTask?.cancel()
+        uploadWatchdogTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self else { return }
+                if Task.isCancelled { return }
+                guard let lastProgress = self.recordingState.lastUploadProgressAt else { continue }
+                let stalledFor = Date().timeIntervalSince(lastProgress)
+                let stillUploading = self.recordingState.uploadFraction < 1.0
+                    && self.mode == .uploading
+                    && self.activeUploadSession != nil
+                if stalledFor > 30, stillUploading {
+                    Log.warning(
+                        "Upload stalled \(Int(stalledFor))s with fraction=\(self.recordingState.uploadFraction) — aborting.",
+                        category: "transcribe"
+                    )
+                    await self.cancelActiveTranscription()
+                    self.recordingState.uploadError = "Upload stalled. Check your connection and retry."
+                    return
+                }
+            }
+        }
+    }
+
     // MARK: - Cancel + resume
 
     /// Cancel whatever transcription is currently running. Mid-upload cancel
@@ -909,9 +970,15 @@ final class MenuBarController: NSObject {
         activeJobTask?.cancel()
         activeJobTask = nil
 
-        // 2) Drop the upload session, if any — kills any in-flight bytes.
+        // 2) Cancel the stall watchdog so it doesn't fire after we've
+        //    already torn down the upload.
+        uploadWatchdogTask?.cancel()
+        uploadWatchdogTask = nil
+
+        // 3) Drop the upload session, if any — kills any in-flight bytes.
         activeUploadSession?.invalidateAndCancel()
         activeUploadSession = nil
+        recordingState.lastUploadProgressAt = nil
 
         // 3) Tell the server to stop. The DELETE is best-effort; on success
         //    we set `serverFinishingJobID` so the UI knows the cancel was
