@@ -774,11 +774,26 @@ final class MenuBarController: NSObject {
         stem: String,
         mode: String
     ) async throws {
+        // --- Step 0: extract audio if the source is a video container ---
+        // A 200 MB MP4 typically becomes a ~15 MB .m4a — often dropping below
+        // the chunked-upload threshold entirely. Failures degrade gracefully
+        // back to the original URL (AudioExtractor never throws).
+        let uploadURL = await AudioExtractor.extractAudioIfVideo(sourceURL)
+        let extractedTempDir: URL? = (uploadURL != sourceURL)
+            ? uploadURL.deletingLastPathComponent()
+            : nil
+        defer {
+            // Always clean up the extraction temp dir, success or failure.
+            if let dir = extractedTempDir {
+                try? FileManager.default.removeItem(at: dir)
+            }
+        }
+
         // Probe audio duration BEFORE upload so we can size the poll deadline.
         // Falls back to a generous 4-hour ceiling if probing fails (corrupt
         // header, unsupported container) — server will reject upload anyway
         // if it really can't decode.
-        let durationSeconds = await Self.probeAudioDuration(sourceURL)
+        let durationSeconds = await Self.probeAudioDuration(uploadURL)
         let deadlineSeconds: TimeInterval
         if let dur = durationSeconds {
             // 3× realtime + 5 min overhead, floor 600s, ceiling 6h.
@@ -795,23 +810,54 @@ final class MenuBarController: NSObject {
         recordingState.uploadError = nil
         recordingState.lastUploadProgressAt = Date()
         startUploadWatchdog()
-        let jobID = try await MeetingAPI.submitFile(
-            sourceURL,
-            mode: mode,
-            progress: { [weak self] fraction in
-                guard let self else { return }
-                self.recordingState.uploadFraction = fraction
-                self.recordingState.lastUploadProgressAt = Date()
-            },
-            sessionRegistered: { [weak self] session in
-                // The continuation closure that creates the URLSession is
-                // @Sendable; hop to the main actor to satisfy isolation on
-                // the controller's `activeUploadSession` field.
-                Task { @MainActor [weak self] in
-                    self?.activeUploadSession = session
+
+        // Pick the upload path based on file size. The 50 MiB threshold leaves
+        // ~50 MB margin under Cloudflare's 100 MB request-body cap.
+        let uploadSize: Int64 = (
+            ((try? FileManager.default.attributesOfItem(atPath: uploadURL.path)[.size]) as? NSNumber)?.int64Value
+        ) ?? 0
+
+        let jobID: JobID
+        if uploadSize > ChunkedUploader.chunkThreshold {
+            Log.info(
+                "File >\(ChunkedUploader.chunkThreshold / (1024 * 1024))MB (\(uploadSize) bytes) — using chunked upload.",
+                category: "transcribe"
+            )
+            jobID = try await ChunkedUploader.upload(
+                fileURL: uploadURL,
+                mode: mode,
+                progress: { [weak self] fraction in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.recordingState.uploadFraction = fraction
+                        self.recordingState.lastUploadProgressAt = Date()
+                    }
+                },
+                sessionRegistered: { [weak self] session in
+                    Task { @MainActor [weak self] in
+                        self?.activeUploadSession = session
+                    }
                 }
-            }
-        )
+            )
+        } else {
+            jobID = try await MeetingAPI.submitFile(
+                uploadURL,
+                mode: mode,
+                progress: { [weak self] fraction in
+                    guard let self else { return }
+                    self.recordingState.uploadFraction = fraction
+                    self.recordingState.lastUploadProgressAt = Date()
+                },
+                sessionRegistered: { [weak self] session in
+                    // The continuation closure that creates the URLSession is
+                    // @Sendable; hop to the main actor to satisfy isolation on
+                    // the controller's `activeUploadSession` field.
+                    Task { @MainActor [weak self] in
+                        self?.activeUploadSession = session
+                    }
+                }
+            )
+        }
         // Upload finished cleanly — drop the session reference + watchdog.
         // Cancel paths also clear these in `cancelActiveTranscription()`.
         uploadWatchdogTask?.cancel()
