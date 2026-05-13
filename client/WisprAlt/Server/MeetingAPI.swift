@@ -238,12 +238,45 @@ enum MeetingAPI {
     ///   - progress: Called on the main queue with upload fraction as data is sent.
     /// - Returns: A `JobID` for use with `poll`, `download`, and `delete`.
     /// - Throws: `ServerError` on any HTTP or transport failure.
+    /// File-size threshold above which uploads automatically route through
+    /// `ChunkedUploader` instead of a single multipart POST. Set just below
+    /// Cloudflare's 100 MB request-body limit so the single-shot path is only
+    /// used when there's zero risk of an edge rejection. Files at or under
+    /// this size keep the simpler legacy code path with no `init`/`finalize`
+    /// round-trip overhead.
+    static let chunkedUploadThresholdBytes: Int64 = 50 * 1024 * 1024  // 50 MB
+
     static func submitFile(
         _ sourceURL: URL,
         mode: String = "file",
         progress: @escaping (Double) -> Void,
         sessionRegistered: (@Sendable (URLSession) -> Void)? = nil
     ) async throws -> JobID {
+        // Auto-dispatch to chunked upload for files past Cloudflare's 100 MB
+        // body limit. Every caller (live recording, custom file picker,
+        // PendingUploadsQueue offline drain) gets large-file support for free.
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: sourceURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        if fileSize > chunkedUploadThresholdBytes {
+            Log.info(
+                "submitFile: routing \(fileSize) bytes via chunked upload (>50 MB)",
+                category: "transcribe"
+            )
+            // `submitFile`'s `progress` closure is non-Sendable, but
+            // ChunkedUploader's delegate hops to the main actor before
+            // calling it — wrap in a sendable shim that re-invokes the
+            // caller's closure via a Task on MainActor.
+            let progressShim: @Sendable (Double) -> Void = { fraction in
+                Task { @MainActor in progress(fraction) }
+            }
+            return try await ChunkedUploader.upload(
+                fileURL: sourceURL,
+                mode: mode,
+                progress: progressShim,
+                sessionRegistered: sessionRegistered,
+                phaseHandler: nil
+            )
+        }
+
         guard let baseURL = Settings.shared.serverURL else {
             throw ServerError.missingConfiguration
         }
