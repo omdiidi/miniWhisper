@@ -923,11 +923,16 @@ final class MenuBarController: NSObject {
     // MARK: - Upload stall watchdog
 
     /// Poll `recordingState.lastUploadProgressAt` every 5s; if it hasn't
-    /// advanced in 30s while an upload is in-flight (`mode == .uploading`
+    /// advanced in 120s while an upload is in-flight (`mode == .uploading`
     /// and `uploadFraction < 1.0`), abort the upload via
     /// `cancelActiveTranscription()` and surface a user-visible error on
     /// `recordingState.uploadError`. The watchdog self-terminates after
     /// firing, when cancelled, or when the upload completes (caller clears it).
+    ///
+    /// 120s threshold (was 30s): large multi-hundred-MB file uploads behind
+    /// cloudflared can legitimately pause for 30-60s while buffering or
+    /// during TCP backpressure spikes. The user prefers "wait longer, then
+    /// abort" over "abort prematurely on a slow connection."
     @MainActor
     private func startUploadWatchdog() {
         uploadWatchdogTask?.cancel()
@@ -941,13 +946,13 @@ final class MenuBarController: NSObject {
                 let stillUploading = self.recordingState.uploadFraction < 1.0
                     && self.mode == .uploading
                     && self.activeUploadSession != nil
-                if stalledFor > 30, stillUploading {
+                if stalledFor > 120, stillUploading {
                     Log.warning(
                         "Upload stalled \(Int(stalledFor))s with fraction=\(self.recordingState.uploadFraction) — aborting.",
                         category: "transcribe"
                     )
                     await self.cancelActiveTranscription()
-                    self.recordingState.uploadError = "Upload stalled. Check your connection and retry."
+                    self.recordingState.uploadError = "Upload stalled for 2 minutes. Check your connection and retry."
                     return
                 }
             }
