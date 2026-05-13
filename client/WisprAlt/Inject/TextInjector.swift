@@ -3,6 +3,15 @@ import ApplicationServices
 import Foundation
 import WisprAltCore
 
+private extension Duration {
+    /// Convert a `Duration` (from `ContinuousClock` arithmetic) into
+    /// floating-point milliseconds for inject timing logs.
+    var injectMs: Double {
+        let comps = self.components
+        return Double(comps.seconds) * 1_000.0 + Double(comps.attoseconds) * 1e-15
+    }
+}
+
 /// Strategy combinator for text injection.
 ///
 /// Captures focus context once at the top of `inject(_:)` (closing the TOCTOU
@@ -45,9 +54,18 @@ enum TextInjector {
             return
         }
 
+        // Per-stage timings so we can diagnose Terminal/TUI flakiness without
+        // attaching Instruments. ContinuousClock is monotonic so we never get
+        // negative deltas across NTP corrections. Emitted at Log.info so they
+        // surface without requiring an OSLog profile.
+        let clock = ContinuousClock()
+        let tStart = clock.now
+
         await restoreTargetIfNeeded(targetPID)
+        let tAfterActivate = clock.now
 
         let (context, element) = captureFocus()
+        let tAfterFocus = clock.now
         Log.debug("inject: target_at_start=\(context.description)", category: "inject")
 
         if shouldRefuseInjection(for: context) {
@@ -56,17 +74,56 @@ enum TextInjector {
                 category: "inject"
             )
             notifySecureSkipDebounced(for: context)
+            let totalMs = (clock.now - tStart).injectMs
+            let activateMs = (tAfterActivate - tStart).injectMs
+            let focusMs = (tAfterFocus - tAfterActivate).injectMs
+            Log.info(
+                "inject: total=\(fmt(totalMs))ms activate=\(fmt(activateMs))ms focus=\(fmt(focusMs))ms ax=0ms clipboard=0ms path=refused bundle=\(context.bundleID) role=\(context.role)",
+                category: "inject"
+            )
             return
         }
 
-        if let element, AccessibilityInjector.tryInsertWith(element: element, text: text) {
-            Log.info("Text injected via AX. target=\(context.description)", category: "inject")
-            return
+        var axMs: Double = 0
+        var clipboardMs: Double = 0
+        var path: String
+
+        if let element {
+            let tAX = clock.now
+            let axOK = AccessibilityInjector.tryInsertWith(element: element, text: text)
+            axMs = (clock.now - tAX).injectMs
+            if axOK {
+                path = "ax"
+                Log.info("Text injected via AX. target=\(context.description)", category: "inject")
+            } else {
+                Log.debug("AX injection unverified — using Cmd+V fallback.", category: "inject")
+                let tClip = clock.now
+                ClipboardInjector.injectViaCmdV(text)
+                clipboardMs = (clock.now - tClip).injectMs
+                path = "clipboard"
+                Log.info("Text injected via Cmd+V. target=\(context.description)", category: "inject")
+            }
+        } else {
+            // No AX element resolvable — skip AX and go straight to clipboard.
+            let tClip = clock.now
+            ClipboardInjector.injectViaCmdV(text)
+            clipboardMs = (clock.now - tClip).injectMs
+            path = "clipboard"
+            Log.info("Text injected via Cmd+V. target=\(context.description)", category: "inject")
         }
 
-        Log.debug("AX injection unverified — using Cmd+V fallback.", category: "inject")
-        ClipboardInjector.injectViaCmdV(text)
-        Log.info("Text injected via Cmd+V. target=\(context.description)", category: "inject")
+        let totalMs = (clock.now - tStart).injectMs
+        let activateMs = (tAfterActivate - tStart).injectMs
+        let focusMs = (tAfterFocus - tAfterActivate).injectMs
+        Log.info(
+            "inject: total=\(fmt(totalMs))ms activate=\(fmt(activateMs))ms focus=\(fmt(focusMs))ms ax=\(fmt(axMs))ms clipboard=\(fmt(clipboardMs))ms path=\(path) bundle=\(context.bundleID) role=\(context.role)",
+            category: "inject"
+        )
+    }
+
+    /// Format a millisecond double as integer-ms for log readability.
+    private static func fmt(_ ms: Double) -> String {
+        String(format: "%.0f", ms)
     }
 
     // MARK: - Focus restoration (network-round-trip drift fix)
