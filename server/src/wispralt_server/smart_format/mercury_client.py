@@ -22,6 +22,7 @@ the length window is the safety net.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Final
@@ -178,34 +179,43 @@ class MercuryClient:
         if raw_n < self._min_words:
             return None
         try:
-            response = await self._client.post(
-                f"{self._base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "X-Title": self._app_title,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self._model,
-                    "messages": [
-                        {"role": "system", "content": _PROMPT_SYSTEM},
-                        {"role": "user", "content": raw_text},
-                    ],
-                    # Budget scales with input length to avoid mid-sentence
-                    # truncation on long-form dictations (the ~750-word
-                    # ceiling — 5 min audio at conversational pace — needs
-                    # well above 2048 tokens). Floor 256 covers short
-                    # boundary cases just above the min-words threshold;
-                    # ceiling 4096 is a safety cap. Mercury 2 charges only
-                    # for actual output, so the ceiling is harmless.
-                    "max_tokens": min(max(len(raw_text) // 2, 256), 4096),
-                    "temperature": 0.0,
-                    # Mercury 2 routes ALL output through the `reasoning` channel by
-                    # default, leaving `content=null`. Explicitly disable reasoning
-                    # so the model returns the cleaned text in the standard `content`
-                    # field. Older Mercury models ignore this flag, so it's safe.
-                    "reasoning": {"enabled": False},
-                },
+            # `httpx.Timeout(...)` only bounds individual phases (connect,
+            # read, write, pool) — it does NOT enforce a strict wall-clock
+            # budget across the full request. In practice we see 800-900ms
+            # calls succeed against a 600ms `timeout_s` because connect+TLS
+            # gets accounted separately from read. Wrap the entire post()
+            # in `asyncio.wait_for` so the budget is a hard cutoff.
+            response = await asyncio.wait_for(
+                self._client.post(
+                    f"{self._base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "X-Title": self._app_title,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self._model,
+                        "messages": [
+                            {"role": "system", "content": _PROMPT_SYSTEM},
+                            {"role": "user", "content": raw_text},
+                        ],
+                        # Budget scales with input length to avoid mid-sentence
+                        # truncation on long-form dictations (the ~750-word
+                        # ceiling — 5 min audio at conversational pace — needs
+                        # well above 2048 tokens). Floor 256 covers short
+                        # boundary cases just above the min-words threshold;
+                        # ceiling 4096 is a safety cap. Mercury 2 charges only
+                        # for actual output, so the ceiling is harmless.
+                        "max_tokens": min(max(len(raw_text) // 2, 256), 4096),
+                        "temperature": 0.0,
+                        # Mercury 2 routes ALL output through the `reasoning` channel by
+                        # default, leaving `content=null`. Explicitly disable reasoning
+                        # so the model returns the cleaned text in the standard `content`
+                        # field. Older Mercury models ignore this flag, so it's safe.
+                        "reasoning": {"enabled": False},
+                    },
+                ),
+                timeout=self._timeout_s,
             )
             response.raise_for_status()
             data = response.json()
@@ -238,6 +248,15 @@ class MercuryClient:
                 return None
             return cleaned
         except httpx.TimeoutException:
+            logger.warning(
+                "mercury timeout after %sms; falling back to raw",
+                int(self._timeout_s * 1000),
+            )
+            return None
+        except asyncio.TimeoutError:
+            # Hard wall-clock cutoff via `asyncio.wait_for`. Logged the same
+            # way as the httpx phase-timeout branch so monitoring sees one
+            # signal regardless of which layer tripped.
             logger.warning(
                 "mercury timeout after %sms; falling back to raw",
                 int(self._timeout_s * 1000),
