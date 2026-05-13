@@ -422,6 +422,101 @@ The handler deletes `{job_id}.json`, `{job_id}.srt`, `{job_id}.vtt`, and `{job_i
 
 ---
 
+### `POST /transcribe/file`
+
+**Auth:** Bearer required.
+
+Submit any audio or video container for transcription. The server runs ffprobe + ffmpeg to extract a canonical 16 kHz PCM WAV before queuing the job. Returns immediately with a job id; poll `GET /transcribe/meeting/{job_id}` for status (same poll route as `/transcribe/meeting`).
+
+**Request:** `multipart/form-data`
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `file` | UploadFile | Yes | Source container. Allowed extensions: `.m4a .mp3 .mp4 .mov .m4v .wav .aac .flac .opus .ogg .webm .caf .aiff`. |
+| `mode` | string | No | `file` (default — single-speaker) or `meeting` (diarized). Explicit form field; replaces the old channel-count heuristic. |
+| `Content-Length` header | integer | Recommended | Enables pre-flight 413 + disk-gate (free < `Content-Length × 2 → 507`). |
+
+**Response 202:** `{ "job_id": "...", "status": "pending" }`
+
+**Errors:** 413 (over `MAX_UPLOAD_BYTES`), 415 (unsupported extension), 422 (mode invalid OR ffprobe rejected the source), 429 (job already running), 503 (RAM <4 GiB), 507 (disk).
+
+---
+
+### `POST /transcribe/file/chunked/init`
+
+**Auth:** Bearer required. **Files: >50 MB or any file when chunking is preferred.**
+
+Open a chunked upload to bypass Cloudflare's 100 MB request-body cap on free / pro / business plans. The server returns an `upload_id` and a chunk size; the client then POSTs each chunk to `/transcribe/file/chunked/{upload_id}/{chunk_index}` and finally calls `/transcribe/file/chunked/{upload_id}/finalize`. The assembled file is processed by the SAME pipeline that handles single-shot `/transcribe/file` uploads — the poll route is unchanged.
+
+**Request:** `application/json`
+
+```json
+{
+  "mode": "file",
+  "total_bytes": 524288000,
+  "chunk_count": 10,
+  "original_filename": "meeting-2025-05-13.m4a"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `mode` | string | `file` or `meeting`. Same enum as `POST /transcribe/file`. |
+| `total_bytes` | integer | Size of the full file. Must be ≤ `min(MAX_UPLOAD_BYTES, 4_000_000_000)` — the 4 GB hard ceiling keeps the finalize concat inside Cloudflare's 100 s proxy timeout window. |
+| `chunk_count` | integer | `1 ≤ chunk_count ≤ 1000`. Client computes as `ceil(total_bytes / 50 MiB)`. |
+| `original_filename` | string | Used to recover the source extension for the assembled staging file. Suffix must be in the same allowlist as `POST /transcribe/file`. |
+
+**Response 200:**
+
+```json
+{ "upload_id": "abc-22-char-token", "chunk_size": 52428800 }
+```
+
+`upload_id` is a `secrets.token_urlsafe(16)` value (22 URL-safe chars). The server records the caller's API-key user id in the upload's metadata; subsequent chunk + finalize calls MUST present a bearer token resolving to the same user id (403 otherwise). Break-glass / single-key clients cannot use chunked upload — they must fall back to single-shot `POST /transcribe/file`.
+
+**Errors:** 403 (anonymous / break-glass caller), 413 (`total_bytes` over limit), 415 (extension), 422 (`chunk_count` out of range), 503 (RAM <4 GiB), 507 (disk).
+
+---
+
+### `POST /transcribe/file/chunked/{upload_id}/{chunk_index}`
+
+**Auth:** Bearer required. **Owner must match the user that ran `/init`.**
+
+Upload a single chunk's raw bytes.
+
+**Request:** `application/octet-stream` (raw chunk body, NOT multipart).
+
+| Header | Required | Notes |
+|---|---|---|
+| `Content-Length` | Yes | Required. Server rejects (411) if missing and rejects (400) if bytes-written ≠ declared length. |
+| `Authorization` | Yes | `Bearer <token>`. |
+
+`chunk_index` is zero-based and must be `< chunk_count` declared at init. Indexes may arrive in any order — the server sorts on finalize.
+
+**Response 200:** `{ "ok": true, "received_bytes": N }`
+
+**Errors:** 400 (size mismatch with Content-Length), 403 (ownership), 404 (`upload_id` unknown or swept), 411 (missing Content-Length), 413 (chunk over 50 MiB + 1 KiB slack), 422 (`chunk_index` out of range).
+
+---
+
+### `POST /transcribe/file/chunked/{upload_id}/finalize`
+
+**Auth:** Bearer required. **Owner must match the user that ran `/init`.**
+
+Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; on transient `MeetingInProgressError` (429) it also cleans up the assembled file so a retry starts fresh.
+
+**Request:** Empty body (`{}`).
+
+**Response 202:** `{ "job_id": "...", "status": "pending" }`
+
+From this point the client polls `GET /transcribe/meeting/{job_id}` exactly as it would for a single-shot `/transcribe/file` upload.
+
+**Errors:** 403 (ownership), 404 (upload not found), 409 (missing chunks or size mismatch), 429 (`MeetingInProgressError` — assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
+
+**Stale-upload TTL:** chunked staging directories whose `meta.json` mtime is older than 1 h are reaped at server startup (and on demand by `ops.staging.sweep_chunked`). Each successful chunk write touches `meta.json` so actively-progressing uploads are never reaped.
+
+---
+
 ### `POST /admin/rotate-key`
 
 **Auth:** Bearer required (current key — this invalidates immediately on success).

@@ -213,6 +213,29 @@ The menubar QuickActions popover (`UI/SettingsView.swift`) exposes a "Transcribe
 
 `MeetingAPI.swift` uses `URLSessionConfiguration` with `timeoutIntervalForRequest=300` and `request.timeoutInterval=6*60*60` so a 90-min upload over a slow uplink can complete without hitting the default 60s inactivity timeout.
 
+### Large-file uploads (audio extraction + chunked upload)
+
+Cloudflare's free / pro / business plans cap inbound request bodies at **100 MB**. A 1-hour stereo meeting WAV is ~460 MB, and a 3-hour AAC-encoded meeting m4a can easily clear 200 MB — both would 413 at the edge before reaching the origin. Two complementary strategies extend the supported range to 4 GB without touching Cloudflare's plan tier.
+
+**Step 0 — Audio extraction (`client/WisprAlt/Capture/AudioExtractor.swift`).** Before deciding which upload path to take, the client passes the user-picked URL to `AudioExtractor.extractAudioIfVideo(_:)`. If the asset has BOTH a video and an audio track, it runs `AVAssetExportSession` with `AVAssetExportPresetPassthrough` and writes just the audio track to a temp `.m4a` (or `.mp4` fallback when the source codec isn't AAC-compatible). A 200 MB MP4 typically becomes a ~15 MB audio file — often dropping under the chunking threshold entirely and letting the existing single-shot `/transcribe/file` path serve the request. The extractor never throws: any probe / export failure returns the original URL so the upload still proceeds.
+
+**Step 1 — Chunked upload (`client/WisprAlt/Server/ChunkedUploader.swift` ↔ `server/src/wispralt_server/routes/transcribe_file.py`).** If `uploadSize > 50 MiB`, the client switches from `MeetingAPI.submitFile` (multipart single-shot) to `ChunkedUploader.upload`. The three-step wire protocol is:
+
+1. `POST /transcribe/file/chunked/init` with JSON `{mode, total_bytes, chunk_count, original_filename}` → server returns `{upload_id, chunk_size}` (22-char `secrets.token_urlsafe(16)`) and creates `staging/chunked/<upload_id>/meta.json` recording the caller's `user.id`.
+2. `POST /transcribe/file/chunked/<upload_id>/<chunk_index>` with raw bytes (`application/octet-stream`, NOT multipart) for each 50 MiB chunk. The body is streamed via `request.stream()` to `chunk-NNNN.part.tmp`, then atomically renamed on success. `Content-Length` is mandatory and validated against bytes-written (corrupt chunks → 400).
+3. `POST /transcribe/file/chunked/<upload_id>/finalize` with an empty body. Server verifies all chunks present + `Σ(part.size) == total_bytes`, concatenates in `run_in_executor` (deletes each `.part` as it copies to halve peak disk), then hands the assembled file to the SAME `MeetingRunner.submit_source_or_429` that the single-shot route uses. Returns `{job_id, status: "pending"}` — from here the existing poll/download/delete loop is unchanged.
+
+**Resilience properties:**
+
+- *Auth ownership.* The user.id from the `/init` caller's bearer token is recorded in `meta.json`; every subsequent chunk + finalize request is rejected (403) unless its bearer resolves to the same id. Break-glass admin (id=−1) is refused at `/init` because cross-request ownership cannot be reliably verified for that path.
+- *Per-chunk bounds.* `Content-Length ≤ 50 MiB + 1 KiB slack` is enforced both up front (411 if header missing, 413 if declared too large) AND during the stream loop (413 if observed bytes exceed the ceiling — defends against chunked-transfer-encoded clients).
+- *Disk + RAM gates.* `/init` requires `free ≥ 2 × total_bytes`; `/finalize` re-checks `free ≥ total_bytes` and `psutil.virtual_memory().available ≥ 4 GiB` before submitting to the runner.
+- *Cloudflare 100s ceiling.* `/init` rejects `total_bytes > 4 GB` so a multi-GB concat never blocks the finalize handler beyond Cloudflare's proxy timeout (Mac mini M4 copies 4 GB in ~8 s — well inside budget).
+- *Stale-upload TTL.* `ops/staging.py:sweep_chunked()` reaps any chunked directory whose `meta.json` mtime is older than 1 h (separate from the 24 h plain-WAV sweep, since abandoned chunked dirs pin much more disk per item). Each successful chunk write `touch`es `meta.json` so an active client is never reaped underneath itself.
+- *Cancel.* One `URLSession` is created at the start of the chunked upload and reused across `/init`, every `/chunk`, and `/finalize`. `MenuBarController.cancelActiveTranscription()` calls `invalidateAndCancel()` on that single session — every in-flight chunk task tears down together.
+- *Progress smoothness.* `URLSessionTaskDelegate.didSendBodyData` reports per-byte progress folded into an overall `[0,1]` fraction (`(chunksDone + chunkFraction) / totalChunks`). This keeps `lastUploadProgressAt` ticking within a slow 50 MiB chunk so the existing 120 s stall-watchdog never fires mid-chunk on a poor link.
+- *Transient errors.* Each chunk is retried once on `URLError` (network reset, dropped connection). Beyond that, the upload tears down via the cancel path and the staging dir is reaped by the next sweep.
+
 ---
 
 ## Latency Budget (Dictation)
