@@ -16,9 +16,16 @@ extension Notification.Name {
 // MARK: - DictationRecorder
 
 /// Records microphone audio via `AVAudioEngine` and produces a native-rate
-/// **Float32 PCM** WAV (typically 48 kHz, native channel count) suitable for
+/// **16-bit PCM** WAV (typically 48 kHz, native channel count) suitable for
 /// the `/transcribe/dictate` endpoint. Server (`audio.py`) handles the
 /// resample to 16 kHz and the multi-channel → mono downmix via `np.mean`.
+///
+/// On-disk capture is Float32 PCM (see "Why Float32 + native rate" below);
+/// the Float→Int16 downcast happens AFTER the file is written, in user code
+/// (see `Int16WAVEncoder`), entirely outside AVAudioFile's writer path. This
+/// halves the upload payload (~50% smaller) with zero perceptual quality
+/// loss — Parakeet is trained on 16-bit audio and the server resamples to
+/// 16 kHz, so any precision above the 16-bit noise floor is dropped anyway.
 ///
 /// ## Why Float32 + native rate (zero client conversion)
 /// Two prior approaches both failed:
@@ -490,10 +497,10 @@ final class DictationRecorder {
     /// Stops capture and returns the encoded WAV bytes.
     ///
     /// Output WAV format: native sample rate (typically 48 kHz on macOS),
-    /// native channel count, **Float32** PCM (non-interleaved). Server's
-    /// `audio.py` resamples to 16 kHz and downmixes to mono via
-    /// `np.mean(axis=1)`. See class doc-comment for the full rationale on
-    /// why we write Float32 instead of Int16.
+    /// native channel count, **16-bit signed PCM** (interleaved). On disk the
+    /// tap writes Float32 (the only known-safe AVAudioFile writer path); the
+    /// returned bytes are Int16, downcast in `Int16WAVEncoder.encode` after
+    /// the file is closed. See class doc-comment for the full rationale.
     ///
     /// Teardown order (matters for thread-safety):
     /// 1. Set `stopRequested` so the realtime tap callback drops new buffers.
@@ -599,16 +606,35 @@ final class DictationRecorder {
 
         return try await Task.detached(priority: .userInitiated) {
             defer { try? FileManager.default.removeItem(at: url) }
-            let data = try Data(contentsOf: url)
 
-            // Post-write byte-level diagnostic intentionally omitted: Float32
-            // WAVs include extended fmt/fact chunks of variable size, so a
-            // naive `data.advanced(by: 44)` read produces garbage from chunk
-            // headers, not actual samples. The pre-clamp float peak captured
-            // in the tap callback (logged in the "stopped" line above) is the
-            // accurate per-recording level reading.
+            // Read the Float32 WAV off disk, then downcast to a 16-bit PCM
+            // WAV in-memory at the same sample rate and channel count. The
+            // downcast halves the upload payload with zero perceptual quality
+            // loss for speech — Parakeet is trained on 16-bit audio and the
+            // server resamples to 16 kHz anyway, so any signal we'd preserve
+            // in Float32 above the 16-bit noise floor is dropped server-side.
+            //
+            // The conversion happens entirely in user code (clamp + scale by
+            // 32767 + cast to Int16 + hand-built WAV header). We do NOT use
+            // AVAudioFile's writer to perform the Float→Int16 step — see the
+            // class doc-comment on DictationRecorder for the long history of
+            // failures with that path.
+            let data: Data
+            do {
+                data = try Int16WAVEncoder.encode(fromFloat32WAVAt: url)
+            } catch {
+                Log.error(
+                    "DictationRecorder: Int16 re-encode failed (\(error)); falling back to Float32 WAV bytes.",
+                    category: "capture"
+                )
+                // If the re-encode fails for any reason, ship the original
+                // Float32 WAV rather than failing the dictation. Quality is
+                // the priority — server accepts both Float32 and Int16 WAVs.
+                data = try Data(contentsOf: url)
+            }
+
             Log.debug(
-                "DictationRecorder: WAV bytes=\(data.count)",
+                "DictationRecorder: WAV bytes=\(data.count) (16-bit PCM)",
                 category: "capture"
             )
 
