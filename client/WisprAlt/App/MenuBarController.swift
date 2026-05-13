@@ -772,10 +772,25 @@ final class MenuBarController: NSObject {
         }
 
         // --- Upload ---
-        let jobID = try await MeetingAPI.submitFile(sourceURL, mode: mode) { [weak self] fraction in
-            guard let self else { return }
-            self.recordingState.uploadFraction = fraction
-        }
+        let jobID = try await MeetingAPI.submitFile(
+            sourceURL,
+            mode: mode,
+            progress: { [weak self] fraction in
+                guard let self else { return }
+                self.recordingState.uploadFraction = fraction
+            },
+            sessionRegistered: { [weak self] session in
+                // The continuation closure that creates the URLSession is
+                // @Sendable; hop to the main actor to satisfy isolation on
+                // the controller's `activeUploadSession` field.
+                Task { @MainActor [weak self] in
+                    self?.activeUploadSession = session
+                }
+            }
+        )
+        // Upload finished cleanly — drop the session reference. Cancel paths
+        // also clear this in `cancelActiveTranscription()`.
+        activeUploadSession = nil
         // Make the job id observable + persistent so a process restart can
         // resume polling and the UI can render Cancel + View-server-log.
         recordingState.activeJobID = jobID.raw

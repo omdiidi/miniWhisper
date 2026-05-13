@@ -241,7 +241,8 @@ enum MeetingAPI {
     static func submitFile(
         _ sourceURL: URL,
         mode: String = "file",
-        progress: @escaping (Double) -> Void
+        progress: @escaping (Double) -> Void,
+        sessionRegistered: (@Sendable (URLSession) -> Void)? = nil
     ) async throws -> JobID {
         guard let baseURL = Settings.shared.serverURL else {
             throw ServerError.missingConfiguration
@@ -337,6 +338,14 @@ enum MeetingAPI {
                     delegateQueue: nil
                 )
                 delegate.session = uploadSession
+
+                // Hand the session up to the caller (MenuBarController) so its
+                // `cancelActiveTranscription()` path has a non-nil URLSession to
+                // call `invalidateAndCancel()` on. The session is owned by this
+                // continuation closure; the delegate's `didCompleteWithError`
+                // path will resume the continuation with NSURLErrorCancelled
+                // when the caller cancels, so we never leak the continuation.
+                sessionRegistered?(uploadSession)
 
                 let task = uploadSession.uploadTask(with: request, fromFile: tempURL)
                 task.resume()
