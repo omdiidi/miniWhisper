@@ -148,7 +148,7 @@ class MercuryClient:
         base_url: str = "https://openrouter.ai/api/v1",
         timeout_ms: int = 1500,
         app_title: str = "WisprAlt",
-        min_words: int = 100,
+        min_words: int = 300,
     ) -> None:
         self._api_key = api_key
         self._model = model

@@ -96,9 +96,15 @@ class Settings(BaseSettings):
     # Minimum dictation length (words) before smart-formatting is invoked. Below
     # this, raw Parakeet output is returned unchanged — short utterances aren't
     # worth the LLM round-trip and Parakeet's inline punctuation is good enough.
-    # Default 100 targets long-form dictations (e.g. LLM prompts) where the
-    # cleanup is actually visible.
-    smart_format_min_words: int = 100
+    #
+    # 2026-05-13 bump 100 -> 300: with the OpenRouter timeout pinned at 600 ms
+    # (see openrouter_timeout_ms above), Mercury empirically can't complete a
+    # 100-300 word polish within budget. Those requests time out and fail-soft
+    # to raw Parakeet text anyway, costing the user ~600 ms of dead wait. At
+    # >=300 words the cleanup is both noticeable AND inside budget. The user
+    # still gets correct Parakeet output (with its inline punctuation) below
+    # the threshold — no transcription content is lost, only the polish step.
+    smart_format_min_words: int = 300
 
 
 # Module-level singleton — import as ``from wispralt_server.config import settings``
