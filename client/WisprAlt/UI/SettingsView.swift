@@ -785,31 +785,46 @@ private struct QuickActionsSection: View {
     @ViewBuilder
     private var inFlightSection: some View {
         GlassCard {
-            VStack(alignment: .leading, spacing: 10) {
-                // Upload-error banner. Rendered when the stall watchdog (or
-                // any future upload-failure surface) sets
-                // `recordingState.uploadError`. Tapping the dismiss button
-                // clears it so the row collapses.
-                if let uploadError = recordingState.uploadError {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
+            // Error state is mutually exclusive with the active-job UI —
+            // showing both a red "stalled" banner AND a "Processing" spinner
+            // is contradictory. When `uploadError` is set the job is already
+            // torn down by `cancelActiveTranscription`, so render error-only.
+            if let uploadError = recordingState.uploadError {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                        .imageScale(.large)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Upload failed")
+                            .font(.body.weight(.medium))
                             .foregroundStyle(.red)
                         Text(uploadError)
                             .font(.caption)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 4)
-                        Button {
-                            recordingState.uploadError = nil
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Dismiss")
                     }
+                    Spacer(minLength: 4)
+                    Button {
+                        recordingState.uploadError = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss")
                 }
+            } else {
+                activeJobBody
+            }
+        }
+        .padding(.vertical, 4)
+    }
 
+    /// Original active-job content (extracted so the error state can render
+    /// alone without nested conditionals).
+    @ViewBuilder
+    private var activeJobBody: some View {
+        VStack(alignment: .leading, spacing: 10) {
                 // Headline row
                 HStack(spacing: 8) {
                     Image(systemName: "waveform")
@@ -884,8 +899,6 @@ private struct QuickActionsSection: View {
                     .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
                 }
             }
-        }
-        .padding(.vertical, 4)
     }
 
     /// Headline shown in the glass card. Falls back through the same priority
