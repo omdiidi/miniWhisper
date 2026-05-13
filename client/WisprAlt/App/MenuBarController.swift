@@ -56,6 +56,12 @@ final class RecordingState: ObservableObject {
     /// finishing" banner and blocks new submissions while this is non-nil.
     @Published var serverFinishingJobID: String? = nil
 
+    /// True while the chunked uploader's `/finalize` step is in flight (server-
+    /// side chunk concatenation). The popover replaces the "Uploading 99%"
+    /// label with an indeterminate "Finalizing" progress bar so the UI doesn't
+    /// lie about progress during the concat window (can be 1-10s on big files).
+    @Published var isFinalizing: Bool = false
+
     /// Reset every per-job field. Caller is responsible for also clearing
     /// the UserDefaults `activeJobID` key — `reset()` only touches in-memory
     /// state so it can be called from contexts that shouldn't write defaults.
@@ -70,6 +76,7 @@ final class RecordingState: ObservableObject {
         phaseElapsedS = nil
         audioDurationS = nil
         activeJobID = nil
+        isFinalizing = false
     }
 
     /// Friendly phase label: uses the server-provided `phaseLabel` when set,
@@ -778,7 +785,26 @@ final class MenuBarController: NSObject {
         // A 200 MB MP4 typically becomes a ~15 MB .m4a — often dropping below
         // the chunked-upload threshold entirely. Failures degrade gracefully
         // back to the original URL (AudioExtractor never throws).
+        let extractStart = Date()
+        let sourceBytes: Int64 = (
+            ((try? FileManager.default.attributesOfItem(atPath: sourceURL.path)[.size]) as? NSNumber)?.int64Value
+        ) ?? 0
         let uploadURL = await AudioExtractor.extractAudioIfVideo(sourceURL)
+        let extractedBytes: Int64 = (
+            ((try? FileManager.default.attributesOfItem(atPath: uploadURL.path)[.size]) as? NSNumber)?.int64Value
+        ) ?? 0
+        let extractElapsedMs = Int(Date().timeIntervalSince(extractStart) * 1000)
+        if uploadURL != sourceURL {
+            Log.info(
+                "AudioExtractor: input=\(sourceBytes) B → output=\(extractedBytes) B in \(extractElapsedMs)ms",
+                category: "transcribe"
+            )
+        } else {
+            Log.info(
+                "AudioExtractor: no extraction (input=\(sourceBytes) B, elapsed=\(extractElapsedMs)ms)",
+                category: "transcribe"
+            )
+        }
         let extractedTempDir: URL? = (uploadURL != sourceURL)
             ? uploadURL.deletingLastPathComponent()
             : nil
@@ -808,7 +834,14 @@ final class MenuBarController: NSObject {
         // Reset stall-watchdog state before bytes start flowing and arm the
         // 30-second no-progress abort.
         recordingState.uploadError = nil
+        // Seed a tiny positive fraction + an initial progress timestamp so the
+        // popover renders the upload card immediately (the visibility gate in
+        // SettingsView keys off `uploadFraction > 0`). Without this seed the
+        // user sees a blank popover during the `/init` round-trip on chunked
+        // uploads, and during the multipart-envelope build for single-shot.
+        recordingState.uploadFraction = 0.001
         recordingState.lastUploadProgressAt = Date()
+        recordingState.isFinalizing = false
         startUploadWatchdog()
 
         // Pick the upload path based on file size. The 50 MiB threshold leaves
@@ -818,45 +851,80 @@ final class MenuBarController: NSObject {
         ) ?? 0
 
         let jobID: JobID
-        if uploadSize > ChunkedUploader.chunkThreshold {
-            Log.info(
-                "File >\(ChunkedUploader.chunkThreshold / (1024 * 1024))MB (\(uploadSize) bytes) — using chunked upload.",
-                category: "transcribe"
-            )
-            jobID = try await ChunkedUploader.upload(
-                fileURL: uploadURL,
-                mode: mode,
-                progress: { [weak self] fraction in
-                    Task { @MainActor [weak self] in
+        do {
+            if uploadSize > ChunkedUploader.chunkThreshold {
+                Log.info(
+                    "File >\(ChunkedUploader.chunkThreshold / (1024 * 1024))MB (\(uploadSize) bytes) — using chunked upload.",
+                    category: "transcribe"
+                )
+                jobID = try await ChunkedUploader.upload(
+                    fileURL: uploadURL,
+                    mode: mode,
+                    progress: { [weak self] fraction in
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.recordingState.uploadFraction = fraction
+                            self.recordingState.lastUploadProgressAt = Date()
+                        }
+                    },
+                    sessionRegistered: { [weak self] session in
+                        Task { @MainActor [weak self] in
+                            self?.activeUploadSession = session
+                        }
+                    },
+                    phaseHandler: { [weak self] phase in
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            switch phase {
+                            case .initRequest, .chunk:
+                                self.recordingState.isFinalizing = false
+                            case .finalize:
+                                self.recordingState.isFinalizing = true
+                            }
+                        }
+                    }
+                )
+            } else {
+                jobID = try await MeetingAPI.submitFile(
+                    uploadURL,
+                    mode: mode,
+                    progress: { [weak self] fraction in
                         guard let self else { return }
                         self.recordingState.uploadFraction = fraction
                         self.recordingState.lastUploadProgressAt = Date()
+                    },
+                    sessionRegistered: { [weak self] session in
+                        // The continuation closure that creates the URLSession is
+                        // @Sendable; hop to the main actor to satisfy isolation on
+                        // the controller's `activeUploadSession` field.
+                        Task { @MainActor [weak self] in
+                            self?.activeUploadSession = session
+                        }
                     }
-                },
-                sessionRegistered: { [weak self] session in
-                    Task { @MainActor [weak self] in
-                        self?.activeUploadSession = session
-                    }
-                }
-            )
-        } else {
-            jobID = try await MeetingAPI.submitFile(
-                uploadURL,
-                mode: mode,
-                progress: { [weak self] fraction in
-                    guard let self else { return }
-                    self.recordingState.uploadFraction = fraction
-                    self.recordingState.lastUploadProgressAt = Date()
-                },
-                sessionRegistered: { [weak self] session in
-                    // The continuation closure that creates the URLSession is
-                    // @Sendable; hop to the main actor to satisfy isolation on
-                    // the controller's `activeUploadSession` field.
-                    Task { @MainActor [weak self] in
-                        self?.activeUploadSession = session
-                    }
-                }
-            )
+                )
+            }
+        } catch {
+            // Tear down watchdog + session refs before surfacing the error so
+            // the stall watchdog doesn't fire on a torn-down upload.
+            uploadWatchdogTask?.cancel()
+            uploadWatchdogTask = nil
+            activeUploadSession = nil
+            recordingState.lastUploadProgressAt = nil
+            recordingState.isFinalizing = false
+            recordingState.uploadFraction = 0
+            // Only set the user-facing banner when the watchdog didn't already
+            // populate it (the watchdog sets a stall-specific message and
+            // calls `cancelActiveTranscription`, which throws `.cancelled`).
+            let isCancellation: Bool
+            if let urlErr = error as? URLError, urlErr.code == .cancelled {
+                isCancellation = true
+            } else {
+                isCancellation = (error is CancellationError)
+            }
+            if !isCancellation && recordingState.uploadError == nil {
+                recordingState.uploadError = uploadErrorMessage(for: error)
+            }
+            throw error
         }
         // Upload finished cleanly — drop the session reference + watchdog.
         // Cancel paths also clear these in `cancelActiveTranscription()`.
@@ -864,6 +932,7 @@ final class MenuBarController: NSObject {
         uploadWatchdogTask = nil
         activeUploadSession = nil
         recordingState.lastUploadProgressAt = nil
+        recordingState.isFinalizing = false
         // Make the job id observable + persistent so a process restart can
         // resume polling and the UI can render Cancel + View-server-log.
         recordingState.activeJobID = jobID.raw
@@ -1066,6 +1135,7 @@ final class MenuBarController: NSObject {
         recordingState.totalChunks = nil
         recordingState.phaseElapsedS = nil
         recordingState.uploadFraction = 0
+        recordingState.isFinalizing = false
         self.mode = .idle
     }
 
@@ -1150,6 +1220,33 @@ final class MenuBarController: NSObject {
                 category: "transcribe"
             )
         }
+    }
+
+    /// Map a thrown upload error to a user-readable banner string. Switches
+    /// on `ChunkedUploaderError` cases so the user sees a specific cause
+    /// (file-too-large vs init vs chunk vs finalize) and falls back to the
+    /// raw `localizedDescription` for everything else (URLError, ServerError,
+    /// `MeetingAPI.submitFile` failures, …).
+    @MainActor
+    private func uploadErrorMessage(for error: Error) -> String {
+        if let chunked = error as? ChunkedUploaderError {
+            switch chunked {
+            case .fileTooLarge:
+                return "File too large (limit 4 GB). Try compressing or splitting."
+            case .invalidFile:
+                return "Upload failed: cannot read the source file."
+            case .chunkUploadFailed(let underlying):
+                return "Upload failed: \(underlying.localizedDescription)"
+            case .initFailed(let underlying):
+                return "Couldn't start upload: \(underlying.localizedDescription)"
+            case .finalizeFailed(let underlying):
+                return "Upload assembled but server rejected: \(underlying.localizedDescription)"
+            }
+        }
+        if case ServerError.unauthorized = error {
+            return "Authentication failed — re-paste your API key in Settings."
+        }
+        return "Upload failed: \(error.localizedDescription)"
     }
 
     /// Map a thrown transcription error to a user-facing message. Shared

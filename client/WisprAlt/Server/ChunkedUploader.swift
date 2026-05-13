@@ -23,6 +23,17 @@ import Foundation
 /// `didSendBodyData` callback feeds the stall-watchdog its
 /// `lastUploadProgressAt` heartbeat within a chunk, so a slow 50 MiB chunk on
 /// a poor link cannot blow the 120 s stall threshold mid-chunk.
+/// Lifecycle phase emitted by `ChunkedUploader.upload` via the optional
+/// `phaseHandler` callback. `MenuBarController` toggles
+/// `recordingState.isFinalizing` based on `.finalize` so the popover can show
+/// an indeterminate "Finalizing" progress bar during server-side chunk concat
+/// instead of a misleading "Uploading 99%".
+enum ChunkedPhase: Sendable, Equatable {
+    case initRequest
+    case chunk(index: Int, totalChunks: Int)
+    case finalize
+}
+
 enum ChunkedUploader {
     /// Hard ceiling — matches server's `_MAX_TOTAL_BYTES` so we 413 client-side
     /// instead of pushing chunks for an upload the server will reject anyway.
@@ -69,7 +80,8 @@ enum ChunkedUploader {
         fileURL: URL,
         mode: String,
         progress: @escaping @Sendable (Double) -> Void,
-        sessionRegistered: (@Sendable (URLSession) -> Void)? = nil
+        sessionRegistered: (@Sendable (URLSession) -> Void)? = nil,
+        phaseHandler: (@Sendable (ChunkedPhase) -> Void)? = nil
     ) async throws -> JobID {
         guard let baseURL = Settings.shared.serverURL else {
             throw ServerError.missingConfiguration
@@ -109,18 +121,24 @@ enum ChunkedUploader {
         let apiKey = (try? KeychainHelper.getAPIKey()) ?? ""
 
         // ── Step 1: /init ──────────────────────────────────────────────────
-        let initResp = try await postJSON(
-            session: session,
-            url: baseURL.appendingPathComponent("/transcribe/file/chunked/init"),
-            apiKey: apiKey,
-            body: InitRequest(
-                mode: mode,
-                total_bytes: fileSize,
-                chunk_count: Self.chunkCount(for: fileSize, chunkSize: defaultChunkSize),
-                original_filename: fileURL.lastPathComponent
-            ),
-            decode: InitResponse.self
-        )
+        phaseHandler?(.initRequest)
+        let initResp: InitResponse
+        do {
+            initResp = try await postJSON(
+                session: session,
+                url: baseURL.appendingPathComponent("/transcribe/file/chunked/init"),
+                apiKey: apiKey,
+                body: InitRequest(
+                    mode: mode,
+                    total_bytes: fileSize,
+                    chunk_count: Self.chunkCount(for: fileSize, chunkSize: defaultChunkSize),
+                    original_filename: fileURL.lastPathComponent
+                ),
+                decode: InitResponse.self
+            )
+        } catch {
+            throw ChunkedUploaderError.initFailed(error)
+        }
         let uploadID = initResp.upload_id
         let chunkSize = initResp.chunk_size > 0 ? initResp.chunk_size : defaultChunkSize
         let totalChunks = Self.chunkCount(for: fileSize, chunkSize: chunkSize)
@@ -148,25 +166,49 @@ enum ChunkedUploader {
             // R-K + watchdog: tell the delegate which chunk we're on so per-
             // byte fractions can be folded into an overall progress value.
             delegate.beginChunk(index: index, totalChunks: totalChunks, chunkBytes: chunkData.count)
+            phaseHandler?(.chunk(index: index, totalChunks: totalChunks))
 
-            try await uploadOneChunk(
-                session: session,
-                baseURL: baseURL,
-                apiKey: apiKey,
-                uploadID: uploadID,
-                chunkIndex: index,
-                data: chunkData
+            Log.info(
+                "chunk \(index + 1)/\(totalChunks) starting (size=\(chunkData.count) B)",
+                category: "transcribe"
+            )
+            let chunkStartedAt = Date()
+            do {
+                try await uploadOneChunk(
+                    session: session,
+                    baseURL: baseURL,
+                    apiKey: apiKey,
+                    uploadID: uploadID,
+                    chunkIndex: index,
+                    data: chunkData
+                )
+            } catch let urlError as URLError where urlError.code == .cancelled {
+                // Caller-initiated cancel — propagate without wrapping.
+                throw urlError
+            } catch {
+                throw ChunkedUploaderError.chunkUploadFailed(error)
+            }
+            let elapsedMs = Int(Date().timeIntervalSince(chunkStartedAt) * 1000)
+            Log.info(
+                "chunk \(index + 1)/\(totalChunks) uploaded in \(elapsedMs)ms",
+                category: "transcribe"
             )
         }
 
         // ── Step 3: /finalize ─────────────────────────────────────────────
-        let finalResp = try await postJSON(
-            session: session,
-            url: baseURL.appendingPathComponent("/transcribe/file/chunked/\(uploadID)/finalize"),
-            apiKey: apiKey,
-            body: EmptyBody(),
-            decode: FinalizeResponse.self
-        )
+        phaseHandler?(.finalize)
+        let finalResp: FinalizeResponse
+        do {
+            finalResp = try await postJSON(
+                session: session,
+                url: baseURL.appendingPathComponent("/transcribe/file/chunked/\(uploadID)/finalize"),
+                apiKey: apiKey,
+                body: EmptyBody(),
+                decode: FinalizeResponse.self
+            )
+        } catch {
+            throw ChunkedUploaderError.finalizeFailed(error)
+        }
 
         Log.info("ChunkedUploader: finalize ok — job_id=\(finalResp.job_id)", category: "transcribe")
         session.finishTasksAndInvalidate()
@@ -319,6 +361,9 @@ enum ChunkedUploader {
 enum ChunkedUploaderError: Error, LocalizedError {
     case invalidFile
     case fileTooLarge(Int64)
+    case initFailed(Error)
+    case chunkUploadFailed(Error)
+    case finalizeFailed(Error)
 
     var errorDescription: String? {
         switch self {
@@ -327,6 +372,12 @@ enum ChunkedUploaderError: Error, LocalizedError {
         case .fileTooLarge(let bytes):
             let gb = Double(bytes) / 1_000_000_000.0
             return String(format: "File is %.2f GB — exceeds 4 GB chunked-upload limit.", gb)
+        case .initFailed(let underlying):
+            return "Couldn't start upload: \(underlying.localizedDescription)"
+        case .chunkUploadFailed(let underlying):
+            return "Upload failed: \(underlying.localizedDescription)"
+        case .finalizeFailed(let underlying):
+            return "Upload assembled but server rejected: \(underlying.localizedDescription)"
         }
     }
 }

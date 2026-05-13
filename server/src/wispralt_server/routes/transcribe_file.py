@@ -412,6 +412,13 @@ async def upload_chunk(
     except OSError:
         pass
 
+    logger.info(
+        "chunked upload %s: chunk %d/%d received (%d bytes)",
+        upload_id,
+        chunk_index + 1,
+        int(meta["chunk_count"]),
+        bytes_written,
+    )
     return JSONResponse({"ok": True, "received_bytes": bytes_written})
 
 
@@ -511,6 +518,10 @@ async def finalize_chunked(
     # Cloudflare's 100s ceiling).
     out_path = settings.staging_dir / f"{upload_id}{ext}"
     loop = asyncio.get_running_loop()
+    # Snapshot per-part sizes BEFORE concat — `_concat_chunks` unlinks each
+    # part as it copies, so stat()ing afterward would return ENOENT.
+    part_sizes_pre = [p.stat().st_size for p in parts]
+    concat_started = time.monotonic()
     try:
         await loop.run_in_executor(None, _concat_chunks, parts, out_path)
     except OSError as exc:
@@ -518,6 +529,14 @@ async def finalize_chunked(
         shutil.rmtree(chunked_dir, ignore_errors=True)
         logger.error("Chunked finalize concat failed: %s", exc)
         raise HTTPException(500, "Concat failed") from exc
+    concat_elapsed_ms = int((time.monotonic() - concat_started) * 1000)
+    logger.info(
+        "chunked upload %s: concat finished in %d ms (%d parts, sizes=%s)",
+        upload_id,
+        concat_elapsed_ms,
+        len(part_sizes_pre),
+        part_sizes_pre,
+    )
 
     # Sanity: assembled size must match declaration.
     try:

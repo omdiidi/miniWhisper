@@ -859,6 +859,16 @@ private struct QuickActionsSection: View {
                     Text("Chunk \(idx) of \(total)")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
+                } else if recordingState.isFinalizing {
+                    // Chunked-upload `/finalize` in flight: server is concat'ing
+                    // chunks (1-10s on big files). Indeterminate bar is more
+                    // honest than "Uploading 99%".
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(.accentColor)
+                    Text("Finalizing")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } else if recordingState.uploadFraction > 0 && recordingState.uploadFraction < 1 {
                     ProgressView(value: recordingState.uploadFraction)
                         .progressViewStyle(.linear)
@@ -907,6 +917,9 @@ private struct QuickActionsSection: View {
         if recordingState.serverFinishingJobID != nil
             && recordingState.activeJobID == nil {
             return "Finishing previous job"
+        }
+        if recordingState.isFinalizing {
+            return "Finalizing"
         }
         if let label = recordingState.phaseLabelDisplay {
             return label
