@@ -188,6 +188,42 @@ def sweep_old(
     return removed
 
 
+def sweep_chunked(staging_dir: Path, max_age_seconds: int = 3600) -> int:
+    """Remove chunked-upload directories under ``staging_dir/chunked`` that are
+    older than *max_age_seconds*.
+
+    Companion to :func:`sweep_old` for the chunked upload path. The TTL is
+    deliberately separate (1 h vs 24 h for plain WAVs) because abandoned
+    chunked dirs eat much more disk per item — a single stranded upload can
+    pin 500 MB.
+
+    The directory's mtime is bumped on every successful chunk write (see
+    ``transcribe_file.upload_chunk``) so an actively-uploading client never
+    has its dir reaped underneath it.
+
+    Returns the count of directories removed.
+    """
+    chunked_root = staging_dir / "chunked"
+    if not chunked_root.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for d in chunked_root.iterdir():
+        if not d.is_dir():
+            continue
+        try:
+            # Prefer meta.json mtime when present — it's the activity signal
+            # (touched on every chunk write). Falls back to the dir mtime.
+            meta = d / "meta.json"
+            ref = meta if meta.exists() else d
+            if now - ref.stat().st_mtime > max_age_seconds:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def validate_wav_completeness(path: Path) -> None:
     """Validate that *path* is a plausible non-truncated WAV file.
 

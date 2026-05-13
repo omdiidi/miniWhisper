@@ -161,6 +161,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if removed:
         logger.info("Startup staging sweep removed %d old WAV(s).", removed)
 
+    # 4a. Sweep stale chunked-upload directories (>1 h). Separate TTL from the
+    #     plain-WAV sweep because abandoned chunked dirs pin a lot of disk per
+    #     item; meta.json mtime is bumped on every chunk write so active
+    #     uploads are safe.
+    chunked_removed = staging.sweep_chunked(
+        settings.staging_dir,
+        max_age_seconds=3600,
+    )
+    if chunked_removed:
+        logger.info(
+            "Startup chunked sweep removed %d stale chunked upload dir(s).",
+            chunked_removed,
+        )
+
     # 4b. Sweep stale .tmp files in meeting output dir (I8).
     tmp_removed = sweep_stale_tmp(settings.meeting_output_dir)
     if tmp_removed:
