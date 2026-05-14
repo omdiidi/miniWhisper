@@ -1,0 +1,18 @@
+<div class="stats-grid">
+  <div class="stat-tile">
+    <div class="label">Dictations</div>
+    <div class="value">{{ stats.get('dictation_count', 0) if stats else 0 }}</div>
+  </div>
+  <div class="stat-tile">
+    <div class="label">Meetings</div>
+    <div class="value">{{ stats.get('meeting_count', 0) if stats else 0 }}</div>
+  </div>
+  <div class="stat-tile">
+    <div class="label">Total words</div>
+    <div class="value">{{ stats.get('total_words', 0) if stats else 0 }}</div>
+  </div>
+  <div class="stat-tile">
+    <div class="label">Time saved (hrs)</div>
+    <div class="value">{{ stats.get('time_saved_hours', 0) if stats else 0 }}</div>
+  </div>
+</div>

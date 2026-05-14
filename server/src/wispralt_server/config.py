@@ -114,6 +114,22 @@ class Settings(BaseSettings):
     # background task. See docs/ARCHITECTURE.md "Transcript persistence".
     transcript_retention_days: int = 90
 
+    # Weekly insights (Phase 2) — Sunday-night LLM analysis of last week's transcripts.
+    # Default model is grok-4.3 — verified existing + cheapest reasoning option on OpenRouter
+    # (Task 0 spike 2026-05-14, ~$0.65/week projected at our employee count).
+    insights_model: str = "x-ai/grok-4.3"
+    insights_timeout_s: float = 30.0
+    insights_max_30d_cost_usd: float = 8.0
+    insights_input_word_cap: int = 30000
+    insights_per_person_min_dictations: int = 5
+    # ISO weekday: Mon=1...Sun=7. Default 7 = Sunday.
+    insights_schedule_weekday: int = 7
+    insights_schedule_hour_local: int = 23
+    insights_timezone: str = "America/Los_Angeles"
+    # Startup-catchup fail-closed by default. Operator opts in via .env AFTER verifying
+    # OpenRouter pricing/model in Task 0 spike. Prevents accidental Wednesday-deploy charge.
+    insights_catchup_enabled: bool = False
+
 
 # Module-level singleton — import as ``from wispralt_server.config import settings``
 settings = Settings()

@@ -15,6 +15,7 @@ Design decisions (v3 deltas P4#4 + P5#2):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -209,6 +210,33 @@ class JobStore:
             " ON dictations(api_key_id, created_at)"
         )
 
+        # Weekly LLM insights (Phase 2). One row per (iso_year, iso_week, scope,
+        # api_key_id). scope='person' stores per-employee summaries with the
+        # api_key_id populated; scope='team' stores the aggregated team summary
+        # with api_key_id NULL. Upsert semantics let the cron re-run a week
+        # idempotently (e.g. retry after transient OpenRouter failure).
+        self.con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_insights (
+                iso_year     INTEGER NOT NULL,
+                iso_week     INTEGER NOT NULL,
+                scope        TEXT NOT NULL,
+                api_key_id   INTEGER,
+                insight_json TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost_usd     REAL NOT NULL,
+                model        TEXT NOT NULL,
+                generated_at REAL NOT NULL,
+                PRIMARY KEY (iso_year, iso_week, scope, api_key_id)
+            )
+            """
+        )
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_weekly_insights_generated"
+            " ON weekly_insights(generated_at)"
+        )
+
         # chmod 600 on jobs.db + -wal + -shm sidecars. Applied unconditionally
         # on every startup so a restored backup (which may have wider perms
         # propagated from the source filesystem) is auto-tightened. Logs at
@@ -352,6 +380,170 @@ class JobStore:
             client_app_version,
             1 if smart_format_applied else 0,
         )
+
+    # ── weekly insights (Phase 2) ────────────────────────────────────────────
+
+    def upsert_weekly_insight(
+        self, *, iso_year: int, iso_week: int, scope: str,
+        api_key_id: int | None, insight: dict,
+        input_tokens: int, output_tokens: int, cost_usd: float, model: str,
+    ) -> None:
+        """Upsert one weekly_insights row keyed by (iso_year, iso_week, scope, api_key_id).
+        Idempotent — a Sunday-night re-run for the same week overwrites in place.
+        """
+        self._exec(
+            """
+            INSERT INTO weekly_insights
+                (iso_year, iso_week, scope, api_key_id, insight_json,
+                 input_tokens, output_tokens, cost_usd, model, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(iso_year, iso_week, scope, api_key_id) DO UPDATE SET
+                insight_json=excluded.insight_json,
+                input_tokens=excluded.input_tokens,
+                output_tokens=excluded.output_tokens,
+                cost_usd=excluded.cost_usd,
+                model=excluded.model,
+                generated_at=excluded.generated_at
+            """,
+            iso_year, iso_week, scope, api_key_id, json.dumps(insight),
+            input_tokens, output_tokens, cost_usd, model, time.time(),
+        )
+
+    def get_weekly_insight_person(
+        self, api_key_id: int, iso_year: int, iso_week: int,
+    ) -> dict | None:
+        cur = self._exec(
+            "SELECT insight_json FROM weekly_insights"
+            " WHERE scope='person' AND api_key_id=? AND iso_year=? AND iso_week=?",
+            api_key_id, iso_year, iso_week,
+        )
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+
+    def get_weekly_insight_team(self, iso_year: int, iso_week: int) -> dict | None:
+        cur = self._exec(
+            "SELECT insight_json FROM weekly_insights"
+            " WHERE scope='team' AND api_key_id IS NULL AND iso_year=? AND iso_week=?",
+            iso_year, iso_week,
+        )
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+
+    def has_any_insight_for_week(self, iso_year: int, iso_week: int) -> bool:
+        """True if at least one row exists for the given ISO week (any scope).
+
+        Used by the cron's startup-catchup to skip a week that already has
+        person and/or team rows so a Sunday-night restart never double-charges.
+        """
+        cur = self._exec(
+            "SELECT 1 FROM weekly_insights WHERE iso_year=? AND iso_week=? LIMIT 1",
+            iso_year, iso_week,
+        )
+        return cur.fetchone() is not None
+
+    def list_filler_counts_for_week(
+        self, iso_year: int, iso_week: int,
+    ) -> list[tuple[int, int]]:
+        """Return ``[(api_key_id, filler_word_count), ...]`` for all person rows
+        in the week, sorted descending by count.
+
+        Filters out malformed insight_json silently (logs a warning) so one
+        bad row doesn't blank the leaderboard.
+        """
+        out: list[tuple[int, int]] = []
+        cur = self._exec(
+            "SELECT api_key_id, insight_json FROM weekly_insights"
+            " WHERE scope='person' AND iso_year=? AND iso_week=?",
+            iso_year, iso_week,
+        )
+        for row in cur.fetchall():
+            try:
+                doc = json.loads(row[1])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "malformed insight_json for api_key_id=%s W%02d",
+                    row[0], iso_week,
+                )
+                continue
+            n = doc.get("filler_word_count")
+            if isinstance(n, int):
+                out.append((int(row[0]), n))
+        out.sort(key=lambda r: r[1], reverse=True)
+        return out
+
+    def compute_user_stats(
+        self, api_key_id: int, *, since_epoch: float,
+    ) -> dict[str, int | float]:
+        """Read-only stats for one user across dictations + jobs since ``since_epoch``.
+
+        Returns ``{dictation_count, meeting_count, total_words, total_inference_ms,
+        time_saved_hours}``. Goes through ``_exec`` for single-writer-lock
+        discipline. Time-saved baseline: 40 WPM typing rate.
+
+        Requires SQLite >= 3.30 for ``COUNT(*) FILTER (WHERE ...)`` syntax.
+        """
+        cur = self._exec(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE kind='dictation') AS dictation_count,
+                COUNT(*) FILTER (WHERE kind='meeting') AS meeting_count,
+                COALESCE(SUM(word_count), 0) AS total_words,
+                COALESCE(SUM(duration_ms), 0) AS total_inference_ms
+            FROM (
+                SELECT 'dictation' AS kind, word_count, duration_ms, created_at
+                  FROM dictations WHERE api_key_id = ? AND created_at >= ?
+                UNION ALL
+                SELECT 'meeting' AS kind, word_count, NULL AS duration_ms, created_at
+                  FROM jobs WHERE api_key_id = ?
+                              AND transcript_text IS NOT NULL
+                              AND created_at >= ?
+            )
+            """,
+            api_key_id, since_epoch, api_key_id, since_epoch,
+        )
+        row = cur.fetchone() or (0, 0, 0, 0)
+        total_words = int(row[2] or 0)
+        return {
+            "dictation_count": int(row[0] or 0),
+            "meeting_count": int(row[1] or 0),
+            "total_words": total_words,
+            "total_inference_ms": int(row[3] or 0),
+            "time_saved_hours": round(total_words / 40.0 / 60.0, 2),
+        }
+
+    def rolling_insights_cost_usd(self, days: int = 30) -> float:
+        cutoff = time.time() - days * 86400
+        cur = self._exec(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM weekly_insights"
+            " WHERE generated_at >= ?",
+            cutoff,
+        )
+        return float(cur.fetchone()[0])
+
+    def transcripts_in_range(
+        self, api_key_id: int, *, since_epoch: float, until_epoch: float,
+    ) -> list[dict]:
+        """Combined dictation + meeting/file transcripts for one employee in
+        [since_epoch, until_epoch). Returns dicts {created_at, text, kind}
+        sorted newest-first. Honors single-writer lock via `_exec`.
+        """
+        cur = self._exec(
+            """
+            SELECT created_at, text, kind FROM (
+                SELECT created_at, text, 'dictation' AS kind
+                  FROM dictations
+                 WHERE api_key_id = ? AND created_at >= ? AND created_at < ?
+                UNION ALL
+                SELECT created_at, transcript_text AS text, 'meeting' AS kind
+                  FROM jobs
+                 WHERE api_key_id = ? AND transcript_text IS NOT NULL
+                   AND created_at >= ? AND created_at < ?
+            ) ORDER BY created_at DESC
+            """,
+            api_key_id, since_epoch, until_epoch,
+            api_key_id, since_epoch, until_epoch,
+        )
+        return [{"created_at": r[0], "text": r[1], "kind": r[2]} for r in cur.fetchall()]
 
     def sweep_transcripts(self, days: int) -> tuple[int, int]:
         """Zero ``jobs.transcript_text`` and delete ``dictations`` rows older

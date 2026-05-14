@@ -627,6 +627,243 @@ worker crashes and mid-upload client upgrades. Missing → stored as NULL.
 
 ---
 
+## Weekly insights
+
+Phase 2 of the portal effort. The capture loop (transcript persistence above)
+runs continuously; the **analysis loop** here turns the previous week's
+captured transcripts into per-employee + team summaries every Sunday night.
+The render loop (`Data portal` below) is what employees and admins see in the
+browser.
+
+Source: `server/src/wispralt_server/insights/{__init__.py, client.py, prompts.py, cron.py}`
+and the `weekly_insights` table + 5 helpers in `jobs/store.py`.
+
+### Schedule
+
+The cron fires at **23:00 in `settings.insights_timezone`** (default
+`America/Los_Angeles`) every Sunday. It's an **in-process asyncio task**
+launched from the FastAPI lifespan — not a separate launchd plist. The
+trade-off: in-process loses the process-isolation that a separate plist would
+buy (a runaway insights pass could in principle starve the dictation loop)
+but gains a warm OpenRouter client + reuse of the existing SQLite/`JobStore`
+connection. The startup-catchup branch (next section) covers the
+reboot-during-fire case, so the in-process path is effectively reliable in
+practice; we accepted the trade.
+
+`_seconds_until_next_fire(tz, *, iso_weekday, hour)` in `insights/cron.py`
+computes the sleep interval via `datetime.now(ZoneInfo(...))` arithmetic,
+which is DST-correct (`zoneinfo` handles the spring-forward / fall-back
+delta automatically) — verified by hand against both the 2026 PST→PDT
+and PDT→PST transitions. The parameterized form lets ops dry-runs and
+the catchup path retarget specific weekdays/hours without code edits;
+the back-compat alias `_seconds_until_sunday_23_local(tz)` is retained
+for one release. The lifespan installs an `asyncio.Lock` on
+`app.state.weekly_insights_lock`; `run_weekly_insights` short-circuits
+with a warning if the lock is already held (catchup overlap → no
+double-bill).
+
+### Startup catchup
+
+Gated behind `settings.insights_catchup_enabled` (defaults **False** — opt-in
+only). When True, on lifespan startup the cron checks whether the most-recent
+completed ISO week has a row in `weekly_insights` for any user **and** ended
+less than 72 hours ago; if both conditions hold, it runs the insights pass
+immediately rather than waiting for the next Sunday. The operator opts in via
+`.env` only after verifying OpenRouter model availability + pricing — leaving
+it False on a fresh deploy prevents an accidental Wednesday-after-deploy
+charge.
+
+### Cost control
+
+A hard 30-day rolling cap (`settings.insights_max_30d_cost_usd`, default
+**$8**) gates the cron at two seams:
+
+1. **Pre-call check.** Before issuing any OpenRouter call, the cron reads
+   `JobStore.rolling_insights_cost_usd(days=30)` and skips the entire run if
+   the figure is already at or above the cap.
+2. **Mid-run check.** Inside the per-user loop, an `accumulated_run_cost`
+   counter tracks spend for the current invocation. After each call the cron
+   re-checks `baseline_30d_cost + accumulated_run_cost ≥ BUDGET` and stops
+   mid-run rather than blowing through the cap on the last few employees.
+
+Cost is extracted from the OpenRouter response body's `usage.cost` field
+(verified to exist on `x-ai/grok-4.3` responses on 2026-05-14 via Task 0).
+If a future model strips the field, `InsightsClient` falls back to a
+hardcoded `INSIGHTS_PRICING_PER_1K` rate-card keyed by model id; the
+`_default` entry is intentionally set high so the fallback fails closed (we'd
+rather skip a run than under-bill against a missing rate).
+
+The OpenRouter 429 rate-limit response is surfaced as `RateLimitedError`
+which aborts the entire current run; the next scheduled Sunday fire will
+retry. We don't sleep-and-retry inside the loop — Sunday-to-Sunday cadence
+gives more than enough recovery time.
+
+### Data shapes
+
+```sql
+CREATE TABLE weekly_insights (
+    iso_year     INTEGER NOT NULL,
+    iso_week     INTEGER NOT NULL,
+    scope        TEXT NOT NULL,         -- 'person' or 'team'
+    api_key_id   INTEGER,                -- NULL for team scope
+    insight_json TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd     REAL NOT NULL,
+    model        TEXT NOT NULL,         -- e.g. 'x-ai/grok-4.3'
+    generated_at REAL NOT NULL,
+    PRIMARY KEY (iso_year, iso_week, scope, api_key_id)
+);
+CREATE INDEX idx_weekly_insights_generated ON weekly_insights(generated_at);
+```
+
+`upsert_weekly_insight` uses `ON CONFLICT (iso_year, iso_week, scope, api_key_id)
+DO UPDATE` so a re-run for the same week overwrites the previous row
+idempotently — useful for catchup, manual re-runs via the
+`python -m wispralt_server.insights.cron --manual` entrypoint, and prompt
+iteration during development.
+
+Per-person `insight_json` schema:
+
+```json
+{
+  "digest": ["3-bullet summary of the employee's week"],
+  "action_items": [{"text": "ship migration", "owner": "Sarah", "eta": "Fri"}],
+  "projects": [{"name": "Acme proposal", "pct_time": 0.40}],
+  "decisions": ["we decided to..."],
+  "blockers": ["mercury timeouts mentioned 6x"],
+  "topics": [{"label": "billing", "weight": 0.3}],
+  "filler_word_count": 47,
+  "quotable_line": "the migration WILL ship on Friday"
+}
+```
+
+Team `insight_json` schema:
+
+```json
+{
+  "themes": [{"label": "client onboarding", "rank": 1, "wow_delta": "+2"}],
+  "team_action_items": [...],
+  "team_blockers": [...],
+  "tool_mentions": {"Mercury": 6, "Cloudflare": 4},
+  "knowledge_gaps": ["questions raised without follow-up"]
+}
+```
+
+### Hallucination guard
+
+`_scrub_hallucinations` in `insights/cron.py` is **two-tier**:
+
+- **`quotable_line` — strict exact substring (case-insensitive).** Must appear
+  verbatim in the week's transcript blob for that user, because the UI
+  renders this field as a literal quote. If absent, the field is replaced
+  with `null` rather than risk attributing made-up words to the employee.
+- **`action_items` / `decisions` / `blockers` — 8-character sliding window.**
+  Each item must share an 8-char substring with the transcript blob. This is
+  paraphrase-tolerant (the LLM legitimately summarizes "we decided X" without
+  copying the exact words) at the cost of false-positives on common phrases.
+  The UI surfaces an **"AI-generated, may be inaccurate"** disclaimer on
+  every card to set user expectations accordingly.
+
+### Scope semantics
+
+- **`scope = 'person'`** rows are emitted per employee that hit the
+  data-floor gate: at least **5 dictations OR at least 1 meeting/file** in
+  the week. Users below the floor are skipped silently (no row written) to
+  avoid charging for thin-data summaries.
+- **`scope = 'team'`** is one row per week with `api_key_id = NULL`. It's
+  written **only when at least 2 employees had successful person-scope
+  insights** — a one-person team aggregate would just be a re-rendering of
+  that person's row.
+
+---
+
+## Data portal
+
+The render loop. All three surfaces share the same base template + vendored
+JS so a single design language covers admin + employee views.
+
+Source: `server/src/wispralt_server/routes/{me.py, admin_data.py}` +
+`server/src/wispralt_server/admin/templates/{me_login, me_insights, data,
+_insight_cards, _stats_grid_partial}.html.j2`.
+
+### Surfaces
+
+- **Admin Data tab — `GET /admin/data`.** Admin-only (router-level
+  `require_admin` + `_require_db_pool` deps). Renders the team `weekly_insights`
+  card stack on top + a per-user leaderboard underneath. The optional
+  `?user_id=N` query param drills into one employee using the same
+  `_insight_cards.html.j2` macro layout the employee self-view renders, so
+  the admin sees exactly what the employee sees.
+- **Employee self-view — `GET /me/insights`.** Authenticated user only.
+  Shows that user's `'person'`-scope insight (most recent week) plus a
+  time-range stats grid (Today / 7d / 30d / 90d / 1y / All). Break-glass
+  admin (`user.id < 0`) is 303'd to `/admin/data` because break-glass
+  identities have no per-user transcript history to summarize.
+- **Employee login — `GET /me/login` / `POST /me/login`.** Token-paste form
+  mirroring the admin login flow. On success it sets the **same**
+  `wispralt_admin_token` cookie that admin login sets, but with `path="/"`
+  so a single cookie scopes across both `/admin/*` and `/me/*` surfaces
+  (the admin login handler was simultaneously broadened to `path="/"` so
+  the cookie is interchangeable in both directions). Break-glass tokens are
+  rejected at this surface with an explanatory error — the break-glass
+  identity is intended for emergency admin access, not employee self-view.
+
+### HTMX partial swaps
+
+The time-range tabs are wired through HTMX. Each surface route inspects the
+`HX-Request: true` header (via the shared `web.htmx.is_htmx` dep): when
+present, the handler returns a *body partial* — `_me_insights_body.html.j2`
+for `/me/insights`, `_admin_data_body.html.j2` for `/admin/data` — which
+includes BOTH the stats grid AND the insight cards. Each partial is
+swapped into the page's `#insights-body` wrapper without a full reload, so
+one range-tab click refreshes both the stats grid AND the insight cards
+in a single round-trip. The Alpine `<nav>` tabs sit outside the swap
+target so their `active` state survives the swap; an `htmx:historyRestore`
+handler in `base.html.j2` dispatches a `range-changed` custom event so the
+Alpine tabs re-sync from the URL on browser back/forward.
+
+### Shared helpers
+
+`web/templates_env.py` exports a single `Jinja2Templates` singleton (with
+`select_autoescape` on `*.html.j2` / `*.html` / `*.j2`) used by
+`routes/admin_ui.py`, `routes/admin_data.py`, and `routes/me.py` so the
+escape policy + template dir stay in sync. `web/htmx.py` exports
+`is_htmx(request)`. `insights/timewindow.py` exports
+`last_full_iso_week` / `iso_week_epoch_bounds` / `epoch_for_range` —
+the cron + both routes share one source of truth for week boundaries
+and the Today/7d/30d/90d/1y/All range tabs. `auth.set_session_cookie`
+/ `clear_session_cookie` / `set_csrf_cookie` / `verify_csrf` centralize
+the `wispralt_admin_token` cookie issuance (path="/", samesite=strict,
+secure, httponly, 8 h) AND the double-submit CSRF token used by both
+`/admin/login` and `/me/login` forms (constant-time compare via
+`hmac.compare_digest`). `JobStore.has_any_insight_for_week`,
+`list_filler_counts_for_week`, and `compute_user_stats` are the public
+read paths the routes use instead of reaching into the private `_exec`.
+
+### CSS scoping
+
+The frosted-glass card rules added to `base.html.j2` are scoped under the
+`.data-page` class so the new visual treatment applies only to
+`me_insights.html.j2` and `data.html.j2`. Existing admin pages (`/admin/`,
+`/admin/users`, `/admin/usage`) inherit the old flat styling unchanged —
+the scoping is a defensive choice so a regression in the new CSS can't
+visually break the existing admin surfaces.
+
+### Vendored JS
+
+HTMX 2.0.4 (`/admin/static/htmx.min.js`, ~50 KB) and Alpine 3.14.8
+(`/admin/static/alpine.min.js`, ~44 KB) are checked in to the repo and
+served by FastAPI's `StaticFiles` mount at `/admin/static`. CDN delivery
+was rejected for two reasons: (1) it would force a CSP carve-out for
+`unpkg.com` (or similar), expanding the supply-chain surface; (2) the
+mini's network egress isn't guaranteed — vendoring locally keeps the
+portal functional during an internet outage at the office. Refresh
+procedure (out-of-band): `curl -fsSL -o ...` from the upstream CDN,
+verify SHA-256 against the published release, commit.
+
+---
+
 ## Process Auto-Start
 
 Three launchd entries keep both sides of WisprAlt alive across reboots, crashes, and logins.

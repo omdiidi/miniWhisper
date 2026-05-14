@@ -23,13 +23,14 @@ The bearer is sha256-hashed and resolved against `wispralt.users` via the asyncp
 - `GET /readyz/dictation` — dictation-pipeline readiness probe
 - `GET /readyz/meeting` — meeting-pipeline readiness probe
 - `GET /admin/login` and `POST /admin/login` — admin UI login form (chicken-and-egg: must be reachable without the cookie it sets)
+- `GET /me/login` and `POST /me/login` — employee portal login form (Phase 2; same chicken-and-egg reason)
 
 These are intentionally open so Kubernetes-style probes, Cloudflare health checks, and external monitoring can poll them without API credentials. The probes expose only ready-flag booleans + free RAM in MB — no user data, no audio, no model output.
 
 **Bearer required:**
 - `POST /transcribe/dictate`, `POST /transcribe/meeting`, `GET /transcribe/meeting/{id}`, `GET /transcribe/meeting/{id}/download/{fmt}`, `DELETE /transcribe/meeting/{id}`
 - `POST /v1/audio/transcriptions` (OpenAI-compatible drop-in)
-- `GET /me`, `PATCH /me`
+- `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /metrics`
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
 - `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
@@ -325,6 +326,107 @@ Update the calling user's own `display_name`. The `label` and `role` are not use
 The token cache is **not** invalidated on `display_name` change because the auth `User` object only carries `(id, label, role)` — `display_name` is fetched fresh from `wispralt.users` each time the client opens its Identity section.
 
 Source: `server/src/wispralt_server/routes/me.py`.
+
+---
+
+### `GET /me/login`
+
+**Auth:** None required.
+
+Renders the employee token-paste form (`me_login.html.j2`). Chicken-and-egg counterpart to `/admin/login` — must be reachable without the cookie it sets. Returns `200` with `text/html`.
+
+Source: `server/src/wispralt_server/routes/me.py` (Phase 2).
+
+---
+
+### `POST /me/login`
+
+**Auth:** None required (this endpoint is what produces the auth cookie).
+
+Validate a pasted token and set the session cookie. Mirrors `POST /admin/login` but rejects break-glass admin tokens at this surface so the break-glass identity stays scoped to emergency admin use.
+
+**Request:** `application/x-www-form-urlencoded`
+
+| Field | Type | Notes |
+|---|---|---|
+| `token` | string | 64-char hex bearer token. Validated through the same 3-stage lookup as admin login: `TokenCache` → asyncpg `wispralt.users` → break-glass env-var hash. |
+
+**Response 303** — token valid (non-break-glass). Redirects to `/me/insights`. Sets `wispralt_admin_token` cookie with `path="/"`, `HttpOnly`, `Secure`, `SameSite=Strict`, `max-age=8h`. The `path="/"` scoping lets the same cookie cover both `/admin/*` and `/me/*` surfaces; admin login was simultaneously broadened to set the cookie with `path="/"` as well.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Invalid / revoked token — re-renders `me_login.html.j2` with an error message. |
+| 403 | Token resolved to the break-glass admin identity — rejected at this surface with an explanatory error. |
+| 503 | Postgres pool unavailable. |
+
+See [ARCHITECTURE.md → Data portal](ARCHITECTURE.md#data-portal) for the rationale behind sharing the cookie between admin + employee surfaces.
+
+Source: `server/src/wispralt_server/routes/me.py` (Phase 2).
+
+---
+
+### `GET /me/insights`
+
+**Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
+
+Per-employee weekly insights page. Returns the most recent `weekly_insights` row with `scope='person'` for the calling user, plus a time-range stats grid (transcript volume, word count, dictation/meeting split) for the selected window.
+
+**Query parameters:**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `range` | enum | `7d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all`. Drives the stats grid window only — the weekly digest card always shows the most recent completed ISO week. |
+
+**Response 200** — full page. `Content-Type: text/html` rendering `me_insights.html.j2`.
+
+**Response 200 (HTMX partial)** — when the request carries `HX-Request: true`, the handler returns only the `_stats_grid_partial.html.j2` fragment for in-place swap. Use this for time-range tab clicks; the full page is only needed on first navigation.
+
+**Response 303** — caller is break-glass admin (`user.id < 0`). Redirects to `/admin/data` because break-glass identities have no per-user transcript history to summarize.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer. |
+| 422 | `range` is not one of the accepted values. |
+| 503 | Postgres pool unavailable. |
+
+The hallucination disclaimer ("AI-generated, may be inaccurate") is rendered inline on each insight card — see [ARCHITECTURE.md → Weekly insights](ARCHITECTURE.md#weekly-insights) for the two-tier scrub policy that backs it.
+
+Source: `server/src/wispralt_server/routes/me.py` (Phase 2).
+
+---
+
+### `GET /admin/data`
+
+**Auth:** Bearer required + `role='admin'`. Router-level `require_admin` + `_require_db_pool` deps mean employee tokens get 403 and a degraded Postgres pool gets 503 — never an `AttributeError` deeper in the handler.
+
+Admin Data tab. Renders the team `weekly_insights` row (most recent completed ISO week) on top, plus a per-user leaderboard underneath. `?user_id=N` drills into one employee using the same card layout the employee self-view (`me_insights.html.j2`) renders, so admin and employee see identical surfaces.
+
+**Query parameters:**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `range` | enum | `7d` | Same set as `GET /me/insights`. Drives the stats grid window. |
+| `user_id` | integer | unset | When present, scope the page to that employee's `'person'`-scope insight + their stats. Without it, the page shows the team insight + per-user leaderboard. |
+
+**Response 200** — full page (`data.html.j2`).
+
+**Response 200 (HTMX partial)** — when the request carries `HX-Request: true`, the handler returns only the `_stats_grid_partial.html.j2` fragment for in-place swap.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer. |
+| 403 | Token is valid but role is not `admin`. |
+| 404 | `user_id` was supplied but no such user exists in `wispralt.users`. |
+| 422 | `range` is not one of the accepted values. |
+| 503 | Postgres pool unavailable. |
+
+Source: `server/src/wispralt_server/routes/admin_data.py` (Phase 2).
 
 ---
 
@@ -652,5 +754,6 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 | GET | `/admin/users/{id}` | admin | Per-user detail HTML (24h/7d/30d tiles + last 50 events) |
 | GET | `/admin/usage` | admin | Drill-down HTML, paginated 100/page. Filters: `kind`, `status`, `user_id`, `since`, `until`, `offset`. |
 | GET | `/admin/usage.csv` | admin | `text/csv` stream (max 10000 rows) |
+| GET | `/admin/data` | admin | Phase 2 — weekly insights Data tab (`data.html.j2`). HTMX partial swap returns `_stats_grid_partial.html.j2`. Documented in detail above under `GET /admin/data`. |
 
 All authed admin routes return **503** "Admin UI unavailable: Postgres degraded." when `app.state.db_pool` is `None` — the admin UI is unusable without a pool, so it fails loudly rather than crashing on `AttributeError` deeper in. The break-glass admin path (env-var bearer when Postgres is unreachable) lets the operator authenticate to the rest of the API but **not** to the admin UI; restart the server once Postgres is back to recover.

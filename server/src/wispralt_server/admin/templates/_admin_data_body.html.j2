@@ -1,0 +1,59 @@
+{% from "_insight_cards.html.j2" import card_action_items, card_project_pie, card_decisions, card_blockers, card_weekly_digest, card_quotable_line, card_team_themes, card_knowledge_gaps, card_tool_mentions, card_filler_leaderboard %}
+{# HTMX swap target body for /admin/data. Includes both the stats grid and
+   the team/person cards so a range tab click refreshes everything in one
+   round-trip. #}
+{% include "_stats_grid_partial.html.j2" %}
+
+{% if user_id and person_insight %}
+  <p class="ai-disclaimer">AI-generated insights — may be inaccurate.</p>
+  {{ card_weekly_digest(person_insight.get('digest', [])) }}
+  {{ card_action_items(person_insight.get('action_items', [])) }}
+  {{ card_project_pie(person_insight.get('projects', [])) }}
+  {{ card_decisions(person_insight.get('decisions', [])) }}
+  {{ card_blockers(person_insight.get('blockers', [])) }}
+  {{ card_quotable_line(person_insight.get('quotable_line', '')) }}
+  <p><a href="/admin/data?range={{ range }}">← Back to team</a></p>
+{% elif not user_id %}
+  {% if team_insight %}
+    <p class="ai-disclaimer">AI-generated team insights — may be inaccurate.</p>
+    {{ card_team_themes(team_insight.get('themes', [])) }}
+    {{ card_knowledge_gaps(team_insight.get('knowledge_gaps', [])) }}
+    {{ card_tool_mentions(team_insight.get('tool_mentions', {})) }}
+  {% else %}
+    <section class="glass-card">
+      <h3>Team insights pending</h3>
+      <p class="muted">Will populate after Sunday's cron run.</p>
+    </section>
+  {% endif %}
+
+  {{ card_filler_leaderboard(per_user_fillers) }}
+
+  <section class="glass-card">
+    <h3>Per-employee stats ({{ range }})</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Employee</th>
+          <th>Dictations</th>
+          <th>Meetings</th>
+          <th>Total words</th>
+          <th>Time saved (hrs)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in users %}
+          {% set us = per_user_stats.get(u.id, {}) if per_user_stats else {} %}
+          <tr>
+            <td>{{ u.display_name or u.label }}</td>
+            <td>{{ us.get('dictation_count', 0) }}</td>
+            <td>{{ us.get('meeting_count', 0) }}</td>
+            <td>{{ us.get('total_words', 0) }}</td>
+            <td>{{ us.get('time_saved_hours', 0) }}</td>
+            <td><a href="/admin/data?range={{ range }}&user_id={{ u.id }}">View →</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+{% endif %}

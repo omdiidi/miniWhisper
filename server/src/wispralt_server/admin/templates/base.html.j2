@@ -15,6 +15,13 @@
       --bar: #2b6cb0;
       --warn: #c05621;
       --bad: #c53030;
+      /* Phase 2 — Apple-liquid glass card vars */
+      --glass-bg: rgba(255, 255, 255, 0.04);
+      --glass-bg-strong: rgba(255, 255, 255, 0.06);
+      --glass-blur: 20px;
+      --radius-card: 14px;
+      --shadow-card: 0 1px 0 rgba(255,255,255,0.04) inset, 0 4px 16px rgba(0,0,0,0.04);
+      --accent-soft: rgba(43, 108, 176, 0.12);
     }
     * { box-sizing: border-box; }
     body {
@@ -122,7 +129,100 @@
     .login-card input { width: 100%; }
     .login-card button { margin-top: 16px; width: 100%; background: var(--accent); color: #fff; border-color: var(--accent); }
     .login-card button:hover { filter: brightness(0.95); }
+    nav.sidebar a.active { background: var(--accent-soft); color: var(--accent); }
+    /* Phase 2 — scoped under .data-page so legacy /admin/overview etc. stay unchanged */
+    .data-page .glass-card {
+      background: var(--glass-bg-strong);
+      backdrop-filter: blur(var(--glass-blur));
+      -webkit-backdrop-filter: blur(var(--glass-blur));
+      border: 1px solid var(--line);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+    @supports not (backdrop-filter: blur(20px)) {
+      .data-page .glass-card { background: var(--panel); }
+    }
+    .data-page h3 { margin: 0 0 12px 0; font-size: 14px; font-weight: 600; }
+    .data-page .muted { color: var(--muted); font-size: 13px; }
+    .data-page .range-tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 16px;
+      padding: 4px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      width: fit-content;
+    }
+    .data-page .range-tabs button {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .data-page .range-tabs button.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: var(--accent-soft);
+    }
+    .data-page .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .data-page .stat-tile {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-card);
+      padding: 14px 16px;
+    }
+    .data-page .stat-tile .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .data-page .stat-tile .value {
+      font-size: 24px;
+      font-weight: 600;
+      margin-top: 4px;
+    }
+    .data-page .action-list { list-style: none; padding: 0; margin: 0; }
+    .data-page .action-list li { padding: 6px 0; border-bottom: 1px solid var(--line); }
+    .data-page .action-list li:last-child { border-bottom: none; }
+    .data-page .action-list li .eta { color: var(--muted); margin-left: 6px; font-size: 12px; }
+    .data-page .ai-disclaimer { color: var(--muted); font-size: 12px; margin: 8px 0 16px 0; font-style: italic; }
+    .data-page blockquote.quotable {
+      font-size: 16px;
+      font-style: italic;
+      margin: 0;
+      padding-left: 12px;
+      border-left: 3px solid var(--accent);
+    }
+    .data-page .leaderboard-row { display: flex; justify-content: space-between; padding: 4px 0; }
   </style>
+  <script src="/admin/static/htmx.min.js" defer
+          integrity="sha256-4gndpcgjVHnzFm3vx3UOHbzVpcGAi3eS/C5nM3aPtEc="
+          crossorigin="anonymous"></script>
+  <script src="/admin/static/alpine.min.js" defer
+          integrity="sha256-tgDjY9mdlURNtUrL+y3v/smueSqpmgkim82geOW1VkM="
+          crossorigin="anonymous"></script>
+  <script defer>
+    // Sync the .range-tabs active state with the URL on browser back/forward.
+    // HTMX pushes history but doesn't re-init Alpine, so tabs can lie about
+    // which range is active when the user navigates. Dispatch a custom event
+    // that each <nav x-data> listens for — stable across Alpine 3.x versions.
+    document.addEventListener("htmx:historyRestore", () => {
+      const params = new URLSearchParams(window.location.search);
+      const range = params.get("range") || "7d";
+      window.dispatchEvent(new CustomEvent("range-changed", { detail: range }));
+    });
+  </script>
 </head>
 <body>
   {% if not hide_chrome %}
@@ -137,9 +237,11 @@
       <a href="/admin/">Overview</a>
       <a href="/admin/users">Users</a>
       <a href="/admin/usage">Usage</a>
+      <a href="/admin/data" class="{% if request.url.path.startswith('/admin/data') %}active{% endif %}">Data</a>
       {% else %}
       <a href="/admin/me">My Usage</a>
       {% endif %}
+      <a href="/me/insights" class="{% if request.url.path.startswith('/me/insights') %}active{% endif %}">My Insights</a>
     </nav>
     <main>
       {% block content %}{% endblock %}

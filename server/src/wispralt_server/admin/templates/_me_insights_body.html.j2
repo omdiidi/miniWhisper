@@ -1,0 +1,20 @@
+{% from "_insight_cards.html.j2" import card_action_items, card_project_pie, card_decisions, card_blockers, card_weekly_digest, card_quotable_line %}
+{# HTMX swap target body for /me/insights. Includes both the stats grid and
+   the per-week insight cards so a range tab click refreshes everything in
+   one round-trip. #}
+{% include "_stats_grid_partial.html.j2" %}
+
+{% if insight %}
+  <p class="ai-disclaimer">AI-generated insights — may be inaccurate.</p>
+  {{ card_weekly_digest(insight.get('digest', [])) }}
+  {{ card_action_items(insight.get('action_items', [])) }}
+  {{ card_project_pie(insight.get('projects', [])) }}
+  {{ card_decisions(insight.get('decisions', [])) }}
+  {{ card_blockers(insight.get('blockers', [])) }}
+  {{ card_quotable_line(insight.get('quotable_line', '')) }}
+{% else %}
+  <section class="glass-card">
+    <h3>No insights yet</h3>
+    <p class="muted">No insights for this week yet — check back Monday morning.</p>
+  </section>
+{% endif %}

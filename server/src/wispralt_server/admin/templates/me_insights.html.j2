@@ -1,0 +1,28 @@
+{% extends "base.html.j2" %}
+{% set TAB_LABELS = {'today': 'Today', '7d': '7d', '30d': '30d', '90d': '90d', '1y': '1y', 'all': 'All'} %}
+{% block title %}My Insights · Wispralt{% endblock %}
+{% block content %}
+<div class="data-page">
+  <h2>My Insights — ISO {{ iso_year }}-W{{ "%02d" | format(iso_week) }}</h2>
+  <p class="muted">Hi, {{ user.label }}. Here's what your week looked like.</p>
+
+  <nav x-data="{ active: '{{ range }}' }"
+       @range-changed.window="active = $event.detail"
+       class="range-tabs">
+    {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
+      <button :class="active === '{{ r }}' ? 'active' : ''"
+              @click="active = '{{ r }}'"
+              hx-get="/me/insights?range={{ r }}"
+              hx-target="#insights-body"
+              hx-swap="innerHTML"
+              hx-push-url="true">
+        {{ TAB_LABELS[r] }}
+      </button>
+    {% endfor %}
+  </nav>
+
+  <div id="insights-body">
+    {% include "_me_insights_body.html.j2" %}
+  </div>
+</div>
+{% endblock %}

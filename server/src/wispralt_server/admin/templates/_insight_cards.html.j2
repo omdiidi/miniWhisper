@@ -1,0 +1,155 @@
+{% macro card_action_items(items, empty_state="No commitments captured this week.") %}
+<section class="glass-card">
+  <h3>Action items</h3>
+  {% if items %}
+    <ul class="action-list">
+      {% for item in items %}
+        <li>
+          <strong>{{ item.owner or 'self' }}</strong>: {{ item.text }}
+          {% if item.eta %}<span class="eta">by {{ item.eta }}</span>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">{{ empty_state }}</p>
+  {% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_project_pie(projects, empty_state="No project allocation captured.") %}
+<section class="glass-card">
+  <h3>Project time allocation</h3>
+  {% if projects %}
+    {% set colors = ['#2b6cb0', '#38a169', '#dd6b20', '#9f7aea', '#e53e3e', '#319795', '#d69e2e'] %}
+    <ul class="action-list">
+      {% for p in projects %}
+        {% set frac = (p.pct_time * 100) | round(0) %}
+        <li>
+          <strong>{{ p.name }}</strong>: {{ frac }}%
+          <div style="background: {{ colors[loop.index0 % colors|length] }}; height: 6px; width: {{ frac }}%; border-radius: 3px; margin-top: 4px;"></div>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">{{ empty_state }}</p>
+  {% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_decisions(decisions, empty_state="No decisions logged.") %}
+<section class="glass-card">
+  <h3>Decisions</h3>
+  {% if decisions %}
+    <ul class="action-list">{% for d in decisions %}<li>{{ d }}</li>{% endfor %}</ul>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_blockers(blockers, empty_state="No blockers reported.") %}
+<section class="glass-card">
+  <h3>Blockers</h3>
+  {% if blockers %}
+    <ul class="action-list">{% for b in blockers %}<li>{{ b }}</li>{% endfor %}</ul>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_weekly_digest(digest, empty_state="Not enough data this week.") %}
+<section class="glass-card">
+  <h3>Weekly digest</h3>
+  {% if digest %}
+    <ul class="action-list">{% for line in digest %}<li>{{ line }}</li>{% endfor %}</ul>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_team_themes(themes, empty_state="No themes detected.") %}
+<section class="glass-card">
+  <h3>Team themes this week</h3>
+  {% if themes %}
+    <ul class="action-list">
+      {% for t in themes %}
+        <li><strong>#{{ t.rank }}</strong> {{ t.label }}
+          {% if t.wow_delta and t.wow_delta != '0' %}<span class="eta">{{ t.wow_delta }} vs last week</span>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_knowledge_gaps(gaps, empty_state="No knowledge gaps detected.") %}
+<section class="glass-card">
+  <h3>Knowledge gaps</h3>
+  {% if gaps %}
+    <ul class="action-list">{% for g in gaps %}<li>{{ g }}</li>{% endfor %}</ul>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_tool_mentions(mentions, empty_state="No tools mentioned.") %}
+<section class="glass-card">
+  <h3>Tool mentions</h3>
+  {% if mentions is mapping and mentions %}
+    <ul class="action-list">
+      {% for tool, n in mentions.items() %}<li><strong>{{ tool }}</strong>: {{ n }} mention{{ '' if n == 1 else 's' }}</li>{% endfor %}
+    </ul>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_quotable_line(line, empty_state="No quotable line this week.") %}
+<section class="glass-card">
+  <h3>Quotable line</h3>
+  {% if line %}<blockquote class="quotable">"{{ line }}"</blockquote>{% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_filler_leaderboard(rows, empty_state="No filler data this week.") %}
+<section class="glass-card">
+  <h3>Filler-word leaderboard</h3>
+  {% if rows %}
+    {% for r in rows %}
+      <div class="leaderboard-row">
+        <span>{{ r.name }}</span>
+        <span><strong>{{ r.filler_word_count }}</strong> filler words</span>
+      </div>
+    {% endfor %}
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_words_dictated_chart(stats, empty_state="No words yet.") %}
+<section class="glass-card">
+  <h3>Words dictated</h3>
+  {% if stats and stats.total_words %}
+    <div class="value" style="font-size: 28px; font-weight: 600;">{{ stats.total_words }}</div>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_time_saved(stats, empty_state="—") %}
+<section class="glass-card">
+  <h3>Time saved</h3>
+  {% if stats and stats.time_saved_hours %}
+    <div class="value" style="font-size: 28px; font-weight: 600;">{{ stats.time_saved_hours }} hrs</div>
+    <p class="muted">vs typing at 40 WPM</p>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}
+
+{% macro card_dictation_vs_meeting_split(stats, empty_state="—") %}
+<section class="glass-card">
+  <h3>Dictation vs meeting split</h3>
+  {% if stats and (stats.dictation_count or stats.meeting_count) %}
+    {% set total = stats.dictation_count + stats.meeting_count %}
+    {% set d_pct = (stats.dictation_count * 100 / total) | round(0) if total > 0 else 0 %}
+    {% set m_pct = 100 - d_pct %}
+    <div style="display: flex; gap: 4px; height: 24px; border-radius: 6px; overflow: hidden;">
+      <div style="background: var(--accent); width: {{ d_pct }}%;" title="Dictations"></div>
+      <div style="background: var(--warn); width: {{ m_pct }}%;" title="Meetings"></div>
+    </div>
+    <p class="muted">{{ stats.dictation_count }} dictations ({{ d_pct }}%) / {{ stats.meeting_count }} meetings ({{ m_pct }}%)</p>
+  {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
+</section>
+{% endmacro %}

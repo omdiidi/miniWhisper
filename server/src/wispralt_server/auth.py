@@ -26,11 +26,13 @@ mint/revoke flow lands in Phase B/C.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import threading
 
 import asyncpg
 from fastapi import Depends, HTTPException, Request
+from fastapi.responses import Response
 
 from wispralt_server.users import cache as _cache_mod
 from wispralt_server.users import store as _store_mod
@@ -204,3 +206,70 @@ def require_admin(user: User = Depends(require_api_key)) -> User:
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin role required")
     return user
+
+
+# ── shared session-cookie + CSRF helpers ──────────────────────────────────────
+#
+# Both /admin/login (admin_ui.py) and /me/login (routes/me.py) issue the same
+# ``wispralt_admin_token`` cookie. Centralizing here means flag changes
+# (max_age, samesite, etc.) hit both surfaces and the CSRF double-submit
+# scheme stays consistent across forms.
+
+SESSION_COOKIE_NAME = "wispralt_admin_token"
+CSRF_COOKIE_NAME = "wispralt_csrf"
+_SESSION_COOKIE_MAX_AGE_S = 8 * 3600  # 8h
+_CSRF_COOKIE_MAX_AGE_S = 30 * 60  # 30m — forms shouldn't sit open longer
+_LEGACY_PATHS = ("/admin/login",)  # historical paths to clear on new login
+
+
+def set_session_cookie(resp: Response, token: str) -> None:
+    """Set the unified session cookie and clear any legacy-path cookies."""
+    for legacy_path in _LEGACY_PATHS:
+        resp.delete_cookie(SESSION_COOKIE_NAME, path=legacy_path)
+    resp.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=_SESSION_COOKIE_MAX_AGE_S,
+        path="/",
+    )
+
+
+def clear_session_cookie(resp: Response) -> None:
+    """Clear the session cookie (used on logout, if ever added)."""
+    resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    for legacy_path in _LEGACY_PATHS:
+        resp.delete_cookie(SESSION_COOKIE_NAME, path=legacy_path)
+
+
+def set_csrf_cookie(resp: Response, csrf_token: str) -> None:
+    """Set the CSRF double-submit cookie.
+
+    NOT HttpOnly: the form template echoes the value back as a hidden input,
+    and the POST handler compares cookie vs form via ``hmac.compare_digest``.
+    SameSite=strict so a cross-origin POST can't carry the cookie alone.
+    """
+    resp.set_cookie(
+        CSRF_COOKIE_NAME,
+        csrf_token,
+        httponly=False,
+        secure=True,
+        samesite="strict",
+        max_age=_CSRF_COOKIE_MAX_AGE_S,
+        path="/",
+    )
+
+
+def verify_csrf(request: Request, form_token: str) -> bool:
+    """Constant-time compare of the form token vs the CSRF cookie.
+
+    Returns False (rather than raising) so the caller can render a friendly
+    "form expired, please reload" page in the same template as other login
+    errors. Empty / missing cookie returns False — no implicit pass-through.
+    """
+    cookie_token = request.cookies.get(CSRF_COOKIE_NAME, "")
+    if not cookie_token or not form_token:
+        return False
+    return hmac.compare_digest(cookie_token, form_token)

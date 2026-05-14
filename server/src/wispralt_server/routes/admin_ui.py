@@ -31,40 +31,30 @@ import csv
 import io
 import json
 import logging
+import secrets
 import urllib.parse
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
-from fastapi.templating import Jinja2Templates
-from jinja2 import select_autoescape
 
 from .. import auth as auth_mod
-from ..auth import require_admin, require_api_key
+from ..auth import (
+    require_admin,
+    require_api_key,
+    set_csrf_cookie,
+    set_session_cookie,
+    verify_csrf,
+)
 from ..config import settings
 from ..constants import MAX_DISPLAY_NAME_LEN
 from ..users import store as users_store
 from ..users.store import User
+from ..web.templates_env import templates
 
 logger = logging.getLogger(__name__)
-
-
-# Resolve relative to this file so launchd's CWD doesn't matter.
-TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "admin" / "templates"
-
-# Jinja2's default autoescape list does NOT include ``.html.j2`` — without
-# this opt-in, fields like label / notes / error_class would render
-# unescaped, opening a stored-XSS hole on the admin UI.
-templates = Jinja2Templates(
-    directory=str(TEMPLATES_DIR),
-    autoescape=select_autoescape(
-        enabled_extensions=("html.j2", "html", "j2"),
-        default_for_string=False,
-    ),
-)
 
 
 async def _require_db_pool(request: Request) -> asyncpg.Pool:
@@ -101,12 +91,36 @@ me_router = APIRouter(
 
 @public_router.get("/login", response_class=HTMLResponse)
 async def login_form(request: Request) -> HTMLResponse:
-    """Render the single-field login form."""
-    return templates.TemplateResponse("login.html.j2", {"request": request})
+    """Render the single-field login form with a fresh CSRF token."""
+    csrf = secrets.token_urlsafe(32)
+    response = templates.TemplateResponse(
+        "login.html.j2",
+        {"request": request, "csrf_token": csrf},
+    )
+    set_csrf_cookie(response, csrf)
+    return response
+
+
+def _render_admin_login_error(
+    request: Request, *, error: str, status_code: int
+) -> HTMLResponse:
+    """Render the admin login form with an error + freshly-minted CSRF token."""
+    csrf = secrets.token_urlsafe(32)
+    response = templates.TemplateResponse(
+        "login.html.j2",
+        {"request": request, "error": error, "csrf_token": csrf},
+        status_code=status_code,
+    )
+    set_csrf_cookie(response, csrf)
+    return response
 
 
 @public_router.post("/login")
-async def login_submit(request: Request, token: str = Form(...)) -> Any:
+async def login_submit(
+    request: Request,
+    token: str = Form(...),
+    csrf_token: str = Form(...),
+) -> Any:
     """Validate *token* and set the session cookie on success.
 
     We resolve the token via the same paths the auth middleware uses
@@ -115,6 +129,13 @@ async def login_submit(request: Request, token: str = Form(...)) -> Any:
     so a recursive call to ``require_api_key`` after a hypothetical
     cookie-write would still see no cookie.
     """
+    if not verify_csrf(request, csrf_token):
+        return _render_admin_login_error(
+            request,
+            error="Form session expired. Please reload and try again.",
+            status_code=403,
+        )
+
     th = users_store.hash_token(token)
     pool = getattr(request.app.state, "db_pool", None)
     user: User | None = None
@@ -143,10 +164,8 @@ async def login_submit(request: Request, token: str = Form(...)) -> Any:
             user = User(id=-1, label="break-glass-admin", role="admin")
 
     if user is None:
-        return templates.TemplateResponse(
-            "login.html.j2",
-            {"request": request, "error": "Invalid token"},
-            status_code=401,
+        return _render_admin_login_error(
+            request, error="Invalid token", status_code=401,
         )
 
     # Role-based landing: admins see the global dashboard; employees see only
@@ -155,14 +174,9 @@ async def login_submit(request: Request, token: str = Form(...)) -> Any:
     # of time.
     target = "/admin/" if user.role == "admin" else "/admin/me"
     resp = RedirectResponse(target, status_code=303)
-    resp.set_cookie(
-        "wispralt_admin_token",
-        token,
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        max_age=8 * 3600,  # 8h session
-    )
+    # Shared helper clears the legacy /admin/login-scoped cookie and sets the
+    # unified path="/" session cookie so it scopes across /admin/* AND /me/*.
+    set_session_cookie(resp, token)
     return resp
 
 

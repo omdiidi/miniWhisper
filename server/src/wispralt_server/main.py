@@ -40,11 +40,18 @@ from typing import AsyncIterator
 
 import asyncpg
 from fastapi import FastAPI, Request, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from wispralt_server import db, observability
 from wispralt_server.config import settings, verify_env_perms
 from wispralt_server.dictate.parakeet import ParakeetService
+from wispralt_server.insights.client import InsightsClient
+from wispralt_server.insights.cron import (
+    _maybe_catchup,
+    _seconds_until_next_fire,
+    run_weekly_insights,
+)
 from wispralt_server.jobs.runner import MeetingRunner
 from wispralt_server.jobs.store import JobStore
 from wispralt_server.meeting import install_compat_shims
@@ -53,7 +60,7 @@ from wispralt_server.middleware import openai_errors
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
 from wispralt_server.ops import staging
 from wispralt_server.ops.env_writer import find_env_path
-from wispralt_server.routes import admin, admin_ui, dev_faults, dictate, health
+from wispralt_server.routes import admin, admin_data, admin_ui, dev_faults, dictate, health
 from wispralt_server.routes import me as me_routes
 from wispralt_server.routes import meeting as meeting_routes
 from wispralt_server.routes import transcribe_file as transcribe_file_routes
@@ -248,6 +255,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("mercury_client not configured (OPENROUTER_API_KEY unset)")
 
+    # 6c. InsightsClient — fail-soft mirror of mercury_client. None when
+    #     OPENROUTER_API_KEY is unset; weekly cron is a no-op in that case.
+    #     Different model + longer timeout than mercury (batch, not live).
+    app.state.insights_client = None
+    if settings.openrouter_api_key:
+        try:
+            app.state.insights_client = InsightsClient(
+                api_key=settings.openrouter_api_key,
+                model=settings.insights_model,
+                timeout_s=settings.insights_timeout_s,
+            )
+            logger.info(
+                "InsightsClient initialized model=%s timeout_s=%.1f",
+                settings.insights_model,
+                settings.insights_timeout_s,
+            )
+        except Exception:
+            logger.exception(
+                "InsightsClient init failed — weekly insights cron will be skipped"
+            )
+            app.state.insights_client = None
+    else:
+        logger.info("InsightsClient init skipped — OPENROUTER_API_KEY unset")
+
     # 7. Install compat shims at startup so the deep-patch over sys.modules hits
     #    pyannote/torch references before any user code runs. The shim
     #    is idempotent and re-invoked from pipeline._ensure_models_loaded() to
@@ -315,6 +346,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.transcript_sweep_task = asyncio.create_task(
         _daily_transcript_sweep()
     )
+
+    # 7e. Phase 2: weekly LLM insights cron. Sunday 23:00 mini-local. Sleeps
+    #     to next fire, runs, repeats. Robust to clock changes — recomputes
+    #     next-fire each iteration. Startup-catchup runs ONCE before the
+    #     sleep loop and is fail-CLOSED unless insights_catchup_enabled=True.
+    #
+    #     Concurrency: install an asyncio.Lock on app.state so a catchup that
+    #     overlaps the scheduled fire can short-circuit rather than double-bill
+    #     OpenRouter. The lock is read inside run_weekly_insights.
+    app.state.weekly_insights_lock = asyncio.Lock()
+
+    async def _weekly_insights_cron() -> None:
+        # Startup catchup runs once before the sleep loop. Wrapped in
+        # broad-except so a zoneinfo or SQLite hiccup doesn't kill the
+        # daemon task at boot.
+        try:
+            await _maybe_catchup(app)
+        except Exception:  # noqa: BLE001 — daemon-loop init must not crash startup
+            logger.exception(
+                "Startup catchup failed; continuing to normal schedule"
+            )
+
+        while not getattr(app.state, "shutting_down", False):
+            try:
+                sleep_s = _seconds_until_next_fire(
+                    settings.insights_timezone,
+                    iso_weekday=settings.insights_schedule_weekday,
+                    hour=settings.insights_schedule_hour_local,
+                )
+            except Exception:  # noqa: BLE001 — zoneinfo failure shouldn't kill the loop
+                logger.exception(
+                    "Weekly insights schedule compute failed; retrying in 1h"
+                )
+                sleep_s = 3600.0
+            logger.info(
+                "Weekly insights — sleeping %.0f s until next Sunday 23:00 local",
+                sleep_s,
+            )
+            try:
+                await asyncio.sleep(sleep_s)
+            except asyncio.CancelledError:
+                raise
+            if getattr(app.state, "shutting_down", False):
+                break
+            try:
+                await run_weekly_insights(app)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — daemon loop
+                logger.exception("Weekly insights run failed; retrying next week")
+
+    app.state.weekly_insights_task = asyncio.create_task(_weekly_insights_cron())
 
     # 8. SIGTERM handler (P5#5 + P5#ExitTimeOut).
     #    I2: Use loop.add_signal_handler so the handler runs safely in the asyncio
@@ -454,14 +537,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 len(pending),
             )
 
-    # Cancel the daily transcript sweep loop.
-    sweep_task: asyncio.Task | None = getattr(
-        app.state, "transcript_sweep_task", None
-    )
-    if sweep_task is not None and not sweep_task.done():
-        sweep_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sweep_task
+    # Cancel the daily transcript sweep AND the weekly insights cron together.
+    # Both are pure daemon loops; same cancel pattern. transcript_sweep_task
+    # was a pre-existing Phase 1 shutdown miss — bundle the fix with the new
+    # weekly_insights_task cancel.
+    for _task_attr in ("transcript_sweep_task", "weekly_insights_task"):
+        _task: asyncio.Task | None = getattr(app.state, _task_attr, None)
+        if _task is not None and not _task.done():
+            _task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _task
 
     # Cancel the db pool watcher first so it stops trying to probe / rebuild
     # while the rest of shutdown is tearing the pool down.
@@ -494,6 +579,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await mercury_client.aclose()
         except Exception as exc:
             logger.warning("mercury_client.aclose failed: %s", exc)
+
+    insights_client: InsightsClient | None = getattr(
+        app.state, "insights_client", None
+    )
+    if insights_client is not None:
+        try:
+            await insights_client.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("insights_client.aclose failed: %s", exc)
 
     await db.close_pool()
 
@@ -634,6 +728,22 @@ def create_app() -> FastAPI:
         trust_forwarded_headers=settings.trust_forwarded_headers,
     )
 
+    # Phase 2: mount vendored HTMX + Alpine for the admin UI. Local, not CDN —
+    # CSP-safe + offline-resilient. WARN (not fatal) when the directory is
+    # missing so a stripped deploy doesn't refuse to boot, but the admin UI
+    # will 404 on those URLs until the static files land alongside the code.
+    _ADMIN_STATIC_DIR = Path(__file__).resolve().parent / "admin" / "static"
+    if _ADMIN_STATIC_DIR.is_dir():
+        app.mount(
+            "/admin/static",
+            StaticFiles(directory=str(_ADMIN_STATIC_DIR)),
+            name="admin_static",
+        )
+    else:
+        logger.warning(
+            "/admin/static directory missing — HTMX/Alpine will 404 in admin UI"
+        )
+
     # Mount routers
     # /healthz and /readyz/* — no prefix; health.py defines full paths.
     app.include_router(health.router)
@@ -648,6 +758,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_ui.public_router)
     app.include_router(admin_ui.me_router)
     app.include_router(admin_ui.authed_router)
+    # /admin/data — Phase 2 admin Data tab (weekly insights + drill-down).
+    app.include_router(admin_data.router)
     # /transcribe/meeting — Phase 2 meeting endpoints.
     app.include_router(meeting_routes.router)
     # /transcribe/file — container-agnostic submission (ffmpeg-transcoded).
