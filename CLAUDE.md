@@ -23,6 +23,30 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 
 > Note: employee-facing install is the `install.sh` curl one-liner (see `docs/INSTALL.md`). The legacy `/wispralt-setup` slash command has been removed. The `/wispralt-update` slash command in `~/.claude-dotfiles/commands/` remains as a developer convenience for in-place updates.
 
+## Driving the Mac mini
+
+There are two MCPs in play and they're not interchangeable:
+
+- **chrome-devtools MCP** — lets you *see* the mini (CRD canvas screenshots, console, network on dev-side Chrome tabs). Vision only.
+- **/macmini skill** — lets you *act* on the mini (paste text, click on canvas, route secrets).
+
+**Hard rule: CRD strips the Shift key on every outbound keystroke.** That means `type_text` and `press_key` through chrome-devtools cannot send capital letters, `:` `|` `~` `$` `@` `!` `#` `%` `^` `&` `*` `(` `)` `_` `+` `{` `}` `<` `>` `?` `"`. So:
+
+- Tailing mini logs (`~/Library/Logs/WisprAlt/...`), piping (`|`), URLs (`https://`), env vars (`$HOME`), grep patterns — **none of these can be typed via chrome-devtools `type_text`.** They will arrive corrupted (e.g. `https//gist.com` with no colon, no pipe).
+- For anything with a shifted character, use **`/macmini paste "<text>"`** (gist transport: pushes a gist on the dev side, fetches via lowercase `curl` on the mini side, lands in `pbpaste`, then `Cmd+V` into the target window). This survives capitals, symbols, unicode, multi-line.
+- Pure-lowercase-unshifted commands (`ls`, `pwd`, `cd foo`) are fine via `type_text`.
+- **Never** type or paste credentials via the default `/macmini paste` — GitHub's secret scanner detects gist contents and auto-revokes within minutes (real incident: two OpenRouter keys burned in <10 min). Use `/macmini paste --secure <ENV_VAR_NAME>` for any credential — the value never enters a gist.
+
+Workflow when devtools is connected and you need to run a command on the mini:
+
+1. `list_pages` → find the `remotedesktop.google.com/access/session/<id>` page, `select_page` it.
+2. `take_screenshot` to confirm canvas is live (black screen → `press_key("Shift")` to wake).
+3. If the command is pure-lowercase-unshifted: `type_text("<cmd>", "Enter")`.
+4. Otherwise: `/macmini paste "<cmd>"`, then `Cmd+V` + `Enter` in the target window.
+5. Vision read-back: `take_screenshot` to capture output.
+
+If you just need to read state and the user is sitting at the mini, the fastest path is often to tell the user to type the command themselves — their keyboard isn't shift-stripped.
+
 ## Key conventions
 
 - Repository pattern: database queries in repository functions, business logic in services, validation at route boundaries only.

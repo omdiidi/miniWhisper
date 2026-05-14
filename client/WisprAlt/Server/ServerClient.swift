@@ -162,15 +162,33 @@ final class ServerClient {
         case 413:
             throw ServerError.uploadTooLarge
         case 422:
-            // Surface the server's actual reason (e.g. "Dictation too long:
-            // 312.0s (max 300s)") instead of the canned "appears incomplete"
-            // string. Parses FastAPI's standard {"detail": "..."} envelope;
-            // falls back to .uploadTruncated when the body isn't decodable.
+            // Surface the server's actual reason instead of the canned
+            // "appears incomplete" string. FastAPI emits two shapes here:
+            //   (a) HTTPException(422, "x") → {"detail": "x"}        (string)
+            //   (b) RequestValidationError  → {"detail": [{...}]}     (list)
+            // Shape (b) lands when path/body/header coercion fails (e.g.
+            // a path converter rejects a value). Previously we only handled
+            // (a) and fell through to `.uploadTruncated` for (b), which
+            // surfaced "appears incomplete or corrupted" for what was
+            // actually a routing bug — masked the real cause for a full
+            // session. Now both shapes surface as `.server(422, ...)` with
+            // a readable detail.
             if let bodyData = bodyString?.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
-               let detail = json["detail"] as? String, !detail.isEmpty
+               let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
             {
-                throw ServerError.server(status: 422, body: detail)
+                if let detail = json["detail"] as? String, !detail.isEmpty {
+                    throw ServerError.server(status: 422, body: detail)
+                }
+                if let detailList = json["detail"] as? [[String: Any]], !detailList.isEmpty {
+                    let summary = detailList.compactMap { entry -> String? in
+                        let loc = (entry["loc"] as? [Any])?.map { "\($0)" }.joined(separator: ".") ?? "?"
+                        let msg = entry["msg"] as? String ?? "validation error"
+                        return "\(loc): \(msg)"
+                    }.joined(separator: "; ")
+                    if !summary.isEmpty {
+                        throw ServerError.server(status: 422, body: summary)
+                    }
+                }
             }
             throw ServerError.uploadTruncated
         case 429:

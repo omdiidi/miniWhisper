@@ -333,7 +333,15 @@ async def init_chunked(
 
 
 @router.post(
-    "/chunked/{upload_id}/{chunk_index}",
+    # Starlette ``:int`` path converter constrains ``chunk_index`` to a digit
+    # run. Without this, ``/chunked/{id}/finalize`` would route here first
+    # (Starlette matches in registration order) and Pydantic would fail to
+    # coerce ``"finalize"`` → int, returning RequestValidationError → 422
+    # before the finalize handler ever runs. The 422 reaches the client as
+    # ``{"detail": [...]}`` (a list, not a string), which the Swift error
+    # mapper interprets as a truncated upload. Surface bug: every chunked
+    # upload finalize 422'd. Don't drop ``:int`` without re-ordering routes.
+    "/chunked/{upload_id}/{chunk_index:int}",
     summary="Upload a single chunk (raw bytes body)",
 )
 async def upload_chunk(

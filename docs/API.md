@@ -478,7 +478,7 @@ Open a chunked upload to bypass Cloudflare's 100 MB request-body cap on free / p
 
 ---
 
-### `POST /transcribe/file/chunked/{upload_id}/{chunk_index}`
+### `POST /transcribe/file/chunked/{upload_id}/{chunk_index:int}`
 
 **Auth:** Bearer required. **Owner must match the user that ran `/init`.**
 
@@ -491,7 +491,7 @@ Upload a single chunk's raw bytes.
 | `Content-Length` | Yes | Required. Server rejects (411) if missing and rejects (400) if bytes-written ≠ declared length. |
 | `Authorization` | Yes | `Bearer <token>`. |
 
-`chunk_index` is zero-based and must be `< chunk_count` declared at init. Indexes may arrive in any order — the server sorts on finalize.
+`chunk_index` is zero-based and must be `< chunk_count` declared at init. Indexes may arrive in any order — the server sorts on finalize. The `:int` Starlette path converter constrains this segment to a digit run so `/finalize` cannot accidentally match this route (previously did, causing every finalize to 422).
 
 **Response 200:** `{ "ok": true, "received_bytes": N }`
 
