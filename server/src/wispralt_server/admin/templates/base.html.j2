@@ -217,10 +217,15 @@
     // HTMX pushes history but doesn't re-init Alpine, so tabs can lie about
     // which range is active when the user navigates. Dispatch a custom event
     // that each <nav x-data> listens for — stable across Alpine 3.x versions.
+    // setTimeout(0) defers the dispatch until after Alpine re-initializes
+    // x-data on the HTMX-restored DOM; without it, the event fires against
+    // a stale instance and the active-tab pip stays at the original render.
     document.addEventListener("htmx:historyRestore", () => {
       const params = new URLSearchParams(window.location.search);
       const range = params.get("range") || "7d";
-      window.dispatchEvent(new CustomEvent("range-changed", { detail: range }));
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent("range-changed", { detail: range }));
+      }, 0);
     });
   </script>
 </head>
