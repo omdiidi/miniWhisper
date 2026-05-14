@@ -28,6 +28,20 @@ Speaker table (keyed by ``speaker_raw``)
 
 from __future__ import annotations
 
+import re
+
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _join_words(items: list[tuple[dict, str]]) -> str:
+    # mlx-whisper word fields often carry a leading space ("·hello"); joining
+    # with " " then yields runs of 2+ spaces in TXT output. Collapse any
+    # whitespace run to a single space.
+    return _WHITESPACE_RUN.sub(
+        " ",
+        " ".join(str(item[0].get("word", "")) for item in items),
+    ).strip()
+
 
 def _make_segment(
     *,
@@ -307,9 +321,7 @@ def assign_speakers_segments(
                         {
                             "start": float(current[0][0]["start"]),
                             "end": float(current[-1][0]["end"]),
-                            "text": " ".join(
-                                str(item[0].get("word", "")) for item in current
-                            ).strip(),
+                            "text": _join_words(current),
                             "speaker": current[0][1],
                             "words": [item[0] for item in current],
                         }
@@ -320,9 +332,7 @@ def assign_speakers_segments(
                 {
                     "start": float(current[0][0]["start"]),
                     "end": float(current[-1][0]["end"]),
-                    "text": " ".join(
-                        str(item[0].get("word", "")) for item in current
-                    ).strip(),
+                    "text": _join_words(current),
                     "speaker": current[0][1],
                     "words": [item[0] for item in current],
                 }

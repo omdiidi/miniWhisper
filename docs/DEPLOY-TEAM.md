@@ -106,8 +106,11 @@ What it does, in order:
    - Refuse if working tree is dirty (it commits the version bump, so
      unrelated changes would get folded in).
    - Refuse if the tag `v0.2.0` already exists locally OR on GitHub.
-2. **Bump `CFBundleShortVersionString`** in `client/WisprAlt/Info.plist`
-   to `0.2.0` via `plutil -replace`.
+2. **Bump `CFBundleShortVersionString` and `CFBundleVersion`** in
+   `client/WisprAlt/Info.plist` to `0.2.0` via two `plutil -replace`
+   calls. Both keys move together so notarization and Sparkle see a
+   monotonic build number; otherwise `CFBundleVersion` would stay
+   stuck at `"1"` across every release.
 3. **Build** via `scripts/build-client-local.sh` (Apple Development
    signing, see [SETUP-CLIENT.md](SETUP-CLIENT.md)).
 4. **Package as DMG** under `/tmp/wispralt-release-0.2.0/WisprAlt-0.2.0.dmg`

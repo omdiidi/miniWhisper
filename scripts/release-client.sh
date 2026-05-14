@@ -55,9 +55,14 @@ if gh release view "${TAG}" --repo "${REPO_SLUG}" >/dev/null 2>&1; then
     exit 1
 fi
 
-# 1. Bump CFBundleShortVersionString in Info.plist.
+# 1. Bump CFBundleShortVersionString + CFBundleVersion in Info.plist.
+#    Both keys move together so notarization + Sparkle see a monotonic build
+#    number instead of "1" forever. Sparkle uses CFBundleVersion for update
+#    comparison; same-value-as-short-string is simplest and works.
 echo "==> Bumping Info.plist version to ${VERSION}"
 plutil -replace CFBundleShortVersionString -string "${VERSION}" \
+  client/WisprAlt/Info.plist
+plutil -replace CFBundleVersion -string "${VERSION}" \
   client/WisprAlt/Info.plist
 
 # 2. Build signed .app via existing build-client-local.sh.
