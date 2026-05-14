@@ -224,6 +224,12 @@
       const params = new URLSearchParams(window.location.search);
       const range = params.get("range") || "7d";
       setTimeout(() => {
+        // Alpine's :class is non-destructive — it won't strip stale "active"
+        // classes baked into the cached snapshot. Scrub them before dispatching
+        // so the new state is the only one visible.
+        document.querySelectorAll(".range-tabs button.active").forEach((b) => {
+          b.classList.remove("active");
+        });
         window.dispatchEvent(new CustomEvent("range-changed", { detail: range }));
       }, 0);
     });
