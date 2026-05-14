@@ -547,6 +547,86 @@ This is fully offline-capable and requires no network connectivity.
 
 ---
 
+## Transcript persistence
+
+Phase 1 of the portal "weekly insights" effort: every transcribed output
+(dictation + meeting + file) is persisted to the mini's SQLite so the future
+weekly-insights cron has data to summarize. Capture is **unconditional and
+transparent** — there is no client-visible toggle and no admin UI redaction.
+Zero behavior change for end users.
+
+### Where the data lives
+
+- **Meeting + file transcripts** are stored on the existing `jobs` row.
+  Four new columns added by an idempotent `ALTER TABLE` in `JobStore.__init__`:
+  `transcript_text`, `word_count`, `client_app_version`, `api_key_id`. The
+  derivation happens inside `MeetingRunner._run_pipeline_inner` right before
+  `set_done`: joins `transcript["segments"][*].text`; falls back to reading
+  `<output_dir>/<job_id>.txt` if the joined string is empty.
+- **Dictation transcripts** live in a separate `dictations` table created in
+  the same `__init__`. Dictation is request-response (no job row), so the
+  route's normal success path fires-and-forgets an `asyncio.create_task` that
+  calls `JobStore.insert_dictation` via `asyncio.to_thread` (the `_exec`
+  lock is sync, so we must hop off the event loop). Tasks are held in
+  `app.state.pending_persists` to defeat the documented `asyncio.create_task`
+  GC race, and drained with a 2-second budget at shutdown.
+
+Both tables carry `api_key_id`, the existing per-user FK to `wispralt.users`.
+This makes the Phase 2 per-employee filter trivial: `/me/insights` will filter
+to one `api_key_id`; `/admin/data` will union all of them.
+
+### Privacy posture
+
+- **No opt-in flag.** Deliberate product decision; do not re-introduce
+  gating "to be safe."
+- **90-day retention.** `JobStore.sweep_transcripts(days)` zeros
+  `jobs.transcript_text` and deletes `dictations` rows older than
+  `transcript_retention_days` (default 90). TTL is measured from
+  `COALESCE(finished_at, created_at)` on jobs (the moment the transcript
+  actually existed, not job submission) and from `created_at` on dictations.
+  Sweep runs once at startup (`main.lifespan`) and on a daily 24 h asyncio
+  timer task (`_daily_transcript_sweep`) so a long-uptime server eventually
+  reaps.
+- **Asymmetric word-count survival.** `jobs.word_count` survives past sweep
+  because the row stays as audit history; `dictations` rows are deleted
+  entirely. This is intentional.
+- **File permissions.** `jobs.db`, `jobs.db-wal`, and `jobs.db-shm` are
+  `chmod 0600` on every startup so a restored backup is auto-tightened.
+  When the mode actually changes, the new mode is logged at INFO.
+- **Break-glass admin (user.id < 0) is skipped everywhere.** No orphaned
+  `-1` rows ever appear in either table.
+- **Empty / whitespace-only dictations are skipped.** Avoids polluting
+  Phase 2 word counts with silence-only audio.
+- **All transcripts stay on the mini.** Nothing is sent to OpenRouter
+  except via the future weekly insights cron (Phase 2).
+
+### Known gap: cloud-fallback dictations
+
+When the mini is offline, the Swift client transcribes via OpenRouter directly
+(see "Cloud Fallback" above) and never sends those transcripts to the server.
+Phase 1 does not capture them. Phase 2 may add an optional best-effort
+`/telemetry/cloud-dictation` endpoint the client calls once the mini reappears,
+but that's deferred.
+
+### Client app version (`X-WisprAlt-Client-Version`)
+
+The Swift client sets this header on every server-bound request
+(`MeetingAPI.submit`, `MeetingAPI.submitFile`, `ChunkedUploader.postJSON` +
+`uploadOneChunk`, and `ServerClient.buildRequest` for `DictationAPI`).
+Format: `"<CFBundleShortVersionString>+<CFBundleVersion>"`. The server reads
+it at submit time and persists it on the row via `JobStore.create` (single-shot
+file + legacy meeting) or on `meta.json` (chunked init) so it survives both
+worker crashes and mid-upload client upgrades. Missing → stored as NULL.
+
+### What's deferred to Phase 2
+
+- LLM weekly cron (launchd timer + OpenRouter summary client + a new
+  `weekly_insights` table).
+- Admin "Data" tab + per-employee self-view portal (`/me/insights`).
+- The data-gate is "≥2 weeks of accumulated capture."
+
+---
+
 ## Process Auto-Start
 
 Three launchd entries keep both sides of WisprAlt alive across reboots, crashes, and logins.

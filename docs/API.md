@@ -34,6 +34,22 @@ These are intentionally open so Kubernetes-style probes, Cloudflare health check
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
 - `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
 
+**Optional client-version header (always-accepted, never required):**
+
+Every `/transcribe/*` route and `/transcribe/dictate` accept an
+`X-WisprAlt-Client-Version` header. The Swift client sets it on every
+server-bound request (format `"<short>+<build>"`, e.g. `"0.3.1+1"`). The
+value is recorded with the persisted transcript on the row (`jobs.client_app_version`
+for meeting/file, `dictations.client_app_version` for dictation) so the
+Phase 2 weekly-insights cron can group captured data by shipped build.
+Missing → stored as NULL. Capture is unconditional and transparent; the
+header is informational only and never affects routing, auth, or rate
+limits. For chunked uploads the version is captured at `/init` into
+`meta.json` and re-read at `/finalize` so an in-flight client upgrade
+doesn't change attribution. See [ARCHITECTURE.md →
+Transcript persistence](ARCHITECTURE.md#transcript-persistence) for the
+storage + 90-day retention sweep details.
+
 **Additional auth validation:**
 - A missing or invalid token returns **401**.
 - An empty token after the `Bearer ` prefix returns **401**.

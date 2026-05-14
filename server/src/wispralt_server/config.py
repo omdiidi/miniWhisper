@@ -106,6 +106,14 @@ class Settings(BaseSettings):
     # the threshold — no transcription content is lost, only the polish step.
     smart_format_min_words: int = 300
 
+    # Transcript persistence TTL. After this many days, transcript text on
+    # `jobs` rows is zeroed (the row stays as audit metadata) and `dictations`
+    # rows are deleted entirely. Measured from COALESCE(finished_at, created_at)
+    # on jobs and from created_at on dictations — i.e. the moment the text
+    # actually existed, not job submission. Daily sweep runs in the lifespan
+    # background task. See docs/ARCHITECTURE.md "Transcript persistence".
+    transcript_retention_days: int = 90
+
 
 # Module-level singleton — import as ``from wispralt_server.config import settings``
 settings = Settings()

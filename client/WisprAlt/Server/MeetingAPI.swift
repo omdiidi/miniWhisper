@@ -169,6 +169,11 @@ enum MeetingAPI {
         if let apiKey = try? KeychainHelper.getAPIKey() {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
+        // Phase 1 transcript-storage: see ServerClient.clientVersion.
+        request.setValue(
+            ServerClient.clientVersion,
+            forHTTPHeaderField: "X-WisprAlt-Client-Version"
+        )
 
         // Perform upload with a dedicated session so we can set a per-upload delegate.
         let (data, response): (Data, HTTPURLResponse)
@@ -352,6 +357,11 @@ enum MeetingAPI {
         if let apiKey = try? KeychainHelper.getAPIKey() {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
+        // Phase 1 transcript-storage: see ServerClient.clientVersion.
+        request.setValue(
+            ServerClient.clientVersion,
+            forHTTPHeaderField: "X-WisprAlt-Client-Version"
+        )
 
         let (data, response): (Data, HTTPURLResponse)
         do {

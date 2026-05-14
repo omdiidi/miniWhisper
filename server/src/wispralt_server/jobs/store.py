@@ -15,7 +15,10 @@ Design decisions (v3 deltas P4#4 + P5#2):
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -25,6 +28,8 @@ from typing import Optional
 
 from wispralt_server._errors import UploadTruncatedError
 from wispralt_server.ops.staging import validate_wav_completeness
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +58,14 @@ class Job:
     total_chunks: int = 0
     cancel_requested: bool = False
     audio_duration_s: Optional[float] = None
+    # Transcript-storage foundation (Phase 1). Captured at completion via
+    # set_done so the future weekly-insights cron has data. Legacy rows have
+    # NULL — Phase 2 cron filters those out. api_key_id is the existing
+    # per-user FK; required for per-employee filtering.
+    transcript_text: Optional[str] = None
+    word_count: Optional[int] = None
+    client_app_version: Optional[str] = None
+    api_key_id: Optional[int] = None
 
 
 def _row_to_job(row: tuple, cursor: sqlite3.Cursor) -> Job:
@@ -80,6 +93,10 @@ def _row_to_job(row: tuple, cursor: sqlite3.Cursor) -> Job:
         total_chunks=int(d.get("total_chunks") or 0),
         cancel_requested=bool(d.get("cancel_requested") or 0),
         audio_duration_s=d.get("audio_duration_s"),
+        transcript_text=d.get("transcript_text"),
+        word_count=d.get("word_count"),
+        client_app_version=d.get("client_app_version"),
+        api_key_id=d.get("api_key_id"),
     )
 
 
@@ -97,6 +114,9 @@ class JobStore:
 
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Retain the path for the chmod-on-startup logic below and for
+        # diagnostics. Sidecar files (-wal, -shm) are derived from this path.
+        self._db_path = db_path
         # isolation_level=None → autocommit; we manage transactions explicitly
         # check_same_thread=False → fine because we guard every call with _lock
         self.con = sqlite3.connect(
@@ -153,11 +173,62 @@ class JobStore:
             "ALTER TABLE jobs ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE jobs ADD COLUMN audio_duration_s REAL",
+            # Transcript-storage foundation (Phase 1). api_key_id is the
+            # existing per-user FK; required for per-employee filters in
+            # the future weekly-insights cron. Legacy rows are NULL —
+            # Phase 2 filters those out at insight-render time.
+            "ALTER TABLE jobs ADD COLUMN transcript_text TEXT",
+            "ALTER TABLE jobs ADD COLUMN word_count INTEGER",
+            "ALTER TABLE jobs ADD COLUMN client_app_version TEXT",
+            "ALTER TABLE jobs ADD COLUMN api_key_id INTEGER",
         ):
             try:
                 self.con.execute(_alter)
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+        # Dictation transcripts live in a separate table because dictation is
+        # request-response and never produces a row in `jobs`. One INSERT per
+        # successful dictation; capture is fire-and-forget from the route.
+        self.con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dictations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                duration_ms INTEGER,
+                text TEXT NOT NULL,
+                word_count INTEGER,
+                client_app_version TEXT,
+                smart_format_applied INTEGER
+            )
+            """
+        )
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dictations_api_key_created"
+            " ON dictations(api_key_id, created_at)"
+        )
+
+        # chmod 600 on jobs.db + -wal + -shm sidecars. Applied unconditionally
+        # on every startup so a restored backup (which may have wider perms
+        # propagated from the source filesystem) is auto-tightened. Logs at
+        # INFO when a mode actually changes so an operator who deliberately
+        # broadened perms knows about the revert.
+        target_mode = stat.S_IRUSR | stat.S_IWUSR  # 0o600
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = Path(str(self._db_path) + suffix)
+            try:
+                current = sidecar.stat().st_mode & 0o777
+            except FileNotFoundError:
+                continue  # -wal / -shm may not exist yet
+            if current != 0o600:
+                try:
+                    os.chmod(sidecar, target_mode)
+                    logger.info("chmod 600 %s (was %o)", sidecar, current)
+                except OSError as exc:
+                    logger.warning(
+                        "chmod 600 failed for %s: %s (continuing)", sidecar, exc
+                    )
 
     # ── private ───────────────────────────────────────────────────────────────
 
@@ -168,7 +239,14 @@ class JobStore:
 
     # ── write operations ──────────────────────────────────────────────────────
 
-    def create(self, wav_path: str, *, request_mode: str = "meeting") -> str:
+    def create(
+        self,
+        wav_path: str,
+        *,
+        request_mode: str = "meeting",
+        client_app_version: str | None = None,
+        api_key_id: int | None = None,
+    ) -> str:
         """Insert a new pending job and return its UUID.
 
         ``request_mode`` encodes the caller's intent (``file`` or ``meeting``)
@@ -176,16 +254,30 @@ class JobStore:
         :class:`MeetingRunner._run_source`. Defaulted to ``meeting`` so the
         legacy ``submit_or_429`` path (called only by /transcribe/meeting POST)
         keeps working without an explicit flag.
+
+        ``client_app_version`` (Phase 1 transcript-storage) records the
+        submitting client's app version at submit time. Survives worker
+        crashes because it's persisted on the original INSERT, not at
+        ``set_done`` time.
+
+        ``api_key_id`` is the owning user's ``wispralt.users.id``. Required
+        for per-employee filtering in the future weekly-insights cron. Pass
+        ``None`` for the break-glass admin (user.id < 0); those rows are
+        explicitly excluded from capture.
         """
         jid = str(uuid.uuid4())
         self._exec(
-            "INSERT INTO jobs(id, status, created_at, wav_path, request_mode)"
-            " VALUES(?,?,?,?,?)",
+            "INSERT INTO jobs("
+            "id, status, created_at, wav_path, request_mode,"
+            " client_app_version, api_key_id"
+            ") VALUES(?,?,?,?,?,?,?)",
             jid,
             "pending",
             time.time(),
             wav_path,
             request_mode,
+            client_app_version,
+            api_key_id,
         )
         return jid
 
@@ -197,15 +289,101 @@ class JobStore:
             jid,
         )
 
-    def set_done(self, jid: str, mode: str, output_dir: str) -> None:
-        """Transition a job from running → done."""
+    def set_done(
+        self,
+        jid: str,
+        mode: str,
+        output_dir: str,
+        *,
+        transcript_text: str | None = None,
+    ) -> None:
+        """Transition a job from running → done.
+
+        ``transcript_text`` (Phase 1 transcript-storage) is the plain-text
+        transcript derived from the pipeline's segment list. When provided
+        the helper also computes ``word_count`` server-side so callers don't
+        have to. Pass ``None`` to leave the columns untouched (e.g. legacy
+        callers that never populated transcripts).
+
+        ``client_app_version`` is intentionally NOT a kwarg here — it is
+        already persisted at :meth:`create` time so the value survives a
+        worker crash mid-pipeline.
+        """
+        word_count = len(transcript_text.split()) if transcript_text else None
         self._exec(
-            "UPDATE jobs SET status='done', mode=?, output_dir=?, finished_at=? WHERE id=?",
+            "UPDATE jobs SET status='done', mode=?, output_dir=?,"
+            " finished_at=?, transcript_text=?, word_count=?"
+            " WHERE id=?",
             mode,
             output_dir,
             time.time(),
+            transcript_text,
+            word_count,
             jid,
         )
+
+    def insert_dictation(
+        self,
+        api_key_id: int,
+        text: str,
+        duration_ms: int | None,
+        client_app_version: str | None,
+        smart_format_applied: bool,
+    ) -> None:
+        """Persist one dictation transcript row.
+
+        Called from a background asyncio task in ``routes/dictate.py`` after
+        the user-facing response has already been returned. ``duration_ms``
+        stores Parakeet inference latency (NOT audio length); the future
+        weekly-insights cron uses it to derive per-user transcription-latency
+        trends.
+        """
+        word_count = len(text.split()) if text else 0
+        self._exec(
+            "INSERT INTO dictations("
+            "api_key_id, created_at, duration_ms, text, word_count,"
+            " client_app_version, smart_format_applied"
+            ") VALUES(?,?,?,?,?,?,?)",
+            api_key_id,
+            time.time(),
+            duration_ms,
+            text,
+            word_count,
+            client_app_version,
+            1 if smart_format_applied else 0,
+        )
+
+    def sweep_transcripts(self, days: int) -> tuple[int, int]:
+        """Zero ``jobs.transcript_text`` and delete ``dictations`` rows older
+        than *days* days.
+
+        TTL is measured from the moment the transcript existed:
+        - jobs: ``COALESCE(finished_at, created_at) < cutoff``. Without
+          COALESCE, a job created 91 days ago but finished today would be
+          reaped tomorrow — wrong intent.
+        - dictations: ``created_at < cutoff``. Dictations are INSERTed at
+          completion, so there is no separate "finished" timestamp.
+
+        Returns ``(jobs_rows_zeroed, dictations_rows_deleted)``.
+
+        Note: ``jobs.word_count`` and other metadata survive the sweep — the
+        row stays as audit history. Dictations are deleted entirely because
+        per-row metadata on a fast-flowing stream isn't worth retaining past
+        the privacy TTL.
+        """
+        cutoff = time.time() - days * 86400
+        # `_exec` is varargs — pass `cutoff` positionally, NOT as a tuple.
+        jobs_cur = self._exec(
+            "UPDATE jobs SET transcript_text = NULL"
+            " WHERE transcript_text IS NOT NULL"
+            " AND COALESCE(finished_at, created_at) < ?",
+            cutoff,
+        )
+        dicts_cur = self._exec(
+            "DELETE FROM dictations WHERE created_at < ?",
+            cutoff,
+        )
+        return jobs_cur.rowcount, dicts_cur.rowcount
 
     def set_failed(self, jid: str, error: str) -> None:
         """Transition any job status → failed."""

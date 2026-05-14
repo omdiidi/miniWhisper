@@ -193,11 +193,25 @@ async def submit_file(
     )
 
     runner = _runner(request)
+    # Phase 1 transcript-storage: capture client version + owning api_key_id
+    # at submit time so they survive worker crashes and restart re-enqueue.
+    client_version = request.headers.get("X-WisprAlt-Client-Version")
+    user = getattr(request.state, "user", None)
+    api_key_id = (
+        int(user.id)
+        if user is not None and hasattr(user, "id") and int(user.id) >= 0
+        else None
+    )
     try:
         # Worker (_run_source) runs ffprobe + ffmpeg + pipeline. Route returns
         # 202 immediately so Cloudflare Tunnel doesn't see a long-running
         # request.
-        jid = await runner.submit_source_or_429(src_path, request_mode=mode)
+        jid = await runner.submit_source_or_429(
+            src_path,
+            request_mode=mode,
+            client_version=client_version,
+            api_key_id=api_key_id,
+        )
     except MeetingInProgressError as exc:
         src_path.unlink(missing_ok=True)
         return JSONResponse(
@@ -320,6 +334,12 @@ async def init_chunked(
         "ext": ext,
         "created_at": time.time(),
         "api_key_id": int(user.id),  # R-B: persist owner for chunk/finalize
+        # Phase 1 transcript-storage: capture client version at init so the
+        # value reflects the ORIGINATING client even if the user upgrades
+        # mid-multi-hour-upload. Reads as None on in-flight uploads from
+        # before this code shipped — row gets NULL client_app_version, no
+        # migration needed.
+        "client_app_version": request.headers.get("X-WisprAlt-Client-Version"),
     }
     (chunked_dir / "meta.json").write_text(json.dumps(meta))
 
@@ -560,9 +580,29 @@ async def finalize_chunked(
     # MeetingInProgressError branch mirrors transcribe_file.py:128-134 so a
     # 429 still cleans up the assembled file (R-C).
     runner = _runner(request)
+    # Phase 1 transcript-storage: read client version that was captured at
+    # /init (more robust than the live header — survives mid-upload client
+    # upgrade). api_key_id is already ownership-verified above.
     try:
         mode_enum = ProcessingMode(meta["mode"])
-        jid = await runner.submit_source_or_429(out_path, request_mode=mode_enum)
+    except (KeyError, ValueError) as exc:
+        out_path.unlink(missing_ok=True)
+        shutil.rmtree(chunked_dir, ignore_errors=True)
+        raise HTTPException(422, "meta.json missing or has invalid mode") from exc
+
+    client_version = meta.get("client_app_version")
+    try:
+        meta_api_key_id = int(meta.get("api_key_id", -999))
+    except (TypeError, ValueError):
+        meta_api_key_id = -999
+    api_key_id = meta_api_key_id if meta_api_key_id >= 0 else None
+    try:
+        jid = await runner.submit_source_or_429(
+            out_path,
+            request_mode=mode_enum,
+            client_version=client_version,
+            api_key_id=api_key_id,
+        )
     except MeetingInProgressError as exc:
         out_path.unlink(missing_ok=True)
         shutil.rmtree(chunked_dir, ignore_errors=True)

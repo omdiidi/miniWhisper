@@ -240,6 +240,11 @@ enum ChunkedUploader {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(String(data.count), forHTTPHeaderField: "Content-Length")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        // Phase 1 transcript-storage: see ServerClient.clientVersion.
+        request.setValue(
+            ServerClient.clientVersion,
+            forHTTPHeaderField: "X-WisprAlt-Client-Version"
+        )
         request.timeoutInterval = 6 * 60 * 60
 
         var lastError: Error?
@@ -304,6 +309,11 @@ enum ChunkedUploader {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        // Phase 1 transcript-storage: see ServerClient.clientVersion.
+        request.setValue(
+            ServerClient.clientVersion,
+            forHTTPHeaderField: "X-WisprAlt-Client-Version"
+        )
         request.timeoutInterval = 60
 
         let encoded = try JSONEncoder().encode(body)

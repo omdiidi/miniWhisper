@@ -19,6 +19,20 @@ final class ServerClient {
 
     static let shared = ServerClient()
 
+    /// Client app version sent on every server-bound request as the
+    /// `X-WisprAlt-Client-Version` header. Format: `"<short>+<build>"`
+    /// (e.g. `"0.3.1+1"`). Read once from `Info.plist`; both keys are
+    /// hard-coded in `client/WisprAlt/Info.plist` and sed-replaced by
+    /// `scripts/release-client.sh` on every release. Falls through to
+    /// `"unknown+0"` if either key is missing (should never happen in a
+    /// shipped build).
+    static let clientVersion: String = {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let short = info["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = info["CFBundleVersion"] as? String ?? "0"
+        return "\(short)+\(build)"
+    }()
+
     // MARK: - Sessions
 
     /// Default session for dictation (small payloads, low latency).
@@ -79,6 +93,17 @@ final class ServerClient {
         if let apiKey = try? KeychainHelper.getAPIKey() {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
+
+        // Phase 1 transcript-storage: include the client app version on every
+        // server-bound request so the server can attribute captured
+        // transcripts to a specific shipped build. Format: "<short>+<build>"
+        // (e.g. "0.3.1+1"); falls through to "unknown+0" if Info.plist is
+        // missing entries (should never happen in shipped builds — the
+        // release script sed-replaces these on every release).
+        request.setValue(
+            ServerClient.clientVersion,
+            forHTTPHeaderField: "X-WisprAlt-Client-Version"
+        )
 
         if let body {
             request.httpBody = body

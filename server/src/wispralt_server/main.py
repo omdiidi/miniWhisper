@@ -29,6 +29,7 @@ import contextlib
 import logging
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -180,10 +181,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if tmp_removed:
         logger.info("Startup tmp sweep removed %d stale .tmp file(s).", tmp_removed)
 
+    # 4c. Phase 1 transcript-storage: zero transcript text on `jobs` rows and
+    #     delete `dictations` rows older than transcript_retention_days. Same
+    #     sweep is re-run every 24 h by the daily timer registered below so a
+    #     long-uptime server eventually reaps.
+    try:
+        jobs_swept, dicts_deleted = job_store.sweep_transcripts(
+            days=settings.transcript_retention_days
+        )
+        if jobs_swept or dicts_deleted:
+            logger.info(
+                "Startup transcript sweep: jobs.transcript_text zeroed=%d, "
+                "dictations deleted=%d",
+                jobs_swept,
+                dicts_deleted,
+            )
+    except sqlite3.Error:
+        logger.exception(
+            "Startup transcript sweep failed; daily timer will retry"
+        )
+
     # 5. Meeting runner — re-enqueue any pending jobs that survived the restart.
     meeting_runner = MeetingRunner(job_store)
     app.state.meeting_runner = meeting_runner
     app.state.shutting_down = False
+
+    # Phase 1 transcript-storage: holds strong refs to in-flight
+    # `_persist_dictation` background tasks so asyncio doesn't GC them
+    # before they complete. The dictate route adds tasks here and removes
+    # them via add_done_callback. Drained on shutdown below.
+    app.state.pending_persists = set()
 
     # Re-enqueueing is deferred until after models load (done below via task).
 
@@ -261,6 +288,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except Exception:  # noqa: BLE001
                     logger.exception("Idle-eviction loop iteration failed")
         app.state.eviction_task = asyncio.create_task(_eviction_loop())
+
+    # 7d. Phase 1 transcript-storage: daily sweep loop. Re-runs the same
+    #     `sweep_transcripts` that ran at startup so a long-uptime server
+    #     eventually reaps. Daemon-loop pattern: broad-except + log so a
+    #     transient SQLite error never kills the task.
+    async def _daily_transcript_sweep() -> None:
+        while not getattr(app.state, "shutting_down", False):
+            try:
+                await asyncio.sleep(24 * 3600)
+            except asyncio.CancelledError:
+                raise
+            try:
+                j, d = job_store.sweep_transcripts(
+                    days=settings.transcript_retention_days
+                )
+                if j or d:
+                    logger.info(
+                        "Daily transcript sweep: jobs=%d, dictations=%d", j, d
+                    )
+            except Exception:  # noqa: BLE001 — daemon loop must never crash
+                logger.exception(
+                    "Daily transcript sweep failed; retrying tomorrow"
+                )
+
+    app.state.transcript_sweep_task = asyncio.create_task(
+        _daily_transcript_sweep()
+    )
 
     # 8. SIGTERM handler (P5#5 + P5#ExitTimeOut).
     #    I2: Use loop.add_signal_handler so the handler runs safely in the asyncio
@@ -373,6 +427,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # ── shutdown ──────────────────────────────────────────────────────────────
+
+    # Phase 1 transcript-storage: drain in-flight dictation persists FIRST so
+    # the SQLite write-lock isn't being released mid-INSERT below. The 2 s
+    # budget is total across all pending persists (gather waits for ALL),
+    # not 2 s each; under a SIGTERM burst some tasks may be abandoned and
+    # the warning log records the count. insert_dictation is SQLite-only
+    # today — placing the drain first keeps the teardown rule clear if a
+    # future persist path ever adds Postgres reads.
+    pending: set[asyncio.Task[None]] | None = getattr(
+        app.state, "pending_persists", None
+    )
+    if pending:
+        logger.info(
+            "Awaiting %d pending dictation persist(s) on shutdown...",
+            len(pending),
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Dictation persist drain timed out; %d task(s) abandoned",
+                len(pending),
+            )
+
+    # Cancel the daily transcript sweep loop.
+    sweep_task: asyncio.Task | None = getattr(
+        app.state, "transcript_sweep_task", None
+    )
+    if sweep_task is not None and not sweep_task.done():
+        sweep_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweep_task
+
     # Cancel the db pool watcher first so it stops trying to probe / rebuild
     # while the rest of shutdown is tearing the pool down.
     db_watcher: asyncio.Task | None = getattr(app.state, "db_watcher_task", None)

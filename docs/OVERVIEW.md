@@ -38,7 +38,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/usage/writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — drain loop, batch INSERT, FK-violation retry |
 | `server/src/wispralt_server/admin/__init__.py` | [ADMIN.md](ADMIN.md) — admin package marker (templates only) |
 | `server/src/wispralt_server/admin/templates/*.html.j2` | [ADMIN.md](ADMIN.md) — Jinja2 templates: base / login / overview / users / user_detail / usage / token_minted / add_employee / employee_added |
-| `server/src/wispralt_server/routes/dictate.py` | [API.md](API.md) — `/transcribe/dictate` endpoint (incl. `X-Smart-Format` header gating) |
+| `server/src/wispralt_server/routes/dictate.py` | [API.md](API.md) — `/transcribe/dictate` endpoint (incl. `X-Smart-Format` and `X-WisprAlt-Client-Version` header gating); fire-and-forget background INSERT into the `dictations` table after the response is built (skips break-glass admin + empty text). |
 | `server/src/wispralt_server/routes/health.py` | [API.md](API.md) — `/healthz`, `/readyz/dictation`, `/readyz/meeting` |
 | `server/src/wispralt_server/routes/v1_transcriptions.py` | [API.md](API.md), [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md) — OpenAI-compatible `/v1/audio/transcriptions` |
 | `server/src/wispralt_server/routes/me.py` | [API.md](API.md), [ARCHITECTURE.md](ARCHITECTURE.md) — JSON `GET /me` + `PATCH /me` for self-service display name |
@@ -54,7 +54,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/src/wispralt_server/meeting/merge.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — segment merging, speaker labeling |
 | `server/src/wispralt_server/meeting/output.py` | [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — atomic output write, SRT/VTT/TXT formats |
 | `server/src/wispralt_server/meeting/pipeline.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — full meeting pipeline orchestration |
-| `server/src/wispralt_server/jobs/store.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — SQLite job store, orphan recovery |
+| `server/src/wispralt_server/jobs/store.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — SQLite job store, orphan recovery; Phase 1 transcript-storage columns (`transcript_text`, `word_count`, `client_app_version`, `api_key_id`) on `jobs`, separate `dictations` table for request-response dictation captures, `sweep_transcripts(days)` daily TTL helper, chmod 0600 on `jobs.db`/`-wal`/`-shm` at startup |
 | `server/src/wispralt_server/jobs/runner.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — asyncio.to_thread runner, semaphore |
 | `server/src/wispralt_server/ops/staging.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [API.md](API.md) — staging area management. Hosts `stream_to_staging_raw` (the sync-open-inside-async pattern reused by the chunked routes — repo deliberately has no async-file dep), the `_ALLOWED_EXTENSIONS` allowlist used at chunked `/init` for filename validation, `sweep_old` (24 h WAV TTL) AND `sweep_chunked` (1 h chunked-dir TTL keyed off `meta.json` mtime so active uploads are never reaped). |
 | `server/src/wispralt_server/ops/env_writer.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [SETUP-SERVER.md](SETUP-SERVER.md) — atomic .env rewrite, verify_env_perms, key rotation |

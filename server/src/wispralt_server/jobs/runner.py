@@ -142,12 +142,24 @@ class MeetingRunner:
 
     # ── public methods ─────────────────────────────────────────────────────────
 
-    async def submit_or_429(self, wav_path: Path) -> str:
+    async def submit_or_429(
+        self,
+        wav_path: Path,
+        *,
+        client_version: str | None = None,
+        api_key_id: int | None = None,
+    ) -> str:
         """Create a job and fire-and-forget its execution coroutine.
 
         Legacy /transcribe/meeting POST entry point. Persists
         ``request_mode=MEETING`` so the row matches the route's intent
         without a route-side change.
+
+        ``client_version`` + ``api_key_id`` (Phase 1 transcript-storage) are
+        persisted on the original ``store.create`` so they survive worker
+        crashes and restart-driven re-enqueues. Pass ``api_key_id=None`` for
+        break-glass admin requests (user.id < 0) — those rows skip capture
+        at the route level.
 
         Raises MeetingInProgressError (which the route converts to HTTP 429) if:
         - A job is already running (semaphore locked), OR
@@ -166,6 +178,8 @@ class MeetingRunner:
             jid = self.store.create(
                 str(wav_path),
                 request_mode=ProcessingMode.MEETING.value,
+                client_app_version=client_version,
+                api_key_id=api_key_id,
             )
             asyncio.create_task(self._run_pipeline(jid, wav_path))
             return jid
@@ -174,6 +188,9 @@ class MeetingRunner:
         self,
         src_path: Path,
         request_mode: ProcessingMode,
+        *,
+        client_version: str | None = None,
+        api_key_id: int | None = None,
     ) -> str:
         """Like :meth:`submit_or_429` but the input is a NOT-YET-TRANSCODED source.
 
@@ -199,6 +216,8 @@ class MeetingRunner:
             jid = self.store.create(
                 str(src_path),
                 request_mode=request_mode.value,
+                client_app_version=client_version,
+                api_key_id=api_key_id,
             )
             asyncio.create_task(self._run_source(jid, src_path, request_mode))
             return jid
@@ -351,7 +370,38 @@ class MeetingRunner:
                 return
 
             mode: str = transcript.get("mode", "unknown")
-            self.store.set_done(jid, mode, str(settings.meeting_output_dir))
+
+            # Phase 1 transcript-storage: derive plain text from segments and
+            # persist on the row. ``transcribe_meeting`` returns segments,
+            # NOT a top-level "text" field (see meeting/pipeline.py:_build_transcript).
+            # Fallback: read the pipeline's <output_dir>/<job_id>.txt file in
+            # case segments are empty or shaped unexpectedly. NULL is the
+            # contract when neither produces text (mid-pipeline failure or
+            # silence-only audio).
+            segments = transcript.get("segments") or []
+            transcript_text = " ".join(
+                (seg.get("text") or "").strip()
+                for seg in segments
+                if isinstance(seg, dict)
+            ).strip()
+            if not transcript_text:
+                txt_path = Path(settings.meeting_output_dir) / f"{jid}.txt"
+                if txt_path.exists():
+                    try:
+                        transcript_text = txt_path.read_text(encoding="utf-8")
+                    except OSError as exc:
+                        logger.warning(
+                            "[%s] transcript .txt fallback read failed: %s",
+                            jid, exc,
+                        )
+                        transcript_text = ""
+
+            self.store.set_done(
+                jid,
+                mode,
+                str(settings.meeting_output_dir),
+                transcript_text=transcript_text or None,
+            )
             logger.info("[%s] Meeting job done (mode=%s).", jid, mode)
 
         except Exception as exc:

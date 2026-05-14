@@ -13,7 +13,9 @@ Validation at this boundary (per backend-patterns rule):
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
@@ -23,7 +25,9 @@ from ..audio import CorruptAudioError
 from ..auth import require_api_key
 from ..config import settings
 from ..dictate.parakeet import MODEL_ID
+from ..jobs.store import JobStore
 from ..smart_format.mercury_client import _word_count
+from ..users.store import User
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +36,13 @@ router = APIRouter()
 
 @router.post(
     "/transcribe/dictate",
-    dependencies=[Depends(require_api_key)],
     summary="Transcribe a short dictation clip",
 )
-async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse:
+async def transcribe_dictate(
+    request: Request,
+    file: UploadFile,
+    user: User = Depends(require_api_key),
+) -> JSONResponse:
     """Transcribe an audio file using the warm Parakeet model.
 
     Parameters (multipart/form-data)
@@ -145,6 +152,68 @@ async def transcribe_dictate(request: Request, file: UploadFile) -> JSONResponse
         len(text),
         applied_smart_format,
     )
+
+    # Phase 1 transcript-storage: fire-and-forget INSERT into the dictations
+    # table. Skip break-glass admin (user.id < 0) and empty/whitespace-only
+    # text — both would pollute the future weekly-insights cron with noise.
+    # The dictation HTTP response has already been computed above; this task
+    # runs after the route returns and never blocks the user-facing path.
+    if (
+        user is not None
+        and user.id >= 0
+        and text
+        and text.strip()
+    ):
+        client_version = request.headers.get("X-WisprAlt-Client-Version")
+        job_store: JobStore | None = getattr(
+            request.app.state, "job_store", None
+        )
+        # duration_ms here stores Parakeet inference latency (NOT audio
+        # length). Phase 2 weekly cron can use it for per-user latency
+        # trends; if we ever want true audio length, add a separate column.
+        captured_inference_ms = (
+            int(inference_ms) if inference_ms is not None else None
+        )
+        captured_text = text
+        captured_smart_format = applied_smart_format
+        captured_api_key_id = int(user.id)
+
+        async def _persist_dictation() -> None:
+            if job_store is None:
+                logger.error("dictation persist skipped: job_store missing")
+                return
+            try:
+                # asyncio.to_thread is required: JobStore._exec acquires a
+                # threading.Lock (sync). Calling synchronously from the event
+                # loop would block under SQLite-WAL contention.
+                await asyncio.to_thread(
+                    job_store.insert_dictation,
+                    captured_api_key_id,
+                    captured_text,
+                    captured_inference_ms,
+                    client_version,
+                    captured_smart_format,
+                )
+            except (sqlite3.Error, OSError) as exc:
+                # Narrow typed errors — only the realistic failure modes for
+                # insert_dictation. Use logger.error (NOT .exception) so a
+                # custom traceback formatter can't include the transcript
+                # text via locals; log the exception type only.
+                logger.error(
+                    "dictation persist failed: %s", type(exc).__name__
+                )
+
+        # Task-leak guard: hold a strong reference until completion. Without
+        # this, asyncio.create_task tasks with no other reference can be
+        # garbage-collected before they run (documented asyncio behavior).
+        # request.app.state.pending_persists is initialized in lifespan().
+        pending: set[asyncio.Task[None]] | None = getattr(
+            request.app.state, "pending_persists", None
+        )
+        task = asyncio.create_task(_persist_dictation())
+        if pending is not None:
+            pending.add(task)
+            task.add_done_callback(pending.discard)
 
     return JSONResponse(
         content={

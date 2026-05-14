@@ -82,8 +82,21 @@ async def submit_meeting(
         content_md5,
     )
 
+    # Phase 1 transcript-storage: capture client version + owning api_key_id
+    # at submit time so they survive worker crashes and restart re-enqueue.
+    client_version = request.headers.get("X-WisprAlt-Client-Version")
+    user = getattr(request.state, "user", None)
+    api_key_id = (
+        int(user.id)
+        if user is not None and hasattr(user, "id") and int(user.id) >= 0
+        else None
+    )
     try:
-        jid = await runner.submit_or_429(wav_path)
+        jid = await runner.submit_or_429(
+            wav_path,
+            client_version=client_version,
+            api_key_id=api_key_id,
+        )
     except MeetingInProgressError as exc:
         staging.cleanup(wav_path)
         return JSONResponse(
