@@ -53,29 +53,38 @@ from wispralt_server.insights.timewindow import (
 logger = logging.getLogger(__name__)
 
 
-async def run_weekly_insights(app) -> None:
+async def run_weekly_insights(
+    app, iso_override: tuple[int, int] | None = None
+) -> None:
     """One full Sunday-night sweep. Idempotent — re-runs for the same week
     are overwrites via the upsert.
 
     Concurrency: holds ``app.state.weekly_insights_lock`` for the entire run
     so an overlapping catchup or rescheduled fire never overlaps. If the
     lock is already held, this returns immediately with a warning log.
+
+    ``iso_override`` (``(iso_year, iso_week)``) forces summarization of an
+    arbitrary week instead of the last full ISO week. Operator use only — the
+    scheduled cron always passes ``None``. Used by ``__main__ --week`` to
+    backfill or smoke-test against a specific window.
     """
     lock = getattr(app.state, "weekly_insights_lock", None)
     if lock is None:
         # Test / __main__ path — no FastAPI lifespan to install the lock.
         # Concurrency isn't possible here so just run the inner body.
-        return await _run_weekly_insights_inner(app)
+        return await _run_weekly_insights_inner(app, iso_override=iso_override)
     if lock.locked():
         logger.warning(
             "Weekly insights skipped — another run still in progress"
         )
         return
     async with lock:
-        return await _run_weekly_insights_inner(app)
+        return await _run_weekly_insights_inner(app, iso_override=iso_override)
 
 
-async def _run_weekly_insights_inner(app) -> None:
+async def _run_weekly_insights_inner(
+    app, iso_override: tuple[int, int] | None = None
+) -> None:
     """Body of :func:`run_weekly_insights`. See its docstring."""
     insights_client: InsightsClient | None = getattr(
         app.state, "insights_client", None
@@ -110,10 +119,15 @@ async def _run_weekly_insights_inner(app) -> None:
         )
         return
 
-    # 2. Target week — last full ISO week. Shared math via timewindow.py so
-    #    the routes/me.py + routes/admin_data.py pages always agree with the
-    #    cron about which week was just summarized.
-    iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
+    # 2. Target week — last full ISO week by default. Shared math via
+    #    timewindow.py so the routes/me.py + routes/admin_data.py pages always
+    #    agree with the cron about which week was just summarized.
+    #    ``iso_override`` (operator-only) lets ``--week`` backfill or smoke-test
+    #    against a specific ISO week without waiting for it to be "last full".
+    if iso_override is not None:
+        iso_year, iso_week = iso_override
+    else:
+        iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
     week_start_epoch, week_end_epoch = iso_week_epoch_bounds(
         iso_year, iso_week, settings.insights_timezone,
     )
@@ -490,9 +504,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Run one cron pass immediately",
     )
+    parser.add_argument(
+        "--week",
+        metavar="YYYY-WW",
+        help=(
+            "Override target ISO week (e.g. 2026-20). Operator backfill / "
+            "smoke-test only — the scheduled cron always uses last full ISO "
+            "week regardless of this flag."
+        ),
+    )
     args = parser.parse_args()
     if not args.manual:
         parser.error("--manual required (no-op without it)")
+
+    iso_override: tuple[int, int] | None = None
+    if args.week:
+        try:
+            _y, _w = args.week.split("-", 1)
+            iso_override = (int(_y), int(_w))
+        except (ValueError, AttributeError):
+            parser.error(
+                f"--week must be YYYY-WW (got {args.week!r})"
+            )
 
     async def _main() -> None:
         # Verify required config — fail loud, not with an obscure AttributeError.
@@ -522,7 +555,7 @@ if __name__ == "__main__":
             )
         )
         try:
-            await run_weekly_insights(app)
+            await run_weekly_insights(app, iso_override=iso_override)
         finally:
             await app.state.insights_client.aclose()
             await db_module.close_pool()
