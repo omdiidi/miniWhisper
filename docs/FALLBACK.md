@@ -77,6 +77,43 @@ to a Supabase RPC after each fallback — but that requires either a
 shared anon key in the binary (acceptable trade-off, negligible blast
 radius) or a per-employee JWT (out of scope for this minimal version).
 
+## Telemetry sync
+
+Plan A adds a disk-backed Swift queue
+(`client/WisprAlt/Storage/DictationFallbackQueue.swift`) that records every
+OpenRouter-served dictation and replays it to the origin's
+`POST /telemetry/cloud-dictation` endpoint once the mini is reachable
+again. The dictation lands in the same `dictations` table as
+origin-served ones (`source='cloud_fallback'`), shows up in
+`/me/history`, and feeds the future weekly-insights cron — closing the
+"Known gap: cloud-fallback dictations" hole that earlier phases left
+open.
+
+Each queue file lives at
+`~/Library/Application Support/co.wispralt/cloud-fallback-queue/<client_dedup_id>.json`
+where `<client_dedup_id>` is a fresh UUIDv4 minted at enqueue time.
+Drain triggers fire on `NSApplication.didBecomeActiveNotification` and
+immediately after any successful online dictation; concurrent drains are
+coalesced into one in-flight task. Each POST carries up to 200 items.
+Idempotency is enforced server-side by a partial unique index on
+`dictations.client_dedup_id` plus `ON CONFLICT DO NOTHING`, so a batch
+that is retried after a partial 5xx lands the missing rows exactly once.
+
+Items that fail 5 drain attempts — or sit in the queue more than 7 days
+— move to a `failed/` sibling directory so they don't retry forever.
+See [ARCHITECTURE.md → Cloud-fallback telemetry sync](ARCHITECTURE.md#cloud-fallback-telemetry-sync)
+for the full data lineage diagram and status policy.
+
+**Privacy note.** The `client_dedup_id` is a randomly-generated UUIDv4
+with no embedded user / device / time signal — it exists solely so the
+server can dedup retries. The server records exactly what the
+[`POST /telemetry/cloud-dictation`](API.md#post-telemetrycloud-dictation)
+request body carries (text, UTC timestamp, word count, client app
+version, dedup id) and nothing else; no IP, no User-Agent fingerprint,
+no per-batch attestation. The same 90-day retention sweep that zeroes
+origin-served dictations applies to cloud-fallback rows — they are not
+treated as a distinct class for retention purposes.
+
 ## Threat model
 
 - **OpenRouter key compromise**: bounded by the monthly spend cap set
@@ -109,9 +146,19 @@ required.
   / `setOpenRouterAPIKey()`.
 - `client/WisprAlt/Storage/PendingUploadsQueue.swift` — meeting-only,
   unrelated to OpenRouter; queues WAVs for retry when the mini is back.
+- `client/WisprAlt/Storage/DictationFallbackQueue.swift` — Plan A
+  cloud-fallback telemetry queue: disk-backed, idempotent via UUIDv4
+  `client_dedup_id`, drains to `POST /telemetry/cloud-dictation` on
+  app foreground + successful online dictation. See "Telemetry sync"
+  above.
+- `server/src/wispralt_server/routes/telemetry.py` — Plan A ingest
+  endpoint (`POST /telemetry/cloud-dictation`). Bearer-only, rate-limited
+  to 10 batches/min/IP, batches of up to 200 dictations each.
 - `client/WisprAlt/App/MenuBarController.swift` — meeting-offline toast,
   drain triggers (dictation success / app foreground / 120s timer),
-  fallback-unavailable toast.
+  fallback-unavailable toast. Plan A adds two cloud-fallback-queue drain
+  triggers: `didBecomeActive` observer + post-successful-online-dictation
+  hook.
 - `server/src/wispralt_server/routes/dev_faults.py` — dev-only
   `?fault=503` injection so we can verify the classifier doesn't trip on
   origin 5xx-with-X-Request-Id. Mounted only when `WISPRALT_DEV_FAULTS=1`

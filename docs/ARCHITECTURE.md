@@ -600,13 +600,16 @@ to one `api_key_id`; `/admin/data` will union all of them.
 - **All transcripts stay on the mini.** Nothing is sent to OpenRouter
   except via the future weekly insights cron (Phase 2).
 
-### Known gap: cloud-fallback dictations
+### Cloud-fallback dictations (closed in Plan A)
 
-When the mini is offline, the Swift client transcribes via OpenRouter directly
-(see "Cloud Fallback" above) and never sends those transcripts to the server.
-Phase 1 does not capture them. Phase 2 may add an optional best-effort
-`/telemetry/cloud-dictation` endpoint the client calls once the mini reappears,
-but that's deferred.
+Phase 1 originally had no capture path for the dictations that go through
+the OpenRouter cloud-fallback while the mini is unreachable. Plan A
+closes that gap end-to-end: a disk-backed Swift queue
+(`DictationFallbackQueue`) records each fallback dictation with a UUIDv4
+`client_dedup_id`, then drains to `POST /telemetry/cloud-dictation` on
+the next app-foreground OR successful online dictation. Rows land in the
+same `dictations` table with `source='cloud_fallback'`. Full design lives
+in [Cloud-fallback telemetry sync](#cloud-fallback-telemetry-sync) below.
 
 ### Client app version (`X-WisprAlt-Client-Version`)
 
@@ -861,6 +864,249 @@ mini's network egress isn't guaranteed — vendoring locally keeps the
 portal functional during an internet outage at the office. Refresh
 procedure (out-of-band): `curl -fsSL -o ...` from the upstream CDN,
 verify SHA-256 against the published release, commit.
+
+---
+
+## Personal history (`/me/history`)
+
+Plan A's headline employee surface. Every authenticated employee can browse
+their own dictations + meetings + custom file transcriptions in one
+chronological list, filter by range / kind / search term, expand any row to
+see the full transcript text, soft-delete with a one-click undo path, and
+download an individual transcript as `.txt` or `.json`. Sits in the same
+sidebar as `/me/insights` and inherits the data-portal frosted-glass
+treatment.
+
+Source: `server/src/wispralt_server/routes/me.py` (handlers) +
+`server/src/wispralt_server/admin/templates/{me_history, _me_history_body,
+_me_history_page, _me_history_row, _me_history_row_expanded}.html.j2`
+(render). Design lineage:
+`tmp/ready-plans/2026-05-15-plan-a-me-history-and-cloud-telemetry.md`.
+
+### Two-leg union
+
+A "history row" is either a dictation (from the `dictations` table) or a
+job-style transcript (from the `jobs` table — meeting OR file). Both legs
+carry `api_key_id` already, so per-user scoping is free. `JobStore.transcripts_in_range_filtered`
+runs two parameterized SQL queries — one per leg — applies the range +
+optional kind + optional `LIKE` search filter, ORDERs each by
+`(created_at DESC, row_id DESC)`, then merge-sorts the two streams in
+Python.
+
+Filters live entirely server-side:
+
+- `range` (default `30d`) — one of `today`, `7d`, `30d`, `90d`, `1y`, `all`,
+  reusing `insights/timewindow.epoch_for_range` so the history page and the
+  insights page agree on what "30d" means.
+- `kind` (optional) — `dictation` or `meeting`. Empty string from the
+  `<select>` element is normalized to None at the handler.
+- `search` (optional) — minimum **3 characters** after `.strip()`; shorter
+  strings are silently dropped to keep the `LIKE '%…%'` scan bounded.
+
+### Per-leg cursor pagination
+
+Each leg has its own opaque cursor (`dict_cursor`, `jobs_cursor`) so a page
+that's heavy on dictations doesn't starve meetings off the next page (and
+vice versa). Cursors are `(created_at, row_id)` tuples base64-urlsafe-encoded
+in the URL; malformed cursors decode to None and silently restart pagination.
+The "Load more" HTMX button posts back both cursors and the server appends
+the next 50 rows. Page size lives in `settings.history_page_size`
+(default **50**).
+
+`row_id` is included as a tie-breaker because two transcripts captured in
+the same wall-clock second otherwise collide on `created_at` alone and one
+of them gets dropped on the next page. Verification step 12 of the plan
+covers this.
+
+### Soft delete
+
+`dictations.deleted_at` and `jobs.deleted_at` (REAL, NULL = live) were
+added by idempotent `ALTER TABLE` calls in `JobStore.__init__`. Two new
+partial indexes (`idx_dictations_api_key_active`,
+`idx_jobs_api_key_active`) keep the live-row scan fast:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_dictations_api_key_active
+  ON dictations(api_key_id, created_at DESC)
+  WHERE deleted_at IS NULL;
+```
+
+`DELETE /me/history/{kind}/{row_id}` flips `deleted_at = NOW()`; the row
+disappears from `/me/history` and from every downstream read path that
+respects the flag. `compute_user_stats` and `transcripts_in_range` were
+audited to filter `deleted_at IS NULL` on both UNION legs so the
+admin Data tab's word-count tiles, the weekly-insights cron's input, and
+the personal stats grid all decrement after a delete. `POST
+/me/history/{kind}/{row_id}/restore` clears the flag.
+
+Hard deletion + cascade across already-generated `weekly_insights` rows is
+out of scope for Plan A — the v1 contract is "I won't appear in *future*
+insights and I'm hidden from my own history" rather than "I never
+existed".
+
+### CSRF + ownership
+
+Both mutating routes (`DELETE`, `POST /restore`) accept the standard form
+`csrf_token` field validated through the shared
+`auth.verify_csrf`/`set_csrf_cookie` helpers (same double-submit pattern
+as `/admin/login` and `/me/login`). Every read AND mutation re-checks
+ownership: `get_history_row(api_key_id, kind, row_id)` filters on
+`api_key_id` so a malicious or stale row_id from another user uniformly
+returns **404** — we never leak existence to non-owners. Break-glass
+admin (`user.id < 0`) is rejected from every history route (no person
+row to scope to).
+
+### HTMX render contract
+
+Three template shapes, picked at the handler based on request kind:
+
+| Trigger | Template | Notes |
+|---|---|---|
+| Fresh page load | `me_history.html.j2` | Full chrome (nav, filter bar, table shell + first page). |
+| HTMX nav (range/kind/search change) | `_me_history_body.html.j2` | Body fragment swapped into `#history-body`. |
+| HTMX Load-more | `_me_history_page.html.j2` | Just the next batch of `<tr>` rows + the updated Load-more button. |
+| Row expand | `_me_history_row_expanded.html.j2` | Swaps the compact row in place; transcript text + per-row Delete/Download buttons. |
+| Row collapse / restore | `_me_history_row.html.j2` | Compact row partial. |
+
+Delete returns `<tr id="row-{kind}-{row_id}" hx-swap-oob="delete"></tr>`
+so the row simply vanishes without a re-fetch. Downloads (`GET
+/me/history/{kind}/{row_id}/download/{fmt}`) stream `text/plain` or
+`application/json` with a `Content-Disposition: attachment;
+filename="{kind}-{iso-date}-{row_id}.{fmt}"` header.
+
+```
+employee browser
+   │  GET /me/history?range=30d
+   ▼
+me.py:me_history ──▶ JobStore.transcripts_in_range_filtered
+                       │
+                       ├─ leg A: dictations (deleted_at IS NULL)
+                       └─ leg B: jobs       (deleted_at IS NULL)
+                              │
+                              ▼ merge-sort by created_at DESC, then row_id DESC
+                      first 50 rows + next (dict_cursor, jobs_cursor)
+                       │
+                       ▼
+            me_history.html.j2 (or body/page/row partial)
+```
+
+---
+
+## Cloud-fallback telemetry sync
+
+Plan A's other half: closes the gap noted in the "Known gap:
+cloud-fallback dictations" subsection above. When the Mac mini is offline,
+the Swift client transcribes via OpenRouter directly (see [Cloud Fallback
+(dictation only)](#cloud-fallback-dictation-only) and [docs/FALLBACK.md](FALLBACK.md));
+those transcripts used to be invisible to the origin and never appeared in
+`/me/history` or the weekly insights cron. Plan A adds an idempotent
+client-side queue + a server ingest endpoint so cloud-fallback dictations
+eventually land in the same `dictations` table as origin-served ones.
+
+Source: `client/WisprAlt/Storage/DictationFallbackQueue.swift` (queue +
+drain) + `client/WisprAlt/Server/DictationAPI.swift` (enqueue at the
+OpenRouter success site) + `client/WisprAlt/App/MenuBarController.swift`
+(drain triggers) on the client side;
+`server/src/wispralt_server/routes/telemetry.py` (ingest) +
+`JobStore.insert_cloud_fallback_dictation` on the server side.
+
+### Data lineage
+
+```
+  offline dictation
+   │  (mini unreachable; classifier in ServerClient::isOfflineSignature trips)
+   ▼
+ DictationAPI.callOpenRouter ──── inject text into focused app ────► user sees result
+   │
+   │  (try?) DictationFallbackQueue.shared.enqueue(...)
+   ▼
+ ~/Library/Application Support/co.wispralt/cloud-fallback-queue/<dedup>.json
+   │
+   │  drain triggers: app didBecomeActive  +  next successful online dictation
+   ▼
+ POST https://transcribe.integrateapi.ai/telemetry/cloud-dictation
+   │   { dictations: [ { client_dedup_id, text, dictated_at, word_count,
+   │                     client_app_version }, … up to 200 per batch ] }
+   ▼
+ routes/telemetry.py ──▶ JobStore.insert_cloud_fallback_dictation
+   │                       (ON CONFLICT DO NOTHING via partial unique
+   │                        index on client_dedup_id IS NOT NULL)
+   ▼
+ dictations table (source='cloud_fallback')  →  /me/history  +  future cron inputs
+```
+
+### Queue design (client)
+
+The queue is a singleton actor wrapper around a disk directory. Each
+queued dictation is a single JSON file named `<client_dedup_id>.json`
+(`client_dedup_id` is a freshly-minted UUIDv4 per dictation). Writes are
+atomic in the same style as `PendingUploadsQueue`: write `.tmp` → fsync
+file → rename → fsync parent directory. Concurrent drain calls are
+coalesced into one in-flight task by `DictationFallbackDrainCoordinator`
+so a foreground notification arriving mid-drain doesn't double-POST.
+
+Lifecycle:
+
+- **Enqueue** — `DictationAPI.callOpenRouter` enqueues on the success
+  path immediately after the parse, wrapped in `try?` so any queue write
+  failure is logged but never breaks the dictation user experience.
+- **Drain** — fires on `NSApplication.didBecomeActiveNotification` and
+  immediately after any successful online dictation. Each invocation
+  reads up to 200 files, builds one batch, POSTs, then handles the
+  response per the status policy below.
+- **Retry / TTL** — a `retry_count` field is bumped on transient
+  failure. Items that hit `maxAttempts = 5` or exceed the 7-day age
+  ceiling move to a `failed/` sibling directory rather than retry
+  forever (matches the same pattern in `PendingUploadsQueue`). Local
+  bookkeeping fields (`created_at`, `retry_count`, `last_attempt_at`)
+  are stripped before the POST body is built so the server only sees
+  the fields it validates.
+
+Status policy on the drain POST:
+
+| Server status | Client action |
+|---|---|
+| 2xx | Delete the batch's files. Done. |
+| 401 | Log + abort drain. User likely needs to re-paste a token. |
+| 4xx non-401 | Bump `retry_count` on every file in the batch. Will retry next trigger. |
+| 5xx / transport error | Leave files in place. Retry next trigger. |
+
+### Endpoint design (server)
+
+`POST /telemetry/cloud-dictation` is **Bearer-only**: a cookie-only
+request with no `Authorization` header is rejected with 401 even if the
+shared session cookie would normally satisfy auth. This stops a malicious
+site that holds a `wispralt_admin_token` cookie (set when the user logged
+into `/me/login`) from triggering ingest from a logged-in browser session
+the user didn't initiate. Pydantic validates the batch shape (`client_dedup_id`
+is a UUID-shaped string, `text` is 1–200_000 chars, batch size 1–200);
+the handler then bounds `dictated_at` to `[now − 365d, now + 5min]` so a
+clock-skew or replay attack can't backfill the cron's input.
+
+Idempotency lives in the schema: a partial unique index
+`idx_dictations_client_dedup` on `client_dedup_id WHERE client_dedup_id
+IS NOT NULL` plus `INSERT … ON CONFLICT (client_dedup_id) DO NOTHING` in
+`insert_cloud_fallback_dictation` means a retried batch with the same
+`client_dedup_id`s lands exactly once. The handler returns `{inserted,
+received}` so the client can distinguish "all new" from "all duplicates"
+in OSLog.
+
+Rate-limited at 10 batches per minute per IP through the same
+`middleware/rate_limit.py` that gates `/transcribe/*` (new
+`telemetry_per_min` kwarg + `/telemetry/*` branch in dispatch); each
+batch can carry up to 200 dictations, so 2000 dictations/minute is the
+ceiling — more than enough for a 10-person team's worst-case
+offline-then-online surge.
+
+### Provenance
+
+Cloud-fallback rows carry `source='cloud_fallback'` (server-set in
+`insert_cloud_fallback_dictation`). Origin-served dictations carry
+`source='server'` (NULL coalesces to `'server'` for the migration's
+existing rows; the column was added by an idempotent `ALTER TABLE` in
+`JobStore.__init__`). `/me/history` renders the source as a small
+icon/label so users can tell at a glance which dictations went through
+the cloud-fallback path.
 
 ---
 

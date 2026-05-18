@@ -31,6 +31,8 @@ These are intentionally open so Kubernetes-style probes, Cloudflare health check
 - `POST /transcribe/dictate`, `POST /transcribe/meeting`, `GET /transcribe/meeting/{id}`, `GET /transcribe/meeting/{id}/download/{fmt}`, `DELETE /transcribe/meeting/{id}`
 - `POST /v1/audio/transcriptions` (OpenAI-compatible drop-in)
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
+- `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
+- `POST /telemetry/cloud-dictation` (Plan A — **Bearer-only**, cookie auth is explicitly rejected with 401)
 - `GET /metrics`
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
 - `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
@@ -68,6 +70,7 @@ Enforced by `middleware/rate_limit.py` (per-IP, in-memory rolling window):
 | `POST /transcribe/dictate` | 60 requests per 60-second window (configurable: `DICTATE_RATE_PER_MIN`) |
 | `POST /transcribe/meeting` | 4 requests per 3600-second window (configurable: `MEETING_RATE_PER_HOUR`) |
 | `GET /readyz/*`, `GET /healthz` | 120 requests per 60-second window (configurable: `PROBE_RATE_PER_MIN`). Cloudflare's typical 5–10s health-check cadence sits well under this; the cap exists to bound probe-flood damage on the unauthenticated probe endpoints. |
+| `POST /telemetry/*` | 10 requests per 60-second window (configurable: `telemetry_per_min`). Each batch carries up to 200 cloud-fallback dictations, so the ceiling is 2000 dictations/minute per IP. |
 
 Exceeded limits return **429** with a `Retry-After` header (value = window duration in seconds).
 
@@ -399,6 +402,142 @@ Source: `server/src/wispralt_server/routes/me.py` (Phase 2).
 
 ---
 
+### `GET /me/history`
+
+**Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
+
+Personal transcript archive — the calling user's own dictations + meetings + custom file transcriptions in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `api_key_id` AND `deleted_at IS NULL`).
+
+**Query parameters:**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `range` | enum | `30d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all`. Reuses `insights.timewindow.epoch_for_range`. |
+| `kind` | enum \| empty | unset | Either `dictation` or `meeting`. Empty string from a `<select>` is normalized to "no filter". |
+| `search` | string | unset | Free-text LIKE filter on the transcript body. Strings shorter than **3 chars after `.strip()`** are silently dropped to keep the scan bounded. |
+| `dict_cursor` | opaque | unset | Base64-urlsafe encoded `(created_at, row_id)` tuple for the dictations leg. Malformed → silently restart pagination. |
+| `jobs_cursor` | opaque | unset | Same shape, for the jobs (meeting/file) leg. |
+
+**Response 200** — full page (`me_history.html.j2`).
+
+**Response 200 (HTMX nav)** — when `HX-Request: true` is present and no cursor was sent, returns `_me_history_body.html.j2` (the body fragment for in-place swap).
+
+**Response 200 (HTMX Load-more)** — when a cursor was sent, returns `_me_history_page.html.j2` (the next batch of `<tr>` rows + the updated Load-more button). Page size is `settings.history_page_size` (default **50**) per leg.
+
+**Response 303** — caller is break-glass admin (`user.id < 0`). Redirects to `/admin/data`.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer. |
+| 422 | `range` is not one of the accepted values. |
+| 503 | Postgres pool unavailable. |
+
+Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+
+---
+
+### `GET /me/history/{kind}/{row_id}`
+
+**Auth:** Bearer required. Ownership-checked.
+
+Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `kind`, unknown `row_id`, or a `row_id` owned by another user all uniformly return **404** so we never leak existence to non-owners.
+
+**Path parameters:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | enum | `dictation` or `meeting`. Anything else → 404. |
+| `row_id` | string | Job UUID for `meeting`, integer row id for `dictation`. |
+
+**Query parameters:**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `compact` | bool | `false` | When `true`, return `_me_history_row.html.j2` (collapsed). Otherwise return `_me_history_row_expanded.html.j2` with the full transcript text + Delete + Download buttons. |
+
+**Response 200** — partial HTML fragment ready for HTMX swap-in.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer. |
+| 404 | Unknown kind, unknown row_id, soft-deleted, or owned by another user. |
+
+Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+
+---
+
+### `DELETE /me/history/{kind}/{row_id}`
+
+**Auth:** Bearer required + CSRF token. Ownership-checked.
+
+Soft-delete one owned row. Flips `deleted_at = NOW()` on the underlying row; downstream read paths (`/me/history`, `compute_user_stats`, the weekly-insights cron) all filter `deleted_at IS NULL`, so the row disappears from every surface. Reversible via the `/restore` route below until the 90-day TTL sweep zeros the transcript text.
+
+**Request:** `application/x-www-form-urlencoded`
+
+| Field | Type | Notes |
+|---|---|---|
+| `csrf_token` | string | Double-submit value matched against the cookie set by the prior `GET /me/history*` render. Constant-time compare via `hmac.compare_digest`. |
+
+**Response 200** — body is the OOB delete fragment `<tr id="row-{kind}-{row_id}" hx-swap-oob="delete"></tr>`. HTMX removes the row from the table without re-fetching the page.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer. |
+| 403 | CSRF token missing or mismatched. |
+| 404 | Unknown kind, unknown row_id, already-deleted, or owned by another user. |
+
+Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+
+---
+
+### `POST /me/history/{kind}/{row_id}/restore`
+
+**Auth:** Bearer required + CSRF token. Ownership-checked.
+
+Restore one soft-deleted row by clearing `deleted_at`. Returns the compact row partial (`_me_history_row.html.j2`) so HTMX can drop the row back into the table at its original position.
+
+**Request:** Same `csrf_token` form field as `DELETE`.
+
+**Response 200** — `_me_history_row.html.j2` partial.
+
+**Errors:** Same as `DELETE /me/history/{kind}/{row_id}`.
+
+Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+
+---
+
+### `GET /me/history/{kind}/{row_id}/download/{fmt}`
+
+**Auth:** Bearer required. Ownership-checked.
+
+Download one owned transcript as plain text or JSON. Returns a streaming response with `Content-Disposition: attachment; filename="{kind}-{iso-date}-{row_id}.{fmt}"`.
+
+**Path parameter `fmt`:** `txt` or `json`. Anything else → 404.
+
+**Response 200:**
+
+| `fmt` | `Content-Type` | Body |
+|---|---|---|
+| `txt` | `text/plain; charset=utf-8` | The joined transcript text. Falls back to `transcript_text` if `text` is unset. |
+| `json` | `application/json` | The full row as a JSON object (all columns; `json.dumps(row, default=str)`). |
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer. |
+| 404 | Unknown kind, unknown fmt, unknown row_id, soft-deleted, or owned by another user. |
+
+Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+
+---
+
 ### `GET /admin/data`
 
 **Auth:** Bearer required + `role='admin'`. Router-level `require_admin` + `_require_db_pool` deps mean employee tokens get 403 and a degraded Postgres pool gets 503 — never an `AttributeError` deeper in the handler.
@@ -427,6 +566,64 @@ Admin Data tab. Renders the team `weekly_insights` row (most recent completed IS
 | 503 | Postgres pool unavailable. |
 
 Source: `server/src/wispralt_server/routes/admin_data.py` (Phase 2).
+
+---
+
+### `POST /telemetry/cloud-dictation`
+
+**Auth:** Bearer required. **Bearer-only** — a cookie-only request with no `Authorization` header is rejected with **401** even if the shared `wispralt_admin_token` cookie would normally satisfy auth. This stops a browser-CSRF abuse where a malicious site that holds the session cookie triggers ingest from a logged-in browser the user didn't initiate.
+
+Ingest a batch of cloud-fallback dictations from a Swift client. The macOS app enqueues every OpenRouter-served dictation locally (see [ARCHITECTURE.md → Cloud-fallback telemetry sync](ARCHITECTURE.md#cloud-fallback-telemetry-sync) for the queue + drain flow) and POSTs in batches once the mini is reachable again. Idempotent via `client_dedup_id` + the partial unique index on `dictations.client_dedup_id`.
+
+**Request:** `application/json`
+
+```json
+{
+  "dictations": [
+    {
+      "client_dedup_id": "1f5b0b71-f8e3-4f6f-9b21-2f6d7c2e9e02",
+      "text": "Hello world, this was dictated while the mini was offline.",
+      "dictated_at": 1747526471.0,
+      "word_count": 11,
+      "client_app_version": "0.3.1+1"
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `dictations` | array | Yes | 1–200 items per batch. |
+| `dictations[].client_dedup_id` | string (UUID) | Yes | 36-char `^[0-9a-fA-F-]{36}$`. A fresh UUIDv4 per dictation; the same id must be used on every retry of the same dictation. |
+| `dictations[].text` | string | Yes | 1–200,000 chars. Whitespace-only entries are silently skipped. |
+| `dictations[].dictated_at` | number | Yes | UTC epoch seconds. Bounds-checked to `[now − 365d, now + 5min]`; out-of-range entries are logged and skipped. |
+| `dictations[].word_count` | integer \| null | No | Optional; defaults to `len(text.split())` when null. |
+| `dictations[].client_app_version` | string \| null | No | Up to 64 chars. Stored on the row for the same Phase 2 attribution as origin-served dictations. |
+
+**Response 200:**
+
+```json
+{ "inserted": 1, "received": 1 }
+```
+
+| Field | Description |
+|---|---|
+| `inserted` | Rows that actually landed (excludes `ON CONFLICT DO NOTHING` dedup conflicts and skipped entries). |
+| `received` | Items that passed pydantic validation. |
+
+A repeat batch with the same `client_dedup_id`s returns `{inserted: 0, received: N}` — the client uses this to confirm the batch is fully drained.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing bearer header (including the cookie-only case described above). |
+| 403 | Caller is the break-glass admin (`user.id < 0`) — break-glass has no user row to attribute dictations to. |
+| 422 | Body fails pydantic validation (malformed UUID, batch too large, text too long, etc.). |
+| 429 | Per-IP telemetry rate limit (10 batches per 60-second window) exceeded. Includes `Retry-After: 60`. |
+| 503 | Postgres pool unavailable. |
+
+Source: `server/src/wispralt_server/routes/telemetry.py` (Plan A).
 
 ---
 
