@@ -195,6 +195,17 @@ enum DictationAPI {
             "DictationAPI: source=fallback http=200 chars=\(text.count) ms=\(Int(elapsedMs))",
             category: "fallback"
         )
+
+        // Plan A §A8: persist this cloud-fallback dictation for later sync so it
+        // appears in /me/history + period insights. Non-throwing — a queue
+        // failure must NEVER break the user's primary "got text" flow.
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        DictationFallbackQueue.shared.enqueue(
+            text: text,
+            dictatedAt: Date(),
+            clientAppVersion: appVersion
+        )
+
         return text
     }
 

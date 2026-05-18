@@ -261,6 +261,13 @@ final class MenuBarController: NSObject {
             Task.detached(priority: .utility) {
                 await PendingUploadsQueue.shared.drain()
             }
+            // Plan A §A8: cloud-fallback dictation queue shares this
+            // foreground trigger so any OpenRouter-served dictations
+            // from offline mode sync to the origin as soon as the user
+            // refocuses the app.
+            Task.detached(priority: .utility) {
+                await DictationFallbackQueue.shared.drain()
+            }
         }
 
         // 120s timer trigger. `Timer.scheduledTimer` adds itself to the
@@ -1578,6 +1585,13 @@ extension MenuBarController: FNKeyEventsDelegate {
                 // immediately.
                 Task.detached(priority: .utility) {
                     await PendingUploadsQueue.shared.drain()
+                }
+                // Plan A §A8: also drain cloud-fallback queue on online
+                // dictation success — a successful online dictation proves
+                // the origin is reachable, so this is the best moment to
+                // flush any queued OpenRouter-served dictations.
+                Task.detached(priority: .utility) {
+                    await DictationFallbackQueue.shared.drain()
                 }
 
             } catch ServerError.unauthorized {
