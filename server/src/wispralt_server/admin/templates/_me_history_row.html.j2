@@ -5,7 +5,7 @@
   <td>{{ row.created_at_iso }}</td>
   <td style="text-align:right;">{{ row.word_count or 0 }}</td>
   <td>
-    {{ row.preview }}
+    {{ row.preview if row.preview is defined else (row.text or row.transcript_text or '')[:200] }}
     {% if row.source == 'cloud_fallback' %}<span class="muted" style="font-size:11px;"> · cloud sync</span>{% endif %}
   </td>
   <td>

@@ -647,7 +647,13 @@ class JobStore:
                 sql_d += " AND text LIKE ?"
                 args_d.append(f"%{search}%")
             if dict_cursor is not None:
-                sql_d += " AND (created_at, CAST(id AS TEXT)) < (?, ?)"
+                # dictations.id is INTEGER; ORDER BY id DESC uses integer
+                # ordering, so the WHERE must compare as INTEGER too — a
+                # text compare disagrees across digit-width boundaries
+                # (e.g. id=9 vs id=10 with the same created_at would drop
+                # or repeat rows). The cursor wire-format stays as a
+                # decimal string for jobs compatibility; we coerce here.
+                sql_d += " AND (created_at, id) < (?, CAST(? AS INTEGER))"
                 args_d.extend(dict_cursor)
             sql_d += " ORDER BY created_at DESC, id DESC LIMIT ?"
             args_d.append(limit)
