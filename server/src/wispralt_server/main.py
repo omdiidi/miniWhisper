@@ -458,7 +458,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.usage_drainer = asyncio.create_task(
             usage_writer.drain_loop(observability.usage_queue, pool)
         )
-    except (asyncpg.PostgresError, OSError, db.PostgresUnavailable):
+    except (asyncpg.Error, OSError, db.PostgresUnavailable):
         logger.exception(
             "Postgres unavailable at startup; only break-glass admin will work"
         )
@@ -483,7 +483,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
                 try:
                     new_pool = await db.recreate_pool()
-                except (asyncpg.PostgresError, OSError, db.PostgresUnavailable):
+                except (asyncpg.Error, OSError, db.PostgresUnavailable):
                     logger.exception("db_watcher: rebuild failed; will retry in 10s")
                     continue
                 app.state.db_pool = new_pool

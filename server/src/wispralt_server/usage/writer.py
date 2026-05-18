@@ -72,7 +72,7 @@ async def drain_loop(queue: UsageEventQueue, pool: asyncpg.Pool) -> None:
                 if len(batch) >= BATCH_MAX:
                     try:
                         await _flush(pool, batch)
-                    except (asyncpg.PostgresError, OSError):
+                    except (asyncpg.Error, OSError):
                         logger.exception(
                             "usage_event final flush failed; dropping batch of %d",
                             len(batch),
@@ -81,7 +81,7 @@ async def drain_loop(queue: UsageEventQueue, pool: asyncpg.Pool) -> None:
             if batch:
                 try:
                     await _flush(pool, batch)
-                except (asyncpg.PostgresError, OSError):
+                except (asyncpg.Error, OSError):
                     logger.exception(
                         "usage_event final flush failed; dropping batch of %d",
                         len(batch),
@@ -92,7 +92,7 @@ async def drain_loop(queue: UsageEventQueue, pool: asyncpg.Pool) -> None:
             if batch:
                 try:
                     await _flush(pool, batch)
-                except (asyncpg.PostgresError, OSError):
+                except (asyncpg.Error, OSError):
                     logger.exception(
                         "usage_event flush failed; dropping batch of %d",
                         len(batch),
