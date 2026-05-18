@@ -209,6 +209,45 @@ class JobStore:
             "CREATE INDEX IF NOT EXISTS idx_dictations_api_key_created"
             " ON dictations(api_key_id, created_at)"
         )
+        # Plan A history + cloud-fallback telemetry. Idempotent ALTERs run
+        # AFTER the dictations CREATE TABLE so existing prod DBs (which lack
+        # these columns) are migrated forward. For a brand-new DB the CREATE
+        # TABLE above produces the legacy schema and these ALTERs immediately
+        # add the new columns — same shape either way.
+        #   deleted_at (REAL epoch) — soft-delete tombstone for /me/history.
+        #     NULL = live; non-NULL = hidden from reads but kept on disk for
+        #     audit + restore. Added to BOTH dictations and jobs.
+        #   source (TEXT) — origin tag for dictations. NULL coalesces to
+        #     'server' on read; cloud-fallback inserts populate 'cloud_fallback'.
+        #   client_dedup_id (TEXT) — client-supplied UUID for cloud-fallback
+        #     idempotency. Unique partial index below enforces dedup.
+        for _alter in (
+            "ALTER TABLE dictations ADD COLUMN deleted_at REAL",
+            "ALTER TABLE jobs ADD COLUMN deleted_at REAL",
+            "ALTER TABLE dictations ADD COLUMN source TEXT",
+            "ALTER TABLE dictations ADD COLUMN client_dedup_id TEXT",
+        ):
+            try:
+                self.con.execute(_alter)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        # Plan A history: partial indexes scoped to live (non-soft-deleted)
+        # rows for the per-user history feed. Partial unique index enforces
+        # cloud-fallback dedup without imposing uniqueness on legacy rows
+        # where client_dedup_id is NULL.
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dictations_api_key_active"
+            " ON dictations(api_key_id, created_at) WHERE deleted_at IS NULL"
+        )
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_api_key_active"
+            " ON jobs(api_key_id)"
+            " WHERE deleted_at IS NULL AND transcript_text IS NOT NULL"
+        )
+        self.con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dictations_client_dedup"
+            " ON dictations(client_dedup_id) WHERE client_dedup_id IS NOT NULL"
+        )
 
         # Weekly LLM insights (Phase 2). One row per (iso_year, iso_week, scope,
         # api_key_id). scope='person' stores per-employee summaries with the
@@ -357,7 +396,7 @@ class JobStore:
         duration_ms: int | None,
         client_app_version: str | None,
         smart_format_applied: bool,
-    ) -> None:
+    ) -> int:
         """Persist one dictation transcript row.
 
         Called from a background asyncio task in ``routes/dictate.py`` after
@@ -365,21 +404,29 @@ class JobStore:
         stores Parakeet inference latency (NOT audio length); the future
         weekly-insights cron uses it to derive per-user transcription-latency
         trends.
+
+        Returns the new row's ``id`` (used by Plan 2 dedup logic). Direct
+        ``con.execute`` under ``self._lock`` so we can capture ``lastrowid``
+        before any subsequent statement resets the cursor.
         """
         word_count = len(text.split()) if text else 0
-        self._exec(
-            "INSERT INTO dictations("
-            "api_key_id, created_at, duration_ms, text, word_count,"
-            " client_app_version, smart_format_applied"
-            ") VALUES(?,?,?,?,?,?,?)",
-            api_key_id,
-            time.time(),
-            duration_ms,
-            text,
-            word_count,
-            client_app_version,
-            1 if smart_format_applied else 0,
-        )
+        with self._lock:
+            cur = self.con.execute(
+                "INSERT INTO dictations("
+                "api_key_id, created_at, duration_ms, text, word_count,"
+                " client_app_version, smart_format_applied"
+                ") VALUES(?,?,?,?,?,?,?)",
+                (
+                    api_key_id,
+                    time.time(),
+                    duration_ms,
+                    text,
+                    word_count,
+                    client_app_version,
+                    1 if smart_format_applied else 0,
+                ),
+            )
+            return int(cur.lastrowid)
 
     # ── weekly insights (Phase 2) ────────────────────────────────────────────
 
@@ -492,10 +539,12 @@ class JobStore:
             FROM (
                 SELECT 'dictation' AS kind, word_count, duration_ms, created_at
                   FROM dictations WHERE api_key_id = ? AND created_at >= ?
+                              AND deleted_at IS NULL
                 UNION ALL
                 SELECT 'meeting' AS kind, word_count, NULL AS duration_ms, created_at
                   FROM jobs WHERE api_key_id = ?
                               AND transcript_text IS NOT NULL
+                              AND deleted_at IS NULL
                               AND created_at >= ?
             )
             """,
@@ -533,10 +582,12 @@ class JobStore:
                 SELECT created_at, text, 'dictation' AS kind
                   FROM dictations
                  WHERE api_key_id = ? AND created_at >= ? AND created_at < ?
+                   AND deleted_at IS NULL
                 UNION ALL
                 SELECT created_at, transcript_text AS text, 'meeting' AS kind
                   FROM jobs
                  WHERE api_key_id = ? AND transcript_text IS NOT NULL
+                   AND deleted_at IS NULL
                    AND created_at >= ? AND created_at < ?
             ) ORDER BY created_at DESC
             """,
@@ -544,6 +595,229 @@ class JobStore:
             api_key_id, since_epoch, until_epoch,
         )
         return [{"created_at": r[0], "text": r[1], "kind": r[2]} for r in cur.fetchall()]
+
+    # ── /me/history (Plan A) ─────────────────────────────────────────────────
+
+    def transcripts_in_range_filtered(
+        self,
+        api_key_id: int,
+        *,
+        since_epoch: float,
+        until_epoch: float,
+        kind: str | None = None,
+        search: str | None = None,
+        dict_cursor: tuple[float, str] | None = None,
+        jobs_cursor: tuple[float, str] | None = None,
+        limit: int = 50,
+    ) -> tuple[
+        list[dict],
+        tuple[float, str] | None,
+        tuple[float, str] | None,
+    ]:
+        """Per-leg cursor pagination for the personal history feed.
+
+        Returns ``(rows, next_dict_cursor, next_jobs_cursor)`` where ``rows``
+        is a merged list of dicts ``{row_id, kind, created_at, preview,
+        word_count, deleted_at, source}`` sorted by ``created_at DESC`` and
+        capped at ``limit``. Each leg's cursor is populated only if THAT leg
+        returned ``limit`` rows (i.e. there may be more to page through);
+        ``None`` signals end-of-leg.
+
+        Reviewer fix vs. plan pseudocode: the plan's ``next_*`` derivation
+        keyed off the merged ``rows`` (which is wrong — the merged tail is
+        not the per-leg tail). We capture each leg's raw query result and
+        derive cursors from those instead so subsequent pages are correct.
+        """
+        dict_rows_raw: list[dict] = []
+        jobs_rows_raw: list[dict] = []
+
+        if kind != "meeting":
+            sql_d = (
+                "SELECT CAST(id AS TEXT) AS row_id, 'dictation' AS kind,"
+                " created_at, substr(text, 1, 200) AS preview,"
+                " word_count, deleted_at,"
+                " COALESCE(source, 'server') AS source"
+                " FROM dictations"
+                " WHERE api_key_id = ?"
+                " AND created_at >= ? AND created_at < ?"
+                " AND deleted_at IS NULL"
+            )
+            args_d: list[object] = [api_key_id, since_epoch, until_epoch]
+            if search:
+                sql_d += " AND text LIKE ?"
+                args_d.append(f"%{search}%")
+            if dict_cursor is not None:
+                sql_d += " AND (created_at, CAST(id AS TEXT)) < (?, ?)"
+                args_d.extend(dict_cursor)
+            sql_d += " ORDER BY created_at DESC, id DESC LIMIT ?"
+            args_d.append(limit)
+            cur_d = self._exec(sql_d, *args_d)
+            cols_d = [c[0] for c in cur_d.description]
+            dict_rows_raw = [dict(zip(cols_d, r)) for r in cur_d.fetchall()]
+
+        if kind != "dictation":
+            sql_j = (
+                "SELECT id AS row_id, 'meeting' AS kind, created_at,"
+                " substr(transcript_text, 1, 200) AS preview,"
+                " word_count, deleted_at, 'server' AS source"
+                " FROM jobs"
+                " WHERE api_key_id = ?"
+                " AND created_at >= ? AND created_at < ?"
+                " AND transcript_text IS NOT NULL"
+                " AND deleted_at IS NULL"
+            )
+            args_j: list[object] = [api_key_id, since_epoch, until_epoch]
+            if search:
+                sql_j += " AND transcript_text LIKE ?"
+                args_j.append(f"%{search}%")
+            if jobs_cursor is not None:
+                sql_j += " AND (created_at, id) < (?, ?)"
+                args_j.extend(jobs_cursor)
+            sql_j += " ORDER BY created_at DESC, id DESC LIMIT ?"
+            args_j.append(limit)
+            cur_j = self._exec(sql_j, *args_j)
+            cols_j = [c[0] for c in cur_j.description]
+            jobs_rows_raw = [dict(zip(cols_j, r)) for r in cur_j.fetchall()]
+
+        merged = sorted(
+            dict_rows_raw + jobs_rows_raw,
+            key=lambda r: (-r["created_at"], r["row_id"]),
+        )[:limit]
+
+        next_dict = (
+            (dict_rows_raw[-1]["created_at"], dict_rows_raw[-1]["row_id"])
+            if len(dict_rows_raw) == limit
+            else None
+        )
+        next_jobs = (
+            (jobs_rows_raw[-1]["created_at"], jobs_rows_raw[-1]["row_id"])
+            if len(jobs_rows_raw) == limit
+            else None
+        )
+        return merged, next_dict, next_jobs
+
+    def get_history_row(
+        self, api_key_id: int, kind: str, row_id: str,
+    ) -> dict | None:
+        """Owner-checked + deleted_at-filtered single-row fetch.
+
+        ``row_id`` is always a string: jobs uses UUID-string id, dictations
+        uses INTEGER id (we CAST inside the WHERE so callers don't have to
+        cast). Returns ``dict(row)`` or ``None``.
+        """
+        if kind == "dictation":
+            cur = self._exec(
+                "SELECT * FROM dictations"
+                " WHERE api_key_id=? AND id=CAST(? AS INTEGER)"
+                " AND deleted_at IS NULL",
+                api_key_id, row_id,
+            )
+        elif kind == "meeting":
+            cur = self._exec(
+                "SELECT * FROM jobs"
+                " WHERE api_key_id=? AND id=?"
+                " AND transcript_text IS NOT NULL AND deleted_at IS NULL",
+                api_key_id, row_id,
+            )
+        else:
+            return None
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [c[0] for c in cur.description]
+        return dict(zip(cols, row))
+
+    def soft_delete_history_row(
+        self, api_key_id: int, kind: str, row_id: str,
+    ) -> bool:
+        """Set ``deleted_at = now`` for one owner-checked row. Returns True
+        iff a live row was updated (a re-delete is a no-op → False).
+        """
+        now = time.time()
+        if kind == "dictation":
+            cur = self._exec(
+                "UPDATE dictations SET deleted_at=?"
+                " WHERE api_key_id=? AND id=CAST(? AS INTEGER)"
+                " AND deleted_at IS NULL",
+                now, api_key_id, row_id,
+            )
+        elif kind == "meeting":
+            cur = self._exec(
+                "UPDATE jobs SET deleted_at=?"
+                " WHERE api_key_id=? AND id=?"
+                " AND deleted_at IS NULL",
+                now, api_key_id, row_id,
+            )
+        else:
+            return False
+        return cur.rowcount > 0
+
+    def restore_history_row(
+        self, api_key_id: int, kind: str, row_id: str,
+    ) -> bool:
+        """Symmetric inverse of :meth:`soft_delete_history_row`. Returns True
+        iff a previously-soft-deleted row was restored.
+        """
+        if kind == "dictation":
+            cur = self._exec(
+                "UPDATE dictations SET deleted_at=NULL"
+                " WHERE api_key_id=? AND id=CAST(? AS INTEGER)"
+                " AND deleted_at IS NOT NULL",
+                api_key_id, row_id,
+            )
+        elif kind == "meeting":
+            cur = self._exec(
+                "UPDATE jobs SET deleted_at=NULL"
+                " WHERE api_key_id=? AND id=?"
+                " AND deleted_at IS NOT NULL",
+                api_key_id, row_id,
+            )
+        else:
+            return False
+        return cur.rowcount > 0
+
+    def insert_cloud_fallback_dictation(
+        self,
+        *,
+        api_key_id: int,
+        text: str,
+        dictated_at: float,
+        word_count: int,
+        client_app_version: str | None,
+        client_dedup_id: str,
+    ) -> int | None:
+        """Persist one cloud-fallback dictation (i.e. the user dictated while
+        the mini was unreachable and the Swift client transcribed via
+        OpenRouter directly). ``dictated_at`` is the user-reported epoch of
+        the dictation's actual occurrence (NOT the ingest time) and becomes
+        ``created_at`` so the history feed and weekly-insights cron see the
+        event in its true time window.
+
+        Idempotency: ``client_dedup_id`` is the client-supplied UUID; the
+        partial unique index ``idx_dictations_client_dedup`` enforces dedup
+        on the database. Returns the new row's ``id`` on insert, or ``None``
+        if a row with the same ``client_dedup_id`` already exists.
+        """
+        with self._lock:
+            cur = self.con.execute(
+                "INSERT INTO dictations("
+                " api_key_id, created_at, duration_ms, text, word_count,"
+                " client_app_version, smart_format_applied,"
+                " source, client_dedup_id"
+                ") VALUES(?,?,NULL,?,?,?,0,'cloud_fallback',?)"
+                " ON CONFLICT(client_dedup_id)"
+                " WHERE client_dedup_id IS NOT NULL"
+                " DO NOTHING",
+                (
+                    api_key_id,
+                    dictated_at,
+                    text,
+                    word_count,
+                    client_app_version,
+                    client_dedup_id,
+                ),
+            )
+            return int(cur.lastrowid) if cur.rowcount > 0 else None
 
     def sweep_transcripts(self, days: int) -> tuple[int, int]:
         """Zero ``jobs.transcript_text`` and delete ``dictations`` rows older
