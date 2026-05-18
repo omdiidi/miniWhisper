@@ -63,6 +63,7 @@ from wispralt_server.ops.env_writer import find_env_path
 from wispralt_server.routes import admin, admin_data, admin_ui, dev_faults, dictate, health
 from wispralt_server.routes import me as me_routes
 from wispralt_server.routes import meeting as meeting_routes
+from wispralt_server.routes import telemetry as telemetry_routes
 from wispralt_server.routes import transcribe_file as transcribe_file_routes
 from wispralt_server.routes import v1_transcriptions
 from wispralt_server.smart_format.mercury_client import MercuryClient
@@ -766,6 +767,10 @@ def create_app() -> FastAPI:
     app.include_router(transcribe_file_routes.router)
     # /me — JSON identity self-management (any authenticated role).
     app.include_router(me_routes.router)
+    # /telemetry/cloud-dictation — Swift client cloud-fallback dictation sync.
+    #     Bearer-auth (cookie-only rejected). Rate-limited 10 batches/min/IP via
+    #     RateLimitMiddleware.
+    app.include_router(telemetry_routes.router)
     # /v1/audio/transcriptions — OpenAI-compat shim.
     app.include_router(v1_transcriptions.router)
 

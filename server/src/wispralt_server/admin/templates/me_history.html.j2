@@ -1,0 +1,56 @@
+{% extends "base.html.j2" %}
+{% set TAB_LABELS = {'today': 'Today', '7d': '7d', '30d': '30d', '90d': '90d', '1y': '1y', 'all': 'All'} %}
+{% set KIND_LABELS = [('', 'All'), ('dictation', 'Dictations'), ('meeting', 'Meetings')] %}
+{% block title %}My History · Wispralt{% endblock %}
+{% block content %}
+<div class="data-page">
+  <h2>My History</h2>
+  <p class="muted">Your dictations and meetings — search, expand, download, or remove. Deleting a row excludes it from future weekly insights.</p>
+
+  <nav x-data="{ active: '{{ range }}' }"
+       @range-changed.window="active = $event.detail"
+       class="range-tabs">
+    {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
+      <button :class="active === '{{ r }}' ? 'active' : ''"
+              @click="active = '{{ r }}'"
+              hx-get="/me/history"
+              hx-vals='{"range": "{{ r }}", "kind": "{{ kind or '' }}", "search": "{{ search or '' }}"}'
+              hx-target="#history-body"
+              hx-swap="innerHTML"
+              hx-push-url="true">
+        {{ TAB_LABELS[r] }}
+      </button>
+    {% endfor %}
+  </nav>
+
+  <div class="filters" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin: 12px 0;">
+    <input type="hidden" name="range" value="{{ range }}">
+    <input type="search"
+           name="search"
+           placeholder="Search transcript text (min 3 chars)…"
+           value="{{ search or '' }}"
+           hx-get="/me/history"
+           hx-include="[name=range],[name=kind]"
+           hx-trigger="keyup changed delay:300ms, search"
+           hx-target="#history-body"
+           hx-swap="innerHTML"
+           hx-push-url="true"
+           style="min-width: 280px;">
+    <select name="kind"
+            hx-get="/me/history"
+            hx-include="[name=range],[name=search]"
+            hx-trigger="change"
+            hx-target="#history-body"
+            hx-swap="innerHTML"
+            hx-push-url="true">
+      {% for opt_value, opt_label in KIND_LABELS %}
+        <option value="{{ opt_value }}" {% if (kind or '') == opt_value %}selected{% endif %}>{{ opt_label }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div id="history-body">
+    {% include "_me_history_body.html.j2" %}
+  </div>
+</div>
+{% endblock %}

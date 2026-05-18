@@ -18,13 +18,19 @@ path is set to ``/`` so it actually traverses the boundary.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import json
 import logging
 import secrets
 import string
+import time
+from datetime import datetime
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import asyncpg
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -268,4 +274,286 @@ async def me_insights(
 
     return templates.TemplateResponse(
         request, "me_insights.html.j2", ctx,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan A: /me/history — personal transcript archive with search/filter/download
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _encode_cursor(cur: tuple[float, str] | None) -> str | None:
+    """Base64-urlsafe encode a (epoch, row_id) cursor for round-trip in URLs."""
+    if cur is None:
+        return None
+    raw = f"{cur[0]}:{cur[1]}".encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def _decode_cursor(s: str | None) -> tuple[float, str] | None:
+    """Decode a base64-urlsafe cursor. Malformed → ``None`` (restart pagination)."""
+    if not s:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(s.encode()).decode()
+        epoch_str, _, row_id = raw.partition(":")
+        return (float(epoch_str), row_id)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+
+
+def _decorate_row(row: dict, tz_name: str) -> dict:
+    """Attach an ISO-formatted timestamp for template render. Pure; returns new dict."""
+    ts = row.get("created_at")
+    iso = ""
+    if ts is not None:
+        try:
+            iso = datetime.fromtimestamp(
+                float(ts), ZoneInfo(tz_name),
+            ).isoformat(timespec="minutes")
+        except (ValueError, OSError):
+            iso = ""
+    return {**row, "created_at_iso": iso}
+
+
+@router.get("/history", response_class=HTMLResponse)
+async def me_history(
+    request: Request,
+    user: User = Depends(require_api_key),
+    range: str = "30d",
+    kind: str | None = None,
+    search: str | None = None,
+    dict_cursor: str | None = None,
+    jobs_cursor: str | None = None,
+) -> HTMLResponse:
+    """Personal transcript archive (dictations + meetings).
+
+    Break-glass admins (``user.id < 0``) have no person row, so they get
+    redirected to ``/admin/data``. Search shorter than 3 chars is silently
+    dropped to keep the LIKE-scan cost bounded.
+    """
+    if user.id < 0:
+        return RedirectResponse(url="/admin/data", status_code=303)
+
+    if search is not None:
+        search = search.strip() or None
+    if search and len(search) < 3:
+        search = None
+
+    # Normalize empty-string kind from form-select to None
+    if kind == "":
+        kind = None
+
+    since = epoch_for_range(range, settings.insights_timezone)
+    until = time.time()
+
+    dc = _decode_cursor(dict_cursor)
+    jc = _decode_cursor(jobs_cursor)
+
+    job_store: JobStore = request.app.state.job_store
+    rows, next_dc, next_jc = await asyncio.to_thread(
+        job_store.transcripts_in_range_filtered,
+        user.id,
+        since_epoch=since,
+        until_epoch=until,
+        kind=kind,
+        search=search,
+        dict_cursor=dc,
+        jobs_cursor=jc,
+        limit=settings.history_page_size,
+    )
+
+    decorated = [_decorate_row(r, settings.insights_timezone) for r in rows]
+
+    is_loadmore = bool(dc or jc)
+    if is_loadmore:
+        template_name = "_me_history_page.html.j2"
+    elif is_htmx(request):
+        template_name = "_me_history_body.html.j2"
+    else:
+        template_name = "me_history.html.j2"
+
+    csrf = secrets.token_urlsafe(32)
+    ctx = {
+        "request": request,
+        "user": user,
+        "rows": decorated,
+        "next_dict_cursor": _encode_cursor(next_dc),
+        "next_jobs_cursor": _encode_cursor(next_jc),
+        "range": range,
+        "kind": kind,
+        "search": search,
+        "csrf_token": csrf,
+    }
+    response = templates.TemplateResponse(request, template_name, ctx)
+    set_csrf_cookie(response, csrf)
+    return response
+
+
+@router.get("/history/{kind}/{row_id}", response_class=HTMLResponse)
+async def me_history_row(
+    request: Request,
+    kind: str,
+    row_id: str,
+    user: User = Depends(require_api_key),
+    compact: bool = False,
+) -> HTMLResponse:
+    """Expanded (or compact, if ``?compact=1``) single-row partial.
+
+    Unknown ``kind`` or non-owned ``row_id`` both return 404 uniformly so we
+    don't leak existence to other users.
+    """
+    if user.id < 0:
+        raise HTTPException(status_code=404)
+    if kind not in ("dictation", "meeting"):
+        raise HTTPException(status_code=404)
+
+    job_store: JobStore = request.app.state.job_store
+    row = await asyncio.to_thread(
+        job_store.get_history_row, user.id, kind, row_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+
+    decorated = _decorate_row(row, settings.insights_timezone)
+    decorated["kind"] = kind
+    decorated["row_id"] = row_id
+
+    csrf = secrets.token_urlsafe(32)
+    template_name = (
+        "_me_history_row.html.j2" if compact
+        else "_me_history_row_expanded.html.j2"
+    )
+    ctx = {
+        "request": request,
+        "row": decorated,
+        "kind": kind,
+        "csrf_token": csrf,
+    }
+    response = templates.TemplateResponse(request, template_name, ctx)
+    set_csrf_cookie(response, csrf)
+    return response
+
+
+@router.delete("/history/{kind}/{row_id}")
+async def me_history_delete(
+    request: Request,
+    kind: str,
+    row_id: str,
+    csrf_token: str = Form(...),
+    user: User = Depends(require_api_key),
+) -> Response:
+    """Soft-delete one owned row. Returns an HTMX OOB delete fragment."""
+    if user.id < 0:
+        raise HTTPException(status_code=404)
+    if kind not in ("dictation", "meeting"):
+        raise HTTPException(status_code=404)
+    if not verify_csrf(request, csrf_token):
+        raise HTTPException(status_code=403)
+
+    job_store: JobStore = request.app.state.job_store
+    ok = await asyncio.to_thread(
+        job_store.soft_delete_history_row, user.id, kind, row_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=404)
+
+    return HTMLResponse(
+        f'<tr id="row-{kind}-{row_id}" hx-swap-oob="delete"></tr>',
+        media_type="text/html",
+    )
+
+
+@router.post("/history/{kind}/{row_id}/restore", response_class=HTMLResponse)
+async def me_history_restore(
+    request: Request,
+    kind: str,
+    row_id: str,
+    csrf_token: str = Form(...),
+    user: User = Depends(require_api_key),
+) -> HTMLResponse:
+    """Restore one soft-deleted owned row. Returns the compact row partial."""
+    if user.id < 0:
+        raise HTTPException(status_code=404)
+    if kind not in ("dictation", "meeting"):
+        raise HTTPException(status_code=404)
+    if not verify_csrf(request, csrf_token):
+        raise HTTPException(status_code=403)
+
+    job_store: JobStore = request.app.state.job_store
+    ok = await asyncio.to_thread(
+        job_store.restore_history_row, user.id, kind, row_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=404)
+
+    # Re-fetch so the template has the full row context.
+    row = await asyncio.to_thread(
+        job_store.get_history_row, user.id, kind, row_id,
+    )
+    if row is None:
+        # Race: deleted again between restore + read. Treat as 404.
+        raise HTTPException(status_code=404)
+
+    decorated = _decorate_row(row, settings.insights_timezone)
+    decorated["kind"] = kind
+    decorated["row_id"] = row_id
+
+    csrf = secrets.token_urlsafe(32)
+    ctx = {
+        "request": request,
+        "row": decorated,
+        "kind": kind,
+        "csrf_token": csrf,
+    }
+    response = templates.TemplateResponse(request, "_me_history_row.html.j2", ctx)
+    set_csrf_cookie(response, csrf)
+    return response
+
+
+@router.get("/history/{kind}/{row_id}/download/{fmt}")
+async def me_history_download(
+    request: Request,
+    kind: str,
+    row_id: str,
+    fmt: str,
+    user: User = Depends(require_api_key),
+) -> Response:
+    """Plain-text or JSON download of one owned row."""
+    if user.id < 0:
+        raise HTTPException(status_code=404)
+    if kind not in ("dictation", "meeting"):
+        raise HTTPException(status_code=404)
+    if fmt not in ("txt", "json"):
+        raise HTTPException(status_code=404)
+
+    job_store: JobStore = request.app.state.job_store
+    row = await asyncio.to_thread(
+        job_store.get_history_row, user.id, kind, row_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+
+    try:
+        iso_date = datetime.fromtimestamp(
+            float(row["created_at"]), ZoneInfo(settings.insights_timezone),
+        ).date().isoformat()
+    except (ValueError, OSError, KeyError, TypeError):
+        iso_date = "unknown"
+
+    fname = f"{kind}-{iso_date}-{row_id}.{fmt}"
+    headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
+
+    if fmt == "txt":
+        content = row.get("text") or row.get("transcript_text") or ""
+        return Response(
+            content=content,
+            media_type="text/plain; charset=utf-8",
+            headers=headers,
+        )
+    # fmt == "json"
+    return Response(
+        content=json.dumps(row, default=str),
+        media_type="application/json",
+        headers=headers,
     )

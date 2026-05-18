@@ -1,0 +1,16 @@
+{# Compact row. Expects `row` with: kind, row_id, created_at_iso, word_count,
+   preview, source. Server-decorated upstream — never compute formatting here. #}
+<tr id="row-{{ row.kind }}-{{ row.row_id }}">
+  <td>{% if row.kind == 'dictation' %}🎙{% else %}📝{% endif %}</td>
+  <td>{{ row.created_at_iso }}</td>
+  <td style="text-align:right;">{{ row.word_count or 0 }}</td>
+  <td>
+    {{ row.preview }}
+    {% if row.source == 'cloud_fallback' %}<span class="muted" style="font-size:11px;"> · cloud sync</span>{% endif %}
+  </td>
+  <td>
+    <button hx-get="/me/history/{{ row.kind }}/{{ row.row_id }}"
+            hx-target="#row-{{ row.kind }}-{{ row.row_id }}"
+            hx-swap="outerHTML">Expand</button>
+  </td>
+</tr>

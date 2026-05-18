@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     # background task. See docs/ARCHITECTURE.md "Transcript persistence".
     transcript_retention_days: int = 90
 
+    # Plan A /me/history pagination size. Each request returns at most this
+    # many rows per leg (dictations + meetings), merged and capped to this
+    # value before render. Load-more uses per-leg cursors.
+    history_page_size: int = 50
+
     # Weekly insights (Phase 2) — Sunday-night LLM analysis of last week's transcripts.
     # Default model is grok-4.3 — verified existing + cheapest reasoning option on OpenRouter
     # (Task 0 spike 2026-05-14, ~$0.65/week projected at our employee count).

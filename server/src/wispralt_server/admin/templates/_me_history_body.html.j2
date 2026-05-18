@@ -1,0 +1,31 @@
+{% if rows %}
+<table style="width:100%; border-collapse:collapse;">
+  <thead>
+    <tr>
+      <th style="width:32px;"></th>
+      <th style="text-align:left;">When</th>
+      <th style="text-align:right;">Words</th>
+      <th style="text-align:left;">Preview</th>
+      <th style="width:96px;"></th>
+    </tr>
+  </thead>
+  <tbody id="history-rows">
+    {% for row in rows %}
+      {% include "_me_history_row.html.j2" %}
+    {% endfor %}
+  </tbody>
+</table>
+{% if next_dict_cursor or next_jobs_cursor %}
+  <div style="margin-top:12px;">
+    <button id="load-more"
+            hx-get="/me/history"
+            hx-vals='{"range": "{{ range }}", "kind": "{{ kind or '' }}", "search": "{{ search or '' }}", "dict_cursor": "{{ next_dict_cursor or '' }}", "jobs_cursor": "{{ next_jobs_cursor or '' }}"}'
+            hx-target="this"
+            hx-swap="outerHTML">
+      Load more
+    </button>
+  </div>
+{% endif %}
+{% else %}
+<p class="muted">No transcripts in this range. Adjust the date range, kind, or search.</p>
+{% endif %}

@@ -1,0 +1,20 @@
+{# Load-more response: append new rows to existing tbody (OOB), then replace
+   the load-more button itself (the hx-target for this request is #load-more
+   with hx-swap=outerHTML). #}
+<tbody hx-swap-oob="beforeend:#history-rows">
+  {% for row in rows %}
+    {% include "_me_history_row.html.j2" %}
+  {% endfor %}
+</tbody>
+{% if next_dict_cursor or next_jobs_cursor %}
+<button id="load-more"
+        hx-get="/me/history"
+        hx-vals='{"range": "{{ range }}", "kind": "{{ kind or '' }}", "search": "{{ search or '' }}", "dict_cursor": "{{ next_dict_cursor or '' }}", "jobs_cursor": "{{ next_jobs_cursor or '' }}"}'
+        hx-target="this"
+        hx-swap="outerHTML">
+  Load more
+</button>
+{% else %}
+{# Last page — no replacement button. The original #load-more button is
+   replaced by this empty comment block via outerHTML swap. #}
+{% endif %}

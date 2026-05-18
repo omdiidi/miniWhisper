@@ -1,0 +1,23 @@
+{# Expanded row. Expects `row` with full transcript text + `csrf_token`.
+   Collapse re-fetches the compact partial via ?compact=1 on the same route. #}
+<tr id="row-{{ row.kind }}-{{ row.row_id }}">
+  <td>{% if row.kind == 'dictation' %}🎙{% else %}📝{% endif %}</td>
+  <td>{{ row.created_at_iso }}</td>
+  <td style="text-align:right;">{{ row.word_count or 0 }}</td>
+  <td colspan="2">
+    <pre style="white-space: pre-wrap; max-height: 400px; overflow:auto; background: var(--bg); padding: 12px; border-radius: 6px; margin: 0 0 8px 0;">{{ row.text or row.transcript_text or '' }}</pre>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button hx-get="/me/history/{{ row.kind }}/{{ row.row_id }}?compact=1"
+              hx-target="#row-{{ row.kind }}-{{ row.row_id }}"
+              hx-swap="outerHTML">Collapse</button>
+      <a href="/me/history/{{ row.kind }}/{{ row.row_id }}/download/txt" download>Download TXT</a>
+      <a href="/me/history/{{ row.kind }}/{{ row.row_id }}/download/json" download>Download JSON</a>
+      <button class="danger"
+              hx-delete="/me/history/{{ row.kind }}/{{ row.row_id }}"
+              hx-vals='{"csrf_token": "{{ csrf_token }}"}'
+              hx-confirm="Delete this {{ row.kind }}? It will be excluded from future insights.">
+        Delete
+      </button>
+    </div>
+  </td>
+</tr>

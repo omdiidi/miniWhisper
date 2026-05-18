@@ -251,8 +251,10 @@
       <a href="/admin/data" class="{% if request.url.path.startswith('/admin/data') %}active{% endif %}">Data</a>
       {% else %}
       <a href="/admin/me">My Usage</a>
-      {% endif %}
       <a href="/me/insights" class="{% if request.url.path.startswith('/me/insights') %}active{% endif %}">My Insights</a>
+      <a href="/me/history" class="{% if request.url.path.startswith('/me/history') %}active{% endif %}">My History</a>
+      {# Plan 2 will add: <a href="/me/profile" ...>My Profile</a> #}
+      {% endif %}
     </nav>
     <main>
       {% block content %}{% endblock %}
