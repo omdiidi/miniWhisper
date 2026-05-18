@@ -32,11 +32,20 @@ import psutil
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from wispralt_server import db
 from wispralt_server.meeting import pipeline as meeting_pipeline
 
 router = APIRouter()
 
 _2GiB = 2 * 1024 ** 3
+
+# 500ms is the budget for an external HTTP health probe. The asyncpg
+# command_timeout is 10s (db.py:67); pool acquire under load can queue
+# briefly. 500ms is well above the cross-region floor for Supabase
+# pooler + Cloudflare tunnel + dev machine triangulation, and well below
+# the watcher's own 2s probe (which has a different SLA — it runs
+# once per 10s and can afford to wait).
+READYZ_DB_TIMEOUT_S = 0.5
 
 
 @router.get("/healthz", summary="Liveness probe — no auth required")
@@ -117,3 +126,36 @@ async def readyz_meeting(request: Request) -> JSONResponse:
             },
         )
     return JSONResponse(content={"status": "ok", **common_body})
+
+
+@router.get(
+    "/readyz/db",
+    summary="Readiness probe for Postgres pool — no auth required",
+)
+async def readyz_db(request: Request) -> JSONResponse:
+    """Probe the asyncpg pool with a sub-500ms SELECT 1.
+
+    Returns 503 when pool is None or health_check returns False — the same
+    state the db_watcher uses to trigger a rebuild.
+
+    !!! OBSERVABILITY-ONLY !!! This endpoint is for monitoring/alerting,
+    NOT a restart trigger. A flaky pool causing cascading restarts would
+    amplify the outage this endpoint is meant to detect.
+    DO NOT wire into Cloudflare origin health-check (use /healthz),
+    DO NOT wire into launchd HTTP KeepAlive (uses process exit),
+    DO NOT wire into any liveness probe that restarts on failure.
+    External uptime monitors should alert-only.
+    """
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is None:
+        return JSONResponse(
+            {"status": "degraded", "reason": "no_pool"},
+            status_code=503,
+        )
+    ok = await db.health_check(pool, timeout_s=READYZ_DB_TIMEOUT_S)
+    if not ok:
+        return JSONResponse(
+            {"status": "degraded", "reason": "pool_unhealthy"},
+            status_code=503,
+        )
+    return JSONResponse({"status": "ok"})

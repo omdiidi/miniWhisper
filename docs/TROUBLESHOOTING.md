@@ -140,6 +140,48 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 ---
 
+## DB pool watcher — diagnosing a stuck state
+
+### Symptoms
+- `/me/*` or `/admin/*` returns 503 for >2 minutes.
+- Dictation: mic light is on but no text appears.
+
+### Healthy state
+- `curl https://transcribe.integrateapi.ai/readyz/db` → 200 `{"status":"ok"}`
+- `tail -200 ~/Library/Logs/WisprAlt/server.err.log | grep db_watcher` shows
+  EITHER nothing (steady-state) OR alternating `pool unhealthy` / `pool rebuilt`
+  pairs (transient recovery).
+
+### Stuck state (what we hit on 2026-05-17)
+- `/readyz/db` returns 503 for >2 consecutive probes.
+- Log shows `db_watcher: unexpected error; continuing loop` repeating
+  every 10s without an intervening `pool rebuilt`.
+
+### Inline grep recipe (run on the mini)
+```bash
+# Count "unexpected error" lines since last "pool rebuilt".
+# Healthy: small number. Stuck: counts grow without bound at ~6/min.
+tail -2000 ~/Library/Logs/WisprAlt/server.err.log \
+  | awk '/db_watcher: pool rebuilt/{c=0; next} /db_watcher: unexpected error/{c++} END{print c+0}'
+```
+
+### Recovery
+1. `launchctl kickstart -k gui/501/co.wispralt.server` — restarts the server,
+   which rebuilds the pool on startup.
+2. Investigate WHY the watcher didn't self-heal — almost certainly a missed
+   exception class. Search `db.py` and `main.py` for `except asyncpg.PostgresError`
+   and consider broadening to `asyncpg.Error`.
+3. After fix, set `WISPRALT_DEV_FAULTS=1` on a STAGING mini, deploy, and run
+   `scripts/check-watcher.sh` to confirm self-healing works end-to-end.
+
+### IMPORTANT: /readyz/db is observability-only
+Do NOT wire `/readyz/db` into Cloudflare origin health-check (use `/healthz`),
+launchd KeepAlive (uses process exit), or any liveness probe that RESTARTS
+the server on failure. A flaky pool causing cascading restarts would amplify
+the outage this endpoint is meant to detect.
+
+---
+
 ## Client Issues
 
 ### FN tap not detected

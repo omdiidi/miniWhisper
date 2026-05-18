@@ -207,7 +207,10 @@ async def me_login_submit(
     if user is None and pool is not None:
         try:
             user = await users_store.lookup(pool, th)
-        except asyncpg.PostgresError:
+        except asyncpg.Error:
+            # asyncpg.Error covers both PostgresError AND InterfaceError ("pool is
+            # closed"). The narrower catch would let InterfaceError escape and 500
+            # the request even though the break-glass fallback below could serve it.
             logger.exception("Postgres lookup failed during /me/login")
             user = None
         if user is not None:

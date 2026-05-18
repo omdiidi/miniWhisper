@@ -112,6 +112,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     # ── startup ───────────────────────────────────────────────────────────────
 
+    # Lock in the taxonomic property f5178be depends on: asyncpg.InterfaceError
+    # MUST be a subclass of asyncpg.Error or the watcher's catches won't cover
+    # it. See 2026-05-17 postmortem.
+    assert issubclass(asyncpg.InterfaceError, asyncpg.Error), (
+        "asyncpg exception taxonomy changed; the db_watcher catches and the "
+        "broadened f5178be catches assume InterfaceError ∈ Error. If this "
+        "assertion fails on a future asyncpg upgrade, audit every "
+        "'except asyncpg.Error' site and re-verify the watcher path covers "
+        "the new exception classes. See 2026-05-17 postmortem."
+    )
+
     # 1. Validate .env permissions
     env_path = find_env_path()
     if not verify_env_perms(env_path):
@@ -503,6 +514,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — watcher must never crash silently
+                # POSTMORTEM 2026-05-17: do NOT narrow this catch. It is the
+                # last-resort guard. The bug we fixed was that asyncpg.InterfaceError
+                # ("pool is closed") slipped past health_check's narrow
+                # asyncpg.PostgresError catch and got swallowed HERE — silently
+                # looping for 5 hours. The right fix was to broaden the INNER
+                # catches (f5178be), not to make this outer one type-specific.
+                # Any new code added inside the loop MUST catch its own
+                # exceptions narrowly so this catch-all doesn't mask new bug shapes.
                 logger.exception("db_watcher: unexpected error; continuing loop")
 
     app.state.db_watcher_task = asyncio.create_task(_db_watcher_loop())

@@ -24,6 +24,7 @@ import socket
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -84,3 +85,35 @@ async def fault_dictate(
         # tunnel-level).
         raise HTTPException(status_code=503, detail="Auth temporarily unavailable")
     raise HTTPException(status_code=400, detail=f"Unsupported fault: {fault!r}")
+
+
+@router.post("/dev/db/close")
+async def dev_db_close(request: Request) -> JSONResponse:
+    """Force the asyncpg pool closed to reproduce InterfaceError.
+
+    Used by scripts/check-watcher.sh to exercise the watcher recovery
+    path end-to-end. Calls pool.close() directly, which reproduces the
+    EXACT failure mode from 2026-05-17 (InterfaceError "pool is closed"
+    on next acquire) — pg_terminate_backend cannot do this because
+    asyncpg surfaces backend termination as ConnectionDoesNotExistError
+    (a PostgresError subclass) which the pre-f5178be code would have
+    caught fine. This endpoint is the only way to reproduce the actual
+    bug in a deterministic way.
+
+    Returns 200 with the previous pool's status. The watcher loop will
+    detect the closed pool within ~10s and rebuild it.
+    """
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is None:
+        return JSONResponse(
+            {"status": "no_pool", "action": "noop"},
+            status_code=200,
+        )
+    try:
+        await pool.close()
+    except Exception:  # noqa: BLE001 — best-effort fault injection
+        logger.exception("dev_db_close: pool.close() raised; pool may already be closed")
+    return JSONResponse(
+        {"status": "closed", "next_rebuild_within_s": 10},
+        status_code=200,
+    )

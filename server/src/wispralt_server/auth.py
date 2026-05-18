@@ -171,7 +171,10 @@ async def require_api_key(request: Request) -> User:
     if pool is not None:
         try:
             user = await _store_mod.lookup(pool, th)
-        except asyncpg.PostgresError:
+        except asyncpg.Error:
+            # asyncpg.Error covers both PostgresError AND InterfaceError ("pool is
+            # closed"). The narrower catch would let InterfaceError escape and 500
+            # the request even though the break-glass fallback below could serve it.
             logger.exception("Postgres lookup failed; falling through to break-glass")
             user = None
             postgres_errored = True
