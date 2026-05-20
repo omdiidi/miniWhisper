@@ -95,8 +95,8 @@ async def health_check(pool: asyncpg.Pool, timeout_s: float = 2.0) -> bool:
             async with pool.acquire() as conn:
                 await conn.fetchval("SELECT 1")
         return True
-    except (asyncpg.Error, OSError, asyncio.TimeoutError):
-        # asyncpg.Error covers both server-side PostgresError AND client-side
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, asyncio.TimeoutError):
+        # asyncpg.PostgresError + asyncpg.InterfaceError together cover both server-side PostgresError AND client-side
         # InterfaceError ("pool is closed"). The narrower PostgresError caused
         # the watcher to get stuck in the outer except branch on 2026-05-17 —
         # pool closed silently, watcher never reached the rebuild path.
@@ -116,9 +116,9 @@ async def recreate_pool() -> asyncpg.Pool:
         if _pool is not None:
             try:
                 await _pool.close()
-            except (asyncpg.Error, OSError):
+            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
                 # The old pool was broken anyway; log and move on. Use the
-                # base asyncpg.Error so InterfaceError (pool already closed)
+                # explicit PostgresError + InterfaceError tuple so InterfaceError (pool already closed)
                 # doesn't escape and abort the rebuild.
                 logger.exception("Closing dead pool raised; continuing with rebuild")
             _pool = None

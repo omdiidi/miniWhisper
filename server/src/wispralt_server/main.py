@@ -112,15 +112,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     # ── startup ───────────────────────────────────────────────────────────────
 
-    # Lock in the taxonomic property f5178be depends on: asyncpg.InterfaceError
-    # MUST be a subclass of asyncpg.Error or the watcher's catches won't cover
-    # it. See 2026-05-17 postmortem.
-    assert issubclass(asyncpg.InterfaceError, asyncpg.Error), (
-        "asyncpg exception taxonomy changed; the db_watcher catches and the "
-        "broadened f5178be catches assume InterfaceError ∈ Error. If this "
-        "assertion fails on a future asyncpg upgrade, audit every "
-        "'except asyncpg.Error' site and re-verify the watcher path covers "
-        "the new exception classes. See 2026-05-17 postmortem."
+    # Verify the watcher's exception coverage. asyncpg has NO common base
+    # class for the two failure modes we need to catch: PostgresError
+    # (server-side) and InterfaceError ("pool is closed", client-side).
+    # Both inherit directly from Exception via separate private hierarchies
+    # (verified asyncpg 0.31.0). The watcher and route catches enumerate
+    # both explicitly; this assertion confirms both class names still exist
+    # at module top-level. A future asyncpg rename/unexport will fail boot
+    # loudly instead of silently regressing the watcher to the 2026-05-17 bug.
+    assert hasattr(asyncpg, "PostgresError") and hasattr(asyncpg, "InterfaceError"), (
+        "asyncpg taxonomy changed — PostgresError or InterfaceError no longer "
+        "exposed at the package top-level. Audit every "
+        "`except (asyncpg.PostgresError, asyncpg.InterfaceError)` site and "
+        "re-verify the watcher path covers both. See 2026-05-17 postmortem."
     )
 
     # 1. Validate .env permissions
@@ -470,7 +474,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.usage_drainer = asyncio.create_task(
             usage_writer.drain_loop(observability.usage_queue, pool)
         )
-    except (asyncpg.Error, OSError, db.PostgresUnavailable):
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, db.PostgresUnavailable):
         logger.exception(
             "Postgres unavailable at startup; only break-glass admin will work"
         )
@@ -495,7 +499,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
                 try:
                     new_pool = await db.recreate_pool()
-                except (asyncpg.Error, OSError, db.PostgresUnavailable):
+                except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, db.PostgresUnavailable):
                     logger.exception("db_watcher: rebuild failed; will retry in 10s")
                     continue
                 app.state.db_pool = new_pool

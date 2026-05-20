@@ -150,10 +150,12 @@ async def login_submit(
     if user is None and pool is not None:
         try:
             user = await users_store.lookup(pool, th)
-        except asyncpg.Error:
-            # asyncpg.Error covers both PostgresError AND InterfaceError ("pool is
-            # closed"). The narrower catch would let InterfaceError escape and 500
-            # the request even though the break-glass fallback below could serve it.
+        except (asyncpg.PostgresError, asyncpg.InterfaceError):
+            # asyncpg has NO common base class for these two — PostgresError
+            # (server-side) and InterfaceError ("pool is closed", client-side)
+            # both inherit directly from Exception via separate private
+            # hierarchies. The explicit tuple is the only correct form.
+            # See 2026-05-17 postmortem.
             logger.exception("Postgres lookup failed during admin login")
             user = None
         if user is not None:
