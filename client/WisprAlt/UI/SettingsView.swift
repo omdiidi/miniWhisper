@@ -86,6 +86,7 @@ struct SettingsView: View {
                 serverSection
                 apiKeySection
                 apiKeyExportImportSection
+                aboutAndQuitSection
             }
             identitySection
         }
@@ -279,6 +280,37 @@ struct SettingsView: View {
                     .foregroundStyle(.green)
             }
         }
+    }
+
+    /// About + Quit — bottom of the advanced section. Shows the installed
+    /// WisprAlt version and a one-click full-quit (NSApp.terminate). v0.4.5+.
+    private var aboutAndQuitSection: some View {
+        Section {
+            HStack {
+                Text("Version")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(Self.appVersionString)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Button(role: .destructive) {
+                Log.info("User quit WisprAlt from Settings.", category: "app")
+                NSApp.terminate(nil)
+            } label: {
+                Label("Quit WisprAlt", systemImage: "power")
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    private static var appVersionString: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return short == build ? short : "\(short)+\(build)"
     }
 
     /// Identity section — lets the user set a friendly `display_name` that the
