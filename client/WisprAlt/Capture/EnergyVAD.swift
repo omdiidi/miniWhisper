@@ -16,11 +16,14 @@ struct EnergyVAD {
     static let speechExitThresholdAboveNoiseFloorDB: Float = 8
     static let noiseFloorWindowMs: Double = 1_000
     static let noiseFloorFallbackDB: Float = -55
-    // v0.4.1 tuning (2026-05-19): silenceHangoverMs lowered 600→400 after real-user
-    // evidence — at 600 the detector missed natural conversational pauses (~300-500 ms)
-    // so 38 s of talking never cut. At 400 the same speech pattern produces clean cuts
-    // every ~30 s of speech (≈ 75 words at conversational rate).
-    static let silenceHangoverMs: Double = 400
+    // v0.4.4 tuning (2026-05-19): lowered 400→250 ms per user request. Catches even
+    // shorter natural breaths (mid-sentence comma-pauses, quick inter-clause gaps).
+    // No word-loss risk — the recorder writes every frame to the audio buffer
+    // regardless of VAD state; the hangover only decides when to fire a CUT event.
+    // 250 ms is well above typical inter-syllable gaps (50-150 ms), so we won't
+    // chatter-cut inside words.
+    // History: 600 (v0.4.0, original) → 400 (v0.4.1, after first real-user test) → 250 (v0.4.4).
+    static let silenceHangoverMs: Double = 250
     static let minSpeechBeforeStreamMs: Double = 8_000   // bypass threshold (Plan constraint #4)
     // v0.4.2: lowered 20_000 → 5_000 per first-principles take. Smaller chunks
     // mean MORE chunks fire during recording (each transcribes in ~1.5 s on
