@@ -117,7 +117,13 @@ class Settings(BaseSettings):
     # >=300 words the cleanup is both noticeable AND inside budget. The user
     # still gets correct Parakeet output (with its inline punctuation) below
     # the threshold — no transcription content is lost, only the polish step.
-    smart_format_min_words: int = 300
+    #
+    # 2026-05-19 drop 300 -> 80 (user pref May 19): user explicitly asked for
+    # Mercury to fire on shorter dictations. Risk: at 80-300 words, polish may
+    # time out at 600 ms and fail-soft to raw text, costing ~600 ms of dead
+    # wait. Mitigation: revisit openrouter_timeout_ms if telemetry shows
+    # excessive fail-overs at the new threshold.
+    smart_format_min_words: int = 80
 
     # Transcript persistence TTL. After this many days, transcript text on
     # `jobs` rows is zeroed (the row stays as audit metadata) and `dictations`

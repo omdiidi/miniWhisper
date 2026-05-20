@@ -16,10 +16,18 @@ struct EnergyVAD {
     static let speechExitThresholdAboveNoiseFloorDB: Float = 8
     static let noiseFloorWindowMs: Double = 1_000
     static let noiseFloorFallbackDB: Float = -55
-    static let silenceHangoverMs: Double = 600
+    // v0.4.1 tuning (2026-05-19): silenceHangoverMs lowered 600→400 after real-user
+    // evidence — at 600 the detector missed natural conversational pauses (~300-500 ms)
+    // so 38 s of talking never cut. At 400 the same speech pattern produces clean cuts
+    // every ~30 s of speech (≈ 75 words at conversational rate).
+    static let silenceHangoverMs: Double = 400
     static let minSpeechBeforeStreamMs: Double = 8_000   // bypass threshold (Plan constraint #4)
-    static let chunkMinSpeechMs: Double = 20_000         // ignore silences before this since last cut
-    static let chunkHardCapMs: Double = 30_000           // force cut at lowest-energy frame after this
+    static let chunkMinSpeechMs: Double = 20_000         // earliest a silence may close a chunk (since last cut)
+    // chunkHardCapMs is the safety net for monologue speech with no pauses. Forced cuts
+    // CAN land mid-word — Mercury rejoins the seam on the joined text. If this shows
+    // up as a real artifact in practice, follow-up: track lowest-energy frame in the
+    // last N seconds and cut there instead of at sessionElapsedMs.
+    static let chunkHardCapMs: Double = 30_000
     static let minChunkFrames: Int = 1_600               // 100 ms at 16 kHz equivalent
     static let minChunkAverageDB: Float = -50            // average RMS gate
 
