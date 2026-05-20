@@ -2,6 +2,8 @@
 
 A self-hosted, privacy-first replacement for Wispr Flow. Sub-400ms dictation and speaker-diarized meeting transcription running entirely on hardware you own — no cloud subscription, no audio leaving your network. Powered by Parakeet TDT 0.6B v2 (MLX) for dictation and mlx-whisper large-v3-turbo + Pyannote 3.1 for meetings.
 
+**v0.4.0 (May 2026)** adds opt-in **streaming dictation** — long dictations transcribe audio chunks in parallel with recording so only a short tail remains on FN release. Off by default; enable via Settings → "Streaming dictation (experimental — faster for long dictations)". Falls back to the standard path on any failure. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#streaming-dictation-opt-in-experimental).
+
 ![Demo](docs/demo.gif)
 
 ## What it is
