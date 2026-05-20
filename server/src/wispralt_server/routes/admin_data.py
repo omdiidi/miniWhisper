@@ -100,7 +100,6 @@ async def admin_data(
         target_user = users[0] if users else None
     else:
         person_insight = None
-        stats = None
         target_user = None
         users = await pool.fetch(
             "SELECT id, label, display_name, role FROM wispralt.users "
@@ -114,6 +113,26 @@ async def admin_data(
             per_user_stats[u["id"]] = await asyncio.to_thread(
                 job_store.compute_user_stats, u["id"], since_epoch=since,
             )
+        # Top-tile aggregate for team view — sum the per-user stats we already
+        # computed instead of leaving the tiles at 0. Time-saved is re-derived
+        # from total_words (40 WPM baseline) so the rounding matches the
+        # per-user tile rather than summing already-rounded fractions.
+        _total_words = sum(
+            s.get("total_words", 0) for s in per_user_stats.values()
+        )
+        stats = {
+            "dictation_count": sum(
+                s.get("dictation_count", 0) for s in per_user_stats.values()
+            ),
+            "meeting_count": sum(
+                s.get("meeting_count", 0) for s in per_user_stats.values()
+            ),
+            "total_words": _total_words,
+            "total_inference_ms": sum(
+                s.get("total_inference_ms", 0) for s in per_user_stats.values()
+            ),
+            "time_saved_hours": round(_total_words / 40.0 / 60.0, 2),
+        }
 
         # Filler leaderboard for team view: pull every person row for this
         # week via JobStore (no _exec leak), then resolve api_key_id →
