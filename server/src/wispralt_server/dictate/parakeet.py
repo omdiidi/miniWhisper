@@ -112,13 +112,31 @@ class ParakeetService:
     def _extract_text_and_tokens(self, result: object) -> tuple[str, list | None]:
         """Return (text, aligned_tokens_or_none).
 
-        aligned_tokens is None when result is a Hypothesis (text-only),
-        or a list of AlignedToken objects when alignment is surfaced.
-        Used by /v1 verbose_json segmentation.
+        aligned_tokens is None when result is a Hypothesis-shaped object
+        OR a list of items that lack per-token start/end timestamps
+        (e.g. parakeet-mlx ``AlignedResult`` wrappers — they expose ``.text``
+        but not ``.start``/``.end`` at the top level).
+
+        aligned_tokens is a list ONLY when every item exposes the full
+        ``.text`` + ``.start`` + ``.end`` triple — the shape needed for
+        verbose_json segmentation and SRT/VTT cue boundaries.
+
+        Used by /v1 verbose_json/srt/vtt segmentation.
         """
-        if isinstance(result, list) and result and hasattr(result[0], "text"):
+        if (
+            isinstance(result, list)
+            and result
+            and hasattr(result[0], "text")
+            and hasattr(result[0], "start")
+            and hasattr(result[0], "end")
+        ):
             text = "".join(str(t.text) for t in result).strip()
             return text, list(result)
+        # List but items lack timestamps — extract text only, no segmentation.
+        if isinstance(result, list) and result and hasattr(result[0], "text"):
+            text = "".join(str(t.text) for t in result).strip()
+            return text, None
+        # Single Hypothesis-shaped object with .text.
         if hasattr(result, "text"):
             return str(result.text).strip(), None
         logger.warning("Unexpected Parakeet result type: %s", type(result))
