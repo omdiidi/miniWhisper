@@ -19,9 +19,7 @@ import asyncio
 import html
 import logging
 import secrets
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -302,15 +300,17 @@ async def admin_data_run_insights_now(
             media_type="text/html",
         )
 
-    # Compute current in-progress ISO week. Cron will UPSERT-replace these
-    # rows Sunday 23:00, so there's no orphan-row risk.
-    tz = ZoneInfo(settings.insights_timezone)
-    cal = datetime.now(tz).isocalendar()
-    iso_year, iso_week = int(cal[0]), int(cal[1])
+    # Target the LAST FULL ISO week — same week the page header displays via
+    # last_full_iso_week(). Targeting the in-progress week would produce rows
+    # that never appear on /admin/data because the page is keyed on the last
+    # full week. Sunday's natural cron will UPSERT-replace these rows when
+    # the next full week becomes available; no orphan-row risk.
+    iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
 
-    # Spawn fire-and-forget with strong-ref. The set + closure-callback
-    # pattern mirrors `main.py:215-220` (pending_persists) so the GC can't
-    # collect the task mid-run.
+    # Spawn fire-and-forget with strong-ref. force=True bypasses the per-user
+    # idempotency skip in run_weekly_insights so re-clicking the button always
+    # produces fresh insights (and re-triggers the team-aggregate pass even
+    # when person rows already exist). Lock + 30d budget guard still apply.
     pending: set[asyncio.Task] | None = getattr(
         app.state, "weekly_insights_manual_tasks", None,
     )
@@ -318,7 +318,9 @@ async def admin_data_run_insights_now(
         pending = set()
         app.state.weekly_insights_manual_tasks = pending
     task = asyncio.create_task(
-        run_weekly_insights(app, iso_override=(iso_year, iso_week)),
+        run_weekly_insights(
+            app, iso_override=(iso_year, iso_week), force=True,
+        ),
     )
     pending.add(task)
     task.add_done_callback(_make_done_callback(pending))

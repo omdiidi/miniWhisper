@@ -54,7 +54,10 @@ logger = logging.getLogger(__name__)
 
 
 async def run_weekly_insights(
-    app, iso_override: tuple[int, int] | None = None
+    app,
+    iso_override: tuple[int, int] | None = None,
+    *,
+    force: bool = False,
 ) -> None:
     """One full Sunday-night sweep. Idempotent — re-runs for the same week
     are overwrites via the upsert.
@@ -67,23 +70,37 @@ async def run_weekly_insights(
     arbitrary week instead of the last full ISO week. Operator use only — the
     scheduled cron always passes ``None``. Used by ``__main__ --week`` to
     backfill or smoke-test against a specific window.
+
+    ``force=True`` bypasses the per-user idempotency skip so existing rows
+    for the target week are re-generated (UPSERT-replaced). Used by the
+    admin manual-run button so re-clicking always produces fresh insights.
+    The lock + 30d budget guard still apply, so the worst case is a few
+    extra dollars on rapid re-clicks. ``force=False`` (default) preserves
+    the Sunday cron's restart-safe behavior.
     """
     lock = getattr(app.state, "weekly_insights_lock", None)
     if lock is None:
         # Test / __main__ path — no FastAPI lifespan to install the lock.
         # Concurrency isn't possible here so just run the inner body.
-        return await _run_weekly_insights_inner(app, iso_override=iso_override)
+        return await _run_weekly_insights_inner(
+            app, iso_override=iso_override, force=force,
+        )
     if lock.locked():
         logger.warning(
             "Weekly insights skipped — another run still in progress"
         )
         return
     async with lock:
-        return await _run_weekly_insights_inner(app, iso_override=iso_override)
+        return await _run_weekly_insights_inner(
+            app, iso_override=iso_override, force=force,
+        )
 
 
 async def _run_weekly_insights_inner(
-    app, iso_override: tuple[int, int] | None = None
+    app,
+    iso_override: tuple[int, int] | None = None,
+    *,
+    force: bool = False,
 ) -> None:
     """Body of :func:`run_weekly_insights`. See its docstring."""
     insights_client: InsightsClient | None = getattr(
@@ -164,7 +181,9 @@ async def _run_weekly_insights_inner(
 
         # Skip if this person already has a row for this ISO week — re-run
         # idempotency (don't double-charge OpenRouter on Sunday-night restart).
-        if (
+        # `force=True` (admin manual button) bypasses this so re-clicks produce
+        # fresh insights via UPSERT; the lock + 30d budget guard still apply.
+        if not force and (
             job_store.get_weekly_insight_person(user["id"], iso_year, iso_week)
             is not None
         ):
@@ -258,8 +277,13 @@ async def _run_weekly_insights_inner(
         accumulated_run_cost += resp.cost_usd
         total_cost += resp.cost_usd
 
-    # 4. Team pass — only if at least 2 people had insights
-    if len(person_digests) >= 2:
+    # 4. Team pass — fires whenever at least 1 person was insighted this run.
+    # Threshold was >=2 historically (a "team" implies multiple people) but on
+    # single-active-user deployments that gate left team-scope rows empty
+    # forever, and the /admin/data team-aggregate card stayed "pending" even
+    # after a successful per-user pass. >=1 is the right floor: the team
+    # template handles N=1 cleanly (themes = the one person's themes, etc.).
+    if len(person_digests) >= 1:
         digests_jsonl = "\n".join(
             json.dumps(
                 {"employee": dn, "api_key_id": kid, "insight": d}
