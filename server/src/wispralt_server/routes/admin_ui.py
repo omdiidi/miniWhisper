@@ -31,6 +31,7 @@ import csv
 import io
 import json
 import logging
+import re
 import secrets
 import urllib.parse
 from datetime import datetime
@@ -264,9 +265,10 @@ async def _aggregate_stats(pool: asyncpg.Pool) -> dict[str, Any]:
 async def overview(request: Request) -> HTMLResponse:
     pool = request.app.state.db_pool
     stats = await _aggregate_stats(pool)
+    integration_count = await users_store.count_kind(pool, "integration")
     return templates.TemplateResponse(
         "overview.html.j2",
-        {"request": request, **stats},
+        {"request": request, "integration_count": integration_count, **stats},
     )
 
 
@@ -420,6 +422,171 @@ async def users_mint(request: Request, user_id: int) -> HTMLResponse:
             "request": request,
             "user_id": user_id,
             "plaintext": new_plaintext,
+        },
+    )
+
+
+# ── /admin/keys — integration API keys (OpenAI-compat /v1 callers) ────────────
+#
+# Distinct from /admin/users (humans) — these are tokens issued for third-party
+# programs (Buzz, MacWhisper, Open WebUI, etc.) that talk to /v1/audio/*.
+# Under the hood: same wispralt.users row + role='employee', but with
+# kind='integration' which both (a) hides them from /admin/users and
+# (b) blocks them from /me/* and /telemetry/* via forbid_integration_kind.
+
+
+_SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
+_KEY_LABEL_PREFIX = "key-"
+# _LABEL_MAX_LEN is 80; prefix is 5 chars, so slug must fit in 75. Cap at 70
+# to leave a little headroom and produce predictable labels.
+_KEY_SLUG_MAX_LEN = 70
+
+
+def _slugify_program_name(raw: str) -> str:
+    """Lowercase + collapse non-[a-z0-9] runs to ``-`` + trim leading/trailing
+    dashes + truncate to ``_KEY_SLUG_MAX_LEN`` chars. Returns ``""`` when the
+    input has no alphanumeric content (caller treats that as a validation
+    failure)."""
+    lowered = raw.lower()
+    collapsed = _SLUG_PATTERN.sub("-", lowered).strip("-")
+    return collapsed[:_KEY_SLUG_MAX_LEN]
+
+
+@authed_router.get("/keys", response_class=HTMLResponse)
+async def keys_list(request: Request) -> HTMLResponse:
+    """List all non-revoked integration keys (kind='integration')."""
+    pool = request.app.state.db_pool
+    rows = await users_store.list_integrations(pool)
+    return templates.TemplateResponse(
+        "keys.html.j2",
+        {"request": request, "keys": rows},
+    )
+
+
+@authed_router.get("/keys/new", response_class=HTMLResponse)
+async def keys_add_form(request: Request) -> HTMLResponse:
+    """Render the add-integration-key form."""
+    return templates.TemplateResponse(
+        "add_key.html.j2",
+        {"request": request, "form_program_name": ""},
+    )
+
+
+@authed_router.post("/keys/new", response_class=HTMLResponse)
+async def keys_add_submit(
+    request: Request,
+    program_name: str = Form(...),
+) -> HTMLResponse:
+    """Mint an integration API key tied to a third-party program name.
+
+    Steps:
+        1. Validate ``program_name`` (1..MAX_DISPLAY_NAME_LEN chars, no
+           control chars). Reuses ``_validate_optional_display_name`` but
+           treats empty as an error here (Add Employee allows empty).
+        2. Slugify the name into ``label = "key-<slug>"``.
+        3. Mint the user row (role='employee', display_name=program_name).
+        4. Flip ``kind`` to ``'integration'`` (separate UPDATE — column
+           default is 'employee').
+        5. Re-fetch the row so the User dataclass we pass to the template
+           reflects the post-update ``kind='integration'`` value (avoids
+           the stale-from-mint footgun).
+        6. Render the key_added page with the plaintext + OpenAI env-var
+           snippet.
+    """
+    clean_name, err = _validate_optional_display_name(program_name)
+    if err is not None or not clean_name:
+        return templates.TemplateResponse(
+            "add_key.html.j2",
+            {
+                "request": request,
+                "error": err or "Program name is required.",
+                "form_program_name": program_name,
+            },
+            status_code=400,
+        )
+
+    slug = _slugify_program_name(clean_name)
+    if not slug:
+        return templates.TemplateResponse(
+            "add_key.html.j2",
+            {
+                "request": request,
+                "error": (
+                    "Program name must contain at least one letter or digit."
+                ),
+                "form_program_name": program_name,
+            },
+            status_code=400,
+        )
+
+    label = f"{_KEY_LABEL_PREFIX}{slug}"
+
+    pool = request.app.state.db_pool
+    user, plaintext = await users_store.mint(
+        pool,
+        label=label,
+        role="employee",
+        display_name=clean_name,
+    )
+    await users_store.set_kind(pool, user_id=user.id, kind="integration")
+    # Re-fetch so the value we hand to the template carries the updated
+    # kind='integration'. The mint() return is built from the INSERT row,
+    # which still shows the column-default 'employee'.
+    refreshed = await users_store.lookup_by_id(pool, user.id)
+    user_kind = refreshed.kind if refreshed is not None else "integration"
+
+    return templates.TemplateResponse(
+        "key_added.html.j2",
+        {
+            "request": request,
+            "mode": "mint",
+            "program_name": clean_name,
+            "plaintext": plaintext,
+            "label": label,
+            "kind": user_kind,
+        },
+    )
+
+
+@authed_router.post("/keys/{user_id}/revoke")
+async def keys_revoke(request: Request, user_id: int) -> RedirectResponse:
+    """Revoke an integration key and invalidate its cached token entry."""
+    pool = request.app.state.db_pool
+    revoked_hash = await users_store.revoke(pool, user_id)
+    if revoked_hash:
+        auth_mod.token_cache.invalidate(revoked_hash)
+    return RedirectResponse("/admin/keys", status_code=303)
+
+
+@authed_router.post("/keys/{user_id}/rotate", response_class=HTMLResponse)
+async def keys_rotate(request: Request, user_id: int) -> HTMLResponse:
+    """Rotate an integration key in place; show the new plaintext once."""
+    pool = request.app.state.db_pool
+    new_plaintext, old_hash = await users_store.rotate(pool, user_id)
+    if old_hash:
+        auth_mod.token_cache.invalidate(old_hash)
+
+    # Re-fetch so we can show the original program name on the success page.
+    refreshed = await users_store.lookup_by_id(pool, user_id)
+    program_name = None
+    label = None
+    if refreshed is not None:
+        label = refreshed.label
+        # We don't have display_name on the cached User dataclass; pull it
+        # via fetch_profile_by_id which returns it.
+        profile = await users_store.fetch_profile_by_id(pool, user_id)
+        if profile is not None:
+            program_name = profile.display_name
+
+    return templates.TemplateResponse(
+        "key_added.html.j2",
+        {
+            "request": request,
+            "mode": "rotate",
+            "program_name": program_name,
+            "plaintext": new_plaintext,
+            "label": label,
+            "kind": "integration",
         },
     )
 

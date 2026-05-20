@@ -111,10 +111,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         ip: str = _extract_client_ip(request, trust_forwarded=self.trust_forwarded_headers)
         now = time.time()
 
-        if path.startswith("/transcribe/dictate") or path.startswith("/v1/audio/transcriptions"):
+        # /v1/audio/transcriptions handles its own per-token rate limit via
+        # Depends(rate_limit_v1_per_token) — see ratelimit_per_token.py. The
+        # middleware can't bucket by user.id (auth hasn't resolved yet at this
+        # layer), so /v1 traffic is intentionally excluded from the per-IP
+        # dictate bucket and enforced post-auth instead.
+        if path.startswith("/transcribe/dictate"):
             self._prune(self._dictate[ip], now - self.dictate_window)
             if len(self._dictate[ip]) >= self.dictate_max:
-                return self._429(int(self.dictate_window), is_v1=path.startswith("/v1/"))
+                return self._429(int(self.dictate_window))
             self._dictate[ip].append(now)
 
         elif path.startswith("/transcribe/meeting") and request.method == "POST":

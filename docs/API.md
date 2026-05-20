@@ -29,7 +29,7 @@ These are intentionally open so Kubernetes-style probes, Cloudflare health check
 
 **Bearer required:**
 - `POST /transcribe/dictate`, `POST /transcribe/meeting`, `GET /transcribe/meeting/{id}`, `GET /transcribe/meeting/{id}/download/{fmt}`, `DELETE /transcribe/meeting/{id}`
-- `POST /v1/audio/transcriptions` (OpenAI-compatible drop-in)
+- `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/models/{id}` (OpenAI-compatible drop-in surface — see [OPENAI-COMPAT.md](OPENAI-COMPAT.md))
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
 - `GET /me/dictations/last` (v0.5.0 — caller's most recent non-deleted dictation; powers the "Copy last dictation" menubar button)
@@ -176,7 +176,7 @@ Transcribe a short audio clip using the warm Parakeet model.
 
 | Header | Values | Default | Notes |
 |---|---|---|---|
-| `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized AND the raw transcript is at or above `SMART_FORMAT_MIN_WORDS` (default 100), the transcript is post-processed by OpenRouter Mercury 2: punctuation, casing, paragraph breaks, light filler removal ("um"/"uh"/repeats), and bullet-list formatting where the speaker is enumerating. Meaning is preserved (no rephrasing, no summarization, no new content). A length-window safety check (cleaned ∈ [0.7×, 1.10×] of raw word count) falls back to raw on suspicious output. Fail-soft: any timeout or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. The native macOS client sets this header when the user toggles "Smart formatting" in Settings. The `/v1/audio/transcriptions` shim never sets it. |
+| `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized AND the raw transcript is at or above `SMART_FORMAT_MIN_WORDS` (default 80), the transcript is post-processed by OpenRouter Mercury 2: punctuation, casing, paragraph breaks, light filler removal ("um"/"uh"/repeats), and bullet-list formatting where the speaker is enumerating. Meaning is preserved (no rephrasing, no summarization, no new content). A length-window safety check (cleaned ∈ [0.7×, 1.10×] of raw word count) falls back to raw on suspicious output. Fail-soft: any timeout or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. The native macOS client sets this header when the user toggles "Smart formatting" in Settings. The `/v1/audio/transcriptions` shim never sets it. |
 | `X-Client-Dedup-Id` | UUID v4 string | absent ⇒ off | **Optional, additive (Phase 5b streaming-dictation).** When present, must be a syntactically valid UUID v4. Forwarded to `JobStore.insert_dictation(..., client_dedup_id=...)`; the row participates in the `idx_dictations_client_dedup` partial-unique index, so a subsequent retry that sends the same UUID is silently de-duped (`ON CONFLICT(client_dedup_id) DO NOTHING`). Used by the safety-buffer fallback in `DictationStreamSession` to guarantee at most one persisted row per utterance when a streaming finalize loses to its local fallback. When the header is **absent**, behavior is bit-identical to the pre-streaming contract: the column is left NULL and the partial-unique index never applies. Malformed UUIDs are rejected at the validation boundary (422). |
 
 **Audio format flexibility (server-side resampling):**
@@ -202,7 +202,7 @@ Transcribe a short audio clip using the warm Parakeet model.
 
 `duration_ms` is wall-clock Parakeet inference time (excludes queue wait).
 `smart_formatted` is `true` only when `X-Smart-Format` was truthy AND the raw
-transcript was at or above `SMART_FORMAT_MIN_WORDS` (default 100) AND the
+transcript was at or above `SMART_FORMAT_MIN_WORDS` (default 80) AND the
 Mercury cleanup actually replaced the text (OpenRouter responded within the
 1500 ms budget, output passed the length-window safety check, no errors).
 It's `false` for every other case, including header absent, header non-truthy,
@@ -306,49 +306,43 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 
 ---
 
-### `POST /v1/audio/transcriptions`
+### `/v1/*` — OpenAI-compatible surface
 
-**Auth:** Bearer required.
+The `/v1/*` routes are a drop-in replacement for OpenAI's audio
+transcription API. The full wire-level contract — every form parameter,
+every response format (`json`, `text`, `verbose_json`, `srt`, `vtt`),
+every response header (`x-request-id`, `openai-version`,
+`openai-processing-ms`, `openai-model`), every error `code`, file format
+support, rate limits, integration vs employee key kinds — lives in the
+canonical reference: **[OPENAI-COMPAT.md](OPENAI-COMPAT.md)**.
 
-OpenAI-compatible drop-in transcription endpoint. **For setup and SDK usage examples, see [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md).** This section documents the wire-level constraints.
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | `/v1/audio/transcriptions` | Bearer | Sync transcription. 5 response formats. ≤25 MB / ≤15 min. |
+| GET  | `/v1/models` | Bearer | Lists the 5 advertised model IDs. Open WebUI gates on this. `Cache-Control: no-cache, must-revalidate`. |
+| GET  | `/v1/models/{id}` | Bearer | Single model object. 404 `model_not_found` for unknown IDs. |
+| POST | `/v1/audio/translations` | Bearer | NOT IMPLEMENTED. Returns 400 `endpoint_not_supported`. |
 
-**Request:** `multipart/form-data`. Field names follow the OpenAI Audio API spec.
+**Key constraints that matter at the API contract level:**
 
-| Field | Required | Notes |
-|---|---|---|
-| `file` | Yes | Audio bytes; any libsndfile-decodable format. |
-| `model` | No | Accepted; ignored. Always routed to Parakeet TDT 0.6B v2. Unknown values are logged for admin visibility. |
-| `response_format` | No | `json` (default) or `text`. `srt`, `vtt`, and `verbose_json` return **422** — Parakeet doesn't emit per-segment timestamps on the dictate path; use `/transcribe/meeting` for those. |
-| `language`, `prompt`, `temperature` | No | Accepted; ignored. |
+- **Bearer-only auth on `/v1/*`** — the `wispralt_admin_token` session
+  cookie is NOT consulted, even if the browser carries it. Programs use
+  Bearer; humans use cookies; the two surfaces stay separate.
+- **Per-token rate limit** (60 req/min/token), independent of the
+  per-IP bucket on `/transcribe/dictate`.
+- **4xx for client errors, 5xx for server errors** — categorization
+  matters because `openai-python` retries 408 / 409 / 429 / ≥500 by
+  default. Decoder failures map to 400 so the SDK doesn't retry-storm a
+  broken upload.
+- **CORS** — `Access-Control-Allow-Origin: *` on every `/v1/*`
+  response including 429 envelopes, so browser clients see real HTTP
+  errors instead of CORS failures.
+- **Smart formatting is never applied on `/v1/*`** — the shim
+  deliberately ignores `X-Smart-Format`. Third-party callers that want
+  cleanup hit `/transcribe/dictate` directly.
 
-**Constraints:**
-
-- **Size cap: 25 MB** (matches OpenAI's documented limit; `OPENAI_COMPAT_SIZE_CAP` in `constants.py`). Returns **413** with the OpenAI error envelope.
-- **Sync only** — blocks until Parakeet returns. Use `/transcribe/meeting` for long audio.
-- **Smart formatting is never applied here.** The shim deliberately ignores `X-Smart-Format`. Third-party callers that want cleanup hit `/transcribe/dictate` directly.
-- Per-IP rate limit: shares the 60 req/min window with `/transcribe/dictate`.
-
-**Response 200 (`response_format=json`):**
-```json
-{ "text": "Hello world." }
-```
-
-**Response 200 (`response_format=text`):** plain `text/plain` body, no JSON wrapper.
-
-**Errors** (OpenAI envelope shape, see [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md#auth-failure-shape)):
-
-| Code | `code`                       | Condition |
-|------|------------------------------|-----------|
-| 401  | `invalid_api_key`            | Missing/invalid/revoked bearer |
-| 413  | `file_too_large`             | Body exceeds 25 MB cap |
-| 422  | `unsupported_response_format`| `srt` / `vtt` / `verbose_json` requested |
-| 422  | `invalid_response_format`    | Value isn't a recognized format string |
-| 429  | (rate-limit envelope)        | 60 req/min window exceeded |
-| 500  | `transcription_failed`       | Parakeet raised an exception (unexpected) |
-
-Errors include `error.request_id` when the observability middleware has attached one — quote it in support requests.
-
-Source: `server/src/wispralt_server/routes/v1_transcriptions.py`.
+Sources: `server/src/wispralt_server/routes/v1_transcriptions.py`,
+`server/src/wispralt_server/routes/v1_models.py`.
 
 ---
 

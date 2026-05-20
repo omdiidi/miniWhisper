@@ -267,6 +267,80 @@ The route handlers live at `routes/admin_ui.py:users_add_form` (GET) and
 `employee_added.html.j2` with the install one-liner composed from
 `settings.server_url`.
 
+## Integration Keys
+
+Integration keys are tokens minted for **third-party programs** (Buzz,
+MacWhisper, Bazarr, Open WebUI, an internal Python script, etc.) — as
+opposed to **employee** tokens, which are minted for humans using the
+macOS client. Both live in `wispralt.users` as rows; the distinction is
+the `kind` column (`'employee'` or `'integration'`).
+
+### What integration keys are
+
+- Same shape as employee tokens (64-char hex bearer, sha256-hashed).
+- `kind='integration'` — UI groups them separately and the auth layer
+  gates them differently.
+- Scoped to `/v1/*` **only**:
+  - **CAN** call `POST /v1/audio/transcriptions`, `GET /v1/models`,
+    `GET /v1/models/{id}`.
+  - **CANNOT** call `/me/*` or `/telemetry/*` — both return **403**.
+    Those surfaces are for humans (history, insights, personal
+    portal), not for programs.
+- Subject to a per-token rate limit of 60 requests/60 s, independent
+  of the per-IP bucket on `/transcribe/dictate`.
+
+### Minting an integration key
+
+1. Open `/admin/keys/new`.
+2. Enter a `label` (1–80 chars, no control chars — name it after the
+   program, e.g. `buzz-laptop`, `obs-streaming`, `bazarr-server`).
+3. Submit. The result page shows:
+   - The plaintext token **once** (copy now or rotate later).
+   - A ready-to-paste OpenAI env-var snippet:
+
+     ```bash
+     export OPENAI_BASE_URL=https://transcribe.integrateapi.ai/v1
+     export OPENAI_API_KEY=<token>
+     ```
+
+   - A pointer to [OPENAI-COMPAT.md](OPENAI-COMPAT.md).
+4. Paste the snippet into the integrating program's environment.
+   Any OpenAI Whisper-API client (`openai-python`, `openai-node`, curl,
+   etc.) Just Works.
+
+### Listing integration keys
+
+`/admin/keys` lists every integration key (analogous to `/admin/users`
+for employees). Rows: label, created_at, last_seen_at, revoked status.
+
+### Rotating an integration key
+
+`/admin/keys/{id}/rotate` rotates in place: same id / label / kind, new
+sha256 hash. The page redirects to a one-shot plaintext page. Update
+the program's env var, restart the program. Old token stops working
+within 60 s (cache TTL).
+
+### Revoking an integration key
+
+`/admin/keys/{id}/revoke` sets `revoked_at = now()` and invalidates the
+cache entry. Their next `/v1` request returns **401**.
+
+### What integration keys can / can't access
+
+| Surface | Integration key | Employee key |
+|---|---|---|
+| `POST /v1/audio/transcriptions` | yes | yes |
+| `GET /v1/models`, `GET /v1/models/{id}` | yes | yes |
+| `POST /transcribe/dictate`, `POST /transcribe/meeting`, etc. | no (403) | yes |
+| `GET /me/*` (history, insights, profile) | no (403) | yes |
+| `POST /telemetry/*` | no (403) | yes |
+| `/admin/*` | no | only if `role='admin'` |
+
+The full /v1 contract — error codes, response formats, headers, file
+formats — lives in [OPENAI-COMPAT.md](OPENAI-COMPAT.md).
+
+---
+
 ## Revoking an employee
 
 1. `/admin/users` → find the row → click **Revoke**.
@@ -313,8 +387,8 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 | `WISPRALT_API_KEY` | Yes | First-boot break-glass admin token; seeds the initial admin row in `wispralt.users` if the table is empty. |
 | `SUPABASE_DATABASE_URL` | Yes (multi-tenant) | Postgres connection string for the `wispralt` schema. Without it, multi-token auth and usage events both fall back to break-glass mode. |
 | `HF_TOKEN` | Yes | Pyannote gated-model access. |
-| `OPENROUTER_API_KEY` | No | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` and at least `SMART_FORMAT_MIN_WORDS` words (default 100) are post-processed by Mercury 2 — punctuation, casing, filler removal, and light list formatting; meaning preserved. Below the threshold, the call short-circuits to raw. When unset, the toggle is silently a no-op — the server returns raw text and `smart_formatted: false` regardless of the header. Get a key at https://openrouter.ai/keys. |
-| `SMART_FORMAT_MIN_WORDS` | No | Minimum word count for smart-formatting to engage. Default 100. Below this, raw Parakeet output is returned unchanged — short utterances aren't worth the LLM round-trip. |
+| `OPENROUTER_API_KEY` | No | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` and at least `SMART_FORMAT_MIN_WORDS` words (default 80) are post-processed by Mercury 2 — punctuation, casing, filler removal, and light list formatting; meaning preserved. Below the threshold, the call short-circuits to raw. When unset, the toggle is silently a no-op — the server returns raw text and `smart_formatted: false` regardless of the header. Get a key at https://openrouter.ai/keys. |
+| `SMART_FORMAT_MIN_WORDS` | No | Minimum word count for smart-formatting to engage. Default 80. Below this, raw Parakeet output is returned unchanged — short utterances aren't worth the LLM round-trip. |
 
 ---
 

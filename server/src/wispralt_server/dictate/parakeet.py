@@ -28,7 +28,6 @@ from parakeet_mlx import from_pretrained, DecodingConfig  # type: ignore[import-
 from parakeet_mlx.audio import get_logmel  # type: ignore[import-untyped]
 
 from ..audio import decode_wav_bytes, safe_resample
-from .._errors import CorruptAudioError
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +109,21 @@ class ParakeetService:
         logger.warning("Unexpected Parakeet result type: %s", type(result))
         return ""
 
+    def _extract_text_and_tokens(self, result: object) -> tuple[str, list | None]:
+        """Return (text, aligned_tokens_or_none).
+
+        aligned_tokens is None when result is a Hypothesis (text-only),
+        or a list of AlignedToken objects when alignment is surfaced.
+        Used by /v1 verbose_json segmentation.
+        """
+        if isinstance(result, list) and result and hasattr(result[0], "text"):
+            text = "".join(str(t.text) for t in result).strip()
+            return text, list(result)
+        if hasattr(result, "text"):
+            return str(result.text).strip(), None
+        logger.warning("Unexpected Parakeet result type: %s", type(result))
+        return "", None
+
     def _sync_transcribe(self, audio_bytes: bytes) -> tuple[str, float]:
         """Blocking inference — runs inside the single-thread executor.
 
@@ -134,10 +148,9 @@ class ParakeetService:
         # to prevent ulaw/alaw or pathological-sr uploads decoding into multi-minute
         # arrays that block the single-thread executor.
         if len(audio_np) > MAX_SAMPLES:
-            # Specific message — clients map "too long" differently from a
-            # genuine corrupt-decode error.
-            raise CorruptAudioError(
-                f"Dictation too long: {len(audio_np) / TARGET_SR:.1f}s "
+            from wispralt_server._errors import AudioTooLongError
+            raise AudioTooLongError(
+                f"Audio too long: {len(audio_np) / TARGET_SR:.1f}s "
                 f"(max {MAX_SAMPLES / TARGET_SR:.0f}s). For longer audio, use "
                 f"meeting recording (FN-triple-tap)."
             )
@@ -181,6 +194,60 @@ class ParakeetService:
         self.recent_durations.append(duration_ms)
         return text, duration_ms
 
+    def _sync_transcribe_with_alignment(
+        self, samples: np.ndarray,
+    ) -> tuple[str, float, list | None]:
+        """Variant of _sync_transcribe taking pre-decoded samples; returns aligned tokens.
+
+        Used by /v1/audio/transcriptions which performs its own libsndfile/ffmpeg
+        decode before this call.
+
+        Parameters
+        ----------
+        samples
+            16 kHz mono float32 ndarray. Caller is responsible for decoding +
+            resampling + downmixing.
+
+        Returns
+        -------
+        (text, inference_ms, aligned_tokens_or_None)
+            aligned_tokens is the parakeet-mlx AlignedToken list when the model
+            returned per-token alignment, or None when only a Hypothesis was returned.
+        """
+        from wispralt_server._errors import AudioTooLongError
+
+        t0 = time.perf_counter()
+
+        if len(samples) > MAX_SAMPLES:
+            raise AudioTooLongError(
+                f"Audio too long: {len(samples) / TARGET_SR:.1f}s "
+                f"(max {MAX_SAMPLES / TARGET_SR:.0f}s). For longer audio, use "
+                f"meeting recording (FN-triple-tap)."
+            )
+        if len(samples) < MIN_SAMPLES:
+            logger.debug(
+                "Parakeet skipping short clip: %d samples (< MIN_SAMPLES=%d)",
+                len(samples), MIN_SAMPLES,
+            )
+            return "", 0.0, None
+
+        audio_mlx = mx.array(samples, dtype=mx.float32)
+        mel = get_logmel(audio_mlx, self.model.preprocessor_config)  # type: ignore[union-attr]
+        result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
+        mx.eval(result)
+
+        text, tokens = self._extract_text_and_tokens(result)
+
+        del result, mel, audio_mlx
+        try:
+            mx.metal.clear_cache()
+        except AttributeError:
+            pass
+
+        duration_ms = (time.perf_counter() - t0) * 1_000.0
+        self.recent_durations.append(duration_ms)
+        return text, duration_ms, tokens
+
     # ── public async interface ────────────────────────────────────────────────
 
     async def transcribe(self, audio_bytes: bytes) -> tuple[str, float]:
@@ -191,6 +258,19 @@ class ParakeetService:
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._exec, self._sync_transcribe, audio_bytes)
+
+    async def transcribe_with_alignment(
+        self, samples: np.ndarray,
+    ) -> tuple[str, float, list | None]:
+        """Async wrapper around _sync_transcribe_with_alignment.
+
+        Offloads to the single-thread executor (same as `transcribe`) so the
+        FastAPI event loop stays free during MLX inference.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._exec, self._sync_transcribe_with_alignment, samples,
+        )
 
     # ── metrics helpers ───────────────────────────────────────────────────────
 

@@ -145,7 +145,7 @@ All configuration is read from `server/.env` (mode 0600). The template is `serve
 | `STAGING_DIR` | Yes | — | Temporary directory for in-flight WAV uploads |
 | `SUPABASE_DATABASE_URL` | No | — | Postgres URL for the `wispralt` schema (multi-token auth + usage events). When unset, server falls back to env-var break-glass admin only. See [DEPLOY-TEAM.md](DEPLOY-TEAM.md) for the connection-string format and the schema-bootstrap migration. |
 | `OPENROUTER_API_KEY` | No | — | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` AND at least `SMART_FORMAT_MIN_WORDS` words are post-processed by OpenRouter Mercury 2 (~$0.0001 per cleanup, ~250ms added wall-clock, fail-soft on timeout/error). Cleanup includes punctuation, casing, filler removal, and bullet-list formatting; meaning preserved. When unset, the header is silently a no-op and the toggle in the macOS client appears to do nothing. Get a key at https://openrouter.ai/keys. |
-| `SMART_FORMAT_MIN_WORDS` | No | `100` | Minimum word count for smart-formatting to engage. Below this the call short-circuits to raw Parakeet output. Targets long-form dictations (LLM prompts, notes) where the cleanup is actually visible; short utterances aren't worth the LLM round-trip. |
+| `SMART_FORMAT_MIN_WORDS` | No | `80` | Minimum word count for smart-formatting to engage. Below this the call short-circuits to raw Parakeet output. Targets long-form dictations (LLM prompts, notes) where the cleanup is actually visible; short utterances aren't worth the LLM round-trip. |
 | `SILENCE_THRESHOLD` | No | `0.002` | Per-frame RMS threshold for in-person mode detection |
 | `MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum upload size in bytes (default 2 GiB) |
 

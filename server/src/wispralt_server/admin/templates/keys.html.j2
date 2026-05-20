@@ -1,0 +1,34 @@
+{% extends "base.html.j2" %}
+{% block title %}Integration API Keys · WisprAlt Admin{% endblock %}
+{% block content %}
+<h1>Integration API Keys</h1>
+<p>API keys minted for third-party programs that talk to <code>/v1/audio/transcriptions</code>. These keys are blocked from <code>/me/*</code> and <code>/telemetry/*</code> — they are read-only against the transcription API.</p>
+
+<p><a href="/admin/keys/new" class="btn btn-primary">+ Add API key</a></p>
+
+{% if keys %}
+<table>
+  <thead><tr><th>Program</th><th>Label</th><th>Created</th><th>Last seen</th><th></th></tr></thead>
+  <tbody>
+  {% for key in keys %}
+    <tr>
+      <td>{{ key.display_name or "(unnamed)" }}</td>
+      <td><code>{{ key.label }}</code></td>
+      <td>{{ key.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+      <td>{{ key.last_seen_at.strftime("%Y-%m-%d %H:%M") if key.last_seen_at else "—" }}</td>
+      <td>
+        <form method="POST" action="/admin/keys/{{ key.id }}/rotate" style="display:inline">
+          <button type="submit">Rotate</button>
+        </form>
+        <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline" onsubmit="return confirm('Revoke this key? Clients using it will fail immediately.')">
+          <button type="submit" class="btn-danger">Revoke</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p><em>No integration keys yet.</em></p>
+{% endif %}
+{% endblock %}

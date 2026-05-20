@@ -28,6 +28,10 @@
       <div class="label">p50 latency 24h</div>
       <div class="value">{% if totals.p50_24h %}{{ "%.0f"|format(totals.p50_24h) }} ms{% else %}—{% endif %}</div>
     </div>
+    <div class="tile">
+      <div class="label"><a href="/admin/keys">Integration keys</a></div>
+      <div class="value">{{ integration_count or 0 }}</div>
+    </div>
   </div>
 
   <h2>Top 5 active users (last 7d)</h2>

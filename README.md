@@ -2,6 +2,8 @@
 
 A self-hosted, privacy-first replacement for Wispr Flow. Sub-400ms dictation and speaker-diarized meeting transcription running entirely on hardware you own — no cloud subscription, no audio leaving your network. Powered by Parakeet TDT 0.6B v2 (MLX) for dictation and mlx-whisper large-v3-turbo + Pyannote 3.1 for meetings.
 
+**OpenAI-compatible**: point any Whisper-API client at `https://transcribe.integrateapi.ai/v1`. See [docs/OPENAI-COMPAT.md](docs/OPENAI-COMPAT.md).
+
 **v0.4.0 (May 2026)** adds opt-in **streaming dictation** — long dictations transcribe audio chunks in parallel with recording so only a short tail remains on FN release. Off by default; enable via Settings → "Streaming dictation (experimental — faster for long dictations)". Falls back to the standard path on any failure. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#streaming-dictation-opt-in-experimental).
 
 ![Demo](docs/demo.gif)
@@ -106,6 +108,8 @@ Building from source (developers only): [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT
 | [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md) | Full server setup walkthrough |
 | [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md) | Client install, permissions, and config |
 | [docs/API.md](docs/API.md) | HTTP endpoint reference |
+| [docs/OPENAI-COMPAT.md](docs/OPENAI-COMPAT.md) | OpenAI Whisper API drop-in (`/v1/*`) — canonical reference |
+| [docs/INTEGRATION-GUIDE.md](docs/INTEGRATION-GUIDE.md) | Third-party integration quickstart (Python / Node / curl) |
 | [docs/TRANSCRIPT-FORMAT.md](docs/TRANSCRIPT-FORMAT.md) | Transcript JSON schema, SRT/VTT/TXT formats |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common issues and fixes |
 | [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | CI secrets, Sparkle key management, PR workflow |

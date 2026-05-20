@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from wispralt_server import auth as auth_mod
 from wispralt_server.auth import (
-    require_api_key,
+    forbid_integration_kind,
     set_csrf_cookie,
     set_session_cookie,
     verify_csrf,
@@ -97,7 +97,7 @@ def _profile_to_response(p: users_store.UserProfile) -> MeResponse:
 
 @router.get("", response_model=MeResponse)
 async def get_me(
-    request: Request, user: User = Depends(require_api_key)
+    request: Request, user: User = Depends(forbid_integration_kind)
 ) -> MeResponse:
     profile = await users_store.fetch_profile_by_id(
         request.app.state.db_pool, user.id
@@ -111,20 +111,20 @@ async def get_me(
 async def patch_me(
     request: Request,
     body: PatchMeRequest,
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
 ) -> MeResponse:
     pool = request.app.state.db_pool
     await users_store.update_display_name(pool, user.id, body.display_name)
     # No token-cache invalidation needed — display_name is not cached on the auth User.
     profile = await users_store.fetch_profile_by_id(pool, user.id)
-    assert profile is not None  # we just authed via require_api_key, the row exists
+    assert profile is not None  # we just authed via forbid_integration_kind, the row exists
     return _profile_to_response(profile)
 
 
 @router.get("/dictations/last")
 async def me_last_dictation(
     request: Request,
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
 ) -> JSONResponse:
     """Return the most recent dictation row for the authenticated user.
 
@@ -315,7 +315,7 @@ async def me_login_submit(
 @router.get("/insights", response_class=HTMLResponse)
 async def me_insights(
     request: Request,
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
     range: str = "7d",
 ):
     """Employee self-view of their last-week LLM insight + time-range stats.
@@ -396,7 +396,7 @@ def _decorate_row(row: dict, tz_name: str) -> dict:
 @router.get("/history", response_class=HTMLResponse)
 async def me_history(
     request: Request,
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
     range: str = "30d",
     kind: str | None = None,
     search: str | None = None,
@@ -472,7 +472,7 @@ async def me_history_row(
     request: Request,
     kind: str,
     row_id: str,
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
     compact: bool = False,
 ) -> HTMLResponse:
     """Expanded (or compact, if ``?compact=1``) single-row partial.
@@ -518,7 +518,7 @@ async def me_history_delete(
     kind: str,
     row_id: str,
     csrf_token: str = Form(...),
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
 ) -> Response:
     """Soft-delete one owned row. Returns an HTMX OOB delete fragment."""
     if user.id < 0:
@@ -547,7 +547,7 @@ async def me_history_restore(
     kind: str,
     row_id: str,
     csrf_token: str = Form(...),
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
 ) -> HTMLResponse:
     """Restore one soft-deleted owned row. Returns the compact row partial."""
     if user.id < 0:
@@ -594,7 +594,7 @@ async def me_history_download(
     kind: str,
     row_id: str,
     fmt: str,
-    user: User = Depends(require_api_key),
+    user: User = Depends(forbid_integration_kind),
 ) -> Response:
     """Plain-text or JSON download of one owned row."""
     if user.id < 0:

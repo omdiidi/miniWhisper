@@ -56,6 +56,14 @@ def install(app: FastAPI) -> None:
             return _openai_envelope(
                 str(exc.detail), "invalid_request_error", "forbidden", 403, rid, headers
             )
+        if exc.status_code == 404:
+            return _openai_envelope(
+                str(exc.detail), "invalid_request_error", "not_found", 404, rid, headers
+            )
+        if exc.status_code == 413:
+            return _openai_envelope(
+                str(exc.detail), "invalid_request_error", "file_too_large", 413, rid, headers
+            )
         if exc.status_code == 429:
             return _openai_envelope(
                 str(exc.detail), "rate_limit_error", "rate_limit_exceeded", 429, rid, headers

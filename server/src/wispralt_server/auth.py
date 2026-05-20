@@ -102,13 +102,14 @@ def set_current_key(new_key: str) -> None:
 
 
 def _extract_bearer(request: Request) -> str | None:
-    """Extract a bearer token from the request.
+    """Extract a bearer token from the ``Authorization`` header ONLY.
 
-    Order of precedence:
-        1. ``Authorization: Bearer ...`` header.
-        2. ``wispralt_admin_token`` cookie (used by the admin UI's browser
-           session flow — Authorization headers can't be attached to
-           cross-page navigations).
+    Cookie fallback is intentionally NOT consulted here — callers that
+    accept session-cookie auth (the admin UI surface via
+    :func:`require_api_key`) layer the cookie lookup on top. Callers that
+    must be Bearer-only (the OpenAI-compat /v1 surface via
+    :func:`require_api_key_v1`) get the right behavior for free by using
+    this helper directly.
 
     Raises
     ------
@@ -119,8 +120,7 @@ def _extract_bearer(request: Request) -> str | None:
     if len(headers) > 1:
         raise HTTPException(status_code=400, detail="Multiple Authorization headers not allowed")
     if not headers:
-        cookie = request.cookies.get("wispralt_admin_token")
-        return cookie or None
+        return None
     raw = headers[0]
     if not raw.lower().startswith("bearer "):
         return None
@@ -128,32 +128,40 @@ def _extract_bearer(request: Request) -> str | None:
     return token or None
 
 
-# ── FastAPI dependencies ──────────────────────────────────────────────────────
+# ── shared token-resolution state machine ─────────────────────────────────────
 
 
-async def require_api_key(request: Request) -> User:
-    """Authenticate the request and return the resolved :class:`User`.
+async def _resolve_token_user(request: Request, plaintext: str) -> User:
+    """Resolve a plaintext bearer token to a :class:`User`.
 
-    Side effects:
-        - Stores the user on ``request.state.user`` for the observability
-          middleware to attribute usage events.
+    Shared by :func:`require_api_key` (Bearer + cookie) and
+    :func:`require_api_key_v1` (Bearer-only). Side-effect: sets
+    ``request.state.user`` on every success path so the observability
+    middleware can attribute usage events.
 
-    Raises
-    ------
-    HTTPException(400)
-        Multiple ``Authorization`` headers (via :func:`_extract_bearer`).
-    HTTPException(401)
-        Missing / empty / invalid bearer token.
-    HTTPException(503)
-        Postgres pool unavailable AND the bearer doesn't match the
-        break-glass hash — operator can't recover this without fixing
-        Postgres or re-setting WISPRALT_API_KEY in the env.
+    State machine (preserve EXACTLY — security-critical):
+        1. Cache fast-path: ``token_cache.get(th)`` hit → stash on
+           ``request.state.user`` and return.
+        2. Postgres lookup via ``users_store.lookup(pool, th)``:
+           2a. Row found → cache it, stash on request.state.user, return.
+           2b. Row not found AND Postgres did NOT error → 401. (Revocation
+               invariant: do NOT consult break-glass — that would
+               undermine revoking a compromised token while Postgres is
+               healthy.)
+        3. Postgres errored (caught ``(asyncpg.PostgresError,
+           asyncpg.InterfaceError)`` — see 2026-05-17 postmortem for why
+           this exact tuple, no common base class) OR pool is None:
+           3a. Break-glass hash matches via ``hmac.compare_digest`` →
+               return the synthetic admin sentinel
+               ``User(id=-1, label="break-glass-admin", role="admin",
+               kind="employee")``. id=-1 tells the observability
+               middleware to skip the usage-event enqueue (no FK
+               violation against ``wispralt.usage_events.user_id``).
+           3b. No break-glass match → 503 so legitimate clients see
+               "service degraded" (NOT 401 — that would falsely suggest
+               their token is wrong).
     """
-    bearer = _extract_bearer(request)
-    if not bearer:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-
-    th = _store_mod.hash_token(bearer)
+    th = _store_mod.hash_token(plaintext)
 
     # 1. cache fast-path
     cached = token_cache.get(th)
@@ -161,9 +169,9 @@ async def require_api_key(request: Request) -> User:
         request.state.user = cached
         return cached
 
-    # 2. Postgres lookup.  The seeded break-glass row also lives here once
+    # 2. Postgres lookup. The seeded break-glass row also lives here once
     #    the lifespan has run; this is the path 99% of break-glass calls
-    #    take.  Track WHY user is None — "row missing" (token revoked or
+    #    take. Track WHY user is None — "row missing" (token revoked or
     #    invalid) must NOT fall through to break-glass; only "Postgres
     #    errored" or "pool unavailable" should trigger that escape hatch.
     pool = getattr(request.app.state, "db_pool", None)
@@ -185,25 +193,115 @@ async def require_api_key(request: Request) -> User:
             request.state.user = user
             return user
         if not postgres_errored:
-            # Postgres said "no row" — token is invalid OR was revoked.
-            # Do NOT consult break-glass: that would defeat revocation.
+            # Branch 2b: Postgres said "no row" — token is invalid OR
+            # was revoked. Do NOT consult break-glass: that would defeat
+            # revocation.
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
-    # 3. Pool is None OR Postgres errored.  The env-var token grants admin
-    #    so the operator never locks themselves out.  user.id = -1 is a
+    # 3. Pool is None OR Postgres errored. The env-var token grants admin
+    #    so the operator never locks themselves out. Constant-time compare
+    #    on the hex digest to avoid timing oracles. user.id = -1 is a
     #    sentinel; the observability middleware skips usage-event enqueue
     #    for negative ids (no FK violation against wispralt.usage_events).
     bg_hash = getattr(request.app.state, "break_glass_token_hash", None)
-    if bg_hash is not None and th == bg_hash:
-        user = User(id=-1, label="break-glass-admin", role="admin")
+    if bg_hash is not None and hmac.compare_digest(th, bg_hash):
+        user = User(
+            id=-1,
+            label="break-glass-admin",
+            role="admin",
+            kind="employee",
+        )
         request.state.user = user
         logger.warning("auth: break-glass admin path used (Postgres degraded)")
         return user
 
-    # No pool, no break-glass match → return 503 so legitimate clients
-    # know the service is degraded (NOT 401, which would suggest the
-    # token is wrong).
+    # No pool, no break-glass match → 503 so legitimate clients know
+    # the service is degraded (NOT 401, which would suggest the token
+    # is wrong).
     raise HTTPException(status_code=503, detail="Auth temporarily unavailable")
+
+
+# ── FastAPI dependencies ──────────────────────────────────────────────────────
+
+
+async def require_api_key(request: Request) -> User:
+    """Authenticate the request and return the resolved :class:`User`.
+
+    Accepts EITHER an ``Authorization: Bearer ...`` header OR the
+    ``wispralt_admin_token`` cookie (used by the admin UI's browser
+    session flow — cross-page navigations can't carry Authorization
+    headers).
+
+    Side effects:
+        - Stores the user on ``request.state.user`` for the observability
+          middleware to attribute usage events (via
+          :func:`_resolve_token_user`).
+
+    Raises
+    ------
+    HTTPException(400)
+        Multiple ``Authorization`` headers (via :func:`_extract_bearer`).
+    HTTPException(401)
+        Missing / empty / invalid bearer token.
+    HTTPException(503)
+        Postgres pool unavailable AND the bearer doesn't match the
+        break-glass hash — operator can't recover this without fixing
+        Postgres or re-setting WISPRALT_API_KEY in the env.
+    """
+    bearer = _extract_bearer(request)
+    if not bearer:
+        # Cookie fallback: admin UI browser navigations can't attach
+        # Authorization headers, so /admin/login sets ``wispralt_admin_token``
+        # as a session cookie and we accept it here. Bearer-only surfaces
+        # (i.e. /v1/*) use :func:`require_api_key_v1` which deliberately
+        # skips this fallback.
+        bearer = request.cookies.get("wispralt_admin_token") or None
+    if not bearer:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    return await _resolve_token_user(request, bearer)
+
+
+async def require_api_key_v1(request: Request) -> User:
+    """/v1/* only: Bearer required, cookie ignored.
+
+    Third-party API surface — programs sending the admin session cookie
+    by accident should NOT be auth'd through this dep. Browser-based
+    OpenAI clients send Bearer too (the OpenAI SDK sets the
+    ``Authorization`` header explicitly), so we lose nothing by refusing
+    the cookie path here.
+    """
+    plaintext = _extract_bearer(request)
+    if not plaintext:
+        raise HTTPException(
+            status_code=401,
+            detail="Expected 'Bearer <token>' Authorization header",
+        )
+    return await _resolve_token_user(request, plaintext)
+
+
+async def forbid_integration_kind(
+    user: User = Depends(require_api_key),
+) -> User:
+    """Dep for /me/* and /telemetry/* — rejects integration-kind tokens.
+
+    Integration keys (``kind='integration'``) are minted for third-party
+    programs talking to /v1/audio/transcriptions. They should NOT have
+    access to dictation history or user-event telemetry — those are
+    human-only surfaces.
+
+    NOTE: do NOT chain this after :func:`require_api_key_v1` — /v1 is
+    precisely the surface that integration keys are FOR.
+    """
+    if user.kind == "integration":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Integration keys cannot access /me or /telemetry — "
+                "use /v1/audio/transcriptions only"
+            ),
+        )
+    return user
 
 
 def require_admin(user: User = Depends(require_api_key)) -> User:

@@ -77,7 +77,7 @@ from wispralt_server.routes import me as me_routes
 from wispralt_server.routes import meeting as meeting_routes
 from wispralt_server.routes import telemetry as telemetry_routes
 from wispralt_server.routes import transcribe_file as transcribe_file_routes
-from wispralt_server.routes import v1_transcriptions
+from wispralt_server.routes import v1_models, v1_transcriptions
 from wispralt_server.smart_format.mercury_client import MercuryClient
 from wispralt_server.usage import writer as usage_writer
 from wispralt_server.usage.events import UsageEvent
@@ -556,6 +556,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.db_watcher_task = asyncio.create_task(_db_watcher_loop())
 
+    # Initialize per-token rate-limit state for /v1/* routes. Idempotent.
+    # Imported locally to avoid a top-of-module cycle with the auth/users modules.
+    from wispralt_server.ratelimit_per_token import init_rate_limit_state
+
+    init_rate_limit_state(app)
+
     # ── yield — server is live ─────────────────────────────────────────────────
     yield
 
@@ -687,6 +693,8 @@ TRACKED_ROUTES = frozenset([
     "transcribe/meeting",
     "transcribe/file",
     "v1/audio",
+    "v1/models",  # OpenAI-compat model-list probes
+    "v1/audio/translations",  # unsupported-endpoint stub probes (still want visibility)
 ])
 TRACKED_METHODS = frozenset({"POST"})
 
@@ -697,6 +705,8 @@ _KIND_MAP = {
     "transcribe/meeting": "meeting",
     "transcribe/file": "file",
     "v1/audio": "v1_dictate",
+    "v1/models": "v1_models",
+    "v1/audio/translations": "v1_translations",
 }
 
 
@@ -809,6 +819,17 @@ def create_app() -> FastAPI:
         trust_forwarded_headers=settings.trust_forwarded_headers,
     )
 
+    # CORS — OUTERMOST middleware. MUST be the final app.add_middleware call:
+    # Starlette wraps middleware in LIFO order, so last-added runs first on the
+    # request path and last on the response path. This guarantees EVERY response
+    # (including rate-limit 429 envelopes from RateLimitMiddleware above) carries
+    # Access-Control-Allow-Origin so browser clients see real errors instead of
+    # opaque CORS failures. Imported locally to keep the top-of-module import
+    # block focused on hot-path dependencies.
+    from wispralt_server.middleware.cors import install_cors
+
+    install_cors(app)
+
     # Phase 2: mount vendored HTMX + Alpine for the admin UI. Local, not CDN —
     # CSP-safe + offline-resilient. WARN (not fatal) when the directory is
     # missing so a stripped deploy doesn't refuse to boot, but the admin UI
@@ -858,6 +879,9 @@ def create_app() -> FastAPI:
     app.include_router(telemetry_routes.router)
     # /v1/audio/transcriptions — OpenAI-compat shim.
     app.include_router(v1_transcriptions.router)
+    # /v1/models — OpenAI-compat static model list. Open WebUI + enterprise
+    # clients probe this before transcribing.
+    app.include_router(v1_models.router)
 
     # Dev-only fault injection. Mounted ONLY when WISPRALT_DEV_FAULTS=1 AND
     # the host is non-prod. Used to verify the Swift client's offline-signature

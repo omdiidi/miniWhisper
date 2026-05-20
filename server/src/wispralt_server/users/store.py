@@ -27,6 +27,13 @@ class User:
     id: int
     label: str
     role: str  # 'admin' | 'employee'
+    # ``kind`` distinguishes human-employee tokens from third-party
+    # ``integration`` keys (OpenAI-compat /v1 callers). Defaults to
+    # ``'employee'`` so the synthetic break-glass User (which has no DB
+    # row backing it) is treated like a human admin. The DB column's
+    # own default is also ``'employee'``, so cached Users built from
+    # ``lookup()`` will carry the explicit row value.
+    kind: str = "employee"  # 'employee' | 'integration'
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +48,8 @@ class UserRow:
     last_seen_at: datetime | None  # derived from MAX(usage_events.ts)
     display_name: str | None  # NEW — additive, defaults to None for any rows fetched
                               # before the migration ran (none in practice; harmless)
+    kind: str  # 'employee' | 'integration' — DB column has a default, so the
+               # row is never NULL post-migration; no default here on purpose.
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,24 +75,28 @@ async def lookup(pool: asyncpg.Pool, token_hash: str) -> User | None:
     Returns ``None`` when no matching active row exists.
     """
     row = await pool.fetchrow(
-        "SELECT id, label, role FROM wispralt.users "
+        "SELECT id, label, role, kind FROM wispralt.users "
         "WHERE token_hash = $1 AND revoked_at IS NULL",
         token_hash,
     )
     if row is None:
         return None
-    return User(id=row["id"], label=row["label"], role=row["role"])
+    return User(
+        id=row["id"], label=row["label"], role=row["role"], kind=row["kind"]
+    )
 
 
 async def lookup_by_id(pool: asyncpg.Pool, user_id: int) -> User | None:
     """Look up any user (revoked or not) by primary key."""
     row = await pool.fetchrow(
-        "SELECT id, label, role FROM wispralt.users WHERE id = $1",
+        "SELECT id, label, role, kind FROM wispralt.users WHERE id = $1",
         user_id,
     )
     if row is None:
         return None
-    return User(id=row["id"], label=row["label"], role=row["role"])
+    return User(
+        id=row["id"], label=row["label"], role=row["role"], kind=row["kind"]
+    )
 
 
 async def mint(
@@ -108,13 +121,21 @@ async def mint(
     th = hash_token(plaintext)
     row = await pool.fetchrow(
         "INSERT INTO wispralt.users (label, token_hash, role, display_name) "
-        "VALUES ($1, $2, $3, $4) RETURNING id, label, role, display_name",
+        "VALUES ($1, $2, $3, $4) RETURNING id, label, role, kind, display_name",
         label,
         th,
         role,
         display_name,
     )
-    return User(id=row["id"], label=row["label"], role=row["role"]), plaintext
+    # ``kind`` is set by the column default ('employee') at INSERT time.
+    # Integration keys are flipped via :func:`set_kind` immediately after
+    # mint by the /admin/keys/new handler — see admin_ui.py.
+    return (
+        User(
+            id=row["id"], label=row["label"], role=row["role"], kind=row["kind"]
+        ),
+        plaintext,
+    )
 
 
 async def rotate(pool: asyncpg.Pool, user_id: int) -> tuple[str, str | None]:
@@ -161,18 +182,24 @@ async def revoke(pool: asyncpg.Pool, user_id: int) -> str | None:
 
 
 async def list_all(pool: asyncpg.Pool) -> list[UserRow]:
-    """Return every user with derived ``last_seen_at`` for the admin UI.
+    """Return every employee user with derived ``last_seen_at`` for the admin UI.
 
     Single round-trip: the correlated sub-SELECT against
     ``MAX(usage_events.ts)`` keeps the admin page fast even with thousands
     of usage events.
+
+    Filters to ``kind = 'employee'`` so the Employees admin page does NOT
+    surface integration keys (those have their own /admin/keys page driven
+    by :func:`list_integrations`).
     """
     rows = await pool.fetch(
         """
-        SELECT u.id, u.label, u.role, u.created_at, u.revoked_at, u.display_name,
+        SELECT u.id, u.label, u.role, u.created_at, u.revoked_at,
+               u.display_name, u.kind,
                (SELECT MAX(ts) FROM wispralt.usage_events e
                 WHERE e.user_id = u.id) AS last_seen_at
           FROM wispralt.users u
+         WHERE u.kind = 'employee'
          ORDER BY u.created_at DESC
         """
     )
@@ -185,9 +212,73 @@ async def list_all(pool: asyncpg.Pool) -> list[UserRow]:
             revoked_at=r["revoked_at"],
             last_seen_at=r["last_seen_at"],
             display_name=r["display_name"],
+            kind=r["kind"],
         )
         for r in rows
     ]
+
+
+async def list_integrations(pool: asyncpg.Pool) -> list[UserRow]:
+    """List all non-revoked ``kind='integration'`` rows for the /admin/keys page.
+
+    Mirrors :func:`list_all` (same correlated sub-SELECT pattern) but filters
+    to integration kind AND hides revoked rows — the admin Employees page
+    shows revoked rows for audit, but the API Keys page is operator-action-
+    oriented (mint, rotate, revoke) so revoked keys are noise.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT u.id, u.label, u.role, u.created_at, u.revoked_at,
+               u.display_name, u.kind,
+               (SELECT MAX(ts) FROM wispralt.usage_events e
+                WHERE e.user_id = u.id) AS last_seen_at
+          FROM wispralt.users u
+         WHERE u.kind = 'integration' AND u.revoked_at IS NULL
+         ORDER BY u.created_at DESC
+        """
+    )
+    return [
+        UserRow(
+            id=r["id"],
+            label=r["label"],
+            role=r["role"],
+            created_at=r["created_at"],
+            revoked_at=r["revoked_at"],
+            last_seen_at=r["last_seen_at"],
+            display_name=r["display_name"],
+            kind=r["kind"],
+        )
+        for r in rows
+    ]
+
+
+async def set_kind(pool: asyncpg.Pool, user_id: int, kind: str) -> None:
+    """Update ``wispralt.users.kind`` for an existing row. Idempotent.
+
+    Used by /admin/keys/new immediately after :func:`mint` to flip the
+    fresh row from the default 'employee' to 'integration'. No revocation
+    guard — the row is brand new and writing to a revoked row by id is
+    benign (the column is only consulted in WHERE clauses elsewhere).
+    """
+    if kind not in ("employee", "integration"):
+        raise ValueError(f"invalid kind: {kind!r}")
+    await pool.execute(
+        "UPDATE wispralt.users SET kind = $1 WHERE id = $2",
+        kind,
+        user_id,
+    )
+
+
+async def count_kind(pool: asyncpg.Pool, kind: str) -> int:
+    """Count non-revoked rows of the given kind. For the admin overview tile."""
+    return (
+        await pool.fetchval(
+            "SELECT COUNT(*) FROM wispralt.users "
+            "WHERE kind = $1 AND revoked_at IS NULL",
+            kind,
+        )
+        or 0
+    )
 
 
 async def fetch_profile_by_id(pool: asyncpg.Pool, user_id: int) -> UserProfile | None:

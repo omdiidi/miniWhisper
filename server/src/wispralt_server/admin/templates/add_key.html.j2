@@ -1,0 +1,16 @@
+{% extends "base.html.j2" %}
+{% block title %}Add API Key · WisprAlt Admin{% endblock %}
+{% block content %}
+<h1>Add API key for a third-party program</h1>
+<p>This key will work against <code>/v1/audio/transcriptions</code> and <code>/v1/models</code> only — it cannot access <code>/me</code> or <code>/telemetry</code>.</p>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="POST" action="/admin/keys/new">
+  <label for="program_name">Program name <small>(displayed in admin UI; e.g. "Buzz on Bob's MacBook", "Open WebUI prod")</small></label>
+  <input type="text" name="program_name" id="program_name" required maxlength="40" autofocus value="{{ form_program_name or '' }}" />
+
+  <button type="submit" class="btn btn-primary">Mint key</button>
+  <a href="/admin/keys">Cancel</a>
+</form>
+{% endblock %}

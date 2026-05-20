@@ -24,6 +24,7 @@ from starlette.testclient import TestClient
 
 from wispralt_server.auth import require_admin, require_api_key
 from wispralt_server.routes import admin_ui
+from wispralt_server.users import store as users_store
 from wispralt_server.users.store import User
 
 
@@ -55,6 +56,13 @@ def app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
         return {"totals": {}, "top_users": [], "daily": []}
 
     monkeypatch.setattr(admin_ui, "_aggregate_stats", _fake_aggregate_stats)
+
+    # Stub count_kind — overview tile reads integration-key count; we don't
+    # want the auth test to require a live Postgres pool just for the tile.
+    async def _fake_count_kind(_pool: Any, _kind: str) -> int:
+        return 0
+
+    monkeypatch.setattr(users_store, "count_kind", _fake_count_kind)
 
     return application
 

@@ -6,7 +6,10 @@ batches here when a dictation succeeded via the OpenRouter cloud-fallback path
 period insights. Idempotent via per-dictation ``client_dedup_id`` (UUIDv4)
 + partial unique index in dictations.
 
-Auth: same Bearer-token model as other authed routes (Depends(require_api_key)).
+Auth: same Bearer-token model as other authed routes
+(Depends(forbid_integration_kind)). Integration keys (kind='integration') are
+rejected here — telemetry ingest is a human-employee surface and integration
+programs have no reason to push cloud-fallback dictation rows.
 Bearer-ONLY — cookie-only requests are rejected to prevent browser-CSRF abuse
 from a malicious site that holds a session cookie but no token.
 """
@@ -20,7 +23,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from wispralt_server.auth import require_api_key
+from wispralt_server.auth import forbid_integration_kind
 
 if TYPE_CHECKING:
     from wispralt_server.users.store import User
@@ -58,7 +61,7 @@ class CloudDictationBatchResponse(BaseModel):
 async def post_cloud_dictation(
     body: CloudDictationBatch,
     request: Request,
-    user: "User" = Depends(require_api_key),
+    user: "User" = Depends(forbid_integration_kind),
 ) -> CloudDictationBatchResponse:
     """Accept a batch of cloud-fallback dictations from a Swift client.
 
