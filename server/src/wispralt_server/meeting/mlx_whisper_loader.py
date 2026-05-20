@@ -67,11 +67,32 @@ def load() -> None:
 
 
 def reset() -> None:
-    """Drop the loaded flag. MLX uses unified memory so this is essentially
-    a no-op for RAM reclaim — the OS will reuse pages on demand. Kept for
-    API symmetry with whisperx_loader.reset()."""
+    """Drop the mlx-whisper model from MLX unified memory.
+
+    POSTMORTEM 2026-05-19: The old version of this function was a no-op
+    that only flipped `_loaded = False`. mlx-whisper caches the loaded
+    Whisper model in a class-level `ModelHolder.model` attribute inside
+    `mlx_whisper.transcribe` (mlx-whisper==0.4.2, transcribe.py:50-58).
+    Without explicitly nulling that attribute, `mx.clear_cache()` in the
+    eviction path only frees the cache pool (mlx_cache_mb → 0) while the
+    model weights stay live as active MLX memory (~2.7 GB for
+    whisper-large-v3-turbo). Verified via /metrics on prod showing
+    `mlx_active_mb: 2761, mlx_cache_mb: 0` 33 minutes after idle eviction
+    fired and logged "released meeting models".
+
+    Setting `ModelHolder.model = None` removes the only reference to the
+    Whisper weights; GC then collects them, and the subsequent
+    `mx.clear_cache()` in pipeline.evict_if_idle() returns the unified-
+    memory pages to the OS.
+    """
     global _loaded
     _loaded = False
+    try:
+        from mlx_whisper.transcribe import ModelHolder
+        ModelHolder.model = None
+        ModelHolder.model_path = None
+    except Exception:  # noqa: BLE001 — best-effort; never crash eviction
+        logger.exception("Could not clear mlx_whisper.ModelHolder cache during reset")
 
 
 def transcribe_channel(

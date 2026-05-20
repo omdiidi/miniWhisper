@@ -220,6 +220,17 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
             mx.reset_peak_memory()
         except Exception:  # noqa: BLE001 — best-effort; clear_cache is non-critical
             logger.debug("mx.clear_cache() failed during eviction", exc_info=True)
+        # POSTMORTEM 2026-05-19: pyannote runs on PyTorch MPS (diarize.py:62-69
+        # moves the pipeline to MPS). PyTorch's MPS allocator caches buffers
+        # independently of MLX — setting _pipeline=None drops the Python ref
+        # but the MPS caching allocator keeps ~1-2 GB resident. Without
+        # torch.mps.empty_cache(), pyannote's weights survive eviction.
+        try:
+            import torch  # local import keeps the lifespan import graph stable
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:  # noqa: BLE001 — best-effort; non-critical
+            logger.debug("torch.mps.empty_cache() failed during eviction", exc_info=True)
         _meeting_models_ready = False
         return True
     finally:
