@@ -108,7 +108,13 @@ async def stream_chunk(
     async with session.lock:
         if session.status != "active":
             raise HTTPException(410, f"Session is {session.status}")
-        if len(session.pending_tasks) >= store.max_queue_depth:
+        # v0.4.2: count IN-FLIGHT tasks only, not the dict's lifetime size.
+        # pending_tasks accumulates a Task object per chunk index for the
+        # entire session; older entries stay in the dict so finalize() can
+        # await them. Counting len(...) makes the gate effectively "total
+        # chunks ever sent" which leaks queue capacity on long sessions.
+        in_flight = sum(1 for t in session.pending_tasks.values() if not t.done())
+        if in_flight >= store.max_queue_depth:
             raise HTTPException(429, "Per-session queue depth exceeded")
         # Streaming-only mid-recording cap: refuse chunks past 270 s so the
         # final join still fits inside the 300 s dictation_max_duration_s cap
@@ -121,10 +127,13 @@ async def stream_chunk(
     await store.enqueue_inference(
         session, index, audio_bytes, request.app.state.parakeet_service
     )
+    # queue_depth in response reflects post-enqueue in-flight count, same
+    # accounting as the gate above (not lifetime dict size).
+    post_in_flight = sum(1 for t in session.pending_tasks.values() if not t.done())
     return JSONResponse(
         {
             "received_index": index,
-            "queue_depth": len(session.pending_tasks),
+            "queue_depth": post_in_flight,
         },
         status_code=202,
     )

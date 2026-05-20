@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     #   tail inference to complete before raising FinalizeTimeout.
     streaming_session_ttl_s: int = 900
     streaming_max_active: int = 2
-    streaming_max_queue_depth: int = 6
+    streaming_max_queue_depth: int = 12   # v0.4.2: raised 6→12 for headroom with 5 s chunks (route now counts only in-flight tasks)
     streaming_finalize_timeout_s: int = 15
 
     # Trust CF-Connecting-IP / X-Forwarded-For headers for rate-limit IP extraction.

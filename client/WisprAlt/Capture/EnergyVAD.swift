@@ -22,7 +22,14 @@ struct EnergyVAD {
     // every ~30 s of speech (≈ 75 words at conversational rate).
     static let silenceHangoverMs: Double = 400
     static let minSpeechBeforeStreamMs: Double = 8_000   // bypass threshold (Plan constraint #4)
-    static let chunkMinSpeechMs: Double = 20_000         // earliest a silence may close a chunk (since last cut)
+    // v0.4.2: lowered 20_000 → 5_000 per first-principles take. Smaller chunks
+    // mean MORE chunks fire during recording (each transcribes in ~1.5 s on
+    // M4 Parakeet, fully overlapped with continued speech), so the tail on
+    // FN release is always small and finalize is ~1-2 s. Quality unchanged —
+    // cuts still land on natural silences, never mid-word. Mercury (when on)
+    // re-joins the seams on the concatenated text. Paired with the
+    // streaming_session.py queue-depth fix that counts only in-flight tasks.
+    static let chunkMinSpeechMs: Double = 5_000          // earliest a silence may close a chunk (since last cut)
     // chunkHardCapMs is the safety net for monologue speech with no pauses. Forced cuts
     // CAN land mid-word — Mercury rejoins the seam on the joined text. If this shows
     // up as a real artifact in practice, follow-up: track lowest-energy frame in the
