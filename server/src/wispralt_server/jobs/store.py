@@ -764,6 +764,32 @@ class JobStore:
         )
         return merged, next_dict, next_jobs
 
+    def get_most_recent_dictation(self, api_key_id: int) -> dict | None:
+        """Return the newest non-deleted dictation row for *api_key_id*, or None.
+
+        Selects from the same ``dictations`` table that ``/me/history`` reads.
+        Always filtered by ``api_key_id`` — no cross-user leak possible.
+        Honors the soft-delete semantics: rows with ``deleted_at IS NOT NULL``
+        are excluded (matches the ``idx_dictations_api_key_active`` partial
+        index used by ``/me/history``).
+
+        The ``id`` is CAST to TEXT in the SELECT so the JSON response shape
+        matches the Swift ``LastDictation.id: String`` decoder. Tie-break by
+        ``id DESC`` on identical ``created_at`` ensures deterministic results.
+        """
+        cur = self.con.execute(
+            "SELECT CAST(id AS TEXT) AS id, text, created_at "
+            "FROM dictations "
+            "WHERE api_key_id = ? AND text != '' AND deleted_at IS NULL "
+            "ORDER BY created_at DESC, id DESC "
+            "LIMIT 1",
+            (api_key_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "text": row[1], "created_at": row[2]}
+
     def get_history_row(
         self, api_key_id: int, kind: str, row_id: str,
     ) -> dict | None:

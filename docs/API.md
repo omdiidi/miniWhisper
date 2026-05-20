@@ -32,6 +32,7 @@ These are intentionally open so Kubernetes-style probes, Cloudflare health check
 - `POST /v1/audio/transcriptions` (OpenAI-compatible drop-in)
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
+- `GET /me/dictations/last` (v0.5.0 — caller's most recent non-deleted dictation; powers the "Copy last dictation" menubar button)
 - `POST /telemetry/cloud-dictation` (Plan A — **Bearer-only**, cookie auth is explicitly rejected with 401)
 - `GET /metrics`
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
@@ -418,6 +419,42 @@ Source: `server/src/wispralt_server/routes/me.py`.
 
 ---
 
+### `GET /me/dictations/last`
+
+**Auth:** Bearer required (employee or admin token via `Authorization: Bearer <token>`).
+
+Returns the caller's most recent dictation as JSON. Powers the menubar
+"Copy last dictation" button (v0.5.0). The row is filtered by
+`deleted_at IS NULL` so a soft-deleted dictation is not returned; tie-break
+on identical `created_at` is `id DESC`.
+
+**Response 200** (`application/json`):
+
+```json
+{ "id": "4217", "text": "<dictation transcript>", "created_at": 1747700123.456 }
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | The `dictations.id` row id, `CAST(id AS TEXT)` server-side so the value decodes cleanly into the Swift `LastDictationResponse.id: String` shape. |
+| `text` | string | Raw transcript text (no smart-format reapplication). |
+| `created_at` | number | Epoch seconds (float). |
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing / invalid bearer. |
+| 403 | Caller is the break-glass admin (`user.id < 0`) — break-glass identities have no personal dictation history. |
+| 404 | Caller has zero non-deleted dictations. |
+| 503 | SQLite job store transiently unavailable. |
+
+Source: `server/src/wispralt_server/routes/me.py` +
+`JobStore.get_most_recent_dictation(api_key_id)` in
+`server/src/wispralt_server/jobs/store.py`.
+
+---
+
 ### `GET /me/login`
 
 **Auth:** None required.
@@ -440,7 +477,7 @@ Validate a pasted token and set the session cookie. Mirrors `POST /admin/login` 
 |---|---|---|
 | `token` | string | 64-char hex bearer token. Validated through the same 3-stage lookup as admin login: `TokenCache` → asyncpg `wispralt.users` → break-glass env-var hash. |
 
-**Response 303** — token valid (non-break-glass). Redirects to `/me/insights`. Sets `wispralt_admin_token` cookie with `path="/"`, `HttpOnly`, `Secure`, `SameSite=Strict`, `max-age=8h`. The `path="/"` scoping lets the same cookie cover both `/admin/*` and `/me/*` surfaces; admin login was simultaneously broadened to set the cookie with `path="/"` as well.
+**Response 303** — token valid (non-break-glass). Redirects to `/me/insights` by default, or to the value of the optional `?next=` query parameter when it's a **relative path under `/me/*`** (open-redirect guard — absolute URLs, scheme-prefixed values, and paths outside `/me/*` are silently ignored and the redirect falls back to `/me/insights`). The menubar "Open My Dictations" button (v0.5.0) uses `?next=/me/history` so first-time employees land directly on their history page after token-paste. Sets `wispralt_admin_token` cookie with `path="/"`, `HttpOnly`, `Secure`, `SameSite=Strict`, `max-age=8h`. The `path="/"` scoping lets the same cookie cover both `/admin/*` and `/me/*` surfaces; admin login was simultaneously broadened to set the cookie with `path="/"` as well.
 
 **Errors:**
 

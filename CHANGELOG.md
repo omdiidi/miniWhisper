@@ -35,6 +35,78 @@ All notable changes to WisprAlt are documented here.
   → UserDefaults write → app launch. All steps clean on macOS 26.4
   Tahoe.
 
+## [0.5.0] - 2026-05-19
+
+### Security
+
+- **Role tightening on three admin routes.** `GET /admin/active`,
+  `GET /admin/server-log/{job_id}`, and `GET /metrics` now require
+  `require_admin` instead of `require_api_key`. Previously any authenticated
+  bearer (including employee tokens) could read operator-level introspection.
+  Employees are now scoped to `/me/*` for their own data. The client's "View
+  server log" sheet handles the 403 with a friendly "Admin-only — ask your
+  administrator" message rather than a raw error.
+
+### Changed
+
+- **`install.sh` is now bundle-ID-driven.** Discovery uses `mdfind` to
+  enumerate every WisprAlt bundle anywhere on the filesystem (not just
+  `/Applications/`), gracefully quits each one via AppleScript (with a
+  narrow `pkill -f co.wispralt.WisprAlt` fallback), removes orphan bundles,
+  and sweeps `~/Library/LaunchAgents/co.wispralt*.plist` before installing
+  to the canonical `/Applications/WisprAlt.app` path. Closes the
+  "broken old install left on employee's Mac" hole. Re-running the
+  one-liner is still the idempotent update path.
+
+### Added
+
+#### Client
+
+- **In-app update checker** (`client/WisprAlt/Update/UpdateChecker.swift`).
+  Polls `releases/latest` 60 s after launch and every 6 h, debounced via
+  `Settings.shared.lastUpdateCheck`. On a newer release, sets
+  `Settings.shared.updateAvailable` and a subtle orange dot on the menubar
+  icon via `MenuBarController.setUpdateBadge(visible:)` (only when
+  `serverURL != nil`). Settings → Advanced → Updates shows the current vs
+  latest version and an "Install now…" button that shells out to
+  `Terminal.app` via `NSAppleScript` with the canonical curl one-liner;
+  falls back to clipboard if Automation TCC is denied. Deliberately NOT
+  Sparkle — reuses `install.sh` as the canonical install path. The
+  pre-existing `SparkleController.swift` remains disabled and kept for
+  reference.
+- **"Copy last dictation"** menubar button pinned at the very top of the
+  popover. Calls the new `LastDictationAPI.fetch()` namespace in
+  `DictationAPI.swift` against `GET /me/dictations/last`, copies the
+  returned text to the clipboard, and shows a "Copied" toast. Surfaces a
+  friendly "No dictations yet" on 404 and a break-glass-admin message on
+  403.
+- **"Open My Dictations"** menubar button opens
+  `<serverURL>/me/login?next=/me/history` so first-time employees land on
+  their personal history page after token-paste instead of the default
+  `/me/insights`.
+
+#### Server
+
+- **`GET /me/dictations/last`** (`server/src/wispralt_server/routes/me.py`).
+  Returns the caller's most recent non-deleted dictation as JSON:
+  `{id, text, created_at}` on 200, 404 on empty, 403 for the break-glass
+  admin. Backed by a new `JobStore.get_most_recent_dictation(api_key_id)`
+  repository function — single-row SELECT filtered by `deleted_at IS NULL`
+  AND `text != ''`, ordered `created_at DESC, id DESC`, `CAST(id AS TEXT)`
+  for the Swift `String` decode.
+- **`POST /me/login` honors `?next=`** — open-redirect-guarded to relative
+  paths under `/me/*` only. Powers the "Open My Dictations" deep-link.
+
+### Deployment notes
+
+- **Mini redeploy required.** The three admin-route role swaps + the
+  `/me/dictations/last` route + the `/me/login?next=` parameter all live
+  server-side. Standard `scripts/deploy-server.sh` flow.
+- **Client cdhash changes.** The Update/UpdateChecker.swift addition and
+  the menubar layout shuffle (Copy last dictation + Open My Dictations
+  buttons) produce a new cdhash, which triggers macOS TCC re-prompts on
+  first run after install. Expected.
+
 ## [Unreleased]
 
 ### Added

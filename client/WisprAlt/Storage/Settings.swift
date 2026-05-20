@@ -30,6 +30,8 @@ final class Settings: ObservableObject {
         static let smartFormatting = "smartFormatting"
         static let streamingDictation = "streamingDictation"
         static let displayName = "displayName"  // mirror of server-side display_name; source of truth is server
+        static let updateAvailable = "updateAvailable"
+        static let lastUpdateCheck = "lastUpdateCheck"
     }
 
     // MARK: - Published properties
@@ -145,6 +147,30 @@ final class Settings: ObservableObject {
         }
     }
 
+    /// Latest GitHub Release tag that's newer than the bundled version, or nil
+    /// when up-to-date. Set by UpdateChecker.
+    @Published var updateAvailable: String? {
+        didSet {
+            if let value = updateAvailable {
+                defaults.set(value, forKey: Key.updateAvailable)
+            } else {
+                defaults.removeObject(forKey: Key.updateAvailable)
+            }
+        }
+    }
+
+    /// Epoch timestamp of the last successful UpdateChecker poll. Used to
+    /// debounce checks to 6h. Nil means "never checked".
+    @Published var lastUpdateCheck: Date? {
+        didSet {
+            if let value = lastUpdateCheck {
+                defaults.set(value.timeIntervalSince1970, forKey: Key.lastUpdateCheck)
+            } else {
+                defaults.removeObject(forKey: Key.lastUpdateCheck)
+            }
+        }
+    }
+
     // MARK: - Init
 
     private init() {
@@ -163,6 +189,20 @@ final class Settings: ObservableObject {
         let storedSmart = suite.object(forKey: Key.smartFormatting) as? Bool ?? false
         let storedStreaming = suite.object(forKey: Key.streamingDictation) as? Bool ?? false
         let storedName = suite.string(forKey: Key.displayName)
+        let storedUpdate = suite.string(forKey: Key.updateAvailable)
+        let storedLastEpoch = suite.object(forKey: Key.lastUpdateCheck) as? Double
+
+        // Drop stale updateAvailable if persisted value is no longer newer
+        // than the bundled version (e.g., user just installed the version
+        // we were nagging about). Avoids a confusing stale "Update available"
+        // banner during the 60s window before UpdateChecker.checkSoon() runs.
+        let bundledShort = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
+        let cleanedUpdate: String? = storedUpdate.flatMap { stored in
+            UpdateChecker.isNewer(remote: stored, bundled: bundledShort) ? stored : nil
+        }
+        if cleanedUpdate == nil && storedUpdate != nil {
+            suite.removeObject(forKey: Key.updateAvailable)
+        }
 
         // @Published properties must be set before the object is fully initialised;
         // assign directly via stored property (bypasses didSet observers).
@@ -174,6 +214,10 @@ final class Settings: ObservableObject {
         self._smartFormatting = Published(initialValue: storedSmart)
         self._streamingDictation = Published(initialValue: storedStreaming)
         self._displayName = Published(initialValue: storedName)
+        self._updateAvailable = Published(initialValue: cleanedUpdate)
+        self._lastUpdateCheck = Published(
+            initialValue: storedLastEpoch.map { Date(timeIntervalSince1970: $0) }
+        )
         self._serverURL = Published(initialValue: nil) // set below after init completes
         self.serverURL = loadServerURL(from: suite)
     }

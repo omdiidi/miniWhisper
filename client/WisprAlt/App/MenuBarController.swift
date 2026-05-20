@@ -146,6 +146,17 @@ final class MenuBarController: NSObject {
     /// Cleared when the user retries the update check.
     var lastUpdateError: String? = nil
 
+    /// v0.5.0: whether the menubar icon should render with an orange-dot
+    /// badge to indicate an available update. Driven by `UpdateChecker`.
+    private(set) var updateBadgeVisible: Bool = false
+
+    /// Set/clear the update-available badge. Idempotent and main-thread-only.
+    func setUpdateBadge(visible: Bool) {
+        guard updateBadgeVisible != visible else { return }
+        updateBadgeVisible = visible
+        updateIcon()
+    }
+
     // MARK: - Recording state (observed by RecordingIndicatorView)
 
     let recordingState = RecordingState()
@@ -575,18 +586,62 @@ final class MenuBarController: NSObject {
                 case .meetingRecording: return ("mic", "WisprAlt")  // unreachable
                 }
             }()
-            let image = NSImage(
+            let baseImage = NSImage(
                 systemSymbolName: symbolName,
                 accessibilityDescription: accessibilityLabel
             )
-            image?.isTemplate = true
-            button.image = image
+            baseImage?.isTemplate = true
+            button.image = updateBadgeVisible
+                ? Self.compositeDot(on: baseImage)
+                : baseImage
             button.contentTintColor = nil
             button.attributedTitle = NSAttributedString(string: "")
             button.title = ""
             button.imagePosition = .imageOnly
             button.toolTip = accessibilityLabel
         }
+    }
+
+    /// Compose an SF Symbol with an orange dot in the upper-right corner.
+    /// Returns nil if `base` is nil. Manually tints the SF Symbol with
+    /// `NSColor.controlTextColor` so the composite reads correctly on both
+    /// light and dark menubars (the composite's `isTemplate=false` disables
+    /// the automatic template-image tinting).
+    private static func compositeDot(on base: NSImage?) -> NSImage? {
+        guard let base else { return nil }
+        let dim = max(NSStatusBar.system.thickness, 22)
+        let size = NSSize(width: dim, height: dim)
+        let composite = NSImage(size: size)
+        composite.lockFocus()
+        if let tintedBase = base.copy() as? NSImage {
+            tintedBase.lockFocus()
+            NSColor.controlTextColor.set()
+            NSRect(origin: .zero, size: tintedBase.size).fill(using: .sourceAtop)
+            tintedBase.unlockFocus()
+            tintedBase.isTemplate = false
+            tintedBase.draw(
+                in: NSRect(origin: .zero, size: size),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1.0
+            )
+        } else {
+            base.draw(in: NSRect(origin: .zero, size: size))
+        }
+        let dotSide = dim * 0.30
+        let dotRect = NSRect(
+            x: dim - dotSide - 1,
+            y: dim - dotSide - 1,
+            width: dotSide,
+            height: dotSide
+        )
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: dotRect.insetBy(dx: -1, dy: -1)).fill()
+        NSColor.systemOrange.setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+        composite.unlockFocus()
+        composite.isTemplate = false
+        return composite
     }
 
     // MARK: - Popover toggle

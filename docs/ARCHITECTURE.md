@@ -179,6 +179,16 @@ Phase names are the canonical keys used in `runner.PHASE_BUDGETS` / `PHASE_LABEL
 - `GET /admin/active` — rich projection of the currently in-flight job: `id, status, request_mode, mode, phase, phase_label, phase_elapsed_s, chunk_index, total_chunks, started_at, wav_path, audio_duration_s, attempts, cancel_requested, current_rss_mb`. Same auth dependency as `/admin/metrics`.
 - `GET /admin/server-log/{job_id}` — plain-text response: the 100 lines bracketing the job's first and last appearance in `settings.server_log_path` (resolved from settings, NOT hardcoded). Includes intervening lines (ffmpeg stderr, pyannote warnings) for full-context diagnosis. The client's "View server log" sheet polls this every 5s.
 
+**Role gate (v0.5.0).** `GET /admin/active`, `GET /admin/server-log/{job_id}`,
+and `GET /metrics` are **admin-only** — previously they were behind
+`require_api_key` (any authenticated bearer), which leaked operator-level
+introspection to employee tokens. The dependency was tightened to
+`require_admin` in `routes/admin.py` so employees get a 403 on these surfaces
+and use the per-user `/me/*` routes (`/me`, `/me/insights`, `/me/history`,
+`/me/dictations/last`) for their own data instead. The client's "View server
+log" sheet handles the 403 with a friendly "Admin-only — ask your
+administrator" message rather than a raw error.
+
 ---
 
 ## Honest Limitations
@@ -1189,6 +1199,63 @@ existing rows; the column was added by an idempotent `ALTER TABLE` in
 `JobStore.__init__`). `/me/history` renders the source as a small
 icon/label so users can tell at a glance which dictations went through
 the cloud-fallback path.
+
+---
+
+## In-app updater (v0.5.0)
+
+A lightweight in-app update checker runs alongside the still-disabled Sparkle
+wrapper. The new module lives at
+`client/WisprAlt/Update/UpdateChecker.swift` and is **deliberately not Sparkle**
+— it reuses `install.sh` (the curl one-liner) as the canonical install path so
+there is exactly one update mechanism to reason about.
+
+- **Polling.** The checker fires 60 s after launch and then every 6 h,
+  debounced via `Settings.shared.lastUpdateCheck` so a wake-from-sleep doesn't
+  trigger an immediate re-poll. The request hits
+  `https://api.github.com/repos/<owner>/<repo>/releases/latest` and compares the
+  `tag_name` (minus the leading `v`) against the bundled
+  `CFBundleShortVersionString` via a SemVer-aware numeric compare.
+- **Badge.** When a newer release is found, the checker flips
+  `Settings.shared.updateAvailable` (UserDefaults-backed) and calls
+  `MenuBarController.shared.setUpdateBadge(visible: true)` — the latter
+  composites a subtle orange dot onto the menubar mic icon. The badge is only
+  rendered when `Settings.shared.serverURL != nil` so a half-configured install
+  doesn't show a misleading update prompt.
+- **Install now.** Settings → Advanced → Updates shows the current version, the
+  latest tag, and an "Install now…" button. The button shells out to
+  `Terminal.app` via `NSAppleScript` with the canonical curl install one-liner
+  pre-typed; if Automation TCC is denied (no Terminal scripting permission)
+  the command is dropped onto the clipboard with a "Paste this into Terminal"
+  toast as a fallback so the user is never stuck.
+
+Source: `client/WisprAlt/Update/UpdateChecker.swift` +
+`client/WisprAlt/Storage/Settings.swift` (`updateAvailable`,
+`lastUpdateCheck`) + `client/WisprAlt/App/MenuBarController.swift`
+(`setUpdateBadge(visible:)`).
+
+---
+
+## User-facing client surfaces (v0.5.0)
+
+Two menubar-popover additions surface the existing portal more clearly to
+employees.
+
+- **"Copy last dictation"** — pinned at the very top of the popover. Calls
+  `LastDictationAPI.fetch()` which hits the new `GET /me/dictations/last`
+  JSON endpoint (see [API.md → `GET /me/dictations/last`](API.md)) and copies
+  the returned `text` to the clipboard with a 60 s-debounced "Copied" toast.
+  Surfaces a friendly "No dictations yet" message on 404 and the standard
+  network error toast on 5xx / offline.
+- **"Open My Dictations"** — opens
+  `<serverURL>/me/login?next=/me/history` in the default browser. The
+  `?next=` parameter (server-side open-redirect-guarded to relative paths
+  under `/me/*` only) lets first-time employees land on their personal
+  history page after token-paste instead of the default `/me/insights`
+  landing — which was the discoverability gap raised against v0.4.x.
+
+The other QuickActions buttons (Transcribe file…, Copy last meeting / custom
+transcription, etc.) are unchanged from the v0.4.6 layout.
 
 ---
 

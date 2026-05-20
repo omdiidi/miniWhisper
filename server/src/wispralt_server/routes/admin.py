@@ -29,7 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .. import auth, observability
-from ..auth import require_admin, require_api_key
+from ..auth import require_admin
 from ..config import settings
 from ..jobs.runner import PHASE_LABELS
 from ..meeting import pipeline as meeting_pipeline
@@ -159,7 +159,7 @@ async def rotate_key(request: Request) -> JSONResponse:
 
 @router.get(
     "/metrics",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
     summary="Structured server observability metrics",
 )
 async def metrics(request: Request) -> JSONResponse:
@@ -301,7 +301,7 @@ async def metrics(request: Request) -> JSONResponse:
 
 @router.get(
     "/admin/active",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
     summary="List active (pending or running) jobs with rich phase projection",
 )
 async def admin_active(request: Request) -> JSONResponse:
@@ -355,7 +355,7 @@ _DEFAULT_SERVER_LOG_PATH = Path.home() / "Library" / "Logs" / "WisprAlt" / "serv
 
 @router.get(
     "/admin/server-log/{job_id}",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
     summary="Return the slice of server.log bracketing a job_id's appearances",
 )
 async def admin_server_log(request: Request, job_id: str) -> PlainTextResponse:

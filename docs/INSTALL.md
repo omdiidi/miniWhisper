@@ -182,6 +182,19 @@ this machine — TCC re-prompts and all.
 
 ## 10. Troubleshooting
 
+### "I have an old / renamed WisprAlt copy somewhere — will the installer find it?"
+
+Yes. As of v0.5.0 the installer is **bundle-ID-driven**: it uses `mdfind` to
+enumerate every WisprAlt bundle anywhere on the filesystem (including
+`~/Applications/`, renamed copies, or whatever path an earlier install dropped
+it at), not just `/Applications/`. The curl one-liner is idempotent — re-running
+it cleanly removes orphan bundles, gracefully quits running instances via
+AppleScript (with a `pkill -f co.wispralt.WisprAlt` fallback for stragglers),
+and reinstalls to the canonical `/Applications/WisprAlt.app` path. Any
+`~/Library/LaunchAgents/co.wispralt*.plist` files matching the WisprAlt prefix
+are also swept on install so a stale autostart entry from an old install
+location cannot relaunch a deleted binary.
+
 ### "macOS says 'Apple cannot check it for malicious software'"
 
 The signed build is notarized, but Gatekeeper occasionally surfaces this

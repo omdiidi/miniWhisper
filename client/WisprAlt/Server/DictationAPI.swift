@@ -372,3 +372,34 @@ private extension String {
         Data(utf8)
     }
 }
+
+// MARK: - LastDictation (v0.5.0)
+
+/// Response shape for `GET /me/dictations/last`.
+struct LastDictation: Decodable {
+    let id: String
+    let text: String
+    let created_at: Double  // epoch seconds (SQLite REAL → JSON number)
+}
+
+/// Namespace for the `/me/dictations/last` endpoint used by the menubar
+/// "Copy last dictation" button. Matches the MeAPI.get() pattern exactly:
+/// build via `ServerClient.shared.buildRequest`, execute via
+/// `ServerClient.shared.execute`, decode with JSONDecoder.
+enum LastDictationAPI {
+    /// `GET /me/dictations/last` — fetch the caller's most recent
+    /// (non-deleted) dictation. Throws `ServerError.server(status: 404, _)`
+    /// when the user has zero dictations.
+    static func fetch() async throws -> LastDictation {
+        let request = try ServerClient.shared.buildRequest(
+            path: "/me/dictations/last",
+            method: "GET"
+        )
+        let (data, _) = try await ServerClient.shared.execute(request)
+        do {
+            return try JSONDecoder().decode(LastDictation.self, from: data)
+        } catch {
+            throw ServerError.decoding(error)
+        }
+    }
+}

@@ -127,6 +127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.fnKeyMonitor = FNKeyMonitor()
             self.fnKeyMonitor.start(delegate: self.menuBarController)
         }
+
+        // v0.5.0: poll GitHub Releases 60s after launch to surface available updates
+        // via the menubar dot + Settings → Updates section.
+        UpdateChecker.shared.checkSoon()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

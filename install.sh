@@ -25,6 +25,9 @@ DMG_URL=""
 SHA_URL=""
 DMG_PATH=""
 SHA_PATH=""
+# Populated by enumerate_existing_installs(); referenced before that call by
+# should_skip_install() in some code paths, so initialize for `set -u`.
+FOUND_BUNDLES=()
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -62,7 +65,7 @@ preflight() {
 
     local missing=()
     local tool
-    for tool in curl shasum security defaults hdiutil xattr tccutil pkill pgrep file awk; do
+    for tool in curl shasum security defaults hdiutil xattr tccutil pkill pgrep file awk mdfind osascript launchctl find; do
         command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
     done
     if (( ${#missing[@]} > 0 )); then
@@ -74,13 +77,154 @@ preflight() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# detect_reinstall — flag if we're replacing an existing install.
+# enumerate_existing_installs — find every WisprAlt.app on disk via Spotlight
+# (bundle-ID query) plus a belt-and-suspenders explicit-path fallback and a
+# `find`-based orphan sweep across user-writable dirs. Populates FOUND_BUNDLES.
 # ───────────────────────────────────────────────────────────────────────────────
-detect_reinstall() {
-    if [[ -d "/Applications/WisprAlt.app" ]]; then
+enumerate_existing_installs() {
+    FOUND_BUNDLES=()
+    # mdfind newline-separated. Post-filter to exclude:
+    #   /Volumes/*         — mounted DMGs, external drives, Time Machine snapshots
+    #   *Backups.backupdb* — Time Machine local store
+    #   */.Trash/*         — bundles the user already deleted
+    # The post-filter avoids rm-rf'ing things that are not real installs.
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" == /Volumes/* ]] && continue
+        [[ "$line" == *Backups.backupdb* ]] && continue
+        [[ "$line" == */.Trash/* ]] && continue
+        [[ -d "$line" ]] || continue
+        [[ -x "$line/Contents/MacOS/WisprAlt" ]] || continue
+        FOUND_BUNDLES+=("$line")
+    done < <(mdfind "kMDItemCFBundleIdentifier == \"${BUNDLE_ID}\"" 2>/dev/null)
+
+    # Belt-and-suspenders: explicit fallback paths in case Spotlight has them
+    # excluded or hasn't reindexed yet. Append only if not already in
+    # FOUND_BUNDLES.
+    local p
+    for p in "/Applications/WisprAlt.app" "$HOME/Applications/WisprAlt.app"; do
+        [[ -d "$p" ]] || continue
+        [[ -x "$p/Contents/MacOS/WisprAlt" ]] || continue
+        local already=0
+        local b
+        for b in "${FOUND_BUNDLES[@]}"; do
+            [[ "$b" == "$p" ]] && already=1 && break
+        done
+        (( already == 0 )) && FOUND_BUNDLES+=("$p")
+    done
+
+    # v3: third orphan-discovery source via `find`. Catches WisprAlt copies in
+    # non-canonical user paths (~/Downloads, ~/Desktop, ~/Applications) that
+    # Spotlight hasn't indexed yet (fresh download, indexing disabled, etc).
+    # Depth-3 cap so we don't crawl deep trees. /Applications already covered
+    # above; this widens to user-writeable directories.
+    local found
+    while IFS= read -r found; do
+        [[ -z "$found" ]] && continue
+        [[ -d "$found" ]] || continue
+        [[ -x "$found/Contents/MacOS/WisprAlt" ]] || continue
+        local already=0
+        local b
+        for b in "${FOUND_BUNDLES[@]}"; do
+            [[ "$b" == "$found" ]] && already=1 && break
+        done
+        (( already == 0 )) && FOUND_BUNDLES+=("$found")
+    done < <(find "$HOME/Downloads" "$HOME/Desktop" "$HOME/Applications" \
+        -maxdepth 3 -name "WisprAlt*.app" -type d 2>/dev/null)
+
+    if (( ${#FOUND_BUNDLES[@]} > 0 )); then
         IS_REINSTALL=1
-        info "Existing WisprAlt detected — will replace it."
+        info "Found ${#FOUND_BUNDLES[@]} existing WisprAlt install(s):"
+        local b
+        for b in "${FOUND_BUNDLES[@]}"; do
+            info "  - $b"
+        done
     fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# should_skip_install — idempotency early-exit. Returns 0 (skip) ONLY when:
+#   1 found bundle, AT /Applications/WisprAlt.app, no running instance, and
+#   CFBundleShortVersionString matches the target release. Saves a TCC reset
+#   on no-op re-runs while still healing a hung/duplicate situation.
+# ───────────────────────────────────────────────────────────────────────────────
+should_skip_install() {
+    # Only valid as a check AFTER fetch_release_metadata.
+    (( ${#FOUND_BUNDLES[@]} == 1 )) || return 1
+    [[ "${FOUND_BUNDLES[0]}" == "/Applications/WisprAlt.app" ]] || return 1
+    # v3: also require no running instance. If the canonical app is running we
+    # still want to kill+replace so a hung process doesn't survive the no-op.
+    pgrep -f "co.wispralt.WisprAlt" >/dev/null 2>&1 && return 1
+    local installed
+    installed="$(defaults read /Applications/WisprAlt.app/Contents/Info CFBundleShortVersionString 2>/dev/null || true)"
+    local target="${RELEASE_TAG#v}"
+    [[ -n "$installed" && "$installed" == "$target" ]]
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# quit_all_installs — graceful AppleScript-quit by bundle id, then escalate to
+# SIGTERM and finally SIGKILL. Narrow pkill/pgrep pattern (co.wispralt.WisprAlt,
+# NOT co.wispralt) so we don't accidentally kill the mini's wispralt_server or
+# cloudflared processes on a dev box running both client and server.
+# ───────────────────────────────────────────────────────────────────────────────
+quit_all_installs() {
+    (( ${#FOUND_BUNDLES[@]} > 0 )) || return 0
+    info "Quitting running WisprAlt instances (graceful)..."
+    # Graceful AppleScript-quit by bundle id — works regardless of bundle path.
+    osascript -e "tell application id \"${BUNDLE_ID}\" to quit" 2>/dev/null || true
+    # v3: give Terminal.app time to receive its `do script` Apple Event before
+    # we kill the WisprAlt parent that spawned us. macOS cold-launches Terminal
+    # in 2-5s; 2.5s is the sweet spot between snappy and reliable.
+    sleep 2.5
+    # Grace window. Poll for any binary still running with our bundle id pattern.
+    local i
+    for i in 1 2 3 4; do
+        # pgrep -f matches against full command path.
+        pgrep -f "co.wispralt.WisprAlt" >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    # Hard kill for stragglers.
+    warn "Sending SIGTERM to remaining WisprAlt processes..."
+    pkill -TERM -f "co.wispralt.WisprAlt" 2>/dev/null || true
+    sleep 1
+    if pgrep -f "co.wispralt.WisprAlt" >/dev/null 2>&1; then
+        warn "Sending SIGKILL to remaining WisprAlt processes..."
+        pkill -KILL -f "co.wispralt.WisprAlt" 2>/dev/null || true
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# remove_all_installs — rm -rf every bundle enumerate_existing_installs found.
+# Warns (does not die) on individual failures so a single locked bundle doesn't
+# block the rest of the cleanup.
+# ───────────────────────────────────────────────────────────────────────────────
+remove_all_installs() {
+    local b
+    for b in "${FOUND_BUNDLES[@]}"; do
+        info "Removing $b ..."
+        rm -rf "$b" || warn "Could not remove $b (continuing)."
+    done
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# sweep_launch_agents — unload + delete any co.wispralt*.plist in the user
+# LaunchAgents dir. Defensive: the current client app does NOT install plists
+# (LoginItem is via SMAppService), but a stale plist from a past version or
+# third-party tooling would still resurrect a dead bundle path. EXCLUDES the
+# mini's co.wispralt.server and co.wispralt.cloudflared plists which only
+# exist on the server host, not on a client install.
+# ───────────────────────────────────────────────────────────────────────────────
+sweep_launch_agents() {
+    local agent_dir="$HOME/Library/LaunchAgents"
+    local plist
+    shopt -s nullglob
+    for plist in "$agent_dir"/co.wispralt*.plist; do
+        info "Unloading + removing $(basename "$plist") ..."
+        launchctl unload "$plist" 2>/dev/null || true
+        rm -f "$plist" 2>/dev/null || true
+    done
+    shopt -u nullglob
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -181,29 +325,11 @@ download_and_verify() {
 install_bundle() {
     local app_path="/Applications/WisprAlt.app"
     local mount_point="/tmp/wispralt-mount.$$"
-    local lock_dir="/tmp/wispralt-install.lock"
 
-    # mkdir-mutex against concurrent invocations.
-    # The cleanup() function (registered at script top) unconditionally rmdir's
-    # this lock on every exit path — no trap re-register needed, no race window.
-    mkdir "$lock_dir" 2>/dev/null \
-        || die "Another WisprAlt install appears to be in progress (lock at $lock_dir). If stale, remove with: rmdir $lock_dir"
-
-    if (( IS_REINSTALL == 1 )); then
-        info "Stopping running WisprAlt..."
-        pkill -TERM -f "/Applications/WisprAlt.app/Contents/MacOS/WisprAlt" 2>/dev/null || true
-        local i
-        for i in 1 2 3 4; do
-            pgrep -f "/Applications/WisprAlt.app/Contents/MacOS/WisprAlt" >/dev/null 2>&1 || break
-            sleep 0.5
-        done
-        if pgrep -f "/Applications/WisprAlt.app/Contents/MacOS/WisprAlt" >/dev/null 2>&1; then
-            warn "WisprAlt did not exit cleanly — sending SIGKILL."
-            pkill -KILL -f "/Applications/WisprAlt.app/Contents/MacOS/WisprAlt" 2>/dev/null || true
-        fi
-        # Remove old bundle; cp -R into an existing dir nests instead of replacing.
-        rm -rf "$app_path" || die "Could not remove existing $app_path."
-    fi
+    # Note: the install-wide mutex is acquired in main() so it covers BOTH the
+    # skip-install fast path and this full path. The cleanup() trap rmdir's it
+    # on every exit. Discovery / quit / remove all happen in main() before we
+    # get here; install_bundle now just mounts → copies → strips quarantine.
 
     # Defensive: stale mount from a previous failed run.
     hdiutil detach "$mount_point" >/dev/null 2>&1 || true
@@ -361,11 +487,29 @@ print_next_steps() {
 # ───────────────────────────────────────────────────────────────────────────────
 main() {
     preflight
-    detect_reinstall
+    # v3: mutex acquisition moved up so it covers BOTH the skip-install code
+    # path and the full install path. Previously inside install_bundle, which
+    # the skip path bypassed — two concurrent same-version reruns could race
+    # on provision_credentials. cleanup() trap unconditionally rmdir's the
+    # lock on every exit path.
+    local lock_dir="/tmp/wispralt-install.lock"
+    mkdir "$lock_dir" 2>/dev/null \
+        || die "Another WisprAlt install appears to be in progress (lock at $lock_dir). If stale, remove with: rmdir $lock_dir"
+    enumerate_existing_installs       # populates IS_REINSTALL + FOUND_BUNDLES
     fetch_release_metadata
+    if should_skip_install; then
+        info "Already on $RELEASE_TAG at the canonical path with no running instance. Skipping reinstall."
+        provision_credentials         # still write Keychain if WISPRALT_API_KEY was passed
+        open_app_and_verify_launch
+        print_next_steps
+        return 0
+    fi
     download_and_verify
-    install_bundle
-    provision_credentials
+    quit_all_installs                 # AppleScript-quit + 2.5s Terminal-grace + SIGTERM/SIGKILL
+    remove_all_installs               # rm -rf every found bundle
+    sweep_launch_agents               # plus LaunchAgent plists in $HOME/Library/LaunchAgents/
+    install_bundle                    # cp -R into /Applications/ (canonical) — mutex already held
+    provision_credentials             # tccutil reset gated on IS_REINSTALL=1
     open_app_and_verify_launch
     print_next_steps
 }

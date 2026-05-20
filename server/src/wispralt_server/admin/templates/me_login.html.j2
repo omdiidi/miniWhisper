@@ -5,7 +5,7 @@
   <h2>Sign in</h2>
   <p style="margin-top: 0; color: var(--muted); font-size: 13px;">Sign in to view your insights. Paste your WisprAlt token below.</p>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
-  <form method="post" action="/me/login">
+  <form method="post" action="/me/login{% if next %}?next={{ next | urlencode }}{% endif %}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="token">Token</label>
     <input type="password" id="token" name="token" autocomplete="off" autofocus required>

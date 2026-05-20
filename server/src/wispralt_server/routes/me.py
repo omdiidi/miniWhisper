@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
 from wispralt_server import auth as auth_mod
@@ -121,9 +121,71 @@ async def patch_me(
     return _profile_to_response(profile)
 
 
+@router.get("/dictations/last")
+async def me_last_dictation(
+    request: Request,
+    user: User = Depends(require_api_key),
+) -> JSONResponse:
+    """Return the most recent dictation row for the authenticated user.
+
+    Used by the menubar "Copy last dictation" button. The endpoint is
+    employee-scoped: every user gets their OWN last row, never anyone
+    else's. Admin role does not bypass this — admins also see their own
+    last dictation (for cross-user analytics they use /admin/data).
+
+    Returns 404 if the user has zero (non-deleted, non-empty) dictations.
+    Break-glass admin (id < 0) gets 403 — no personal dictation row exists
+    for the env-derived admin.
+    """
+    if user.id < 0:
+        raise HTTPException(403, "Break-glass admin has no personal dictations")
+
+    job_store: JobStore = request.app.state.job_store
+    row = await asyncio.to_thread(
+        job_store.get_most_recent_dictation, user.id,
+    )
+    if row is None:
+        raise HTTPException(404, "No dictations yet")
+
+    return JSONResponse({
+        "id": row["id"],
+        "text": row["text"],
+        "created_at": row["created_at"],
+    })
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2: employee login + insights dashboard (Jinja2-rendered)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _safe_next(raw: str | None) -> str | None:
+    """Sanitize a ?next= URL param for use with /me/login.
+
+    Returns the raw value when it (a) starts with "/me/" AND (b) contains
+    no `..` path segments. Else returns None.
+
+    This prevents both open-redirect and path-traversal browser-normalize
+    bypasses (e.g. "/me/../admin/data" → "/admin/data" after RFC 3986 §5.2.4
+    normalization). Even though require_admin would 403 such requests, we
+    don't want our Location header to carry an attacker-controlled path.
+    """
+    if raw is None:
+        return None
+    if not raw.startswith("/me/"):
+        return None
+    # Defense-in-depth: reject any percent-encoded form of `.` or `/` that
+    # could decode to a path-traversal segment AFTER our check. Belt-and-
+    # suspenders alongside the literal `..` rejection below — protects
+    # against a future `/me/{path:path}` catch-all route being added.
+    lowered = raw.lower()
+    if "%2e" in lowered or "%2f" in lowered:
+        return None
+    # Reject any `..` path segment (path-traversal in URL string form).
+    parts = raw.split("/")
+    if ".." in parts:
+        return None
+    return raw
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -132,6 +194,9 @@ async def me_login_form(request: Request) -> HTMLResponse:
 
     Mints a fresh CSRF token, embeds it in the form, and sets it as a
     short-lived cookie. POST verifies cookie == form via constant-time compare.
+
+    Honors an optional ``?next=`` query param (e.g. ``?next=/me/history``) so
+    the menubar "Open My Dictations" deep-link survives the login round-trip.
     """
     csrf = secrets.token_urlsafe(32)
     response = templates.TemplateResponse(
@@ -142,6 +207,7 @@ async def me_login_form(request: Request) -> HTMLResponse:
             "error": None,
             "hide_chrome": True,
             "csrf_token": csrf,
+            "next": _safe_next(request.query_params.get("next")),
         },
     )
     set_csrf_cookie(response, csrf)
@@ -161,6 +227,7 @@ def _render_me_login_error(
             "error": error,
             "hide_chrome": True,
             "csrf_token": csrf,
+            "next": _safe_next(request.query_params.get("next")),
         },
         status_code=status_code,
     )
@@ -233,7 +300,12 @@ async def me_login_submit(
             request, error="Invalid or revoked token.", status_code=401,
         )
 
-    resp = RedirectResponse(url="/me/insights", status_code=303)
+    # v3: honor ?next= query param for menubar deep-link from "Open My Dictations"
+    # button (lands on /me/history after auth instead of default /me/insights).
+    # Safety: only allow relative same-origin paths under /me/ to prevent
+    # open-redirect AND path-traversal (see _safe_next docstring).
+    next_url = _safe_next(request.query_params.get("next")) or "/me/insights"
+    resp = RedirectResponse(url=next_url, status_code=303)
     # Same cookie name as admin — auth.py:_extract_bearer falls back to it.
     # path="/" so it scopes across /admin/* AND /me/*.
     set_session_cookie(resp, token)

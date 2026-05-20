@@ -55,6 +55,13 @@ struct SettingsView: View {
     @State private var showAdvanced: Bool = false
     @State private var copyFeedback: String?
     @State private var hasStoredAPIKey: Bool = false
+    /// Shown for ~5s when UpdateChecker.triggerInstall() couldn't open Terminal
+    /// (TCC denied / Terminal missing) and fell back to copying the install
+    /// command to the clipboard. Listens for `.updaterFallbackToClipboard`.
+    @State private var updateFallbackToastVisible: Bool = false
+    /// Shown for ~5s when the user pressed "Install now…" while a meeting was
+    /// recording. Listens for `.updaterMeetingActive`.
+    @State private var updateMeetingActiveToastVisible: Bool = false
 
     // Identity (display_name) editing state. Tri-state Optional<String> fixes the
     // snap-back bug:
@@ -86,6 +93,7 @@ struct SettingsView: View {
             meetingsFolderSection
             advancedToggleSection
             if showAdvanced {
+                updateSection
                 serverSection
                 apiKeySection
                 apiKeyExportImportSection
@@ -281,6 +289,67 @@ struct SettingsView: View {
                 Text(msg)
                     .font(.caption)
                     .foregroundStyle(.green)
+            }
+        }
+    }
+
+    /// Update awareness — shows "Update available: vX.Y.Z" + Install button when
+    /// `Settings.shared.updateAvailable` is set; otherwise shows the current
+    /// version + a manual "Check for updates" button. Set by UpdateChecker.
+    private var updateSection: some View {
+        Section("Updates") {
+            if let remote = settings.updateAvailable {
+                HStack {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Update available: v\(remote)")
+                        .font(.body.weight(.medium))
+                    Spacer()
+                    Button("Install now…") {
+                        UpdateChecker.shared.triggerInstall()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                }
+                Text("Opens Terminal to download and install the latest WisprAlt. The current version will quit during the install.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack {
+                    Text("You're on v\(Self.appVersionString)")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Check for updates") {
+                        Task { await UpdateChecker.shared.check(force: true) }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            if updateFallbackToastVisible {
+                Text("Couldn't open Terminal — install command copied to clipboard. Paste it into a new Terminal window.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .transition(.opacity)
+            }
+            if updateMeetingActiveToastVisible {
+                Text("Finish your current meeting recording before installing — the installer will quit the app.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .transition(.opacity)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .updaterFallbackToClipboard)) { _ in
+            updateFallbackToastVisible = true
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
+                updateFallbackToastVisible = false
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .updaterMeetingActive)) { _ in
+            updateMeetingActiveToastVisible = true
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
+                updateMeetingActiveToastVisible = false
             }
         }
     }
@@ -720,6 +789,21 @@ private struct QuickActionsSection: View {
 
     var body: some View {
         Section {
+            // v0.5.0: surface most-recent server-persisted dictation so the
+            // user can re-paste it without rummaging through the portal.
+            Button("Copy last dictation", systemImage: "doc.on.clipboard") {
+                performLastDictationCopy()
+            }
+            .buttonStyle(.bordered)
+            .help("Copies the text of your most recent persisted dictation. May lag your current dictation by a second or two while it finalizes server-side.")
+
+            if let toast = copyToast, toast.button == "last-dictation" {
+                Text(toast.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
+
             // Active-job banner / indicator row. Embedded at the top of the
             // section so progress is the first thing the user sees when they
             // open the popover during a transcription. Only visible when an
@@ -816,6 +900,25 @@ private struct QuickActionsSection: View {
                 settings.serverURL == nil
                     ? "Set a Server URL under Advanced first."
                     : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
+            )
+
+            // v0.5.0: deep-link through /me/login?next=/me/history so first-time users
+            // land directly on their history after auth.
+            Button("Open My Dictations", systemImage: "list.bullet.rectangle") {
+                guard let base = settings.serverURL else { return }
+                var comps = URLComponents(url: base.appendingPathComponent("me/login"),
+                                          resolvingAgainstBaseURL: false)
+                comps?.queryItems = [URLQueryItem(name: "next", value: "/me/history")]
+                guard let url = comps?.url else { return }
+                NSWorkspace.shared.open(url)
+                Log.info("Opened /me/login?next=/me/history: \(url.absoluteString)", category: "settings")
+            }
+            .buttonStyle(.bordered)
+            .disabled(settings.serverURL == nil)
+            .help(
+                settings.serverURL == nil
+                    ? "Set a Server URL under Advanced first."
+                    : "Opens your personal dictation + meeting history in the browser."
             )
         }
         .onAppear {
@@ -1017,6 +1120,29 @@ private struct QuickActionsSection: View {
             }
         }
     }
+
+    private func performLastDictationCopy() {
+        Task { @MainActor in
+            do {
+                let last = try await LastDictationAPI.fetch()
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(last.text, forType: .string)
+                copyToast = ("last-dictation", "Copied — \(last.text.count.formatted(.number)) chars")
+            } catch ServerError.server(status: 404, _) {
+                copyToast = ("last-dictation", "No dictations yet — say something first.")
+            } catch ServerError.server(status: 403, _) {
+                copyToast = ("last-dictation", "Break-glass admin has no personal dictations.")
+            } catch ServerError.unauthorized {
+                copyToast = ("last-dictation", "API key rejected.")
+            } catch {
+                Log.warning("Copy-last-dictation failed: \(error)", category: "settings")
+                copyToast = ("last-dictation", "Couldn't fetch — try again.")
+            }
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            if copyToast?.button == "last-dictation" { copyToast = nil }
+        }
+    }
 }
 
 // MARK: - ServerLogSheet
@@ -1079,6 +1205,13 @@ private struct ServerLogSheet: View {
         defer { isLoading = false }
         do {
             logText = try await MeetingAPI.fetchServerLog(JobID(raw: raw))
+        } catch let error as ServerError {
+            if case .server(let status, _) = error, status == 403 {
+                loadError = "Server logs are admin-only. Ask your administrator for help."
+            } else {
+                loadError = "Failed to fetch log: \(error.localizedDescription)"
+            }
+            Log.warning("ServerLogSheet fetch failed: \(error)", category: "ui")
         } catch {
             loadError = "Failed to fetch log: \(error.localizedDescription)"
             Log.warning("ServerLogSheet fetch failed: \(error)", category: "ui")
