@@ -255,6 +255,88 @@ Cloudflare's free / pro / business plans cap inbound request bodies at **100 MB*
 
 The first dictation request after server start is slower (300ms–2s extra) due to MLX Metal kernel JIT compilation. The warmup pass in `ParakeetService.load()` runs at startup to front-load this cost.
 
+---
+
+## Streaming dictation (opt-in, experimental)
+
+**Goal.** Drop *perceived* latency on long dictations (≥8 s of speech) by transcribing silence-bounded chunks **during** recording rather than uploading the full WAV at FN release. Wall-clock total Parakeet work is unchanged — the win is that by the time the user lifts FN, most chunks have already been transcribed and only the tail needs to clear the wire. Honest p50 reduction on the M4 mini is ~30–45% for utterances above the bypass threshold; short utterances bypass streaming entirely and use the existing single-shot path so they pay zero cost for the feature being available.
+
+This whole feature is **off by default** and additive. Every existing dictation contract (route shape, response envelope, persistence semantics, fallback ladder) is preserved bit-identically when the toggle is off and when the `X-Client-Dedup-Id` header is absent — see [Validation gates §4–6 in the plan](../tmp/ready-plans/2026-05-18-streaming-dictation-chunks.md#validation-gates) for the byte-identity test that locks this in.
+
+### Opt-in surface
+
+`Settings.streamingDictation` (UserDefaults, default `false`). Toggled from the menubar Settings popover. Two further client-side bypasses ensure the streaming path only runs when it can win:
+
+- **Speech-length bypass.** If `EnergyVAD` reports cumulative voiced-frame time `< 8 s` at FN release, `DictationRecorder` discards any pending streaming session and uploads the full WAV via the existing `DictationAPI.transcribe` ladder. Short dictations would not amortize the streaming protocol's session-open + chunk-overhead round-trips.
+- **Bootstrap bypass.** If the first chunk has not been emitted by FN release (e.g. the speaker never paused), the recorder falls through to the single-shot path. The streaming session that was opened on FN press but never advanced is left to the server-side sweeper (900 s TTL).
+
+### Client architecture
+
+| Component | File | Responsibility |
+|---|---|---|
+| Energy VAD | `client/WisprAlt/Capture/EnergyVAD.swift` | Pure-Swift RMS-based detector. Hysteresis (separate enter-voice / leave-voice thresholds) prevents flapping; a rolling noise floor (last ~1.5 s of minimum RMS) lets the gate self-calibrate to mic + room. 30 s hard cap on a single voiced run forces a chunk cut even if the speaker never pauses. Minimum-chunk gating drops chunks below `minChunkFrames` or whose average RMS is under `minChunkAverageDB` so silence-only or single-cough chunks never round-trip. |
+| Streaming session actor | `client/WisprAlt/Server/DictationStreamSession.swift` | Owns one session's `UUID` (`sid`), `chunkIndex`, `clientDedupID`, and a long-lived `URLSession`. Mints `sid` lazily on the first chunk POST; chunks POSTed in order to `/transcribe/dictate/stream/{sid}/chunk/{i}`; FN release flushes the tail via `/finalize`. Falls back silently to `DictationAPI.transcribe` on any chunk 4xx/5xx or stream error — the safety buffer (see below) means the full WAV is always available locally. |
+| Recorder integration | `client/WisprAlt/Capture/DictationRecorder.swift` | Streaming-only branch added inside the tap callback. Voiced frames accumulate in a sliding window; on a silence cut the recorder hands the cut WAV (and its starting sample offset) to the active `DictationStreamSession`. The non-streaming branch is unchanged — same `AVAudioEngine`, same Int16 PCM in-memory WAV at FN release. |
+| Safety buffer | `client/WisprAlt/Capture/DictationRecorder.swift` | A **separate full-utterance WAV** is always written in parallel to the chunked stream. If `DictationStreamSession.finalize` fails or times out, the recorder reverts to the existing 3-attempt fallback ladder (origin → retry → OpenRouter cloud-fallback) on the safety WAV. The user-facing failure mode never gets worse than today. |
+
+### Server architecture
+
+The server side is intentionally small and lives in two new modules:
+
+- `server/src/wispralt_server/dictate/streaming_session.py` hosts `StreamingSession` (dataclass: `sid`, `api_key_id`, `status ∈ {active, finalizing, done, aborted, expired}`, `partial_texts: list[str | None]`, `pending_tasks: dict[int, asyncio.Task]`, `cumulative_audio_ms`, `last_seen`, `lock: asyncio.Lock`) and `StreamingSessionStore` (the in-process registry).
+- `server/src/wispralt_server/routes/dictate_stream.py` exposes the two HTTP surfaces. See [API.md → `POST /transcribe/dictate/stream/...`](API.md#post-transcribedictatestreamsession_idchunkindex) for wire-level details.
+
+**Capacity caps (in-process, intentionally tight):**
+
+- **2 active sessions globally.** Returns `503 capacity_exceeded` on the 3rd open. Sized to match the mini's single-Parakeet-executor reality plus one buffer slot.
+- **1 active session per `api_key_id`.** Returns `409 per_user_busy` if the same user opens a second session while their first is still active. Forces clients to either reuse the existing `sid` (idempotent — `open_or_get` returns `existing`) or wait for the prior `finalize` to land.
+- **270 s cumulative voiced audio mid-chunk; 300 s at finalize.** Mid-chunk cap → `413`. Finalize cap → `413`. Keeps any single session inside Parakeet's comfortable VRAM working-set even under HOL contention.
+- **900 s session TTL.** A background sweeper task (`_streaming_sweeper`) reaps any session whose `last_seen` is older than 900 s, regardless of status. On reap, pending chunk tasks are cancelled and the slot is freed.
+- **15 s finalize timeout.** `finalize` waits up to 15 s for all `pending_tasks` to drain before snapshotting `partial_texts`, joining, and running Mercury. Past 15 s the route returns `504 timeout` and the session is marked `aborted`; the client safety buffer kicks in.
+
+**Single Parakeet executor (no second instance).** Every chunk task is submitted to the same `ParakeetService` `run_in_executor` that `/transcribe/dictate` uses. There is no second model load, no second executor, no second thread pool. This means cross-session head-of-line blocking exists on a shared queue — see Known limitations below. With the 2-session cap, the worst case is 2 chunks contending and is acceptable for the experimental rollout.
+
+**Mercury runs once on joined text.** Each chunk's Parakeet output goes into `partial_texts[index]`. On `finalize` the texts are joined with `" "` separators and Mercury 2 cleanup runs ONCE on the joined string — same Mercury client, same `SMART_FORMAT_MIN_WORDS` threshold, same length-window safety rail as the single-shot path. There is no per-chunk Mercury call: it would (a) cost N× more OpenRouter budget, (b) produce visible seam artifacts because Mercury sometimes capitalizes / repunctuates the first word, and (c) defeat the purpose of streaming since the user's last word lands ~Mercury-RTT after the tail arrives anyway.
+
+### Idempotency
+
+Both the streaming-finalize path and the fallback path (cloud or local retry) write to the SAME `dictations` row by reusing one `client_dedup_id` UUID v4 per utterance:
+
+- The client mints `clientDedupID` once when `DictationStreamSession` opens.
+- `POST /finalize` sends it as a form field; the route calls `JobStore.insert_dictation(..., client_dedup_id=...)`.
+- If finalize fails and the safety-buffer fallback wins, the same UUID is sent to `POST /transcribe/dictate` via the additive `X-Client-Dedup-Id` header (and into `DictationFallbackQueue` if that path takes cloud-fallback).
+- The `idx_dictations_client_dedup` **partial unique index** (`WHERE client_dedup_id IS NOT NULL`, see `jobs/store.py`) combined with `ON CONFLICT (client_dedup_id) DO NOTHING` guarantees **at most one row per utterance** no matter which path wins.
+- When `X-Client-Dedup-Id` is absent (today's non-streaming clients, and `/v1/audio/transcriptions`), the column stays NULL and the partial index has no effect — backward compatibility is bit-identical.
+
+### Honest fallback latency
+
+The latency story when streaming wins is the §"Latency Budget (Dictation)" table above, minus the chunks that were already on the wire. The latency story when streaming **loses** is today's full ladder plus a small detection budget:
+
+- Up to 15 s waiting on `finalize` to drain pending chunks (the cap).
+- ~50 ms client-side fallback dispatch + safety-buffer reload.
+- The full existing 3-attempt ladder runs as it does today on the safety WAV.
+
+The safety buffer is always written, so a streaming failure costs the user **at worst** their normal single-shot latency + ≤15 s detection time. There is no path where a streaming failure produces a *worse* response than today's offline single-shot does.
+
+### Known limitations
+
+- **Cross-session head-of-line blocking on the shared executor.** With the 2-session global cap, session B's first chunk waits behind session A's in-flight chunk. At 2 sessions this is bounded and acceptable; raising the cap will require either a dedicated streaming executor or a smaller `parakeet-mlx` instance. Out of scope for v1.
+- **`duration_ms` semantics drift.** On streaming rows, the persisted `duration_ms` reflects *cumulative* per-chunk inference time (sum of N Parakeet calls), not single-pass wall-clock. The single-shot path persists single-pass wall clock. Both are still useful as "server CPU spent on this utterance" but cannot be compared 1:1 across rows. The `audio_duration_s` column proposed in seq-17 carryovers (still deferred) would resolve this by separating audio length from inference cost.
+- **In-process state.** The store is intentionally in-process — no Redis, no disk persistence. On a server restart, every active session is lost; the next chunk POST gets `410 session_not_found` and the client falls back. Acceptable because (a) restarts are rare, (b) the safety buffer always recovers the user-visible outcome, and (c) the dedup id keeps the row count to exactly one.
+- **No streaming on `/v1/audio/transcriptions`.** The OpenAI-compatible shim is sync-only; streaming dictation is a WisprAlt-native feature that requires the additive header + session URL shape.
+
+### Where this connects
+
+| Concern | File:line landmark |
+|---|---|
+| Endpoint registration | `main.py` lifespan after `parakeet_service.load()`; `include_router(dictate_stream_routes.router)` after `dictate.router` and before `dev_faults.router` |
+| Sweeper lifecycle | `main.py` lifespan creates `_streaming_sweeper` task; shutdown cancels + aborts active sessions before mercury teardown |
+| Per-session lock contract | `streaming_session.py` — every reader/writer of `status / partial_texts / pending_tasks / last_seen / cumulative_audio_ms` acquires `session.lock` before mutating; `finalize` snapshots under lock before releasing for the `asyncio.gather` await |
+| Dedup-id persistence | `jobs/store.py` — `dictations.client_dedup_id` column + `idx_dictations_client_dedup` partial-unique index (added in Plan A, reused here) |
+| Header passthrough on non-streaming | `routes/dictate.py` — additive read of `X-Client-Dedup-Id` (UUID v4 form), forwarded to `insert_dictation(..., client_dedup_id=...)` |
+
+---
+
 ### Meeting Upload Latency
 
 A 1-hour dual-channel 16kHz Float32 WAV is approximately 460 MB. At 100 Mbps symmetric: ~37 seconds upload alone. `RecordingIndicatorView` shows three explicit states with progress: **Uploading (%)** via `URLSession` upload-progress callbacks, then **Processing** (server pipeline), then **Done**.

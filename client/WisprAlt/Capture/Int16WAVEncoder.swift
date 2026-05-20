@@ -136,7 +136,56 @@ enum Int16WAVEncoder {
         }
 
         return makeWAV(
-            samples: pcm,
+            int16Samples: pcm,
+            sampleRate: UInt32(sampleRate.rounded()),
+            channels: UInt16(channelCount)
+        )
+    }
+
+    /// Encodes an in-memory buffer of INTERLEAVED Float32 audio samples to a
+    /// 16-bit PCM WAV `Data` blob, skipping any disk I/O.
+    ///
+    /// Sample layout
+    /// -------------
+    /// `frames` is treated as interleaved: sample at position `f * channels + ch`
+    /// is frame `f`, channel `ch`. For mono audio `channels == 1` and layout is
+    /// trivially `[f0, f1, f2, ...]`.
+    ///
+    /// Float→Int16 conversion
+    /// ----------------------
+    /// Identical to `encode(fromFloat32WAVAt:)`:
+    ///   1. Clamp each float to [-1.0, +1.0] (defends against out-of-range floats).
+    ///   2. Multiply by 32767 (symmetric scale; see notes in `encode(...)` for why
+    ///      not 32768).
+    ///   3. Round-half-away-from-zero via the `+0.5 / -0.5` trick.
+    ///   4. Cast to Int16.
+    ///
+    /// Output byte stream is byte-identical to what `encode(fromFloat32WAVAt:)`
+    /// would produce for an equivalent on-disk Float32 WAV at the same sample
+    /// rate and channel count — both paths funnel through `makeWAV(...)`.
+    ///
+    /// - Parameters:
+    ///   - frames: Interleaved Float32 samples in `[-1, +1]` nominal range. May
+    ///     be empty (returns a valid zero-data WAV).
+    ///   - sampleRate: Source sample rate in Hz. Rounded to the nearest UInt32
+    ///     when written into the header.
+    ///   - channels: Channel count (1 = mono, 2 = stereo, …).
+    static func encodeFloat32Frames(_ frames: [Float], sampleRate: Double, channels: Int) -> Data {
+        let channelCount = max(channels, 1)
+        var pcm = [Int16](repeating: 0, count: frames.count)
+        pcm.withUnsafeMutableBufferPointer { dst in
+            frames.withUnsafeBufferPointer { src in
+                for i in 0..<frames.count {
+                    var v = src[i]
+                    if v > 1.0 { v = 1.0 } else if v < -1.0 { v = -1.0 }
+                    let scaled = v * 32767.0
+                    let rounded = (scaled >= 0 ? scaled + 0.5 : scaled - 0.5)
+                    dst[i] = Int16(rounded)
+                }
+            }
+        }
+        return makeWAV(
+            int16Samples: pcm,
             sampleRate: UInt32(sampleRate.rounded()),
             channels: UInt16(channelCount)
         )
@@ -148,7 +197,7 @@ enum Int16WAVEncoder {
     /// single `data` chunk. No `fact`, no extension fields — minimal layout
     /// that every WAV decoder (and the server's soundfile reader) handles.
     private static func makeWAV(
-        samples: [Int16],
+        int16Samples: [Int16],
         sampleRate: UInt32,
         channels: UInt16
     ) -> Data {
@@ -156,7 +205,7 @@ enum Int16WAVEncoder {
         let bytesPerSample: UInt16 = bitsPerSample / 8
         let blockAlign: UInt16 = channels * bytesPerSample
         let byteRate: UInt32 = sampleRate * UInt32(blockAlign)
-        let dataSize: UInt32 = UInt32(samples.count) * UInt32(bytesPerSample)
+        let dataSize: UInt32 = UInt32(int16Samples.count) * UInt32(bytesPerSample)
         let fmtChunkSize: UInt32 = 16
         let riffSize: UInt32 = 4 /* "WAVE" */ + (8 + fmtChunkSize) + (8 + dataSize)
 
@@ -181,12 +230,12 @@ enum Int16WAVEncoder {
         // data chunk
         data.append(contentsOf: "data".utf8)
         data.appendLE(dataSize)
-        samples.withUnsafeBufferPointer { buf in
+        int16Samples.withUnsafeBufferPointer { buf in
             buf.baseAddress?.withMemoryRebound(
                 to: UInt8.self,
-                capacity: samples.count * MemoryLayout<Int16>.size
+                capacity: int16Samples.count * MemoryLayout<Int16>.size
             ) { byteBase in
-                data.append(byteBase, count: samples.count * MemoryLayout<Int16>.size)
+                data.append(byteBase, count: int16Samples.count * MemoryLayout<Int16>.size)
             }
         }
         return data

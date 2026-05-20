@@ -18,6 +18,7 @@ Usage (dev only):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
@@ -84,6 +85,66 @@ async def fault_dictate(
         # are required by Success Criterion #3 (origin response, not
         # tunnel-level).
         raise HTTPException(status_code=503, detail="Auth temporarily unavailable")
+    raise HTTPException(status_code=400, detail=f"Unsupported fault: {fault!r}")
+
+
+@router.post("/transcribe/dictate/stream/{session_id}/chunk/{index}")
+async def fault_stream_chunk(
+    session_id: str,
+    index: int,
+    fault: Annotated[
+        str | None,
+        Query(description="Streaming-chunk fault to inject. Currently supports 'stall'."),
+    ] = None,
+) -> JSONResponse:
+    """Shadow handler for the streaming chunk endpoint.
+
+    Mirrors the existing ``/transcribe/dictate`` shadow above: registered with
+    the same path as the real ``routes/dictate_stream.py`` handler, but
+    ``include_router(dev_faults.router)`` runs AFTER
+    ``include_router(dictate_stream.router)`` in ``main.py`` so the production
+    route wins when no ``?fault=`` query parameter is set.
+
+    Used by streaming-plan Test K: a 20-second sleep (longer than
+    ``STREAMING_FINALIZE_TIMEOUT_S=15``) so the client's per-chunk POST
+    timeout fires and the recorder falls back to the existing dictation
+    ladder.
+    """
+    logger.warning(
+        "DEV FAULT INJECTION: /transcribe/dictate/stream/%s/chunk/%d?fault=%s "
+        "reached. MUST NOT happen in production.",
+        session_id, index, fault,
+    )
+    if fault == "stall":
+        await asyncio.sleep(20)
+        return JSONResponse(
+            {"received_index": index, "queue_depth": 0}, status_code=202
+        )
+    raise HTTPException(status_code=400, detail=f"Unsupported fault: {fault!r}")
+
+
+@router.post("/transcribe/dictate/stream/{session_id}/finalize")
+async def fault_stream_finalize(
+    session_id: str,
+    fault: Annotated[
+        str | None,
+        Query(description="Streaming-finalize fault to inject. Currently supports 'stall'."),
+    ] = None,
+) -> JSONResponse:
+    """Shadow handler for the streaming finalize endpoint. Same precedence
+    contract as ``fault_stream_chunk`` — production route wins by default.
+
+    ``fault=stall`` simulates a server-side hang past the finalize timeout
+    so the recorder's safety-net path activates.
+    """
+    logger.warning(
+        "DEV FAULT INJECTION: /transcribe/dictate/stream/%s/finalize?fault=%s "
+        "reached. MUST NOT happen in production.",
+        session_id, fault,
+    )
+    if fault == "stall":
+        await asyncio.sleep(20)
+        raise HTTPException(status_code=504, detail="Stalled by dev fault")
     raise HTTPException(status_code=400, detail=f"Unsupported fault: {fault!r}")
 
 

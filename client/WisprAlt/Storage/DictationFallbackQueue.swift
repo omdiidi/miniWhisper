@@ -102,8 +102,21 @@ final class DictationFallbackQueue {
     /// Non-throwing on purpose: callers (DictationAPI.callOpenRouter) must
     /// never fail the user's primary "got text" flow because of a queue
     /// hiccup. Internal errors are logged at WARNING and swallowed.
-    func enqueue(text: String, dictatedAt: Date, clientAppVersion: String?) {
-        let id = UUID().uuidString
+    /// - Parameter clientDedupId: When non-nil, used verbatim as the entry's
+    ///   `client_dedup_id` instead of a fresh UUID. The streaming path passes
+    ///   the active session's dedup id here so a rare streaming-finalize-
+    ///   succeeded + HTTP-lost + OpenRouter-fallback path collides with the
+    ///   already-persisted streaming row on the server-side partial unique
+    ///   index (`idx_dictations_client_dedup`) → one row, not two. When nil
+    ///   (today's only call site default) behavior is bit-identical to
+    ///   pre-Phase-2.
+    func enqueue(
+        text: String,
+        dictatedAt: Date,
+        clientAppVersion: String?,
+        clientDedupId: String? = nil
+    ) {
+        let id = clientDedupId ?? UUID().uuidString
         let now = Date().timeIntervalSince1970
         let wordCount = Self.countWords(in: text)
         let entry = Entry(
@@ -156,7 +169,7 @@ final class DictationFallbackQueue {
         // Skip entirely if the user isn't logged in — no token means the
         // server will 401 us anyway. Defer the work to the next foreground
         // trigger.
-        guard let apiKey = try? KeychainHelper.getAPIKey(), let key = apiKey, !key.isEmpty else {
+        guard let key = (try? KeychainHelper.getAPIKey()) ?? nil, !key.isEmpty else {
             Log.debug(
                 "DictationFallbackQueue: no API key configured; skipping drain.",
                 category: "fallback-queue"

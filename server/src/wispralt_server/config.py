@@ -71,6 +71,19 @@ class Settings(BaseSettings):
     # without letting a runaway upload pin the executor.
     dictation_max_duration_s: int = 300
 
+    # Streaming dictation (cut-on-silence chunked transcription). Phase 1, opt-in.
+    # streaming_session_ttl_s: how long an idle streaming session lives before
+    #   the sweeper aborts it (matches the 15-min Phase 0 worst-case dictation).
+    # streaming_max_active: server-wide cap on concurrent streaming sessions —
+    #   protects the single-thread Parakeet executor from queue depth blow-up.
+    # streaming_max_queue_depth: per-session pending chunk cap (excess → 429).
+    # streaming_finalize_timeout_s: max wait inside /finalize for pending +
+    #   tail inference to complete before raising FinalizeTimeout.
+    streaming_session_ttl_s: int = 900
+    streaming_max_active: int = 2
+    streaming_max_queue_depth: int = 6
+    streaming_finalize_timeout_s: int = 15
+
     # Trust CF-Connecting-IP / X-Forwarded-For headers for rate-limit IP extraction.
     # Set to False if exposing FastAPI directly without Cloudflare Tunnel (e.g. LAN testing)
     # to avoid IP spoofing in rate limiting.

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sqlite3
 import time
 
@@ -30,6 +31,12 @@ from ..smart_format.mercury_client import _word_count
 from ..users.store import User
 
 logger = logging.getLogger(__name__)
+
+# Streaming plan §7: optional client-supplied dedup id. Header is absent on
+# the legacy / non-streaming path, in which case behavior stays bit-identical
+# to the pre-streaming code (NULL is silently accepted by the partial unique
+# index).
+_UUID_RE = re.compile(r"^[0-9a-f-]{36}$", re.I)
 
 router = APIRouter()
 
@@ -119,6 +126,11 @@ async def transcribe_dictate(
     # Permissive value parsing: accept "true", "1", "yes" (case-insensitive).
     header_val = request.headers.get("X-Smart-Format", "").strip().lower()
     smart_format_requested = header_val in {"true", "1", "yes"}
+    # Streaming plan §7: optional dedup id. Absent on legacy clients → None →
+    # insert_dictation_idempotent runs the same INSERT as today.
+    client_dedup_id = request.headers.get("X-Client-Dedup-Id")
+    if client_dedup_id is not None and not _UUID_RE.match(client_dedup_id):
+        client_dedup_id = None  # silently ignore malformed → preserve current behavior
     mercury_client = getattr(request.app.state, "mercury_client", None)
     applied_smart_format = False
     smart_format_ms = 0.0
@@ -177,6 +189,7 @@ async def transcribe_dictate(
         captured_text = text
         captured_smart_format = applied_smart_format
         captured_api_key_id = int(user.id)
+        captured_dedup_id = client_dedup_id
 
         async def _persist_dictation() -> None:
             if job_store is None:
@@ -187,12 +200,13 @@ async def transcribe_dictate(
                 # threading.Lock (sync). Calling synchronously from the event
                 # loop would block under SQLite-WAL contention.
                 await asyncio.to_thread(
-                    job_store.insert_dictation,
-                    captured_api_key_id,
-                    captured_text,
-                    captured_inference_ms,
-                    client_version,
-                    captured_smart_format,
+                    job_store.insert_dictation_idempotent,
+                    api_key_id=captured_api_key_id,
+                    text=captured_text,
+                    duration_ms=captured_inference_ms,
+                    client_app_version=client_version,
+                    smart_format_applied=captured_smart_format,
+                    client_dedup_id=captured_dedup_id,
                 )
             except (sqlite3.Error, OSError) as exc:
                 # Narrow typed errors — only the realistic failure modes for

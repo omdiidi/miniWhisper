@@ -271,6 +271,22 @@ async def metrics(request: Request) -> JSONResponse:
             "requests_total": observability.request_counter.as_dict(),
             "errors_total": observability.error_counter.as_dict(),
             "latencies": latencies_by_route,
+            # Streaming-dictation observability (additive endpoints under
+            # /transcribe/dictate/stream/*). ``opened`` and ``finalized`` are
+            # scalar monotonic counters; ``aborted`` is keyed by reason so
+            # operators can attribute aborts (timeout | inference_failed |
+            # gap | chunk_failed | ttl_expired | lifespan_shutdown).
+            "streaming": {
+                "sessions_opened_total": (
+                    observability.streaming_sessions_opened_total.value
+                ),
+                "sessions_finalized_total": (
+                    observability.streaming_sessions_finalized_total.value
+                ),
+                "sessions_aborted_total": (
+                    observability.streaming_sessions_aborted_total.as_dict()
+                ),
+            },
             "process_uptime_seconds": round(
                 time.monotonic() - observability.process_started_at_monotonic, 1
             ),

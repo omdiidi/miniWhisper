@@ -77,6 +77,7 @@ struct SettingsView: View {
             connectionSection
             inputMicSection
             smartFormattingSection
+            streamingDictationSection
             hotkeySection
             launchAtLoginSection
             meetingsFolderSection
@@ -335,6 +336,28 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } header: { Text("Quality") }
+    }
+
+    /// Streaming-dictation toggle (Phase 2, experimental). When on, long
+    /// dictations stream chunked audio to the server while the user is
+    /// still speaking so the final transcript lands faster after FN
+    /// release. Short (<8 s) dictations are unaffected — they bypass the
+    /// streaming path entirely. If the optimized path stalls or fails,
+    /// the recorder silently falls back to the standard 3-attempt ladder
+    /// after ~8 s.
+    private var streamingDictationSection: some View {
+        Section {
+            Toggle(
+                "Streaming dictation (experimental — faster for long dictations)",
+                isOn: Binding(
+                    get: { settings.streamingDictation },
+                    set: { settings.streamingDictation = $0 }
+                )
+            )
+            Text("Long dictations finalize faster. If the optimized path stalls, falls back to the standard path after ~8 s.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     /// Input mic picker — applies ONLY to WisprAlt's own dictation. Meeting

@@ -23,6 +23,7 @@ __all__ = [
     "split_channels",
     "resample",
     "safe_resample",
+    "wav_header_duration_ms",
 ]
 
 
@@ -89,6 +90,64 @@ def split_channels(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         ch = audio[:, 0]
         return ch, np.zeros_like(ch)
     raise ValueError(f"Unexpected audio shape: {audio.shape}")
+
+
+def wav_header_duration_ms(audio_bytes: bytes) -> float:
+    """Return WAV audio duration in milliseconds by reading the header only.
+
+    Scans for the ``b"data"`` marker after the RIFF header — does NOT assume a
+    fixed offset because ``sox`` and similar tools may insert ``LIST`` or
+    ``bext`` chunks before the data chunk. Also locates the ``b"fmt "`` chunk
+    earlier in the file to read sample rate, channel count, and bit depth.
+
+    Duration is computed from the data chunk's declared byte size rather than
+    the file length, so trailing chunks (``LIST``, ``id3 ``, ...) after the
+    audio payload are ignored.
+
+    Raises ``CorruptAudioError`` if either marker is missing, the format chunk
+    is too short, or ``bytes_per_frame`` is zero.
+    """
+    if not isinstance(audio_bytes, (bytes, bytearray, memoryview)):
+        raise CorruptAudioError("wav_header_duration_ms: input must be bytes-like")
+    buf = bytes(audio_bytes)
+    if len(buf) < 12 or buf[0:4] != b"RIFF" or buf[8:12] != b"WAVE":
+        raise CorruptAudioError("wav_header_duration_ms: missing RIFF/WAVE header")
+
+    # Locate the `fmt ` chunk. Search starts after the 12-byte RIFF/WAVE header.
+    fmt_pos = buf.find(b"fmt ", 12)
+    if fmt_pos < 0:
+        raise CorruptAudioError("wav_header_duration_ms: missing 'fmt ' chunk")
+    fmt_body_start = fmt_pos + 8  # skip 4-byte marker + 4-byte chunk size
+    if len(buf) < fmt_body_start + 16:
+        raise CorruptAudioError("wav_header_duration_ms: truncated 'fmt ' chunk")
+    # WAVE fmt layout (PCM): audio_format(2) num_channels(2) sample_rate(4)
+    # byte_rate(4) block_align(2) bits_per_sample(2)
+    num_channels = int.from_bytes(buf[fmt_body_start + 2 : fmt_body_start + 4], "little")
+    sample_rate = int.from_bytes(buf[fmt_body_start + 4 : fmt_body_start + 8], "little")
+    bits_per_sample = int.from_bytes(
+        buf[fmt_body_start + 14 : fmt_body_start + 16], "little"
+    )
+
+    # Locate the `data` chunk — may come after `LIST`, `bext`, etc.
+    data_pos = buf.find(b"data", fmt_body_start)
+    if data_pos < 0:
+        raise CorruptAudioError("wav_header_duration_ms: missing 'data' chunk")
+    if len(buf) < data_pos + 8:
+        raise CorruptAudioError("wav_header_duration_ms: truncated 'data' chunk header")
+    data_byte_count = int.from_bytes(buf[data_pos + 4 : data_pos + 8], "little")
+
+    bytes_per_frame = num_channels * (bits_per_sample // 8)
+    if bytes_per_frame == 0:
+        raise CorruptAudioError(
+            f"wav_header_duration_ms: zero bytes_per_frame"
+            f" (channels={num_channels}, bits_per_sample={bits_per_sample})"
+        )
+    if sample_rate <= 0:
+        raise CorruptAudioError(
+            f"wav_header_duration_ms: invalid sample_rate={sample_rate}"
+        )
+
+    return (data_byte_count / bytes_per_frame / sample_rate) * 1000.0
 
 
 def resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:

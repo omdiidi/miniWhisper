@@ -428,6 +428,68 @@ class JobStore:
             )
             return int(cur.lastrowid)
 
+    def insert_dictation_idempotent(
+        self,
+        *,
+        api_key_id: int,
+        text: str,
+        duration_ms: int | None,
+        client_app_version: str | None,
+        smart_format_applied: bool,
+        client_dedup_id: str | None,
+    ) -> int:
+        """Idempotent variant of :meth:`insert_dictation` for the streaming
+        plan's cross-route dedup. When ``client_dedup_id`` is ``None`` the
+        method runs the same INSERT as :meth:`insert_dictation` (no ON
+        CONFLICT clause needed because the partial unique index ignores NULL
+        ids); the behavior is bit-identical to the legacy path. When a dedup
+        id is supplied, the partial unique index ``idx_dictations_client_dedup``
+        enforces dedup; on conflict the existing row's id is returned so
+        callers always get a row id back.
+        """
+        word_count = len(text.split()) if text else 0
+        with self._lock:
+            if client_dedup_id is None:
+                cur = self.con.execute(
+                    "INSERT INTO dictations("
+                    " api_key_id, created_at, duration_ms, text, word_count,"
+                    " client_app_version, smart_format_applied"
+                    ") VALUES(?,?,?,?,?,?,?)",
+                    (
+                        api_key_id,
+                        time.time(),
+                        duration_ms,
+                        text,
+                        word_count,
+                        client_app_version,
+                        1 if smart_format_applied else 0,
+                    ),
+                )
+                return int(cur.lastrowid)
+            self.con.execute(
+                "INSERT INTO dictations("
+                " api_key_id, created_at, duration_ms, text, word_count,"
+                " client_app_version, smart_format_applied, client_dedup_id"
+                ") VALUES(?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(client_dedup_id)"
+                " WHERE client_dedup_id IS NOT NULL DO NOTHING",
+                (
+                    api_key_id,
+                    time.time(),
+                    duration_ms,
+                    text,
+                    word_count,
+                    client_app_version,
+                    1 if smart_format_applied else 0,
+                    client_dedup_id,
+                ),
+            )
+            row = self.con.execute(
+                "SELECT id FROM dictations WHERE client_dedup_id = ?",
+                (client_dedup_id,),
+            ).fetchone()
+            return int(row["id"])
+
     # ── weekly insights (Phase 2) ────────────────────────────────────────────
 
     def upsert_weekly_insight(
@@ -820,6 +882,50 @@ class JobStore:
                     text,
                     word_count,
                     client_app_version,
+                    client_dedup_id,
+                ),
+            )
+            return int(cur.lastrowid) if cur.rowcount > 0 else None
+
+    def insert_streaming_dictation_idempotent(
+        self,
+        *,
+        api_key_id: int,
+        text: str,
+        duration_ms: int | None,
+        client_app_version: str | None,
+        smart_format_applied: bool,
+        client_dedup_id: str,
+        dictated_at: float,
+    ) -> int | None:
+        """Persist one streaming-dictation transcript row using the client's
+        speech-started-at timestamp as ``created_at`` (mirrors the cloud-fallback
+        pattern so the history feed and weekly-insights cron see the event in
+        its true time window).
+
+        Idempotency: ``client_dedup_id`` is required; the partial unique index
+        ``idx_dictations_client_dedup`` enforces dedup. Returns the new row's
+        ``id`` on insert, or ``None`` if a row with the same ``client_dedup_id``
+        already exists (the streaming finalize succeeded but the HTTP response
+        was lost; the recorder's safety-net retry must NOT create a second row).
+        """
+        word_count = len(text.split()) if text else 0
+        with self._lock:
+            cur = self.con.execute(
+                "INSERT INTO dictations("
+                " api_key_id, created_at, duration_ms, text, word_count,"
+                " client_app_version, smart_format_applied, client_dedup_id"
+                ") VALUES(?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(client_dedup_id)"
+                " WHERE client_dedup_id IS NOT NULL DO NOTHING",
+                (
+                    api_key_id,
+                    dictated_at,
+                    duration_ms,
+                    text,
+                    word_count,
+                    client_app_version,
+                    1 if smart_format_applied else 0,
                     client_dedup_id,
                 ),
             )

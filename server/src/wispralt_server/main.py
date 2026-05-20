@@ -46,6 +46,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from wispralt_server import db, observability
 from wispralt_server.config import settings, verify_env_perms
 from wispralt_server.dictate.parakeet import ParakeetService
+from wispralt_server.dictate.streaming_session import (
+    StreamingSessionStore,
+    _streaming_sweeper,
+)
 from wispralt_server.insights.client import InsightsClient
 from wispralt_server.insights.cron import (
     _maybe_catchup,
@@ -60,7 +64,15 @@ from wispralt_server.middleware import openai_errors
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
 from wispralt_server.ops import staging
 from wispralt_server.ops.env_writer import find_env_path
-from wispralt_server.routes import admin, admin_data, admin_ui, dev_faults, dictate, health
+from wispralt_server.routes import (
+    admin,
+    admin_data,
+    admin_ui,
+    dev_faults,
+    dictate,
+    health,
+)
+from wispralt_server.routes import dictate_stream as dictate_stream_routes
 from wispralt_server.routes import me as me_routes
 from wispralt_server.routes import meeting as meeting_routes
 from wispralt_server.routes import telemetry as telemetry_routes
@@ -244,6 +256,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.parakeet_last_inference_at = None
 
     logger.info("WisprAlt server — dictation ready.")
+
+    # 6a. Streaming-dictation session store + sweeper. Additive endpoint set
+    #     at /transcribe/dictate/stream/* — backed by the same Parakeet
+    #     executor, gated by streaming_max_active and per-user single-session
+    #     enforcement (see streaming_session.py). The sweeper aborts idle
+    #     sessions past streaming_session_ttl_s.
+    app.state.streaming_sessions = StreamingSessionStore(
+        max_active=settings.streaming_max_active,
+        max_queue_depth=settings.streaming_max_queue_depth,
+        ttl_s=settings.streaming_session_ttl_s,
+        finalize_timeout_s=settings.streaming_finalize_timeout_s,
+    )
+    streaming_sweeper_task = asyncio.create_task(_streaming_sweeper(app))
+    app.state.streaming_sweeper_task = streaming_sweeper_task
 
     # 6b. Mercury client — fail-soft. If init throws, smart formatting is silently
     #     disabled. Same fail-soft contract as runtime: any error → None return.
@@ -597,6 +623,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError):
             await drainer
 
+    # Streaming-dictation sweeper + active sessions. Cancel the sweeper first
+    # so it stops mutating session state, then walk surviving sessions and
+    # cancel their pending inference tasks under the per-session lock. Any
+    # session still in "finalizing" is honored — its route handler will
+    # eventually flip status itself; we only mark "active" sessions as
+    # aborted on lifespan shutdown.
+    streaming_sweeper: asyncio.Task | None = getattr(
+        app.state, "streaming_sweeper_task", None
+    )
+    if streaming_sweeper is not None and not streaming_sweeper.done():
+        streaming_sweeper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await streaming_sweeper
+    streaming_store: StreamingSessionStore | None = getattr(
+        app.state, "streaming_sessions", None
+    )
+    if streaming_store is not None:
+        for _session in streaming_store.snapshot_all():
+            async with _session.lock:
+                # Skip terminal states ("finalized", "aborted") AND mid-flight
+                # "finalizing" sessions. "finalizing" sessions are still
+                # being processed by their route handler's try/finally — let
+                # them complete cleanly rather than regressing their status.
+                if _session.status not in ("finalized", "aborted", "finalizing"):
+                    observability.streaming_sessions_aborted_total.increment(
+                        "lifespan_shutdown"
+                    )
+                    _session.status = "aborted"
+                    for _task in _session.pending_tasks.values():
+                        _task.cancel()
+
     mercury_client: MercuryClient | None = getattr(app.state, "mercury_client", None)
     if mercury_client is not None:
         try:
@@ -773,6 +830,11 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     # /transcribe/dictate — auth applied per-route via Depends(require_api_key).
     app.include_router(dictate.router)
+    # /transcribe/dictate/stream/* — additive streaming path; same auth as
+    # /transcribe/dictate. CRITICAL ORDERING: registered BEFORE dev_faults
+    # below so the production handlers win when no `?fault=` query param is
+    # set (mirrors the legacy /transcribe/dictate vs dev_faults precedence).
+    app.include_router(dictate_stream_routes.router)
     # /admin/* legacy JSON endpoints (rotate-key, /metrics) — auth per-route.
     app.include_router(admin.router)
     # /admin/* Jinja2 UI: three routers under the same prefix.

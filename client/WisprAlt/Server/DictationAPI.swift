@@ -40,14 +40,83 @@ enum DictationAPI {
 
     // MARK: - Public API
 
-    /// Sends PCM WAV data to `POST /transcribe/dictate` and returns the transcribed text.
-    static func transcribe(_ wavData: Data) async throws -> String {
+    /// Sends PCM WAV data to `POST /transcribe/dictate` and returns the
+    /// transcribed text.
+    ///
+    /// Phase 2 streaming dictation
+    /// ---------------------------
+    /// When the caller passes a recorder whose `streamingEnabledForThisSession`
+    /// snapshot is true AND the recorder reports `streamingArmed == true`
+    /// (i.e. at least one chunk has been registered with the actor), this
+    /// finalizes the in-flight streaming session by POSTing the tail audio
+    /// to `/transcribe/dictate/stream/{sessionId}/finalize` and awaiting all
+    /// pending chunk POSTs.
+    ///
+    /// If the streaming finalize fails for ANY reason (chunk POST error,
+    /// finalize 5xx, timeout, decode error, abort) the session is aborted
+    /// and we fall through to the existing 3-attempt origin → OpenRouter
+    /// ladder, threading the streaming session's `clientDedupId` so the
+    /// fallback row collides with any already-persisted streaming row on
+    /// the server-side partial unique index — exactly one `dictations` row
+    /// per logical dictation regardless of which path won.
+    ///
+    /// The settings snapshot lives on the recorder (not Settings.shared) so
+    /// a mid-recording user toggle cannot orphan a server-side session.
+    static func transcribe(
+        _ wavData: Data,
+        recorder: DictationRecorder? = nil
+    ) async throws -> String {
+        let streamingEnabled = recorder?.streamingEnabledForThisSession ?? false
+        if streamingEnabled,
+           let recorder,
+           recorder.streamingArmed,
+           let session = recorder.streamSession
+        {
+            let dedupId = session.clientDedupId
+            do {
+                let tailWav = Int16WAVEncoder.encodeFloat32Frames(
+                    recorder.tailFrames(),
+                    sampleRate: recorder.inputSampleRate,
+                    channels: Int(recorder.inputChannelCount)
+                )
+                return try await session.finalize(
+                    tail: tailWav,
+                    smartFormat: Settings.shared.smartFormatting
+                )
+            } catch {
+                Log.warning(
+                    "DictationAPI: streaming failed (\(error)); falling back with dedup=\(dedupId).",
+                    category: "fallback"
+                )
+                await session.abort()
+                // Thread the same dedup id through the fallback ladder so the
+                // ON CONFLICT(client_dedup_id) DO NOTHING index collapses a
+                // potential duplicate at server-side ingest.
+                return try await runExistingPath(wavData: wavData, clientDedupId: dedupId)
+            }
+        }
+        // Non-streaming path: bit-identical to today (no dedup id header).
+        return try await runExistingPath(wavData: wavData, clientDedupId: nil)
+    }
+
+    /// VERBATIM port of the pre-Phase-2 transcribe(_:) body — the full
+    /// 3-attempt ladder (origin → retry → OpenRouter). The only additive
+    /// changes are: (a) thread `clientDedupId` into the `X-Client-Dedup-Id`
+    /// header when non-nil; (b) thread the same id into `callOpenRouter`
+    /// for the queue-side dedup.
+    private static func runExistingPath(
+        wavData: Data,
+        clientDedupId: String?
+    ) async throws -> String {
         let boundary = UUID().uuidString
         let body = buildMultipartBody(wavData: wavData, boundary: boundary)
 
         var additionalHeaders: [String: String] = [:]
         if Settings.shared.smartFormatting {
             additionalHeaders["X-Smart-Format"] = "true"
+        }
+        if let id = clientDedupId {
+            additionalHeaders["X-Client-Dedup-Id"] = id
         }
 
         // Attempt 1 — origin.
@@ -84,7 +153,11 @@ enum DictationAPI {
             throw ServerError.server(status: 503, body: "Mac mini offline and no OpenRouter fallback key configured")
         }
 
-        return try await callOpenRouter(wavData: wavData, apiKey: apiKey)
+        return try await callOpenRouter(
+            wavData: wavData,
+            apiKey: apiKey,
+            clientDedupId: clientDedupId
+        )
     }
 
     // MARK: - Origin attempt
@@ -133,7 +206,11 @@ enum DictationAPI {
     ///
     /// Defensive parser: `choices[0].message.content` may come back as a
     /// string OR as a multimodal array `[{type:"text", text:"..."}]`.
-    private static func callOpenRouter(wavData: Data, apiKey: String) async throws -> String {
+    private static func callOpenRouter(
+        wavData: Data,
+        apiKey: String,
+        clientDedupId: String? = nil
+    ) async throws -> String {
         let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
         // gpt-4o-audio-preview returns clean verbatim text when prompted
         // explicitly. Without the prompt it sometimes adds commentary like
@@ -203,7 +280,8 @@ enum DictationAPI {
         DictationFallbackQueue.shared.enqueue(
             text: text,
             dictatedAt: Date(),
-            clientAppVersion: appVersion
+            clientAppVersion: appVersion,
+            clientDedupId: clientDedupId
         )
 
         return text

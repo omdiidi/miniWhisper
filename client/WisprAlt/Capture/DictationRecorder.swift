@@ -107,12 +107,15 @@ final class DictationRecorder {
     /// Path to the in-progress WAV file.
     private var audioFileURL: URL?
 
-    /// Native input sample rate (used for diagnostics).
-    private var inputSampleRate: Double = 0
+    /// Native input sample rate. Internal so the streaming-dictation path
+    /// (`DictationAPI.transcribe`) can encode the tail WAV at the same rate
+    /// as the in-flight chunks.
+    private(set) var inputSampleRate: Double = 0
 
-    /// Native input channel count, captured at start() for diagnostic logs.
-    /// We do NOT downmix client-side — the server averages channels via np.mean.
-    private var inputChannelCount: AVAudioChannelCount = 1
+    /// Native input channel count. Internal for the same reason as
+    /// `inputSampleRate`. We do NOT downmix client-side — the server averages
+    /// channels via np.mean.
+    private(set) var inputChannelCount: AVAudioChannelCount = 1
 
     /// Accumulated frame count, mutated on `ioQueue`.
     /// Diagnostic only — read after the queue has been drained on stop.
@@ -187,6 +190,124 @@ final class DictationRecorder {
     /// every FN press is a much higher cost than the rare false-positive abort.
     private var sessionStartTime: TimeInterval = 0
     private static let configChangeSettleWindow: TimeInterval = 0.1
+
+    // MARK: - Streaming dictation state (Phase 2, opt-in)
+
+    /// VAD state (rolling noise floor, hysteresis flags). Reset at start().
+    private var vadState = EnergyVAD.State()
+
+    /// Total session wall-time in audio milliseconds. Reset at start().
+    private var sessionElapsedMs: Double = 0
+
+    /// Audio milliseconds spent in speech since the last emitted cut. Reset
+    /// at start() and after each cut. Drives the chunkMinSpeechMs /
+    /// chunkHardCapMs gates in EnergyVAD.classify(...).
+    private var speechSinceLastCutMs: Double = 0
+
+    /// Interleaved Float32 samples accumulated since the last cut. Drained
+    /// at cut time into the chunk encoder; remaining samples form the
+    /// finalize-tail payload.
+    private var chunkBuffer: [Float] = []
+
+    /// Monotonically increasing per-session chunk index passed to
+    /// `DictationStreamSession.enqueueChunk(_:index:)`.
+    private var nextLocalIndex: Int = 0
+
+    /// Sum of all chunk audio durations sent so far this session, in
+    /// milliseconds. Used to short-circuit additional cuts once we approach
+    /// the 270 s server-side cumulative cap.
+    private var cumulativeChunkAudioMs: Double = 0
+
+    /// The streaming session for the in-progress recording, or nil when
+    /// streaming is disabled for this session. Surfaced read-only so
+    /// `DictationAPI.transcribe(_:recorder:)` can call `finalize(...)` and
+    /// later `abort()`.
+    private(set) var streamSession: DictationStreamSession?
+
+    /// Off the realtime render thread, sequenced via this serial queue.
+    /// Encodes Float32 frames → Int16 WAV and registers the chunk with the
+    /// streaming session via a tiny Task wrapper + DispatchGroup.wait()
+    /// (registration synchronization — see DictationStreamSession.enqueueChunk
+    /// for the actor-isolation contract).
+    private let chunkEncodeQueue = DispatchQueue(
+        label: "co.wispralt.dictation.chunkEncode",
+        qos: .userInitiated
+    )
+
+    /// Flips true once the first chunk has been registered with the actor.
+    /// Read by `DictationAPI.transcribe(_:recorder:)` as the "streaming has
+    /// actually engaged" gate — sub-8 s dictations never set this and so
+    /// silently take the existing non-streaming ladder.
+    private let streamingArmedAtomic = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    /// SNAPSHOT of `Settings.shared.streamingDictation` at `start()` time.
+    /// Read by `DictationAPI.transcribe(_:recorder:)` so a mid-recording
+    /// toggle by the user cannot orphan an already-open server session.
+    private(set) var streamingEnabledForThisSession: Bool = false
+
+    /// Public accessor for the streamingArmed flag. Reads under the lock.
+    var streamingArmed: Bool { streamingArmedAtomic.withLock { $0 } }
+
+    /// One latency reading captured by MenuBarController after paste
+    /// completes. Phase 4.4 reads `~/Library/Caches/WisprAlt/latency.json`
+    /// for A/B timing without flush-nondeterminism from `Log.info`.
+    struct LatencyReading: Codable, Sendable {
+        let fnRelease: Date
+        let paste: Date
+        let dedupId: String?
+    }
+
+    /// Capped-100-entry FIFO of latency readings. `appendLatencyReading`
+    /// trims as it appends; persistence happens on every append, debounced
+    /// to 1 Hz via `latencyPersistDebounce`.
+    private let latencyRing = OSAllocatedUnfairLock<[LatencyReading]>(initialState: [])
+    private let latencyPersistDebounce = OSAllocatedUnfairLock<Date?>(initialState: nil)
+
+    /// Append a latency reading and (debounced 1 Hz) persist the ring to
+    /// `~/Library/Caches/WisprAlt/latency.json`. Safe to call from any
+    /// thread.
+    func appendLatencyReading(_ r: LatencyReading) {
+        latencyRing.withLock { ring in
+            ring.append(r)
+            if ring.count > 100 { ring.removeFirst() }
+        }
+        persistLatencyRingIfDue()
+    }
+
+    /// Snapshot copy of the latency ring. Used by Phase 4.4 telemetry.
+    func snapshotLatencyReadings() -> [LatencyReading] {
+        latencyRing.withLock { $0 }
+    }
+
+    private func persistLatencyRingIfDue() {
+        let now = Date()
+        let due: Bool = latencyPersistDebounce.withLock { last in
+            if let last, now.timeIntervalSince(last) < 1.0 { return false }
+            last = now
+            return true
+        }
+        guard due else { return }
+        let cachesDir = FileManager.default
+            .urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("WisprAlt", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: cachesDir,
+            withIntermediateDirectories: true
+        )
+        let target = cachesDir.appendingPathComponent("latency.json")
+        let tmp = target.appendingPathExtension("tmp")
+        let readings = latencyRing.withLock { $0 }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(readings) else { return }
+        try? data.write(to: tmp, options: .atomic)
+        try? FileManager.default.removeItem(at: target)
+        try? FileManager.default.moveItem(at: tmp, to: target)
+    }
+
+    /// Trailing-audio frames not yet shipped as a chunk. Encoded into the
+    /// `/finalize` request's `file` part by `DictationAPI.transcribe`.
+    func tailFrames() -> [Float] { chunkBuffer }
 
     // MARK: - Public API
 
@@ -286,6 +407,36 @@ final class DictationRecorder {
         writeError.withLock { $0 = nil }
         stopRequested.withLock { $0 = false }
         floatPeak.withLock { $0 = 0 }
+
+        // === Streaming dictation reset (Phase 2). ===
+        // Reset all per-session streaming state BEFORE the tap fires so
+        // there's no chance a leftover chunkBuffer or vadState from a prior
+        // session pollutes the new one.
+        vadState = EnergyVAD.State()
+        sessionElapsedMs = 0
+        speechSinceLastCutMs = 0
+        chunkBuffer = []
+        nextLocalIndex = 0
+        cumulativeChunkAudioMs = 0
+        streamingArmedAtomic.withLock { $0 = false }
+        // Snapshot Settings ONCE for this session. Mid-recording user toggles
+        // do NOT switch behavior — otherwise a toggle-off could orphan an
+        // already-open server-side session.
+        streamingEnabledForThisSession = Settings.shared.streamingDictation
+        if streamingEnabledForThisSession {
+            // Defensive: a leftover session from a rapid double-tap-FN race
+            // gets aborted here. The Task is fire-and-forget on purpose —
+            // start() is sync (callers expect it), and the rare residual
+            // race (old session POST lands on server before its cancellation
+            // completes) is bounded by the server's per-user single-session
+            // cap which silently falls back on the next recording.
+            if let old = streamSession {
+                Task { await old.abort() }
+            }
+            streamSession = DictationStreamSession(speechStartedAt: Date())
+        } else {
+            streamSession = nil
+        }
 
         // Write directly in the input format. The server (soundfile + librosa)
         // resamples to 16 kHz internally, so we don't need to do it client-side.
@@ -457,6 +608,93 @@ final class DictationRecorder {
                     }
                 }
             }
+
+            // === Streaming dictation (opt-in, Phase 2). =====================
+            // Only emit chunks when streaming was enabled at session start.
+            // The classify/append/cut sequence is intentionally inline on the
+            // tap thread — none of it blocks (no I/O, no locks held across
+            // boundaries) so realtime safety is preserved. WAV encoding and
+            // network registration happen on chunkEncodeQueue (off-thread).
+            if let session = self.streamSession, self.streamingEnabledForThisSession {
+                let vad = EnergyVAD()
+                let event = vad.classify(
+                    buffer: buffer,
+                    state: &self.vadState,
+                    sessionElapsedMs: self.sessionElapsedMs,
+                    speechSinceLastCutMs: self.speechSinceLastCutMs
+                )
+                let bufferMs = Double(buffer.frameLength) / buffer.format.sampleRate * 1000.0
+                self.sessionElapsedMs += bufferMs
+                if self.vadState.inSpeech { self.speechSinceLastCutMs += bufferMs }
+
+                // Always append interleaved Float32 frames to the per-session
+                // buffer; the cut path slices off the leading prefix that
+                // corresponds to the cut offset.
+                self.appendFramesToChunkBuffer(buffer)
+
+                switch event {
+                case .noOp, .speechStart:
+                    break
+                case .cut(let offMs, _):
+                    if self.cumulativeChunkAudioMs > 270_000 {
+                        // Server caps cumulative audio at 270 s. Stop emitting
+                        // chunks; the remaining audio rides the finalize tail.
+                        break
+                    }
+                    let cutSampleCount = Self.framesUpTo(
+                        offsetMs: offMs,
+                        in: self.chunkBuffer,
+                        sampleRate: self.inputSampleRate,
+                        channels: Int(self.inputChannelCount)
+                    )
+                    // Empty/silence guard — never send Parakeet a silent
+                    // buffer (it hallucinates short repeated words).
+                    let minInterleavedSamples =
+                        EnergyVAD.minChunkFrames * Int(self.inputChannelCount)
+                    if cutSampleCount < minInterleavedSamples { break }
+                    let cutFrames = Array(self.chunkBuffer.prefix(cutSampleCount))
+                    if EnergyVAD.averageRmsDB(cutFrames) < EnergyVAD.minChunkAverageDB {
+                        break
+                    }
+                    self.chunkBuffer.removeFirst(cutSampleCount)
+                    let chunkAudioMs = Double(cutSampleCount / Int(self.inputChannelCount))
+                        / self.inputSampleRate * 1000.0
+                    self.cumulativeChunkAudioMs += chunkAudioMs
+                    self.speechSinceLastCutMs = 0
+
+                    // Snapshot the values needed off-thread; the recorder's
+                    // sample rate / channel count won't change mid-session
+                    // (configChange invalidates the tap and aborts), but
+                    // explicit capture is cheaper to reason about.
+                    let sampleRate = self.inputSampleRate
+                    let channels = Int(self.inputChannelCount)
+                    self.chunkEncodeQueue.async { [weak self] in
+                        guard let self else { return }
+                        let idx = self.nextLocalIndex
+                        self.nextLocalIndex += 1
+                        let wav = Int16WAVEncoder.encodeFloat32Frames(
+                            cutFrames,
+                            sampleRate: sampleRate,
+                            channels: channels
+                        )
+                        // SYNCHRONOUS actor registration: the DispatchGroup
+                        // waits until the actor's enqueueChunk(_:index:)
+                        // returns (i.e. inFlight[idx] = t has been set), so
+                        // a subsequent finalize() call sees this chunk in
+                        // the in-flight dict no matter how fast the cuts come.
+                        let group = DispatchGroup()
+                        group.enter()
+                        Task {
+                            await session.enqueueChunk(wav, index: idx)
+                            group.leave()
+                        }
+                        group.wait()
+                        if idx == 0 {
+                            self.streamingArmedAtomic.withLock { $0 = true }
+                        }
+                    }
+                }
+            }
         }
 
         // prepare() warms the audio graph so engine.start() doesn't pay
@@ -554,6 +792,13 @@ final class DictationRecorder {
         // safe to release.
         ioQueue.sync { /* barrier — drain any in-flight writes */ }
 
+        // (4b) Drain chunkEncodeQueue: blocks until every pending Float32 →
+        // Int16 WAV encode + actor registration has completed. Without this,
+        // DictationAPI.transcribe(_:recorder:) could call session.finalize()
+        // before a late chunk has been registered with the actor, dropping
+        // it from the in-flight wait-set.
+        chunkEncodeQueue.sync { /* drain pending chunk encodes + actor registrations */ }
+
         // Tear down the configuration-change observer.
         if let token = configChangeObserver {
             NotificationCenter.default.removeObserver(token)
@@ -647,6 +892,42 @@ final class DictationRecorder {
 
             return data
         }.value
+    }
+
+    // MARK: - Streaming helpers (Phase 2)
+
+    /// Append the tap buffer's planar Float32 samples into `chunkBuffer`
+    /// in interleaved layout (frame * channels + ch). The recorder writes
+    /// `interleaved: false` to disk, but the streaming encoder expects
+    /// interleaved samples — interleaving at append time keeps the cut
+    /// path a simple `prefix(n)` slice.
+    private func appendFramesToChunkBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData else { return }
+        let frameCount = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        chunkBuffer.reserveCapacity(chunkBuffer.count + frameCount * channels)
+        for f in 0..<frameCount {
+            for ch in 0..<channels {
+                chunkBuffer.append(channelData[ch][f])
+            }
+        }
+    }
+
+    /// Convert a cut-offset expressed in **audio milliseconds** to the
+    /// INTERLEAVED-sample count it corresponds to inside `buffer`. One
+    /// audio frame = `channels` interleaved samples, so the math is:
+    ///     frames = floor(offsetMs / 1000 * sampleRate)
+    ///     interleavedSamples = frames * channels
+    /// The result is clamped to `buffer.count` to defend against rounding
+    /// pushing us off the end of the actual sample buffer.
+    private static func framesUpTo(
+        offsetMs: Double,
+        in buffer: [Float],
+        sampleRate: Double,
+        channels: Int
+    ) -> Int {
+        let frames = Int(offsetMs / 1000.0 * sampleRate)
+        return min(frames * channels, buffer.count)
     }
 
     deinit {

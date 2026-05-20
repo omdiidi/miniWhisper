@@ -152,6 +152,53 @@ def _percentile(sorted_values: list[float], q: float) -> float:
 request_counter = ThreadSafeCounter()
 error_counter = ThreadSafeCounter()
 latency_histogram = LatencyHistogram()
+
+
+# ── streaming-dictation counters ─────────────────────────────────────────────
+#
+# Three monotonic counters surfaced via /metrics. ``streaming_sessions_aborted``
+# is keyed by a reason string (timeout | inference_failed | gap | chunk_failed |
+# ttl_expired | lifespan_shutdown) so the operator can attribute aborts.
+# Increments are O(1) and lock-protected.
+
+
+class _MonotonicCounter:
+    """Single-value monotonic counter (no labels). Lock-protected ``increment``
+    and ``value``."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value = 0
+
+    def increment(self, n: int = 1) -> None:
+        with self._lock:
+            self._value += n
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
+class _LabeledCounter:
+    """Counter keyed by a single string label. Lock-protected."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_label: Counter[str] = Counter()
+
+    def increment(self, label: str, n: int = 1) -> None:
+        with self._lock:
+            self._by_label[label] += n
+
+    def as_dict(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._by_label)
+
+
+streaming_sessions_opened_total = _MonotonicCounter()
+streaming_sessions_finalized_total = _MonotonicCounter()
+streaming_sessions_aborted_total = _LabeledCounter()
 # Captured once at module import; the `/metrics` route subtracts from
 # `time.monotonic()` to expose process uptime.
 process_started_at_monotonic: float = _time.monotonic()

@@ -1533,6 +1533,12 @@ extension MenuBarController: FNKeyEventsDelegate {
         // Set idle immediately so the icon stops flashing.
         mode = .idle
 
+        // FN-release wall-clock — captured BEFORE the network round-trip so
+        // the latency ring buffer records "FN-up → paste-done" wall delta
+        // (Phase 4.4 A/B timing). Wall-clock here is intentional — we're
+        // measuring user-perceived latency, not monotonic intervals.
+        let fnReleasedAt = Date()
+
         // Capture the user's intended target window NOW — before the network
         // round-trip (which can take 10-20s on slow uplinks) gives them time
         // to switch focus. TextInjector activates this PID before resolving
@@ -1562,7 +1568,7 @@ extension MenuBarController: FNKeyEventsDelegate {
                 )
 
                 let tNet = clock.now
-                let text = try await DictationAPI.transcribe(wavData)
+                let text = try await DictationAPI.transcribe(wavData, recorder: dictationRecorder)
                 let netMs = (clock.now - tNet).milliseconds
                 Log.debug(
                     "dictation/timing: net_total_ms=\(String(format: "%.1f", netMs)) chars=\(text.count)",
@@ -1578,6 +1584,22 @@ extension MenuBarController: FNKeyEventsDelegate {
                     category: "dictation"
                 )
                 Log.info("Dictation injected: \"\(text.prefix(60))\"", category: "dictation")
+
+                // Phase 4.4 A/B timing — record FN-release → paste-done.
+                // dedupId is only set when the streaming path engaged (≥8 s
+                // dictation with at least one chunk armed); otherwise nil so
+                // Phase 4.4 can bucket streaming vs non-streaming.
+                var dedupId: String? = nil
+                if let s = dictationRecorder.streamSession {
+                    dedupId = s.clientDedupId
+                }
+                dictationRecorder.appendLatencyReading(
+                    DictationRecorder.LatencyReading(
+                        fnRelease: fnReleasedAt,
+                        paste: Date(),
+                        dedupId: dedupId
+                    )
+                )
 
                 // Successful dictation is one of the four PendingUploadsQueue
                 // drain triggers. Detached + utility priority so it doesn't

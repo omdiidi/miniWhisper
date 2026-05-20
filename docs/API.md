@@ -176,6 +176,7 @@ Transcribe a short audio clip using the warm Parakeet model.
 | Header | Values | Default | Notes |
 |---|---|---|---|
 | `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized AND the raw transcript is at or above `SMART_FORMAT_MIN_WORDS` (default 100), the transcript is post-processed by OpenRouter Mercury 2: punctuation, casing, paragraph breaks, light filler removal ("um"/"uh"/repeats), and bullet-list formatting where the speaker is enumerating. Meaning is preserved (no rephrasing, no summarization, no new content). A length-window safety check (cleaned ∈ [0.7×, 1.10×] of raw word count) falls back to raw on suspicious output. Fail-soft: any timeout or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. The native macOS client sets this header when the user toggles "Smart formatting" in Settings. The `/v1/audio/transcriptions` shim never sets it. |
+| `X-Client-Dedup-Id` | UUID v4 string | absent ⇒ off | **Optional, additive (Phase 5b streaming-dictation).** When present, must be a syntactically valid UUID v4. Forwarded to `JobStore.insert_dictation(..., client_dedup_id=...)`; the row participates in the `idx_dictations_client_dedup` partial-unique index, so a subsequent retry that sends the same UUID is silently de-duped (`ON CONFLICT(client_dedup_id) DO NOTHING`). Used by the safety-buffer fallback in `DictationStreamSession` to guarantee at most one persisted row per utterance when a streaming finalize loses to its local fallback. When the header is **absent**, behavior is bit-identical to the pre-streaming contract: the column is left NULL and the partial-unique index never applies. Malformed UUIDs are rejected at the validation boundary (422). |
 
 **Audio format flexibility (server-side resampling):**
 
@@ -216,6 +217,91 @@ Mercury timeout, length-window safety check failed, or Mercury HTTP error.
 | 415 | `Content-Type` is not `audio/*` |
 | 422 | Audio bytes cannot be decoded (corrupt file). Includes `LibsndfileError` and `RuntimeError` raised by `soundfile.read` — the decode boundary in `parakeet.py:_sync_transcribe` converts both to `CorruptAudioError` and the route handler maps them to 422. Regression-locked by `server/tests/test_dictate_corrupt_audio.py`. |
 | 429 | Rate limit exceeded (60 req/min) — includes `Retry-After: 60` header |
+
+---
+
+### `POST /transcribe/dictate/stream/{session_id}/chunk/{index}`
+
+**Auth:** Bearer required. **Break-glass / single-key admin callers are rejected (403)** — streaming dictation requires a real `api_key_id` for per-user session bookkeeping. **Opt-in, experimental** — see [ARCHITECTURE.md → Streaming dictation](ARCHITECTURE.md#streaming-dictation-opt-in-experimental) for the end-to-end design.
+
+Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session. The first chunk for a given `session_id` opens a server-side `StreamingSession`; subsequent chunks reuse it. Chunks run on the same single-instance Parakeet executor as `/transcribe/dictate` — no second model is loaded.
+
+**Path params:**
+
+| Param | Type | Notes |
+|---|---|---|
+| `session_id` | UUID v4 string | Client-generated. Syntactically validated (422 on malformed). The same `session_id` is reused for every chunk + the finalize call. |
+| `index` | integer ≥ 0 | Zero-based monotonic chunk index. Out-of-order arrival is tolerated server-side (first arrival wins the slot via `partial_texts[index]`). |
+
+**Request:** `multipart/form-data` with a single `file` field; `Content-Type: audio/wav` (or `audio/*`).
+
+**Response 202:**
+
+```json
+{ "received_index": 0, "queue_depth": 1 }
+```
+
+`queue_depth` is the count of currently-pending Parakeet tasks for this session (≥1 because the just-ingested chunk is counted). The route returns as soon as the chunk is enqueued — actual Parakeet work runs asynchronously and lands in `partial_texts` when complete.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer token. |
+| 403 | Break-glass admin caller, OR the bearer resolves to an `api_key_id` that does not match the session's owner (recorded at first-chunk open). |
+| 409 | `per_user_busy` — this `api_key_id` already owns a different active session. Either reuse its `session_id` or wait for it to finalize/expire. |
+| 410 | Session is no longer active (status ∈ {finalizing, done, aborted, expired}). The client should fall back to single-shot `/transcribe/dictate` with the safety-buffer WAV. |
+| 413 | Cumulative voiced audio for this session exceeds the 270 s mid-chunk ceiling. (Finalize allows up to 300 s.) |
+| 415 | `Content-Type` is not `audio/*`. |
+| 422 | `session_id` is not a valid UUID v4 OR audio bytes cannot be decoded. |
+| 429 | Per-session pending-task queue depth exceeded (defends against runaway clients). |
+| 503 | `capacity_exceeded` — the global 2-session cap is already saturated. Retry after the other sessions drain, or fall back to single-shot. |
+
+---
+
+### `POST /transcribe/dictate/stream/{session_id}/finalize`
+
+**Auth:** Bearer required; same per-user-owner gate as `/chunk`. **Opt-in, experimental.**
+
+Close out a streaming session. The server waits up to 15 s for all pending chunk tasks to drain, joins their texts in index order, runs Mercury cleanup ONCE on the joined string (same `SMART_FORMAT_MIN_WORDS` threshold + length-window safety rail as the single-shot path), persists the row to `dictations`, and returns the final text. The chunked-receive route stops accepting new chunks for this `session_id` (returns 410) the moment finalize starts.
+
+**Path params:** `session_id` (UUID v4) — same as `/chunk`.
+
+**Request:** `multipart/form-data`
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `file` | UploadFile | Yes | The tail WAV — the trailing speech segment that was still being accumulated when FN was released. `Content-Type: audio/*`. May be empty (zero-byte) if the speaker happened to finish exactly on a silence cut. |
+| `smart_format` | boolean | No | Default `false`. Equivalent to the `X-Smart-Format` header on `/transcribe/dictate`; routed through the same Mercury client. |
+| `client_dedup_id` | UUID v4 | Yes | The same UUID the client will reuse on the safety-buffer fallback if this finalize loses. Persisted to `dictations.client_dedup_id`; combined with the `idx_dictations_client_dedup` partial-unique index, guarantees one row per utterance. |
+| `speech_started_at` | float (Unix epoch, sub-second precision) | Yes | The local wall-clock time the *user* began speaking (NOT FN press) — sent so the server can compute end-to-end latency from speech start to text injection without depending on local clock-sync. Sub-second precision is preserved (don't round to int). |
+
+**Response 200:**
+
+```json
+{
+  "text": "Hello world.",
+  "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
+  "duration_ms": 213.4,
+  "smart_formatted": false
+}
+```
+
+`duration_ms` on streaming rows is **cumulative** per-chunk Parakeet inference time (sum of N chunks), not single-pass wall-clock. See [ARCHITECTURE.md → Known limitations](ARCHITECTURE.md#known-limitations) for the semantic drift versus single-shot dictation rows. The response envelope is otherwise byte-identical to `/transcribe/dictate` so the client's existing decoder is unchanged.
+
+**Errors:**
+
+| Code | Condition |
+|---|---|
+| 401 | Missing or invalid bearer token. |
+| 403 | Bearer's `api_key_id` does not match the session's owner. |
+| 409 | `gap_detected` — `partial_texts` contains a `None` entry between two ingested chunks (a chunk POST landed for index N but index N−1 never arrived). The client should fall back to single-shot. |
+| 410 | Session is not in `status="active"` (already finalizing, done, aborted, or expired). |
+| 413 | Cumulative voiced audio + tail exceeds 300 s. |
+| 415 | Tail `Content-Type` is not `audio/*`. |
+| 422 | `session_id` or `client_dedup_id` is not a valid UUID v4, OR tail audio cannot be decoded. |
+| 502 | `inference_failed` — Parakeet raised on the tail or on a still-pending chunk during the 15 s drain. |
+| 504 | `timeout` — pending chunks did not drain inside 15 s. Session marked `aborted`; client safety-buffer fallback kicks in. |
 
 ---
 
