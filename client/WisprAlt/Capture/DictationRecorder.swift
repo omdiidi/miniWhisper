@@ -636,9 +636,12 @@ final class DictationRecorder {
                 case .noOp, .speechStart:
                     break
                 case .cut(let offMs, _):
-                    if self.cumulativeChunkAudioMs > 270_000 {
-                        // Server caps cumulative audio at 270 s. Stop emitting
-                        // chunks; the remaining audio rides the finalize tail.
+                    // v0.4.3: raised 270_000 → 870_000 (14.5 min). Mirrors the server-side
+                    // dictation_max_duration_s - 30 s tail headroom (900 s cap). Supports
+                    // 10+ minute recordings without the client refusing to emit chunks
+                    // past 4.5 min.
+                    if self.cumulativeChunkAudioMs > 870_000 {
+                        // Stop emitting chunks; remaining audio rides the finalize tail.
                         break
                     }
                     let cutSampleCount = Self.framesUpTo(

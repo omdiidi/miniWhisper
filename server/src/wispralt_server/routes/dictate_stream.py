@@ -116,11 +116,13 @@ async def stream_chunk(
         in_flight = sum(1 for t in session.pending_tasks.values() if not t.done())
         if in_flight >= store.max_queue_depth:
             raise HTTPException(429, "Per-session queue depth exceeded")
-        # Streaming-only mid-recording cap: refuse chunks past 270 s so the
-        # final join still fits inside the 300 s dictation_max_duration_s cap
-        # even with a multi-second tail.
-        if session.cumulative_audio_ms + chunk_duration_ms > 270_000:
-            raise HTTPException(413, "Streaming audio exceeds 270 s cap")
+        # Streaming-only mid-recording cap: leave a 30 s tail-headroom under the
+        # configured dictation_max_duration_s so the final join still fits even
+        # with a multi-second tail. v0.4.3: derives the cap from settings instead
+        # of hardcoding 270_000, so raising dictation_max_duration_s flows through.
+        _stream_chunk_cap_ms = (settings.dictation_max_duration_s - 30) * 1000
+        if session.cumulative_audio_ms + chunk_duration_ms > _stream_chunk_cap_ms:
+            raise HTTPException(413, f"Streaming audio exceeds {_stream_chunk_cap_ms // 1000} s cap")
         session.cumulative_audio_ms += chunk_duration_ms
         session.last_seen = time.time()
 

@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     # attacks (1KB body that decodes to many minutes) and single-thread executor
     # starvation. Default 300s (5 min) — covers realistic long-form dictations
     # without letting a runaway upload pin the executor.
-    dictation_max_duration_s: int = 300
+    dictation_max_duration_s: int = 900   # v0.4.3: raised 300→900s (15 min). Supports the 10-min+ recordings the user wants. Streaming offloads inference during recording so end-to-end finalize stays fast even on long dictations; the fallback path is brutally slow at 10 min (single Parakeet pass ≈3 min) but that's only on the failure ladder, not the normal path.
 
     # Streaming dictation (cut-on-silence chunked transcription). Phase 1, opt-in.
     # streaming_session_ttl_s: how long an idle streaming session lives before
