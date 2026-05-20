@@ -205,6 +205,37 @@
       border-left: 3px solid var(--accent);
     }
     .data-page .leaderboard-row { display: flex; justify-content: space-between; padding: 4px 0; }
+    /* Manual weekly-insights trigger row + button + toast. */
+    .data-page .range-tabs-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .data-page .run-insights-button-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .data-page .run-insights-button[disabled] {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .data-page .run-insights-cost-hint {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .data-page .admin-toast {
+      margin: 8px 0 16px 0;
+      padding: 8px 12px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
   </style>
   <script src="/admin/static/htmx.min.js" defer
           integrity="sha256-4gndpcgjVHnzFm3vx3UOHbzVpcGAi3eS/C5nM3aPtEc="

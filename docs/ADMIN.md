@@ -146,6 +146,77 @@ The macOS menubar **Open Portal** button (renamed from "Open Admin
 Portal" in be720a1) targets `/admin/login`, so a single client build
 serves both roles correctly.
 
+### `GET /admin/data` — Manual insights trigger
+
+The Data tab has a **Run insights now** button at the top-right of the
+range-tabs row, with the muted hint "Costs ~$0.65 per run". Clicking it
+fires `insights.cron.run_weekly_insights` against the **current
+in-progress ISO week** as an admin-initiated, fire-and-forget background
+task. The Sunday 23:00 cron continues to fire unchanged — when it runs,
+it UPSERT-replaces the manual-run rows for the now-complete week, so
+there are no orphan rows.
+
+Source: `routes/admin_data.py:admin_data_run_insights_now` (`POST
+/admin/data/insights/run-now`). API contract:
+[API.md → POST /admin/data/insights/run-now](API.md#post-admindatainsightsrun-now).
+
+**Why use it**
+
+- Spot-check a configuration change without waiting until Sunday.
+- Demo the insight cards for an employee onboarding.
+- Recover from a Sunday miss (uvicorn was down, the cron task crashed,
+  etc.) — clicking re-runs cleanly because the per-user idempotency skip
+  (`cron.py:167-176`) short-circuits OpenRouter calls for users whose
+  rows already exist.
+
+**Cost + budget protection**
+
+Each manual run costs roughly $0.65 (varies with team size and weekly
+transcript volume). The server pre-checks the rolling 30-day insights
+spend against `settings.insights_max_30d_cost_usd` (default $8) BEFORE
+spawning the task — over-cap clicks return a toast like
+`Budget exceeded ($8.12 / $8.00 cap). Run skipped.` instead of silently
+incurring a charge.
+
+**Toast meanings**
+
+| Toast | What it means | What to do |
+|---|---|---|
+| `Insights run started for Wxx. Refresh page in ~1 minute to see results.` | Task spawned successfully. Button switched to `Running…` (disabled). | Wait ~30–60 seconds, then full-page-refresh `/admin/data` to see the new rows in the per-user drill-down. |
+| `Insights unavailable — OPENROUTER_API_KEY not configured.` | `OPENROUTER_API_KEY` env var is unset. No task spawned, no charge. | Set the key in `server/.env`, restart the server, click again. |
+| `Budget exceeded ($X.XX / $Y.YY cap). Run skipped.` | Rolling 30-day spend already over the cap. No task spawned, no charge. | Wait for the rolling window to clear, OR raise `insights_max_30d_cost_usd` in `server/.env` and restart. |
+| `A run is already in progress. Refresh in ~1 minute.` | The lock is held — another manual or scheduled run is mid-flight. The button repaints as `Running…`. | Wait. The lock auto-releases when the in-flight run completes. |
+| `Session expired. Refresh the page and try again.` | The CSRF cookie has expired (30-minute TTL — `auth._CSRF_COOKIE_MAX_AGE_S`). | Refresh the page to mint a new cookie, then click again. |
+
+**Known limitations**
+
+- **Refresh-to-resync model.** The button + toast live OUTSIDE
+  `#insights-body`, so clicking a range tab (Today / 7d / 30d / etc.)
+  does NOT repaint either of them — including not updating
+  `Running…` → enabled when the in-flight run completes. The disabled
+  state is read from `app.state.weekly_insights_lock.locked()` at GET
+  time, so a full-page refresh is the way to re-sync the button after a
+  run finishes. This is intentional per the brief (no polling, no SSE).
+- **Phase 2 team-aggregate display bug.** After a manual run completes,
+  the team-aggregate top-level tiles on `/admin/data` may still show 0
+  across the board — that's a pre-existing display bug being tracked
+  separately, NOT a failure of the manual trigger. The actual rows DID
+  land in `weekly_insights`; confirm by drilling into a specific user
+  via `/admin/data?user_id=N` (the per-user cards render correctly).
+- **SIGTERM mid-run.** Manual-trigger tasks are held in
+  `app.state.weekly_insights_manual_tasks` (a `set[asyncio.Task]`) but
+  are NOT included in the lifespan shutdown's cancel loop — restarting
+  uvicorn (or a `launchctl unload`) mid-run drops the task on the
+  floor. Click the button again post-restart: the per-user idempotency
+  skip means already-processed users are not re-charged, and only the
+  un-processed tail of the team re-uses OpenRouter quota.
+- **Single-process assumption.** `weekly_insights_lock` is
+  process-local. If the deployment ever scales to multiple uvicorn
+  workers, the lock-based UX disable will stop working (two workers
+  would each show the button as enabled while the other is running).
+  The double-billing safety still holds via the per-user idempotency
+  skip.
+
 ### `GET /admin/usage` — Usage drill-down
 
 Filters: `kind` (e.g. `dictate`, `meeting`), `status` (HTTP status),

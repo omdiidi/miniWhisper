@@ -1,0 +1,29 @@
+{# Run-insights button + cost hint.
+
+   Used inline in `data.html.j2` (initial render via `{% include %}`) AND as
+   the OOB swap target in the POST handler's HTMLResponse body.
+
+   `oob` defaults to false so the initial include — which doesn't pass `oob`
+   — doesn't crash if the Jinja env ever switches to StrictUndefined.
+
+   Wrapper id `admin-run-insights-button` MUST match the POST response's
+   `hx-swap-oob="outerHTML"` id for the OOB swap to land. #}
+{% set oob = oob | default(false) %}
+{% set running = running | default(false) %}
+<div id="admin-run-insights-button"
+     {% if oob %}hx-swap-oob="outerHTML"{% endif %}
+     class="run-insights-button-wrap">
+  {% if running %}
+    <button class="run-insights-button" disabled>Running…</button>
+  {% else %}
+    <button class="run-insights-button"
+            hx-post="/admin/data/insights/run-now"
+            hx-vals='{"csrf_token": "{{ csrf_token }}"}'
+            hx-target="#admin-run-insights-toast"
+            hx-swap="innerHTML"
+            hx-target-403="#admin-run-insights-toast">
+      Run insights now
+    </button>
+  {% endif %}
+  <span class="run-insights-cost-hint">Costs ~$0.65 per run</span>
+</div>

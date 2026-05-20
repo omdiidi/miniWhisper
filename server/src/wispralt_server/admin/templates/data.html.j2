@@ -8,20 +8,32 @@
     {% if target_user %}— {{ target_user.label }}{% endif %}
   </h2>
 
-  <nav x-data="{ active: '{{ range }}' }"
-       @range-changed.window="active = $event.detail"
-       class="range-tabs">
-    {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
-      <button :class="active === '{{ r }}' ? 'active' : ''"
-              @click="active = '{{ r }}'"
-              hx-get="/admin/data?range={{ r }}{% if user_id %}&user_id={{ user_id }}{% endif %}"
-              hx-target="#insights-body"
-              hx-swap="innerHTML"
-              hx-push-url="true">
-        {{ TAB_LABELS[r] }}
-      </button>
-    {% endfor %}
-  </nav>
+  <div class="range-tabs-row">
+    <nav x-data="{ active: '{{ range }}' }"
+         @range-changed.window="active = $event.detail"
+         class="range-tabs">
+      {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
+        <button :class="active === '{{ r }}' ? 'active' : ''"
+                @click="active = '{{ r }}'"
+                hx-get="/admin/data?range={{ r }}{% if user_id %}&user_id={{ user_id }}{% endif %}"
+                hx-target="#insights-body"
+                hx-swap="innerHTML"
+                hx-push-url="true">
+          {{ TAB_LABELS[r] }}
+        </button>
+      {% endfor %}
+    </nav>
+    {# Manual insights trigger (top-right). Sibling of <nav>, so the
+       range-tab HTMX swap (target #insights-body) does NOT repaint it —
+       intentional per brief (no polling; refresh-to-resync). #}
+    {% with running = weekly_insights_running %}
+      {% include "_admin_run_insights_button.html.j2" %}
+    {% endwith %}
+  </div>
+
+  {# Toast container — also lives outside #insights-body so range-tab swaps
+     do not wipe an in-flight "started" message. #}
+  <div id="admin-run-insights-toast"></div>
 
   <div id="insights-body">
     {% include "_admin_data_body.html.j2" %}

@@ -692,6 +692,45 @@ Source: `server/src/wispralt_server/routes/admin_data.py` (Phase 2).
 
 ---
 
+### `POST /admin/data/insights/run-now`
+
+**Auth:** Bearer + `wispralt_admin_token` session cookie + `role='admin'`. Router-level `_require_db_pool` + handler-level `require_admin` mean an employee token gets **403** and a degraded Postgres pool gets **503**.
+
+Admin-only manual trigger for `insights.cron.run_weekly_insights` against the **current in-progress ISO week**. Fire-and-forget — the handler returns immediately with a tiny HTML body (toast + OOB-swap button fragment) for HTMX to render in place. The spawned task is strong-referenced in `app.state.weekly_insights_manual_tasks` (set of `asyncio.Task`) and removed by a closure-based done-callback that also logs any unhandled exception.
+
+Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip — if a `weekly_insights` row already exists for `(api_key_id, iso_year, iso_week, scope='person')`, the OpenRouter call is skipped. The in-flight lock pre-check is purely UX.
+
+**Request:** `application/x-www-form-urlencoded`
+
+| Field | Type | Notes |
+|---|---|---|
+| `csrf_token` | string | Double-submit value matched against the `wispralt_csrf` cookie set by the prior `GET /admin/data` full-page render. Constant-time compare via `hmac.compare_digest`. 30-minute cookie TTL. |
+
+**Response 200** — `text/html`. Body composes a toast (`<div class="admin-toast">…</div>`) with one of:
+
+| Toast | Trigger |
+|---|---|
+| `Insights run started for Wxx. Refresh page in ~1 minute to see results.` | Happy path — task spawned. Body also includes an OOB-swap `#admin-run-insights-button` fragment that paints the button as `Running…` (disabled). |
+| `Insights unavailable — OPENROUTER_API_KEY not configured.` | `app.state.insights_client is None`. No task spawned. |
+| `Budget exceeded ($X.XX / $Y.YY cap). Run skipped.` | Rolling 30-day insights spend exceeds `settings.insights_max_30d_cost_usd` (default $8). No task spawned. |
+| `A run is already in progress. Refresh in ~1 minute.` | `app.state.weekly_insights_lock.locked()` is True. Body also includes the OOB-swap disabled button. No task spawned. |
+
+**Response 403** — `text/html`. Body is the toast `Session expired. Refresh the page and try again.` so HTMX's `hx-target-403` swaps it into `#admin-run-insights-toast`. Triggered by missing / mismatched / expired `csrf_token`.
+
+**Response 403** — empty body. Triggered by non-admin role (the standard `require_admin` 403 path; employees never reach this surface via the UI).
+
+**Response 503** — Postgres pool unavailable (`_require_db_pool`).
+
+**Notes:**
+
+- Targets the **current** in-progress ISO week (NOT last completed). The Sunday 23:00 cron will UPSERT-replace these rows on its next fire — no orphan rows.
+- Server logs one `INFO` line per trigger: `Manual insights run started by admin_id=<id> for W<nn> (user=<label>)`. Operators distinguish manual vs scheduled runs by grepping for this prefix.
+- Fire-and-forget tasks are NOT durable across SIGTERM — see `docs/ADMIN.md` for the re-click recovery path.
+
+Source: `server/src/wispralt_server/routes/admin_data.py`.
+
+---
+
 ### `POST /telemetry/cloud-dictation`
 
 **Auth:** Bearer required. **Bearer-only** — a cookie-only request with no `Authorization` header is rejected with **401** even if the shared `wispralt_admin_token` cookie would normally satisfy auth. This stops a browser-CSRF abuse where a malicious site that holds the session cookie triggers ingest from a logged-in browser the user didn't initiate.
@@ -1075,5 +1114,6 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 | GET | `/admin/usage` | admin | Drill-down HTML, paginated 100/page. Filters: `kind`, `status`, `user_id`, `since`, `until`, `offset`. |
 | GET | `/admin/usage.csv` | admin | `text/csv` stream (max 10000 rows) |
 | GET | `/admin/data` | admin | Phase 2 — weekly insights Data tab (`data.html.j2`). HTMX partial swap returns `_stats_grid_partial.html.j2`. Documented in detail above under `GET /admin/data`. |
+| POST | `/admin/data/insights/run-now` | admin | Manual trigger for the weekly-insights cron against the current in-progress ISO week. Form-style CSRF. Fire-and-forget; returns HTML toast + OOB-swap button fragment. Documented in detail above under `POST /admin/data/insights/run-now`. |
 
 All authed admin routes return **503** "Admin UI unavailable: Postgres degraded." when `app.state.db_pool` is `None` — the admin UI is unusable without a pool, so it fails loudly rather than crashing on `AttributeError` deeper in. The break-glass admin path (env-var bearer when Postgres is unreachable) lets the operator authenticate to the rest of the API but **not** to the admin UI; restart the server once Postgres is back to recover.
