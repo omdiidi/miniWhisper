@@ -419,10 +419,11 @@ final class DictationRecorder {
         nextLocalIndex = 0
         cumulativeChunkAudioMs = 0
         streamingArmedAtomic.withLock { $0 = false }
-        // Snapshot Settings ONCE for this session. Mid-recording user toggles
-        // do NOT switch behavior — otherwise a toggle-off could orphan an
-        // already-open server-side session.
-        streamingEnabledForThisSession = Settings.shared.streamingDictation
+        // v0.4.6: streaming is ALWAYS on. The user-facing toggle was removed.
+        // Settings.streamingDictation property kept for back-compat but ignored
+        // here. Streaming-then-fallback always wins over a single-POST given
+        // the safety-buffer + dedup-id design, so there's no reason to gate it.
+        streamingEnabledForThisSession = true
         if streamingEnabledForThisSession {
             // Defensive: a leftover session from a rapid double-tap-FN race
             // gets aborted here. The Task is fire-and-forget on purpose —

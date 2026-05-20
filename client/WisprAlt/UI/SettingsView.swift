@@ -77,7 +77,10 @@ struct SettingsView: View {
             connectionSection
             inputMicSection
             smartFormattingSection
-            streamingDictationSection
+            // v0.4.6: streamingDictationSection removed — streaming is always on.
+            // The DictationRecorder hardcodes `streamingEnabledForThisSession = true`
+            // at start(), so no user-facing toggle. Internal Settings.streamingDictation
+            // property left in place for back-compat / future revert; ignored by code.
             hotkeySection
             launchAtLoginSection
             meetingsFolderSection
@@ -355,41 +358,19 @@ struct SettingsView: View {
         )
     }
 
-    /// Smart-formatting toggle. Off by default. Sends `X-Smart-Format: true` on
-    /// `/transcribe/dictate` when on. Server silently ignores the flag if
-    /// `OPENROUTER_API_KEY` is not configured.
+    /// Smart-formatting toggle. Off by default. Adds light cleanup to longer
+    /// dictations (punctuation, capitalization, paragraph breaks) without
+    /// changing the words you said. Adds a small amount of latency.
     private var smartFormattingSection: some View {
         Section {
             Toggle("Smart formatting", isOn: Binding(
                 get: { settings.smartFormatting },
                 set: { settings.smartFormatting = $0 }
             ))
-            Text("Cleans up dictation output (punctuation, casing, paragraph breaks) without changing words. Adds ~250ms latency. Off by default. Requires admin to set OPENROUTER_API_KEY on the server — silently does nothing otherwise.")
+            Text("Adds light cleanup — punctuation, capitalization, paragraph breaks — to longer dictations. Your wording is preserved. Off by default.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } header: { Text("Quality") }
-    }
-
-    /// Streaming-dictation toggle (Phase 2, experimental). When on, long
-    /// dictations stream chunked audio to the server while the user is
-    /// still speaking so the final transcript lands faster after FN
-    /// release. Short (<8 s) dictations are unaffected — they bypass the
-    /// streaming path entirely. If the optimized path stalls or fails,
-    /// the recorder silently falls back to the standard 3-attempt ladder
-    /// after ~8 s.
-    private var streamingDictationSection: some View {
-        Section {
-            Toggle(
-                "Streaming dictation (experimental — faster for long dictations)",
-                isOn: Binding(
-                    get: { settings.streamingDictation },
-                    set: { settings.streamingDictation = $0 }
-                )
-            )
-            Text("Long dictations finalize faster. If the optimized path stalls, falls back to the standard path after ~8 s.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
     }
 
     /// Input mic picker — applies ONLY to WisprAlt's own dictation. Meeting
@@ -576,9 +557,18 @@ struct SettingsView: View {
         }
     }
 
-    /// Test Connection: calls `/healthz`, `/readyz/dictation`, `/readyz/meeting` in parallel and
-    /// surfaces a single status line. Green = both ready, orange = healthy but a pipeline still
-    /// loading, red = host unreachable or auth bad.
+    /// Test Connection: end-to-end probe that actually verifies each surface a
+    /// dictation depends on. v0.4.6 — added authenticated `/me` call so an
+    /// invalid API key is detected (previously only /healthz + /readyz which
+    /// are no-auth, so a wrong key silently passed Test Connection).
+    ///
+    /// Probes in parallel:
+    ///   - /healthz                  — server process alive at all
+    ///   - /readyz/dictation         — Parakeet model loaded
+    ///   - /readyz/meeting           — meeting pipeline RAM-ready
+    ///   - /me (authenticated)       — API key + Supabase user lookup work
+    ///
+    /// Surfaces a single status line color-coded green/orange/red.
     private func testConnection() {
         guard settings.serverURL != nil else {
             connectionFeedback = "Set a Server URL under Advanced first."
@@ -595,9 +585,12 @@ struct SettingsView: View {
                 async let healthOK = client.healthz()
                 async let dictationReady = client.readyz(endpoint: "dictation")
                 async let meetingReady = client.readyz(endpoint: "meeting")
+                async let meAuth = MeAPI.get()      // verifies API key end-to-end
+
                 let h = try await healthOK
                 let d = try await dictationReady
                 let m = try await meetingReady
+                let me = try await meAuth           // throws .unauthorized on bad key
 
                 await MainActor.run {
                     isTesting = false
@@ -606,24 +599,25 @@ struct SettingsView: View {
                         connectionFeedbackKind = .error
                         return
                     }
+                    let who = me.display_name ?? me.label ?? "you"
                     if d.ok && m.ok {
                         connectionFeedback = d.degraded
-                            ? "Connected — dictation degraded (a meeting is using memory)"
-                            : "Connected — dictation + meeting ready."
+                            ? "Connected as \(who) — dictation degraded (meeting using memory)"
+                            : "Connected as \(who) — dictation + meeting ready."
                         connectionFeedbackKind = d.degraded ? .warning : .success
                         return
                     }
                     if d.ok && !m.ok {
-                        connectionFeedback = "Connected — meeting pipeline still loading."
+                        connectionFeedback = "Connected as \(who) — meeting pipeline still loading."
                         connectionFeedbackKind = .warning
                         return
                     }
                     if !d.ok && m.ok {
-                        connectionFeedback = "Connected — dictation pipeline still loading."
+                        connectionFeedback = "Connected as \(who) — dictation pipeline still loading."
                         connectionFeedbackKind = .warning
                         return
                     }
-                    connectionFeedback = "Connected — pipelines still loading."
+                    connectionFeedback = "Connected as \(who) — pipelines still loading."
                     connectionFeedbackKind = .warning
                 }
             } catch ServerError.unauthorized {
@@ -746,18 +740,6 @@ private struct QuickActionsSection: View {
                     : "Pick any audio or video file. WisprAlt transcodes it locally and runs it through the meeting pipeline."
             )
 
-            Button("Open File Transcriptions", systemImage: "folder.badge.questionmark") {
-                let url = CustomTranscriptionsStore.directoryURL
-                try? FileManager.default.createDirectory(
-                    at: url,
-                    withIntermediateDirectories: true
-                )
-                NSWorkspace.shared.open(url)
-                Log.info("Opened custom transcriptions folder: \(url.path)", category: "settings")
-            }
-            .buttonStyle(.bordered)
-            .help("Opens the File Transcriptions folder in Finder.")
-
             // Last-meeting copy + age on one row.
             HStack(spacing: 6) {
                 Button("Copy last meeting", systemImage: "doc.on.clipboard") {
@@ -798,6 +780,30 @@ private struct QuickActionsSection: View {
                     .transition(.opacity)
             }
 
+            // v0.4.6 ordering: Open File Transcriptions sits right above Open Meetings
+            // Folder (the two "show me my outputs" buttons paired). Open Portal moved
+            // to the bottom of the list (least-frequently-clicked of the three).
+            Button("Open File Transcriptions", systemImage: "folder.badge.questionmark") {
+                let url = CustomTranscriptionsStore.directoryURL
+                try? FileManager.default.createDirectory(
+                    at: url,
+                    withIntermediateDirectories: true
+                )
+                NSWorkspace.shared.open(url)
+                Log.info("Opened custom transcriptions folder: \(url.path)", category: "settings")
+            }
+            .buttonStyle(.bordered)
+            .help("Opens the File Transcriptions folder in Finder.")
+
+            Button("Open Meetings Folder", systemImage: "folder") {
+                let url = settings.meetingsPath
+                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                NSWorkspace.shared.open(url)
+                Log.info("Opened meetings folder: \(url.path)", category: "settings")
+            }
+            .buttonStyle(.bordered)
+            .help("Opens \(settings.meetingsPath.path) in Finder.")
+
             Button("Open Portal", systemImage: "safari") {
                 guard let base = settings.serverURL else { return }
                 let url = base.appendingPathComponent("admin/login")
@@ -811,15 +817,6 @@ private struct QuickActionsSection: View {
                     ? "Set a Server URL under Advanced first."
                     : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
             )
-
-            Button("Open Meetings Folder", systemImage: "folder") {
-                let url = settings.meetingsPath
-                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-                NSWorkspace.shared.open(url)
-                Log.info("Opened meetings folder: \(url.path)", category: "settings")
-            }
-            .buttonStyle(.bordered)
-            .help("Opens \(settings.meetingsPath.path) in Finder.")
         }
         .onAppear {
             meetingViewModel.start()
