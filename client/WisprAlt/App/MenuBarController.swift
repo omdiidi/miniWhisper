@@ -830,7 +830,7 @@ final class MenuBarController: NSObject {
     ///
     /// Deadline scales with the source's audio duration (probed via AVAsset)
     /// so a 5-minute clip and a 4-hour meeting both get realistic budgets.
-    /// Multiplier accounts for WhisperX + Pyannote on Mac mini M4 running
+    /// Multiplier accounts for mlx-whisper + Pyannote on Mac mini M4 running
     /// at roughly 0.3-0.5× realtime for stereo diarization. On timeout we
     /// LEAVE the server-side job in place so the user can recover/poll it
     /// later — deleting it would throw away an in-flight transcription.

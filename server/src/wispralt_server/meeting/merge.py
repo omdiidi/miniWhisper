@@ -2,7 +2,7 @@
 meeting/merge.py — Segment labelling and channel merge for meeting transcripts.
 
 All functions in this module are pure (no I/O, no model calls).  They operate
-on WhisperX-style result dicts and return lists of segment dicts that conform
+on whisper result dicts (from mlx_whisper.transcribe) and return lists of segment dicts that conform
 to the locked v3 transcript schema.
 
 Locked v3 segment schema
@@ -68,7 +68,7 @@ def _make_segment(
 
 
 def label_all(
-    whisperx_result: dict,
+    whisper_result: dict,
     display_name: str,
     channel: int | None,
     raw_speakers: list[str],
@@ -80,8 +80,8 @@ def label_all(
 
     Parameters
     ----------
-    whisperx_result:
-        A WhisperX aligned-result dict (has a ``"segments"`` key).
+    whisper_result:
+        A whisper-result dict from mlx_whisper.transcribe (has a ``"segments"`` key).
     display_name:
         The display name to assign to every segment (e.g. ``"You"``).
     channel:
@@ -98,7 +98,7 @@ def label_all(
     """
     raw = raw_speakers[0] if raw_speakers else "mic"
     segments: list[dict] = []
-    for seg in whisperx_result.get("segments", []):
+    for seg in whisper_result.get("segments", []):
         segments.append(
             _make_segment(
                 start=float(seg.get("start", 0.0)),
@@ -127,7 +127,7 @@ def label_others(
     Parameters
     ----------
     diarized_result:
-        A WhisperX result dict after ``whisperx.assign_word_speakers``.  Each
+        A whisper result dict after ``assign_speakers_segments()`` has been applied.  Each
         segment may have a ``"speaker"`` key with a Pyannote raw label.
     base:
         The display name for the first speaker (index 0).
@@ -180,7 +180,7 @@ def relabel_in_person(
     Parameters
     ----------
     diarized_result:
-        A WhisperX result dict after ``whisperx.assign_word_speakers``.
+        A whisper result dict after ``assign_speakers_segments()`` has been applied.
     channel:
         Channel number; None for in-person mode.
 

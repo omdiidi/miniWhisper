@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse
 
 from wispralt_server import db
 from wispralt_server.meeting import pipeline as meeting_pipeline
+from wispralt_server.observability import mlx_active_mb
 
 router = APIRouter()
 
@@ -113,6 +114,7 @@ async def readyz_meeting(request: Request) -> JSONResponse:
         "models_warm": models_warm,
         "models_loading": models_loading,
         "idle_seconds": round(meeting_pipeline.idle_seconds(), 1),
+        "mlx_active_mb": mlx_active_mb(),
     }
 
     if available_bytes < _2GiB:

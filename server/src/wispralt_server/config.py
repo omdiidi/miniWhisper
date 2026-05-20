@@ -65,6 +65,19 @@ class Settings(BaseSettings):
     # this deployment; raise to 300+ if you do meetings in clusters.
     meeting_idle_eviction_seconds: int = 60
 
+    # Eviction self-check thresholds (added by the 2026-05-19 invariant-gates plan).
+    # Probe-verified 2026-05-19 that mx.metal.get_active_memory() is synchronous
+    # with mx.clear_cache() — no async sampling needed.
+    meeting_eviction_delta_floor_mb: int = 1000
+    # A real eviction releases ~1500 MB of meeting-model active memory.
+    # Today's bug had delta=0. Floor of 1000 catches the bug AND partial-release
+    # regressions (e.g., a future library leaking 500 MB while clearing 1000).
+
+    meeting_eviction_pre_active_gate_mb: int = 1500
+    # Parakeet baseline (~1218) + 300 MB headroom = definitively meeting-model-loaded.
+    # Excludes cold-start, partial-load failures. Gate prevents false-positives
+    # when there was nothing meaningful to evict.
+
     # Hard cap on dictation audio length. Defends against decode-amplification
     # attacks (1KB body that decodes to many minutes) and single-thread executor
     # starvation. Default 300s (5 min) — covers realistic long-form dictations

@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import datetime
 import gc
+import importlib.metadata as _meta
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -48,6 +50,7 @@ import mlx.core as mx
 import numpy as np
 import soundfile as sf
 
+from wispralt_server import observability
 from wispralt_server.config import settings
 from wispralt_server.meeting import deepfilter as _df_mod
 from wispralt_server.meeting import diarize as _diarize_mod
@@ -91,7 +94,7 @@ _last_meeting_finished_at: float = time.monotonic()
 
 
 def _ensure_models_loaded() -> None:
-    """Load WhisperX + Pyannote on first invocation; no-op thereafter.
+    """Load mlx-whisper + Pyannote on first invocation; no-op thereafter.
 
     Called from transcribe_meeting() inside the meeting executor thread.
     Single-flight via threading.RLock — defensive; the runner's max_workers=1
@@ -170,7 +173,7 @@ def idle_seconds() -> float:
 
 def evict_if_idle(idle_threshold_s: float) -> bool:
     """If models are warm AND no meeting is in flight AND idle exceeds threshold,
-    unload WhisperX + Pyannote and return True. Otherwise return False.
+    unload mlx-whisper + Pyannote and return True. Otherwise return False.
 
     Background task in main.py calls this every minute. Single-flight via the
     same _load_lock used by _ensure_models_loaded — eviction will skip rather
@@ -186,6 +189,14 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
         return False
     if not _load_lock.acquire(blocking=False):
         return False  # something is loading or another evict is running
+    # Locals captured inside the lock; logging + self-check fire AFTER the
+    # lock releases so a misconfigured logging handler can't hold _load_lock
+    # longer than necessary.
+    did_evict = False
+    pre_active_mb = 0
+    post_active_mb = 0
+    post_cache_mb_after = 0
+    eviction_log_args: tuple | None = None  # (idle, threshold)
     try:
         if not _meeting_models_ready:
             return False
@@ -196,16 +207,15 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
         idle = idle_seconds()
         if idle < idle_threshold_s:
             return False
-        logger.info(
-            "Idle eviction: unloading meeting models after %.0fs idle "
-            "(threshold %.0fs).",
-            idle,
-            idle_threshold_s,
-        )
-        # _mlx_mod.reset() is essentially a no-op for RAM reclaim because MLX
-        # uses Apple's unified memory: dropping the Python ref does not free
-        # the MLX backing pages eagerly. Pyannote + DeepFilterNet still hold
-        # PyTorch tensors that benefit from the gc.collect() hint below.
+        # Save logger args for outside-lock emission (unified into the single
+        # post-lock info log that also reports the memory delta).
+        eviction_log_args = (idle, idle_threshold_s)
+        pre_active_mb = observability.mlx_active_mb()
+        # _mlx_mod.reset() now actively clears mlx_whisper.transcribe.ModelHolder
+        # (fixed in ca49731 / 2026-05-19 postmortem) — it is NO LONGER a no-op
+        # despite the historical comment that lived here. The gc.collect() hint
+        # below still helps PyTorch's pyannote tensors. torch.mps.empty_cache()
+        # below the clear_cache call is the matching fix for the MPS allocator.
         _mlx_mod.reset()
         _diarize_mod.reset()
         gc.collect()
@@ -231,10 +241,45 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
                 torch.mps.empty_cache()
         except Exception:  # noqa: BLE001 — best-effort; non-critical
             logger.debug("torch.mps.empty_cache() failed during eviction", exc_info=True)
+        post_active_mb = observability.mlx_active_mb()
+        post_cache_mb_after = observability.mlx_cache_mb()
         _meeting_models_ready = False
+        did_evict = True
         return True
     finally:
         _load_lock.release()
+        # POST-LOCK: emit the eviction info log + self-check critical log
+        # outside the lock so misconfigured logging handlers can't hold the
+        # load lock longer than necessary.
+        if did_evict and eviction_log_args is not None:
+            _idle, _threshold = eviction_log_args
+            logger.info(
+                "Idle eviction: unloaded meeting models after %.0fs idle "
+                "(threshold %.0fs). Memory delta: pre_active=%d MB "
+                "post_active=%d MB delta=%d MB post_cache=%d MB",
+                _idle, _threshold, pre_active_mb, post_active_mb,
+                pre_active_mb - post_active_mb, post_cache_mb_after,
+            )
+            # Self-check: invariant verification.
+            delta_mb = pre_active_mb - post_active_mb
+            if (pre_active_mb > settings.meeting_eviction_pre_active_gate_mb
+                    and delta_mb < settings.meeting_eviction_delta_floor_mb):
+                observability.eviction_failures_total.increment()
+                try:
+                    mlx_whisper_version = _meta.version("mlx-whisper")
+                except Exception:
+                    mlx_whisper_version = "?"
+                logger.critical(
+                    "Eviction invariant failed (pid=%d): pre_active=%d MB "
+                    "post_active=%d MB delta=%d MB (floor=%d) post_cache=%d MB "
+                    "mlx_whisper_version=%s. A library cache is likely "
+                    "surviving the release path. See "
+                    "docs/TROUBLESHOOTING.md section 'Trust invariants, "
+                    "not flags'.",
+                    os.getpid(), pre_active_mb, post_active_mb, delta_mb,
+                    settings.meeting_eviction_delta_floor_mb,
+                    post_cache_mb_after, mlx_whisper_version,
+                )
 
 
 # ── private helpers ────────────────────────────────────────────────────────────
@@ -540,7 +585,7 @@ def _transcribe_meeting_inner(
     ch1_raw, ch2_raw, src_sr = _load_channels(wav_path)
     logger.debug("[%s] Loaded WAV: sr=%d, duration=%.1fs", job_id, src_sr, len(ch1_raw) / src_sr)
 
-    # Resample to 16 kHz (WhisperX / Pyannote requirement).
+    # Resample to 16 kHz (mlx-whisper / Pyannote requirement).
     ch1 = _resample_to_16k(ch1_raw, src_sr)
     ch2 = _resample_to_16k(ch2_raw, src_sr)
 

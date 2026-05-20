@@ -71,9 +71,14 @@ def load(hf_token: str) -> None:
 
 
 def reset() -> None:
-    """Drop the pipeline singleton so the next load() starts clean. Used on partial-load
-    failure in pipeline._ensure_models_loaded(). Best-effort: drops Python reference but
-    C-level PyTorch handles may not free immediately."""
+    """Drop the pipeline singleton so the next load() starts clean.
+
+    Standalone call: drops Python reference only. PyTorch MPS allocator
+    keeps buffers cached until torch.mps.empty_cache() is called, which
+    happens in pipeline.evict_if_idle() — the eviction path is where
+    real RAM reclaim happens. If you call this function directly outside
+    the eviction path, expect ~1-2 GB to stay resident in MPS.
+    """
     global _pipeline
     _pipeline = None
 

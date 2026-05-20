@@ -199,6 +199,38 @@ class _LabeledCounter:
 streaming_sessions_opened_total = _MonotonicCounter()
 streaming_sessions_finalized_total = _MonotonicCounter()
 streaming_sessions_aborted_total = _LabeledCounter()
+
+# Cumulative count of meeting eviction self-check failures. In-process;
+# resets on restart by design (CRITICAL log persists to server.err.log,
+# and /readyz/meeting exposes mlx_active_mb as the cross-cutting invariant).
+eviction_failures_total = _MonotonicCounter()
+
+
+def mlx_active_mb() -> int:
+    """Return MLX active memory in MB; 0 on any failure.
+
+    Callers (eviction self-check, /readyz/meeting) tolerate 0 as 'unknown'
+    rather than 500-ing the endpoint. Lazy MLX import preserved with except
+    guard so the no-auth /readyz/meeting endpoint NEVER raises on MLX drift.
+    """
+    try:
+        import mlx.core as _mx
+        return int(_mx.metal.get_active_memory()) // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+def mlx_cache_mb() -> int:
+    """Return MLX cache memory in MB; 0 on any failure.
+
+    Used only in the CRITICAL log diagnostic emitted by the eviction
+    self-check. Same lazy-import + except guard as mlx_active_mb().
+    """
+    try:
+        import mlx.core as _mx
+        return int(_mx.metal.get_cache_memory()) // (1024 * 1024)
+    except Exception:
+        return 0
 # Captured once at module import; the `/metrics` route subtracts from
 # `time.monotonic()` to expose process uptime.
 process_started_at_monotonic: float = _time.monotonic()

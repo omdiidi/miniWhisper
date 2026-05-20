@@ -182,6 +182,74 @@ the outage this endpoint is meant to detect.
 
 ---
 
+## Trust invariants, not flags — eviction & release checks
+
+Two outages in May 2026 had the same shape: code trusted a return value or
+flag instead of verifying the invariant it claimed to enforce.
+
+- 2026-05-17 (asyncpg): `db.health_check` returned False; the watcher's
+  rebuild branch should have run; an over-narrow exception class caused
+  the failure to escape into the outer Exception handler instead.
+- 2026-05-19 (mlx-whisper): `evict_if_idle()` logged "released meeting
+  models" and set `models_warm = False`; 2.7 GB of MLX active memory
+  stayed resident because mlx_whisper's internal `ModelHolder.model`
+  cache survived our reset.
+
+Lesson: every release/cleanup function should ALSO verify its effect.
+Flags are necessary but not sufficient.
+
+### Check recipe — meeting eviction (manual)
+
+After a meeting finishes and `idle_seconds > 120`:
+
+    TOKEN=$(security find-generic-password -w -s co.wispralt)
+    curl -fsS -H "Authorization: Bearer $TOKEN" \
+      https://transcribe.integrateapi.ai/metrics | jq '.memory, .meeting'
+
+Expected steady-state (post-eviction, no jobs running):
+
+    memory.mlx_active_mb: ~1218       (Parakeet baseline only)
+    memory.mlx_cache_mb: 0
+    meeting.models_warm: false
+    meeting.idle_seconds: > 60
+    meeting.eviction_failures_total: 0  (cumulative; non-zero = regression)
+
+Also exposed without auth on /readyz/meeting:
+
+    curl -fsS https://transcribe.integrateapi.ai/readyz/meeting | jq .
+    # response includes: mlx_active_mb, models_warm, idle_seconds
+
+If `mlx_active_mb > 2000 AND models_warm=false AND idle_seconds > 120`,
+the eviction invariant is broken. Check
+`~/Library/Logs/WisprAlt/server.err.log` for a CRITICAL line containing
+"Eviction invariant failed".
+
+### Why `mlx_active_mb` is on an unauthenticated endpoint
+
+`/readyz/meeting` is intentionally no-auth so external uptime monitors
+can probe without credential management. Exposing `mlx_active_mb` is
+the cost of buying an outside-the-process observability gate that
+doesn't trust our own logs. The number itself is not sensitive — it
+reveals only that MLX is the runtime (already publicly known per the
+docs) and how much memory a model occupies (also derivable from the
+public mlx-whisper / parakeet-mlx documentation).
+
+### Tuning the self-check
+
+Two settings control the gate (see `config.py`):
+
+- `meeting_eviction_delta_floor_mb` (default 1000): minimum MB the
+  active memory must drop during eviction. Lower if you want stricter
+  detection; raise if you see false positives.
+- `meeting_eviction_pre_active_gate_mb` (default 1500): only fire when
+  active was above this BEFORE eviction. Excludes cold-start and
+  partial-load failures.
+
+Override at deploy via env vars:
+    WISPRALT_MEETING_EVICTION_DELTA_FLOOR_MB=1500
+
+---
+
 ## Client Issues
 
 ### FN tap not detected

@@ -13,7 +13,7 @@ Module-level ``_patch_lock`` serialises the monkey-patch so concurrent
 invocations cannot interleave the temporary attribute swap. Today the
 runner serialises with Semaphore(1) so this is defensive only.
 
-Public surface (matches whisperx_loader.py):
+Public surface (replaced whisperx_loader.py in Phase 10):
     load() -> None
     reset() -> None
     transcribe_channel(audio_16k, *, word_timestamps=False,

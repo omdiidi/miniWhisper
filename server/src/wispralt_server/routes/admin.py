@@ -250,6 +250,7 @@ async def metrics(request: Request) -> JSONResponse:
                 "models_loading": _meeting_loading,
                 "idle_seconds": round(meeting_pipeline.idle_seconds(), 1),
                 "idle_eviction_threshold_s": settings.meeting_idle_eviction_seconds,
+                "eviction_failures_total": observability.eviction_failures_total.value,
             },
             "memory": {
                 "rss_mb": proc_mem.rss // (1024 * 1024),
