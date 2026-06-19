@@ -135,10 +135,12 @@ final class UpdateChecker {
         // Hardcoded so a compromised UpdateChecker can't inject a
         // different command: the script source is a literal, no
         // interpolation, no callable.
+        // -q makes curl ignore ~/.curlrc so a malformed user config can't make this
+        // fetch print an empty-host "curl: (6)" error or fail before the script runs.
         let scriptSource = """
         tell application "Terminal"
             activate
-            do script "curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash"
+            do script "curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash"
         end tell
         """
         var errorInfo: NSDictionary?
@@ -165,7 +167,9 @@ final class UpdateChecker {
 
     private func fallbackToClipboard(reason: String) {
         Log.warning("UpdateChecker: \(reason) — copying install command to clipboard.", category: "update")
-        let command = "curl -fsSL \(Self.installURL) | bash"
+        // -q so a malformed ~/.curlrc can't make this fetch print an empty-host curl
+        // error or fail before the script runs (matches the Terminal path above).
+        let command = "curl -q -fsSL \(Self.installURL) | bash"
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(command, forType: .string)

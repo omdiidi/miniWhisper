@@ -1,0 +1,82 @@
+name: Lint installer
+
+# Fail-closed guard for install.sh. The v0.5.0 installer crashed on a fresh Mac
+# with `FOUND_BUNDLES[@]: unbound variable` — value-expanding an EMPTY array under
+# `set -u` on macOS's bash 3.2.57. That bug-class is SILENT in dev (only fires on a
+# machine with no prior install) and can recur with any new array, so we prove it
+# can't reship: macos-14 gives a free bash-3.2 environment.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - ".github/workflows/lint-install.yml"
+  pull_request:
+    paths:
+      - "install.sh"
+      - ".github/workflows/lint-install.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: macos-14
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm bash 3.2 (the frozen macOS shell)
+        run: bash --version | head -1
+
+      - name: Syntax check
+        run: bash -n install.sh
+
+      - name: Empty-FOUND_BUNDLES smoke (set -u must not crash)
+        run: |
+          set -euo pipefail
+          # The source-guard at the end of install.sh stops main() from running, so we
+          # can call the array-touching functions directly with an empty array — the
+          # exact fresh-machine condition that crashed v0.5.0. Call EVERY function that
+          # value-expands FOUND_BUNDLES so a future bare "${FOUND_BUNDLES[@]}" or
+          # ${FOUND_BUNDLES[0]} reintroduced in any of them is caught here, not on a
+          # fresh Mac. (No WisprAlt on the runner → the array stays empty; these are
+          # read-only / no-ops with nothing installed.)
+          source ./install.sh
+          FOUND_BUNDLES=()
+          enumerate_existing_installs >/dev/null 2>&1 || true
+          should_skip_install || true        # holds the only bare ${FOUND_BUNDLES[0]} access
+          detect_orphaned_setup || true
+          remove_all_installs
+          quit_all_installs
+          echo "empty-array smoke passed (no unbound-variable crash)"
+
+      - name: JXA release-JSON parse (fixture — embedded JS has no other static check)
+        run: |
+          set -euo pipefail
+          source ./install.sh
+          fixture="$(mktemp)"
+          # appcast asset must be ignored; real .dmg + .dmg.sha256 must win.
+          printf '%s' '{"tag_name":"v9.9.9","assets":[{"name":"WisprAlt-9.9.9.dmg","browser_download_url":"https://example.com/a.dmg"},{"name":"WisprAlt-9.9.9.dmg.sha256","browser_download_url":"https://example.com/a.dmg.sha256"},{"name":"WisprAlt-appcast.dmg","browser_download_url":"https://example.com/appcast.dmg"}]}' > "$fixture"
+          out="$(parse_release_json "$fixture")"
+          nf="$(awk -F'\t' '{print NF}' <<< "$out")"
+          IFS=$'\t' read -r tag dmg sha <<< "$out"
+          if [ "$nf" = "3" ] && [ "$tag" = "v9.9.9" ] && [ "$dmg" = "https://example.com/a.dmg" ] && [ "$sha" = "https://example.com/a.dmg.sha256" ]; then
+            echo "JXA parse OK (appcast excluded, 3 tab-separated fields)"
+          else
+            echo "::error::JXA parse produced unexpected output: <$out>"; exit 1
+          fi
+          printf '%s' 'not valid json' > "$fixture"
+          if parse_release_json "$fixture" >/dev/null 2>&1; then
+            echo "::error::JXA accepted malformed JSON (should exit non-zero so '|| die' fires)"; exit 1
+          fi
+          echo "JXA bad-JSON correctly rejected"
+
+      - name: No python3 dependency
+        run: |
+          if grep -n 'python3' install.sh; then
+            echo "::error::python3 reintroduced into install.sh — fresh Macs lack it"
+            exit 1
+          fi
+          echo "no python3 dependency"

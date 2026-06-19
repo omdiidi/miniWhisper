@@ -15,7 +15,11 @@ readonly USERDEFAULTS_DOMAIN="co.wispralt.WisprAlt"
 readonly BUNDLE_ID="co.wispralt.WisprAlt"
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Globals — initialized so `set -u` doesn't bite later.
+# Globals — declared up-front so scalar refs under `set -u` are safe.
+# NOTE: declaring an array as () does NOT make "${arr[@]}" safe on macOS's bash
+# 3.2.57 — value-expanding an EMPTY array under `set -u` still throws `unbound
+# variable` (fixed only in bash 4.4, which macOS never ships). Empty-array loops
+# are made safe by the count guards below, NOT by this initialization.
 # ───────────────────────────────────────────────────────────────────────────────
 IS_REINSTALL=0
 WISPRALT_API_KEY_WAS_SET=0
@@ -25,8 +29,8 @@ DMG_URL=""
 SHA_URL=""
 DMG_PATH=""
 SHA_PATH=""
-# Populated by enumerate_existing_installs(); referenced before that call by
-# should_skip_install() in some code paths, so initialize for `set -u`.
+# Populated by enumerate_existing_installs(). Every value-expansion of this array
+# ("${FOUND_BUNDLES[@]}" / ${FOUND_BUNDLES[0]}) MUST be count-guarded — see note above.
 FOUND_BUNDLES=()
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -60,9 +64,6 @@ preflight() {
     os_major="$(sw_vers -productVersion | cut -d. -f1)"
     [[ "$os_major" -ge 14 ]] || die "macOS 14+ required. Detected: $(sw_vers -productVersion)."
 
-    # Force python3 to actually resolve (Xcode CLT stub returns 0 from `command -v` but errors on use).
-    python3 --version >/dev/null 2>&1 || die "python3 not available. Run: xcode-select --install"
-
     local missing=()
     local tool
     for tool in curl shasum security defaults hdiutil xattr tccutil pkill pgrep file awk mdfind osascript launchctl find; do
@@ -74,6 +75,22 @@ preflight() {
 
     INSTALL_TMP="$(mktemp -d /tmp/wispralt-install.XXXXXX)"
     info "Temp dir: $INSTALL_TMP"
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# is_wispralt_bundle — confirm a directory is a WisprAlt.app before we rm -rf it.
+# Accepts a complete bundle (our executable present) OR a half-copied/corrupt one
+# whose Info.plist still declares our bundle id (catches interrupted installs).
+# Uses the same `defaults read .../Contents/Info <Key>` path form already proven at
+# the CFBundleShortVersionString read in should_skip_install().
+# ───────────────────────────────────────────────────────────────────────────────
+is_wispralt_bundle() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 1
+    [[ -x "$dir/Contents/MacOS/WisprAlt" ]] && return 0
+    local bid
+    bid="$(defaults read "$dir/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
+    [[ "$bid" == "$BUNDLE_ID" ]]
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -95,7 +112,8 @@ enumerate_existing_installs() {
         [[ "$line" == *Backups.backupdb* ]] && continue
         [[ "$line" == */.Trash/* ]] && continue
         [[ -d "$line" ]] || continue
-        [[ -x "$line/Contents/MacOS/WisprAlt" ]] || continue
+        # No executable gate here: mdfind already matched our CFBundleIdentifier, so
+        # even a half-copied/corrupt bundle Spotlight indexed should still be removed.
         FOUND_BUNDLES+=("$line")
     done < <(mdfind "kMDItemCFBundleIdentifier == \"${BUNDLE_ID}\"" 2>/dev/null)
 
@@ -105,12 +123,14 @@ enumerate_existing_installs() {
     local p
     for p in "/Applications/WisprAlt.app" "$HOME/Applications/WisprAlt.app"; do
         [[ -d "$p" ]] || continue
-        [[ -x "$p/Contents/MacOS/WisprAlt" ]] || continue
+        is_wispralt_bundle "$p" || continue
         local already=0
         local b
-        for b in "${FOUND_BUNDLES[@]}"; do
-            [[ "$b" == "$p" ]] && already=1 && break
-        done
+        if (( ${#FOUND_BUNDLES[@]} > 0 )); then
+            for b in "${FOUND_BUNDLES[@]}"; do
+                [[ "$b" == "$p" ]] && already=1 && break
+            done
+        fi
         (( already == 0 )) && FOUND_BUNDLES+=("$p")
     done
 
@@ -123,12 +143,14 @@ enumerate_existing_installs() {
     while IFS= read -r found; do
         [[ -z "$found" ]] && continue
         [[ -d "$found" ]] || continue
-        [[ -x "$found/Contents/MacOS/WisprAlt" ]] || continue
+        is_wispralt_bundle "$found" || continue
         local already=0
         local b
-        for b in "${FOUND_BUNDLES[@]}"; do
-            [[ "$b" == "$found" ]] && already=1 && break
-        done
+        if (( ${#FOUND_BUNDLES[@]} > 0 )); then
+            for b in "${FOUND_BUNDLES[@]}"; do
+                [[ "$b" == "$found" ]] && already=1 && break
+            done
+        fi
         (( already == 0 )) && FOUND_BUNDLES+=("$found")
     done < <(find "$HOME/Downloads" "$HOME/Desktop" "$HOME/Applications" \
         -maxdepth 3 -name "WisprAlt*.app" -type d 2>/dev/null)
@@ -144,6 +166,24 @@ enumerate_existing_installs() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
+# detect_orphaned_setup — widen reinstall detection. Even with no bundle on disk, a
+# leftover Keychain entry or UserDefaults domain means this host had WisprAlt set up
+# before (e.g. the app was manually trashed). Treat that as a reinstall so
+# provision_credentials resets stale TCC grants. No-op when a bundle was already
+# found (IS_REINSTALL already 1), so it NEVER widens TCC reset on the normal path.
+# Existence probes only — no `-w`, so no Keychain prompt; `-s` (no `-a`) matches any
+# account under the service.
+# ───────────────────────────────────────────────────────────────────────────────
+detect_orphaned_setup() {
+    (( IS_REINSTALL == 1 )) && return 0
+    if security find-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 \
+       || defaults read "$USERDEFAULTS_DOMAIN" >/dev/null 2>&1; then
+        IS_REINSTALL=1
+        info "Detected prior WisprAlt config (no app bundle) — will reset permissions."
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
 # should_skip_install — idempotency early-exit. Returns 0 (skip) ONLY when:
 #   1 found bundle, AT /Applications/WisprAlt.app, no running instance, and
 #   CFBundleShortVersionString matches the target release. Saves a TCC reset
@@ -153,6 +193,11 @@ should_skip_install() {
     # Only valid as a check AFTER fetch_release_metadata.
     (( ${#FOUND_BUNDLES[@]} == 1 )) || return 1
     [[ "${FOUND_BUNDLES[0]}" == "/Applications/WisprAlt.app" ]] || return 1
+    # Require a runnable executable. is_wispralt_bundle also accepts a partial bundle
+    # that only carries our Info.plist (an interrupted prior install); such a bundle must
+    # take the reinstall path so it gets repaired, NOT this no-op skip path that would
+    # then `open` a bundle with no executable.
+    [[ -x "/Applications/WisprAlt.app/Contents/MacOS/WisprAlt" ]] || return 1
     # v3: also require no running instance. If the canonical app is running we
     # still want to kill+replace so a hung process doesn't survive the no-op.
     pgrep -f "co.wispralt.WisprAlt" >/dev/null 2>&1 && return 1
@@ -200,6 +245,7 @@ quit_all_installs() {
 # block the rest of the cleanup.
 # ───────────────────────────────────────────────────────────────────────────────
 remove_all_installs() {
+    (( ${#FOUND_BUNDLES[@]} > 0 )) || return 0
     local b
     for b in "${FOUND_BUNDLES[@]}"; do
         info "Removing $b ..."
@@ -228,6 +274,33 @@ sweep_launch_agents() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
+# parse_release_json — extract "tag\tdmg\tsha" from a GitHub /releases/latest JSON
+# file using JXA (osascript -l JavaScript), which ships on every macOS — so a fresh
+# Mac needs no Xcode Command Line Tools. Reads the file path as argv[0]. Throws
+# (non-zero exit) on an unreadable file, malformed JSON, or a tag/URL containing
+# forbidden whitespace. Extracted as a function so CI can exercise the embedded JS
+# against a fixture — it has no other static check (bash -n can't see inside it).
+# ───────────────────────────────────────────────────────────────────────────────
+parse_release_json() {
+    osascript -l JavaScript -e '
+function run(argv) {
+  var data = $.NSData.dataWithContentsOfFile(argv[0]);
+  if (!data) throw new Error("cannot read release json");
+  var r = JSON.parse($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js);
+  var tag = r.tag_name || "", dmg = "", sha = "", a = r.assets || [];
+  for (var i = 0; i < a.length; i++) {
+    var n = a[i].name || "", u = a[i].browser_download_url || "";
+    if (/\.dmg$/.test(n) && n.indexOf("appcast") === -1) dmg = u;
+    else if (/\.dmg\.sha256$/.test(n)) sha = u;
+  }
+  [tag, dmg, sha].forEach(function (v) {
+    if (/[\t\r\n]/.test(v)) throw new Error("forbidden whitespace in tag/url");
+  });
+  return [tag, dmg, sha].join("\t");
+}' "$1"
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
 # fetch_release_metadata — query GitHub for the latest tag + DMG + sha256 URLs.
 # ───────────────────────────────────────────────────────────────────────────────
 fetch_release_metadata() {
@@ -244,7 +317,7 @@ fetch_release_metadata() {
         curl_args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
     fi
 
-    http_code="$(curl "${curl_args[@]}" "$releases_api" || true)"
+    http_code="$(curl -q "${curl_args[@]}" "$releases_api" || true)"
 
     if [[ "$http_code" == "403" ]]; then
         if grep -qi '^X-RateLimit-Remaining: 0' "$headers_file" 2>/dev/null; then
@@ -262,26 +335,12 @@ fetch_release_metadata() {
 
     [[ "$http_code" == "200" ]] || die "GitHub returned HTTP $http_code (expected 200)."
 
+    # Parse the release JSON via parse_release_json (JXA — see its definition above).
+    # A throw (bad JSON / unreadable file / forbidden whitespace) → non-zero → die.
+    # Empty fields (valid-but-wrong-shape JSON) fall through to the `[[ -n ... ]] || die`
+    # checks below.
     local parsed
-    parsed="$(python3 -c '
-import json, sys
-r = json.load(sys.stdin)
-tag = r.get("tag_name", "")
-dmg = ""
-sha = ""
-for a in r.get("assets", []):
-    name = a.get("name", "")
-    url = a.get("browser_download_url", "")
-    if name.endswith(".dmg") and "appcast" not in name:
-        dmg = url
-    elif name.endswith(".dmg.sha256"):
-        sha = url
-for v in (tag, dmg, sha):
-    if any(c in v for c in ("\t", "\r", "\n")):
-        sys.stderr.write("Tag or asset URL contains forbidden whitespace.\n")
-        sys.exit(1)
-print(f"{tag}\t{dmg}\t{sha}")
-' < "$json_file")" || die "Failed to parse release JSON."
+    parsed="$(parse_release_json "$json_file")" || die "Failed to parse release JSON."
 
     local nfields
     nfields="$(awk -F'\t' '{print NF}' <<< "$parsed")"
@@ -305,9 +364,9 @@ download_and_verify() {
     SHA_PATH="$INSTALL_TMP/$(basename "$SHA_URL")"
 
     info "Downloading $RELEASE_TAG..."
-    curl -fsSL --retry 3 --retry-delay 2 --max-time 300 -o "$DMG_PATH" "$DMG_URL" \
+    curl -q -fsSL --retry 3 --retry-delay 2 --max-time 300 -o "$DMG_PATH" "$DMG_URL" \
         || die "Failed to download DMG from $DMG_URL"
-    curl -fsSL --retry 3 --retry-delay 2 --max-time 30 -o "$SHA_PATH" "$SHA_URL" \
+    curl -q -fsSL --retry 3 --retry-delay 2 --max-time 30 -o "$SHA_PATH" "$SHA_URL" \
         || die "Failed to download SHA256 sidecar from $SHA_URL"
 
     # `hdiutil imageinfo` is the authoritative DMG validator. `file` is heuristic.
@@ -334,9 +393,35 @@ install_bundle() {
     # Defensive: stale mount from a previous failed run.
     hdiutil detach "$mount_point" >/dev/null 2>&1 || true
 
+    # Order matters. Mount and PROVE the replacement is present in the DMG BEFORE we
+    # touch the existing install — otherwise a bad/empty DMG or a transient mount failure
+    # would turn a failed update into an uninstall. Once the source is proven, remove the
+    # old bundle, then copy. Every failure path after the attach detaches first, so a
+    # removal/copy failure can never leak the mounted DMG.
     info "Mounting DMG..."
     hdiutil attach "$DMG_PATH" -nobrowse -mountpoint "$mount_point" >/dev/null \
         || die "Failed to mount DMG at $mount_point."
+
+    if [[ ! -d "$mount_point/WisprAlt.app" ]]; then
+        hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+        die "Mounted DMG does not contain WisprAlt.app — leaving the existing install untouched."
+    fi
+
+    # Clear the canonical path so cp -R can't nest the bundle as WisprAlt.app/WisprAlt.app.
+    # is_wispralt_bundle accepts a complete bundle OR a partial one that still carries our
+    # bundle id (an interrupted prior install) — those self-heal; anything we can't confirm
+    # is ours is refused, not deleted. (remove_all_installs usually cleared this already;
+    # this is belt-and-suspenders for a discovery miss.)
+    if [[ -e "$app_path" ]]; then
+        if ! is_wispralt_bundle "$app_path"; then
+            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            die "$app_path exists but is not a WisprAlt bundle — refusing to overwrite. Remove it manually and re-run."
+        fi
+        if ! rm -rf "$app_path"; then
+            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            die "Could not remove existing $app_path (is WisprAlt still running, or the path locked?). Quit WisprAlt and re-run."
+        fi
+    fi
 
     info "Copying WisprAlt.app to /Applications..."
     if ! cp -R "$mount_point/WisprAlt.app" "/Applications/"; then
@@ -496,9 +581,13 @@ main() {
     mkdir "$lock_dir" 2>/dev/null \
         || die "Another WisprAlt install appears to be in progress (lock at $lock_dir). If stale, remove with: rmdir $lock_dir"
     enumerate_existing_installs       # populates IS_REINSTALL + FOUND_BUNDLES
+    detect_orphaned_setup             # widen IS_REINSTALL to orphaned config (manual delete)
     fetch_release_metadata
     if should_skip_install; then
         info "Already on $RELEASE_TAG at the canonical path with no running instance. Skipping reinstall."
+        # True no-op: the existing app's TCC grants are still valid, so do NOT reset
+        # them — resetting would needlessly re-prompt all 4 permissions on a re-run.
+        IS_REINSTALL=0
         provision_credentials         # still write Keychain if WISPRALT_API_KEY was passed
         open_app_and_verify_launch
         print_next_steps
@@ -514,4 +603,8 @@ main() {
     print_next_steps
 }
 
-main "$@"
+# Source-guard: run main only on direct exec or `curl | bash` (piped stdin), NOT when
+# the file is sourced (so the lint-install CI smoke can source these functions safely).
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+    main "$@"
+fi

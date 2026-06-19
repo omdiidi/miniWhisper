@@ -327,8 +327,11 @@ def _build_install_command(server_url: str, plaintext: str) -> str:
     """Compose the curl one-liner. Env vars sit on the bash side of the pipe
     (the curl-side form drops them — see CHANGELOG.md [0.1.1]).
     """
+    # -q makes curl ignore the employee's ~/.curlrc, so a malformed config (a stray
+    # url/proxy line) can't make this fetch print "curl: (6) Could not resolve host:"
+    # or fail before the script runs.
     return (
-        "curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \\\n"
+        "curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \\\n"
         f"  | WISPRALT_API_KEY={plaintext} WISPRALT_SERVER={server_url} bash"
     )
 

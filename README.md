@@ -88,7 +88,7 @@ Full walkthrough: [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md)
 Open Terminal on the Mac you want to dictate from, paste this, hit enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
   | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
 ```
 

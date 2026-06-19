@@ -247,7 +247,7 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
    freshly-minted token and the server URL from `settings.server_url`:
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+   curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
      | WISPRALT_API_KEY=<token> WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
    ```
 

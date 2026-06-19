@@ -145,7 +145,7 @@ either roll back the commit (`git reset --hard HEAD~1`) or bump VERSION.
    [INSTALL.md](INSTALL.md)):
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+   curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
      | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
    ```
 

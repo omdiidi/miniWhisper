@@ -320,13 +320,13 @@ Works on a fresh Mac without cloning this repo. See
 - macOS 14.0 or later (Sonoma+).
 - Apple Silicon (current builds are arm64-only).
 - Internet (anonymous; no GitHub auth needed since the repo is public).
-- Xcode Command Line Tools (or `python3` will trigger the install dialog
-  on first invocation — install ahead of time via `xcode-select --install`).
+- No developer tooling — the installer uses only stock macOS utilities (no Xcode
+  Command Line Tools, no Homebrew).
 
 **Install:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
   | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
 ```
 

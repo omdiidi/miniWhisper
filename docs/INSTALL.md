@@ -7,7 +7,7 @@ Canonical install guide for the WisprAlt macOS client.
 Open Terminal on the Mac you want to dictate from and paste:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
   | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
 ```
 
@@ -43,7 +43,7 @@ export WISPRALT_SERVER=https://transcribe.integrateapi.ai
 EOF
 chmod 0600 /tmp/wispralt-key
 source /tmp/wispralt-key
-curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
 shred -u /tmp/wispralt-key 2>/dev/null || rm -P /tmp/wispralt-key
 unset WISPRALT_API_KEY WISPRALT_SERVER
 ```
@@ -58,11 +58,9 @@ unlinking.)
   supported; contact your admin if this is a blocker.
 - **~200 MB free disk space** for the app bundle.
 - **Internet** — anonymous; no GitHub auth needed for the download itself.
-- **Xcode Command Line Tools** — install with `xcode-select --install` if
-  you've never used the developer tools on this Mac. The first-run `python3`
-  invocation will pop the install dialog automatically and add ~700 MB of
-  tooling (~5 minutes), so installing it ahead of time keeps the install
-  flow clean.
+
+No Xcode Command Line Tools, Homebrew, or other developer tooling is required —
+the installer uses only stock macOS utilities.
 
 ## 3. The 4 macOS permissions WisprAlt needs
 
@@ -88,7 +86,7 @@ This is the common case. Your admin generated a token for you and texted
 you a one-liner. Paste it into Terminal exactly as received:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
+curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
   | WISPRALT_API_KEY=sk_yourtoken WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
 ```
 
@@ -101,7 +99,7 @@ server env var:
 
 ```bash
 WISPRALT_SERVER=https://transcribe.integrateapi.ai \
-  curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+  curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
 ```
 
 The app will install and launch normally. Open WisprAlt menubar icon →
@@ -234,7 +232,7 @@ re-installs, shared NAT, etc.), either wait an hour or set a token:
 
 ```bash
 GITHUB_TOKEN=ghp_yourtoken WISPRALT_API_KEY=sk_xxx \
-  curl -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
+  curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
 ```
 
 A no-scope personal access token is fine; it just needs to authenticate the
@@ -252,11 +250,21 @@ purpose to prevent that footgun.
 Current builds are arm64-only. Intel Macs aren't supported; contact your
 admin.
 
-### "python3 not available"
+### "curl: (6) Could not resolve host:" (empty hostname)
 
-The installer uses `python3` for a tiny JSON parse. Run
-`xcode-select --install`, accept the dialog, and re-run the install
-one-liner.
+A cosmetic line with an **empty** hostname (printed before any `[wispralt]`
+output) is not from the installer — it comes from your shell's `curl` reading a
+malformed `~/.curlrc` (a stray `url`/`proxy` line with no value) or an empty
+proxy variable. It's harmless; the install proceeds. To silence it, inspect and
+clean those up:
+
+```bash
+cat ~/.curlrc 2>/dev/null     # delete any bare url/proxy line with no value
+env | grep -i proxy           # unset any empty *_proxy / ALL_PROXY var
+```
+
+The published one-liner uses `curl -q`, so the installer's own command ignores
+`~/.curlrc` — but a broken config can still surface on other `curl` calls.
 
 ### "App opens but the menubar icon doesn't appear"
 
