@@ -45,6 +45,10 @@ jobs:
           # read-only / no-ops with nothing installed.)
           source ./install.sh
           FOUND_BUNDLES=()
+          add_unique_bundle /tmp/smoke-a.app   # first append against an EMPTY array (the guard)
+          add_unique_bundle /tmp/smoke-a.app   # dedup
+          [ "${#FOUND_BUNDLES[@]}" = "1" ] || { echo "::error::add_unique_bundle dedup broken"; exit 1; }
+          FOUND_BUNDLES=()
           enumerate_existing_installs >/dev/null 2>&1 || true
           should_skip_install || true        # holds the only bare ${FOUND_BUNDLES[0]} access
           detect_orphaned_setup || true

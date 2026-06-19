@@ -29,6 +29,9 @@ DMG_URL=""
 SHA_URL=""
 DMG_PATH=""
 SHA_PATH=""
+# Set by install_bundle() while a DMG is attached, so the cleanup() EXIT trap can
+# force-detach a mount that a failure path (or a held volume) left behind.
+MOUNT_POINT=""
 # Populated by enumerate_existing_installs(). Every value-expansion of this array
 # ("${FOUND_BUNDLES[@]}" / ${FOUND_BUNDLES[0]}) MUST be count-guarded — see note above.
 FOUND_BUNDLES=()
@@ -40,10 +43,25 @@ info() { printf '\033[0;36m[wispralt]\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m[wispralt]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[0;31m[wispralt]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# detach_dmg — unmount, retrying with -force for a volume briefly held by
+# Spotlight/AV/Finder. Returns 0 ONLY on a confirmed detach, 1 if it's still
+# mounted after the forced retry — so callers can tell whether the mount is gone.
+# Callers that just want best-effort cleanup should use `detach_dmg "$mp" || true`.
+detach_dmg() {
+    local mp="${1:-}"
+    [[ -n "$mp" ]] || return 0
+    hdiutil detach "$mp" >/dev/null 2>&1 && return 0
+    hdiutil detach "$mp" -force >/dev/null 2>&1 && return 0
+    return 1
+}
+
 cleanup() {
     if [[ -n "$INSTALL_TMP" && -d "$INSTALL_TMP" ]]; then
         rm -rf "$INSTALL_TMP"
     fi
+    # Force-detach any DMG install_bundle left mounted (e.g. a held volume that
+    # failed its in-line detach). MOUNT_POINT is a global so this trap can reach it.
+    detach_dmg "${MOUNT_POINT:-}" || true
     # Also clean the install-bundle mutex unconditionally — rmdir is idempotent
     # on a non-existent dir (returns nonzero, swallowed). This eliminates a race
     # where SIGINT between mkdir and trap re-register would orphan the lock.
@@ -94,6 +112,22 @@ is_wispralt_bundle() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
+# add_unique_bundle — append a discovered bundle path to FOUND_BUNDLES unless it's
+# already there. Single home for the dedup + the bash-3.2 empty-array guard, so the
+# explicit-path and find-sweep sources can't drift apart.
+# ───────────────────────────────────────────────────────────────────────────────
+add_unique_bundle() {
+    local cand="$1"
+    local b
+    if (( ${#FOUND_BUNDLES[@]} > 0 )); then
+        for b in "${FOUND_BUNDLES[@]}"; do
+            [[ "$b" == "$cand" ]] && return 0
+        done
+    fi
+    FOUND_BUNDLES+=("$cand")
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
 # enumerate_existing_installs — find every WisprAlt.app on disk via Spotlight
 # (bundle-ID query) plus a belt-and-suspenders explicit-path fallback and a
 # `find`-based orphan sweep across user-writable dirs. Populates FOUND_BUNDLES.
@@ -124,14 +158,7 @@ enumerate_existing_installs() {
     for p in "/Applications/WisprAlt.app" "$HOME/Applications/WisprAlt.app"; do
         [[ -d "$p" ]] || continue
         is_wispralt_bundle "$p" || continue
-        local already=0
-        local b
-        if (( ${#FOUND_BUNDLES[@]} > 0 )); then
-            for b in "${FOUND_BUNDLES[@]}"; do
-                [[ "$b" == "$p" ]] && already=1 && break
-            done
-        fi
-        (( already == 0 )) && FOUND_BUNDLES+=("$p")
+        add_unique_bundle "$p"
     done
 
     # v3: third orphan-discovery source via `find`. Catches WisprAlt copies in
@@ -144,14 +171,7 @@ enumerate_existing_installs() {
         [[ -z "$found" ]] && continue
         [[ -d "$found" ]] || continue
         is_wispralt_bundle "$found" || continue
-        local already=0
-        local b
-        if (( ${#FOUND_BUNDLES[@]} > 0 )); then
-            for b in "${FOUND_BUNDLES[@]}"; do
-                [[ "$b" == "$found" ]] && already=1 && break
-            done
-        fi
-        (( already == 0 )) && FOUND_BUNDLES+=("$found")
+        add_unique_bundle "$found"
     done < <(find "$HOME/Downloads" "$HOME/Desktop" "$HOME/Applications" \
         -maxdepth 3 -name "WisprAlt*.app" -type d 2>/dev/null)
 
@@ -383,7 +403,9 @@ download_and_verify() {
 # ───────────────────────────────────────────────────────────────────────────────
 install_bundle() {
     local app_path="/Applications/WisprAlt.app"
-    local mount_point="/tmp/wispralt-mount.$$"
+    # Global (not local) so the cleanup() trap can force-detach the DMG if a failure path
+    # — or a volume briefly held by Spotlight/AV/Finder — leaves it mounted.
+    MOUNT_POINT="/tmp/wispralt-mount.$$"
 
     # Note: the install-wide mutex is acquired in main() so it covers BOTH the
     # skip-install fast path and this full path. The cleanup() trap rmdir's it
@@ -391,7 +413,7 @@ install_bundle() {
     # get here; install_bundle now just mounts → copies → strips quarantine.
 
     # Defensive: stale mount from a previous failed run.
-    hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+    detach_dmg "$MOUNT_POINT" || true
 
     # Order matters. Mount and PROVE the replacement is present in the DMG BEFORE we
     # touch the existing install — otherwise a bad/empty DMG or a transient mount failure
@@ -399,11 +421,11 @@ install_bundle() {
     # old bundle, then copy. Every failure path after the attach detaches first, so a
     # removal/copy failure can never leak the mounted DMG.
     info "Mounting DMG..."
-    hdiutil attach "$DMG_PATH" -nobrowse -mountpoint "$mount_point" >/dev/null \
-        || die "Failed to mount DMG at $mount_point."
+    hdiutil attach "$DMG_PATH" -nobrowse -mountpoint "$MOUNT_POINT" >/dev/null \
+        || die "Failed to mount DMG at $MOUNT_POINT."
 
-    if [[ ! -d "$mount_point/WisprAlt.app" ]]; then
-        hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+    if [[ ! -d "$MOUNT_POINT/WisprAlt.app" ]]; then
+        detach_dmg "$MOUNT_POINT" || true
         die "Mounted DMG does not contain WisprAlt.app — leaving the existing install untouched."
     fi
 
@@ -414,27 +436,39 @@ install_bundle() {
     # this is belt-and-suspenders for a discovery miss.)
     if [[ -e "$app_path" ]]; then
         if ! is_wispralt_bundle "$app_path"; then
-            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            detach_dmg "$MOUNT_POINT" || true
             die "$app_path exists but is not a WisprAlt bundle — refusing to overwrite. Remove it manually and re-run."
         fi
         if ! rm -rf "$app_path"; then
-            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            detach_dmg "$MOUNT_POINT" || true
             die "Could not remove existing $app_path (is WisprAlt still running, or the path locked?). Quit WisprAlt and re-run."
         fi
     fi
 
     info "Copying WisprAlt.app to /Applications..."
-    if ! cp -R "$mount_point/WisprAlt.app" "/Applications/"; then
-        hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+    if ! cp -R "$MOUNT_POINT/WisprAlt.app" "/Applications/"; then
+        detach_dmg "$MOUNT_POINT" || true
         die "Failed to copy WisprAlt.app into /Applications."
     fi
 
-    hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+    # Only forget the mount once it's CONFIRMED detached; if the forced detach still
+    # failed (volume held), keep MOUNT_POINT set so the cleanup() trap retries on exit.
+    if detach_dmg "$MOUNT_POINT"; then
+        MOUNT_POINT=""
+    fi
 
     [[ -d "$app_path" ]] || die "Install failed — $app_path not present."
 
     # Strip quarantine attribute so Gatekeeper accepts our notarized build immediately.
     xattr -dr com.apple.quarantine "$app_path" 2>/dev/null || true
+
+    # Force LaunchServices to register the freshly-copied bundle NOW, so the tccutil reset
+    # in provision_credentials can resolve the bundle id to this path instead of racing LS
+    # indexing — an unregistered bundle makes `tccutil reset` no-op (OSStatus -10814) and
+    # silently leaves stale TCC grants on a cdhash change. lsregister isn't on PATH; invoke
+    # it by framework path, best-effort.
+    local lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    [[ -x "$lsregister" ]] && "$lsregister" -f "$app_path" >/dev/null 2>&1 || true
 }
 
 # ───────────────────────────────────────────────────────────────────────────────
