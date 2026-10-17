@@ -246,6 +246,28 @@ def sweep_stale_tmp(output_dir: Path, max_age_seconds: int = 3600) -> int:
     return removed
 
 
+_OUTPUT_SUFFIXES = (".txt", ".srt", ".vtt", ".json")
+
+
+def remove_job_outputs(output_dir: Path, job_id: str) -> bool:
+    """Delete ``<job_id>.{txt,srt,vtt,json}`` from *output_dir*.
+
+    Missing files are fine (idempotent). Returns True when nothing failed to
+    delete; False if any file could not be removed (caller should keep the
+    job row so the next sweep retries).
+    """
+    ok = True
+    for suffix in _OUTPUT_SUFFIXES:
+        try:
+            (output_dir / f"{job_id}{suffix}").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Could not remove %s%s: %s", job_id, suffix, exc)
+            ok = False
+    return ok
+
+
 # ── orchestration ──────────────────────────────────────────────────────────────
 
 

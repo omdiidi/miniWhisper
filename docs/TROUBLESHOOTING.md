@@ -148,7 +148,7 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 ### Healthy state
 - `curl https://transcribe.integrateapi.ai/readyz/db` → 200 `{"status":"ok"}`
-- `tail -200 ~/Library/Logs/WisprAlt/server.err.log | grep db_watcher` shows
+- `tail -200 ~/Library/Logs/WisprAlt/wispralt.log | grep db_watcher` shows
   EITHER nothing (steady-state) OR alternating `pool unhealthy` / `pool rebuilt`
   pairs (transient recovery).
 
@@ -161,7 +161,7 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 ```bash
 # Count "unexpected error" lines since last "pool rebuilt".
 # Healthy: small number. Stuck: counts grow without bound at ~6/min.
-tail -2000 ~/Library/Logs/WisprAlt/server.err.log \
+tail -2000 ~/Library/Logs/WisprAlt/wispralt.log \
   | awk '/db_watcher: pool rebuilt/{c=0; next} /db_watcher: unexpected error/{c++} END{print c+0}'
 ```
 
@@ -371,7 +371,7 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 **Diagnosis:** The poll loop in `MenuBarController` enforces a deadline of `max(2 × recording_duration, 600 s)`. When the deadline elapses the client automatically cancels the job via `DELETE /transcribe/meeting/{job_id}` and surfaces a `pollTimedOut` error notification. If you see the error, the server-side pipeline likely crashed or was killed mid-run.
 
 **Fix:**
-1. Check `GET /metrics` for `meeting.active` and `meeting.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/server.log` for Python tracebacks.
+1. Check `GET /metrics` for `meeting.active` and `meeting.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/wispralt.log` for Python tracebacks.
 2. Restart the server (`scripts/server-launchd.sh restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staging WAV.
 3. If the server is healthy but the job consistently times out for long recordings, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
 
@@ -609,4 +609,4 @@ dictation/timing: inject_ms=18.7 total_ms=1873.5
 2. If `net_total_ms` >> server-side `parakeet.p50_ms` (visible in `GET /metrics`) — the gap is upload + tunnel. For a 3-sentence (≈3-second) clip at 48kHz Float32 mono, the WAV is ~580 KB. On a typical home connection that's ~50-150ms upload. If `net_total_ms` minus server inference exceeds 800ms, suspect the Cloudflare Tunnel route (cross-region, slow first-byte) or local network egress.
 3. If `stop_ms` > 100ms — `AVAudioFile` close is taking unexpectedly long; investigate the dictation IO queue.
 
-**Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the Mac mini at `~/Library/Logs/WisprAlt/server.log`.
+**Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the Mac mini at `~/Library/Logs/WisprAlt/wispralt.log`.

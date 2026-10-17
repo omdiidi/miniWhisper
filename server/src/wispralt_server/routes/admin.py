@@ -348,12 +348,6 @@ async def admin_active(request: Request) -> JSONResponse:
     return JSONResponse({"jobs": jobs_payload})
 
 
-# Resolved once per import. Settings has no explicit ``server_log_path``
-# field (Phase 3 deliberately keeps the path uncongifurable for now); the
-# launchd plist points stdout/stderr at this path on macOS.
-_DEFAULT_SERVER_LOG_PATH = Path.home() / "Library" / "Logs" / "WisprAlt" / "server.log"
-
-
 @router.get(
     "/admin/server-log/{job_id}",
     dependencies=[Depends(require_admin)],
@@ -368,24 +362,33 @@ async def admin_server_log(request: Request, job_id: str) -> PlainTextResponse:
     text response — the client renders it as monospace in the View Server
     Log sheet.
     """
-    log_path = getattr(
-        settings, "server_log_path", _DEFAULT_SERVER_LOG_PATH,
-    )
-    log_path = Path(log_path)
+    # Rotating application log (see ops/logging_setup.py), NOT launchd's
+    # server.log, which only holds crash output.
+    log_path = Path(settings.server_log_path)
     if not log_path.exists():
         raise HTTPException(404, f"Server log not found at {log_path}")
+    # Rotated backups, oldest first, so a job that straddles a rotation is
+    # still found. Reading is newest-first-capped below.
+    backups = [
+        b for b in (
+            log_path.with_name(f"{log_path.name}.{n}")
+            for n in range(settings.server_log_backup_count, 0, -1)
+        )
+        if b.exists()
+    ]
 
     # Read up to a reasonable cap so a multi-GB log doesn't OOM the server.
     # 50 MiB is enough to reach back hours of output at info-level.
     _MAX_BYTES = 50 * 1024 * 1024
     try:
-        size = log_path.stat().st_size
-        with open(log_path, "rb") as fh:
-            if size > _MAX_BYTES:
-                fh.seek(size - _MAX_BYTES)
-                # Drop partial first line so we start at a line boundary.
-                fh.readline()
-            data = fh.read()
+        chunks: list[bytes] = []
+        for f in [*backups, log_path]:
+            chunks.append(f.read_bytes())
+        data = b"".join(chunks)
+        if len(data) > _MAX_BYTES:
+            data = data[-_MAX_BYTES:]
+            # Drop partial first line so we start at a line boundary.
+            data = data.split(b"\n", 1)[-1]
     except OSError as exc:
         raise HTTPException(500, f"Could not read server log: {exc}") from exc
 

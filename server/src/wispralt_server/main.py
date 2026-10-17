@@ -58,8 +58,9 @@ from wispralt_server.insights.cron import (
 )
 from wispralt_server.jobs.runner import MeetingRunner
 from wispralt_server.jobs.store import JobStore
+from wispralt_server.ops import background
+from wispralt_server.ops.logging_setup import configure_file_logging
 from wispralt_server.meeting import install_compat_shims
-from wispralt_server.meeting.output import sweep_stale_tmp
 from wispralt_server.middleware import openai_errors
 from wispralt_server.middleware.rate_limit import RateLimitMiddleware
 from wispralt_server.ops import staging
@@ -123,6 +124,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Everything before ``yield`` runs at startup; everything after at shutdown.
     """
     # ── startup ───────────────────────────────────────────────────────────────
+
+    # Size-capped app log (launchd can't rotate without sudo). Done here, not
+    # at import, so importing main in tests never touches ~/Library/Logs.
+    configure_file_logging(
+        settings.server_log_path,
+        settings.server_log_max_bytes,
+        settings.server_log_backup_count,
+    )
 
     # Verify the watcher's exception coverage. asyncpg has NO common base
     # class for the two failure modes we need to catch: PostgresError
@@ -188,31 +197,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 4. Sweep stale staging WAVs (> 24 h) left from the previous run.
     #    Exclude WAVs referenced by any non-terminal job so re-queue candidates
     #    are not accidentally removed by the sweep (C7 fix).
-    active_wav_paths = {Path(j.wav_path) for j in job_store.list_active_jobs()}
-    removed = staging.sweep_old(
-        settings.staging_dir,
-        max_age_seconds=86400,
-        exclude_paths=active_wav_paths,
-    )
+    #    The same sweeps re-run daily from ops.background.daily_sweep_loop.
+    #    sweep_old/sweep_chunked/sweep_stale_tmp: chunked-upload dirs use a
+    #    separate 1 h TTL (meta.json mtime is bumped per chunk, so active
+    #    uploads are safe); stale meeting-output .tmp files are removed too.
+    removed, chunked_removed, tmp_removed = background.sweep_staging(job_store)
     if removed:
         logger.info("Startup staging sweep removed %d old WAV(s).", removed)
-
-    # 4a. Sweep stale chunked-upload directories (>1 h). Separate TTL from the
-    #     plain-WAV sweep because abandoned chunked dirs pin a lot of disk per
-    #     item; meta.json mtime is bumped on every chunk write so active
-    #     uploads are safe.
-    chunked_removed = staging.sweep_chunked(
-        settings.staging_dir,
-        max_age_seconds=3600,
-    )
     if chunked_removed:
         logger.info(
             "Startup chunked sweep removed %d stale chunked upload dir(s).",
             chunked_removed,
         )
-
-    # 4b. Sweep stale .tmp files in meeting output dir (I8).
-    tmp_removed = sweep_stale_tmp(settings.meeting_output_dir)
     if tmp_removed:
         logger.info("Startup tmp sweep removed %d stale .tmp file(s).", tmp_removed)
 
@@ -274,7 +270,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 6b. Mercury client — fail-soft. If init throws, smart formatting is silently
     #     disabled. Same fail-soft contract as runtime: any error → None return.
     app.state.mercury_client = None
-    if settings.openrouter_api_key:
+    if settings.smart_format_enabled and settings.openrouter_api_key:
         try:
             app.state.mercury_client = MercuryClient(
                 api_key=settings.openrouter_api_key,
@@ -295,7 +291,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             app.state.mercury_client = None
     else:
-        logger.info("mercury_client not configured (OPENROUTER_API_KEY unset)")
+        logger.info(
+            "mercury_client disabled (SMART_FORMAT_ENABLED=%s, OPENROUTER_API_KEY %s)",
+            settings.smart_format_enabled,
+            "set" if settings.openrouter_api_key else "unset",
+        )
 
     # 6c. InsightsClient — fail-soft mirror of mercury_client. None when
     #     OPENROUTER_API_KEY is unset; weekly cron is a no-op in that case.
@@ -341,52 +341,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.eviction_task = None
     if settings.meeting_idle_eviction_seconds > 0:
-        async def _eviction_loop() -> None:
-            threshold = float(settings.meeting_idle_eviction_seconds)
-            while not getattr(app.state, "shutting_down", False):
-                try:
-                    await asyncio.sleep(60.0)
-                    if meeting_runner.active:
-                        continue
-                    evicted = await asyncio.to_thread(
-                        meeting_pipeline.evict_if_idle, threshold
-                    )
-                    if evicted:
-                        logger.info(
-                            "Idle eviction released meeting models (idle threshold %.0fs).",
-                            threshold,
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    logger.exception("Idle-eviction loop iteration failed")
-        app.state.eviction_task = asyncio.create_task(_eviction_loop())
+        app.state.eviction_task = asyncio.create_task(
+            background.eviction_loop(app, meeting_runner, meeting_pipeline)
+        )
 
     # 7d. Phase 1 transcript-storage: daily sweep loop. Re-runs the same
     #     `sweep_transcripts` that ran at startup so a long-uptime server
     #     eventually reaps. Daemon-loop pattern: broad-except + log so a
     #     transient SQLite error never kills the task.
-    async def _daily_transcript_sweep() -> None:
-        while not getattr(app.state, "shutting_down", False):
-            try:
-                await asyncio.sleep(24 * 3600)
-            except asyncio.CancelledError:
-                raise
-            try:
-                j, d = job_store.sweep_transcripts(
-                    days=settings.transcript_retention_days
-                )
-                if j or d:
-                    logger.info(
-                        "Daily transcript sweep: jobs=%d, dictations=%d", j, d
-                    )
-            except Exception:  # noqa: BLE001 — daemon loop must never crash
-                logger.exception(
-                    "Daily transcript sweep failed; retrying tomorrow"
-                )
-
     app.state.transcript_sweep_task = asyncio.create_task(
-        _daily_transcript_sweep()
+        background.daily_sweep_loop(
+            app, job_store, lambda jid: meeting_runner.active_job_id == jid
+        )
     )
 
     # 7e. Phase 2: weekly LLM insights cron. Sunday 23:00 mini-local. Sleeps
@@ -511,50 +477,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #     operator restarts the server. Triggered by a real outage 2026-05-02.
     app.state.db_watcher_task = None
 
-    async def _db_watcher_loop() -> None:
-        while not getattr(app.state, "shutting_down", False):
-            try:
-                await asyncio.sleep(10.0)
-                pool = getattr(app.state, "db_pool", None)
-                healthy = pool is not None and await db.health_check(pool)
-                if healthy:
-                    continue
-                logger.warning(
-                    "db_watcher: pool unhealthy (pool=%s) — attempting rebuild",
-                    "None" if pool is None else "dead",
-                )
-                try:
-                    new_pool = await db.recreate_pool()
-                except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, db.PostgresUnavailable):
-                    logger.exception("db_watcher: rebuild failed; will retry in 10s")
-                    continue
-                app.state.db_pool = new_pool
-                # Restart the usage drainer against the new pool. Cancel the
-                # old one (if any) — it's holding a reference to the dead pool
-                # and will throw on next acquire.
-                old_drainer = getattr(app.state, "usage_drainer", None)
-                if old_drainer is not None and not old_drainer.done():
-                    old_drainer.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await old_drainer
-                app.state.usage_drainer = asyncio.create_task(
-                    usage_writer.drain_loop(observability.usage_queue, new_pool)
-                )
-                logger.info("db_watcher: pool rebuilt; usage drainer restarted")
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 — watcher must never crash silently
-                # POSTMORTEM 2026-05-17: do NOT narrow this catch. It is the
-                # last-resort guard. The bug we fixed was that asyncpg.InterfaceError
-                # ("pool is closed") slipped past health_check's narrow
-                # asyncpg.PostgresError catch and got swallowed HERE — silently
-                # looping for 5 hours. The right fix was to broaden the INNER
-                # catches (f5178be), not to make this outer one type-specific.
-                # Any new code added inside the loop MUST catch its own
-                # exceptions narrowly so this catch-all doesn't mask new bug shapes.
-                logger.exception("db_watcher: unexpected error; continuing loop")
-
-    app.state.db_watcher_task = asyncio.create_task(_db_watcher_loop())
+    app.state.db_watcher_task = asyncio.create_task(background.db_watcher_loop(app))
 
     # Initialize per-token rate-limit state for /v1/* routes. Idempotent.
     # Imported locally to avoid a top-of-module cycle with the auth/users modules.

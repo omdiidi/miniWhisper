@@ -106,6 +106,12 @@ class Settings(BaseSettings):
     # Optional: when openrouter_api_key is None, smart formatting is silently disabled
     # (clients toggling the X-Smart-Format header on get raw text back).
     openrouter_api_key: str | None = None
+    # Smart formatting is OFF by default: at the 600 ms budget Mercury timed
+    # out on nearly every production request, so each dictation paid an
+    # OpenRouter round-trip for nothing. Set SMART_FORMAT_ENABLED=true to opt
+    # in (also requires OPENROUTER_API_KEY). The weekly insights client does
+    # NOT depend on this flag.
+    smart_format_enabled: bool = False
     openrouter_model: str = "inception/mercury-2"
     # 600 ms ceiling for the Mercury cleanup (lowered from 1500 ms on
     # 2026-05-02 after measuring 7-day production latency: dictate p95
@@ -145,6 +151,21 @@ class Settings(BaseSettings):
     # actually existed, not job submission. Daily sweep runs in the lifespan
     # background task. See docs/ARCHITECTURE.md "Transcript persistence".
     transcript_retention_days: int = 90
+
+    # Finished (done/failed) meeting job rows and their output files
+    # (<id>.txt/.srt/.vtt/.json in meeting_output_dir) older than this many
+    # days are deleted by the daily sweep. 0 disables. Default matches
+    # transcript_retention_days so /me/history keeps meeting rows for as long
+    # as their transcript text is retained. Pending/running jobs are never
+    # deleted.
+    meeting_job_retention_days: int = 90
+
+    # Application log (RotatingFileHandler). launchd's server.log /
+    # server.err.log are left for crash output only. /admin/server-log reads
+    # this file. 10 MB x (1 + 5 backups) = ~60 MB cap.
+    server_log_path: Path = Path.home() / "Library" / "Logs" / "WisprAlt" / "wispralt.log"
+    server_log_max_bytes: int = 10 * 1024 * 1024
+    server_log_backup_count: int = 5
 
     # Plan A /me/history pagination size. Each request returns at most this
     # many rows per leg (dictations + meetings), merged and capped to this

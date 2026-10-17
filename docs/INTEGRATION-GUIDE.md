@@ -225,7 +225,7 @@ you want cleanup in your own pipeline, do it yourself.
 ### Need cleanup but not via the WisprAlt client?
 
 Hit the native endpoint directly with the `X-Smart-Format: true` header. Your
-operator must have `OPENROUTER_API_KEY` configured server-side for this to
+operator must have `SMART_FORMAT_ENABLED=true` and `OPENROUTER_API_KEY` configured server-side for this to
 work; without the key, the header is silently ignored and you get raw output.
 
 ```bash

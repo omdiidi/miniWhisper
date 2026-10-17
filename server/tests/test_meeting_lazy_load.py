@@ -1,6 +1,6 @@
 """Regression tests for the lazy-load model lifecycle.
 
-Mocks _wx_mod.load, _diarize_mod.load, _df_mod.get_df so we can exercise the
+Mocks _mlx_mod.load, _diarize_mod.load, _df_mod.get_df so we can exercise the
 control flow without spending GB-minutes loading real weights.
 
 Three cases (mirrors mercury_safety.py style — focused, no fixtures):
@@ -22,7 +22,7 @@ def _reset_state() -> None:
     p._meeting_models_ready = False
     p._loading_in_flight = False
     p._last_meeting_finished_at = 0.0
-    p._wx_mod.reset()
+    p._mlx_mod.reset()
     p._diarize_mod.reset()
 
 
@@ -46,7 +46,7 @@ def test_evict_if_idle_unloads_when_above_threshold():
     p._meeting_models_ready = True
     import time as _t
     p._last_meeting_finished_at = _t.monotonic() - 600.0  # 10 min ago
-    with patch.object(p._wx_mod, "reset") as wx_reset, \
+    with patch.object(p._mlx_mod, "reset") as wx_reset, \
          patch.object(p._diarize_mod, "reset") as di_reset:
         result = p.evict_if_idle(300.0)  # threshold 5 min
     assert result is True
@@ -58,7 +58,7 @@ def test_evict_if_idle_unloads_when_above_threshold():
 def test_lazy_load_happy_path():
     _reset_state()
     with patch.object(p, "install_compat_shims"), \
-         patch.object(p._wx_mod, "load") as wx, \
+         patch.object(p._mlx_mod, "load") as wx, \
          patch.object(p._diarize_mod, "load") as di, \
          patch.object(p._df_mod, "get_df") as df:
         p._ensure_models_loaded()
@@ -76,8 +76,8 @@ def test_lazy_load_partial_failure_calls_reset_and_retries_clean():
     def fake_wx_reset(): wx_reset.append(1)
     def fake_di_reset(): di_reset.append(1)
     with patch.object(p, "install_compat_shims"), \
-         patch.object(p._wx_mod, "load"), \
-         patch.object(p._wx_mod, "reset", side_effect=fake_wx_reset), \
+         patch.object(p._mlx_mod, "load"), \
+         patch.object(p._mlx_mod, "reset", side_effect=fake_wx_reset), \
          patch.object(p._diarize_mod, "load", side_effect=RuntimeError("boom")), \
          patch.object(p._diarize_mod, "reset", side_effect=fake_di_reset), \
          patch.object(p._df_mod, "get_df"):
@@ -113,7 +113,7 @@ def test_lazy_load_single_flight_under_concurrency():
         p._ensure_models_loaded()
 
     with patch.object(p, "install_compat_shims"), \
-         patch.object(p._wx_mod, "load", side_effect=slow_load), \
+         patch.object(p._mlx_mod, "load", side_effect=slow_load), \
          patch.object(p._diarize_mod, "load"), \
          patch.object(p._df_mod, "get_df"):
         t1 = threading.Thread(target=p._ensure_models_loaded)

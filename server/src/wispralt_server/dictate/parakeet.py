@@ -43,6 +43,9 @@ MIN_SAMPLES = 1_600
 # attribute lookup on the hot path.
 from wispralt_server.config import settings as _settings
 MAX_SAMPLES = TARGET_SR * _settings.dictation_max_duration_s
+# Clear the MLX cache after every clip longer than this, else every Nth request.
+CACHE_CLEAR_MIN_SAMPLES = TARGET_SR * 30
+CACHE_CLEAR_EVERY_N = 20
 
 
 class ParakeetService:
@@ -62,6 +65,7 @@ class ParakeetService:
         self._exec: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parakeet")
         # Rolling window of recent inference durations (milliseconds), maxlen=100 for percentiles
         self.recent_durations: collections.deque[float] = collections.deque(maxlen=100)
+        self._requests_since_clear: int = 0
 
     def load(self) -> None:
         """Load model weights and run a warmup pass to trigger Metal JIT compilation.
@@ -142,15 +146,54 @@ class ParakeetService:
         logger.warning("Unexpected Parakeet result type: %s", type(result))
         return "", None
 
+    def _run_model(self, samples: np.ndarray) -> object:
+        """Run the model on 16 kHz mono float32 *samples*; return the raw result.
+
+        Shared by both ``_sync_transcribe*`` entry points. Tensors are dropped
+        before returning so a following ``_maybe_clear_cache`` can actually
+        release their memory.
+        """
+        audio_mlx = mx.array(samples, dtype=mx.float32)
+        mel = get_logmel(audio_mlx, self.model.preprocessor_config)  # type: ignore[union-attr]
+        result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
+        mx.eval(result)
+        del mel, audio_mlx
+        return result
+
+    def _maybe_clear_cache(self, n_samples: int) -> None:
+        """Return MLX's unified-memory pool to the OS, but not on every request.
+
+        MLX grows the pool to the largest working set seen and never shrinks it
+        on its own, so long clips (big peaks) clear immediately. Short clips
+        reuse the cached buffers (clearing costs ~10-30 ms of re-allocation on
+        the next call), so for those we clear only every
+        ``CACHE_CLEAR_EVERY_N`` requests to bound drift.
+        """
+        self._requests_since_clear += 1
+        if (
+            n_samples <= CACHE_CLEAR_MIN_SAMPLES
+            and self._requests_since_clear < CACHE_CLEAR_EVERY_N
+        ):
+            return
+        self._requests_since_clear = 0
+        try:
+            mx.metal.clear_cache()
+        except AttributeError:
+            # Future MLX may move the API; don't crash dictation over a memory
+            # hygiene call.
+            pass
+
     def _sync_transcribe(self, audio_bytes: bytes) -> tuple[str, float]:
         """Blocking inference — runs inside the single-thread executor.
+
+        Decodes + resamples the WAV bytes, then delegates to
+        :meth:`_sync_transcribe_with_alignment` (which applies the length
+        guards, runs the model and records the duration).
 
         Returns
         -------
         (text, duration_ms)
         """
-        t0 = time.perf_counter()
-
         # Decode + resample at the audio.py boundary — every decode/resample
         # failure becomes CorruptAudioError so the route layer maps it to 422.
         audio_np, sr = decode_wav_bytes(audio_bytes)
@@ -162,63 +205,18 @@ class ParakeetService:
         # Resample to 16 kHz; safe_resample also maps librosa errors to 422.
         audio_np = safe_resample(audio_np, sr, TARGET_SR)
 
-        # Reject decode-amplification: cap post-resample length at MAX_DURATION_S
-        # to prevent ulaw/alaw or pathological-sr uploads decoding into multi-minute
-        # arrays that block the single-thread executor.
-        if len(audio_np) > MAX_SAMPLES:
-            from wispralt_server._errors import AudioTooLongError
-            raise AudioTooLongError(
-                f"Audio too long: {len(audio_np) / TARGET_SR:.1f}s "
-                f"(max {MAX_SAMPLES / TARGET_SR:.0f}s). For longer audio, use "
-                f"meeting recording (FN-triple-tap)."
-            )
-
-        # Guard against too-short clips (silence or near-silence)
-        if len(audio_np) < MIN_SAMPLES:
-            logger.debug(
-                "Parakeet skipping short clip: %d samples (< MIN_SAMPLES=%d)",
-                len(audio_np),
-                MIN_SAMPLES,
-            )
-            return "", 0.0
-
-        audio_mlx = mx.array(audio_np, dtype=mx.float32)
-        mel = get_logmel(audio_mlx, self.model.preprocessor_config)  # type: ignore[union-attr]
-        result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
-        mx.eval(result)
-
-        text = self._extract_text(result)
-
-        # Drop refs before clearing the MLX pool so the cache release actually
-        # returns memory to the OS. Without explicit `del`, Python keeps the
-        # tensors alive until the next assignment and clear_cache() is a no-op
-        # for the bytes those tensors own.
-        del result, mel, audio_mlx
-        # Return MLX's unified-memory pool to the OS. MLX grows the pool to
-        # accommodate the largest working set seen so far (a 2-min dictation
-        # peaks several GB) and NEVER shrinks it on its own. Without this call
-        # the python process accumulates ~all-time-peak unified memory and the
-        # mini's "Memory" column climbs monotonically per dictation. Clearing
-        # adds ~10-30 ms to the next inference (re-allocating from OS) which
-        # is well below the dictation budget and dwarfed by the inference itself.
-        try:
-            mx.metal.clear_cache()
-        except AttributeError:
-            # Future MLX may move the API; don't crash dictation over a memory
-            # hygiene call.
-            pass
-
-        duration_ms = (time.perf_counter() - t0) * 1_000.0
-        self.recent_durations.append(duration_ms)
+        # MAX_SAMPLES (decode-amplification) and MIN_SAMPLES guards live in
+        # the shared method below.
+        text, duration_ms, _ = self._sync_transcribe_with_alignment(audio_np)
         return text, duration_ms
 
     def _sync_transcribe_with_alignment(
         self, samples: np.ndarray,
     ) -> tuple[str, float, list | None]:
-        """Variant of _sync_transcribe taking pre-decoded samples; returns aligned tokens.
+        """Run inference on pre-decoded samples; returns aligned tokens.
 
-        Used by /v1/audio/transcriptions which performs its own libsndfile/ffmpeg
-        decode before this call.
+        Used by /v1/audio/transcriptions (own libsndfile/ffmpeg decode) and by
+        :meth:`_sync_transcribe`.
 
         Parameters
         ----------
@@ -249,18 +247,10 @@ class ParakeetService:
             )
             return "", 0.0, None
 
-        audio_mlx = mx.array(samples, dtype=mx.float32)
-        mel = get_logmel(audio_mlx, self.model.preprocessor_config)  # type: ignore[union-attr]
-        result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
-        mx.eval(result)
-
+        result = self._run_model(samples)
         text, tokens = self._extract_text_and_tokens(result)
-
-        del result, mel, audio_mlx
-        try:
-            mx.metal.clear_cache()
-        except AttributeError:
-            pass
+        del result
+        self._maybe_clear_cache(len(samples))
 
         duration_ms = (time.perf_counter() - t0) * 1_000.0
         self.recent_durations.append(duration_ms)

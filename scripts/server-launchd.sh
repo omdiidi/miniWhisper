@@ -11,7 +11,7 @@
 #
 # LaunchAgent label: co.wispralt.server
 # Plist path:        ~/Library/LaunchAgents/co.wispralt.server.plist
-# Log path:          ~/Library/Logs/WisprAlt/server.{log,err.log}
+# Log path:          ~/Library/Logs/WisprAlt/server.{log,err.log} (crash output only; the app logs to wispralt.log, rotated in-process)
 #
 # Security: no secrets are written to the plist.
 # The .env file (mode 0600) is loaded by Pydantic Settings at uvicorn startup.

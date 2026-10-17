@@ -989,6 +989,41 @@ class JobStore:
         )
         return jobs_cur.rowcount, dicts_cur.rowcount
 
+    def list_expired_finished_jobs(self, days: int) -> list[tuple[str, str | None]]:
+        """Return ``(id, output_dir)`` of *finished* (done/failed) jobs older than *days*.
+
+        Age is ``COALESCE(finished_at, created_at)``. Pending/running jobs are
+        never returned, regardless of age, so an in-flight meeting can't be
+        reaped.
+        """
+        cutoff = time.time() - days * 86400
+        cur = self._exec(
+            "SELECT id, output_dir FROM jobs WHERE status IN ('done','failed')"
+            " AND COALESCE(finished_at, created_at) < ?",
+            cutoff,
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+    def delete_finished_jobs(self, job_ids: list[str]) -> int:
+        """Hard-delete the given jobs, but only if still done/failed.
+
+        The status guard is re-applied in SQL so a row that changed state
+        between :meth:`list_expired_finished_jobs` and this call survives.
+        Returns the number of rows deleted.
+        """
+        deleted = 0
+        # Chunked to stay under SQLite's bound-variable limit.
+        for i in range(0, len(job_ids), 500):
+            batch = job_ids[i : i + 500]
+            placeholders = ",".join("?" * len(batch))
+            cur = self._exec(
+                f"DELETE FROM jobs WHERE status IN ('done','failed')"
+                f" AND id IN ({placeholders})",
+                *batch,
+            )
+            deleted += cur.rowcount
+        return deleted
+
     def set_failed(self, jid: str, error: str) -> None:
         """Transition any job status → failed."""
         self._exec(

@@ -52,7 +52,7 @@ If you just need to read state and the user is sitting at the mini, the fastest 
 - Repository pattern: database queries in repository functions, business logic in services, validation at route boundaries only.
 - No generic `except Exception` — use typed errors.
 - No model loading per dictation request; dictation models are resident at startup. Meeting models load lazily on the first meeting job (async batch — load cost is invisible).
-- No Redis — SQLite-only job store.
+- No Redis. Meeting jobs/dictation transcripts live in a SQLite job store; users, tokens and usage events live in Postgres (Supabase, via asyncpg).
 - No server-side speaker rename — client-only, atomic local rewrite.
 - Cloudflared tunnel token: stored in `~/.config/wispralt/cloudflare-token` (mode 0600)
   outside the repo. Read by the cloudflared LaunchAgent via `--token-file`. Never

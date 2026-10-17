@@ -177,7 +177,9 @@ class TestAddEmployeeRoute:
         self._override_admin(app)
         captured: dict[str, Any] = {}
 
-        async def _fake_mint(_pool: Any, *, label: str, role: str) -> tuple[User, str]:
+        async def _fake_mint(
+            _pool: Any, *, label: str, role: str, display_name: str | None = None
+        ) -> tuple[User, str]:
             captured["label"] = label
             captured["role"] = role
             return User(id=99, label=label, role=role), "deadbeef" * 8
