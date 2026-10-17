@@ -28,7 +28,6 @@ final class Settings: ObservableObject {
         static let maxMeetingMinutes = "maxMeetingMinutes"
         static let preferredInputDeviceUID = "preferredInputDeviceUID"
         static let smartFormatting = "smartFormatting"
-        static let streamingDictation = "streamingDictation"
         static let displayName = "displayName"  // mirror of server-side display_name; source of truth is server
         static let updateAvailable = "updateAvailable"
         static let lastUpdateCheck = "lastUpdateCheck"
@@ -124,16 +123,6 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// Opt-in experimental streaming dictation that transcribes audio chunks in
-    /// parallel with recording so long (~30s+) dictations finalize faster. Off
-    /// by default. If the optimized path stalls or fails, the recorder silently
-    /// falls back to the standard `/transcribe/dictate` ladder after ~8 s.
-    @Published var streamingDictation: Bool {
-        didSet {
-            defaults.set(streamingDictation, forKey: Key.streamingDictation)
-        }
-    }
-
     /// Mirror of the server-side `display_name` field. Source of truth is the
     /// server (`/me`); this local copy is updated after every successful GET/PATCH
     /// so the Settings UI can render the current value without an extra round-trip.
@@ -187,7 +176,6 @@ final class Settings: ObservableObject {
         let storedMaxMeetingMinutes = suite.object(forKey: Key.maxMeetingMinutes) as? Int ?? 90
         let storedPreferredInputUID = suite.string(forKey: Key.preferredInputDeviceUID)
         let storedSmart = suite.object(forKey: Key.smartFormatting) as? Bool ?? false
-        let storedStreaming = suite.object(forKey: Key.streamingDictation) as? Bool ?? false
         let storedName = suite.string(forKey: Key.displayName)
         let storedUpdate = suite.string(forKey: Key.updateAvailable)
         let storedLastEpoch = suite.object(forKey: Key.lastUpdateCheck) as? Double
@@ -212,7 +200,6 @@ final class Settings: ObservableObject {
         self._maxMeetingMinutes = Published(initialValue: storedMaxMeetingMinutes)
         self._preferredInputDeviceUID = Published(initialValue: storedPreferredInputUID)
         self._smartFormatting = Published(initialValue: storedSmart)
-        self._streamingDictation = Published(initialValue: storedStreaming)
         self._displayName = Published(initialValue: storedName)
         self._updateAvailable = Published(initialValue: cleanedUpdate)
         self._lastUpdateCheck = Published(

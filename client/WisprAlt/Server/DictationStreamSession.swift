@@ -14,7 +14,7 @@ enum StreamingFailure: Error {
 
 /// Per-recording streaming dictation session: an actor wrapping the
 /// chunk-by-chunk POST loop. Constructed by `DictationRecorder` at `start()`
-/// when `Settings.streamingDictation == true`; spilled to the recorder's tap
+/// when streaming is enabled for the session; spilled to the recorder's tap
 /// callback which calls `enqueueChunk(_:index:)` once per VAD-cut segment;
 /// finally drained by `DictationAPI.transcribe(_:recorder:)` via
 /// `finalize(tail:smartFormat:)` which awaits all in-flight chunk POSTs and
@@ -81,12 +81,20 @@ actor DictationStreamSession {
         let t = Task.detached(priority: .userInitiated) { [self] in
             do {
                 try await self.postChunk(wav, index: index)
+                // Success: drop the finished task so it is not retained for
+                // the rest of the session. Failures stay out of this path:
+                // they latch `aborted`, which makes finalize() throw.
+                await self.chunkFinished(index)
             } catch {
                 await self.markAborted(reason: "\(error)")
                 throw error
             }
         }
         inFlight[index] = t
+    }
+
+    private func chunkFinished(_ index: Int) {
+        inFlight[index] = nil
     }
 
     // MARK: - Finalize
@@ -97,6 +105,8 @@ actor DictationStreamSession {
     /// in-flight tasks and rethrows so the caller can fall back.
     func finalize(tail: Data, smartFormat: Bool) async throws -> String {
         guard !aborted else { throw StreamingFailure.aborted }
+        // Release consumed tasks on every exit path; the session is one-shot.
+        defer { inFlight.removeAll() }
         return try await withThrowingTaskGroup(of: Void.self) { group in
             for t in inFlight.values {
                 group.addTask { _ = try await t.value }
@@ -119,6 +129,7 @@ actor DictationStreamSession {
     func abort() {
         aborted = true
         for t in inFlight.values { t.cancel() }
+        inFlight.removeAll()
     }
 
     private func markAborted(reason: String) {

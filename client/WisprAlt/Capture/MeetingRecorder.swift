@@ -70,6 +70,7 @@ final class MeetingRecorder: NSObject {
     // hop queues.
 
     private let _isActiveLock = OSAllocatedUnfairLock(initialState: false)
+    private let isStartingLock = OSAllocatedUnfairLock(initialState: false)
 
     /// `true` while capture is active. Thread-safe; safe to read from any thread.
     var isActive: Bool {
@@ -187,6 +188,15 @@ final class MeetingRecorder: NSObject {
             : maxDuration
         let maxDuration = resolvedMaxDuration
         guard !isActive else { throw MeetingRecorderError.alreadyRunning }
+        // Re-entrancy guard: isActive stays false across the awaits below, so
+        // a rapid second start() would otherwise orphan streams/timers.
+        let claimed = isStartingLock.withLock { starting -> Bool in
+            if starting { return false }
+            starting = true
+            return true
+        }
+        guard claimed else { throw MeetingRecorderError.alreadyRunning }
+        defer { isStartingLock.withLock { $0 = false } }
 
         // NOTE: SCStream uses the macOS system default input device for its
         // microphone channel and exposes no per-stream device API. WisprAlt
@@ -734,7 +744,7 @@ extension MeetingRecorder: SCStreamOutput {
         // Compute sample offset using CMTimeSubtract (not float subtraction) to avoid
         // accumulating drift over multi-hour recordings (R1#18 / known gotcha).
         let elapsed = CMTimeSubtract(pts, localStart)
-        let offsetSamples = max(0, Int(CMTimeGetSeconds(elapsed) * 16_000.0))
+        let offsetSamples = max(0, Int((CMTimeGetSeconds(elapsed) * 16_000.0).rounded()))
 
         // Convert via the retained per-channel converter (v3 P4#8).
         switch outputType {

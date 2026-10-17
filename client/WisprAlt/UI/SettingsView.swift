@@ -86,8 +86,8 @@ struct SettingsView: View {
             smartFormattingSection
             // v0.4.6: streamingDictationSection removed — streaming is always on.
             // The DictationRecorder hardcodes `streamingEnabledForThisSession = true`
-            // at start(), so no user-facing toggle. Internal Settings.streamingDictation
-            // property left in place for back-compat / future revert; ignored by code.
+            // at start(), so no user-facing toggle. No
+            // Settings flag exists (the old streamingDictation property was removed).
             hotkeySection
             launchAtLoginSection
             meetingsFolderSection

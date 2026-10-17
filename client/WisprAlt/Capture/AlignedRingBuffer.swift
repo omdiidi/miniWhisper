@@ -54,12 +54,34 @@ final class AlignedRingBuffer {
     /// The sample position up to which data has been committed (written to file).
     private var committed: Int = 0
 
+    /// Cumulative forward-jump corrections per channel (samples), subtracted
+    /// from every later append on that channel.
+    private var micShift: Int = 0
+    private var sysShift: Int = 0
+
     private var lock = os_unfair_lock_s()
 
     // MARK: - Constants
 
     /// 200 ms at 16 kHz = 3200 samples.
     private let gapToleranceSamples: Int = 16_000 / 5
+
+    /// Holes up to 4 ms (64 samples) between consecutive chunks of one channel
+    /// are treated as covered (and zero-filled by `fillChannel`). PTS-derived
+    /// positions jitter by a sample or two; without this a 1-sample hole stalls
+    /// draining while both channels keep queueing audio.
+    private let holeToleranceSamples: Int = 64
+
+    /// If either channel's queue extends further than this past `committed`,
+    /// the next flush is forced (zero-filling holes) so the queues can never
+    /// grow without bound. 10 s at 16 kHz.
+    private let maxBacklogSamples: Int = 16_000 * 10
+
+    /// A single append may not jump further than this past its own channel's
+    /// furthest known position (5 s); larger forward PTS jumps are clamped so gap-sized
+    /// silence buffers are never allocated. Sleep/wake padding goes through
+    /// `padMissing(uptoSampleEnd:)` and is unaffected.
+    private let maxForwardJumpSamples: Int = 16_000 * 5
 
     // MARK: - Wall-clock stall detection
 
@@ -78,12 +100,31 @@ final class AlignedRingBuffer {
     func append(_ buf: AVAudioPCMBuffer, atSamplePos: Int, channel: AudioChannel) {
         guard buf.frameLength > 0 else { return }
 
-        let safe = max(0, atSamplePos)  // v3 P4#2: clamp negative offsets from PTS race
-        let chunk = Chunk(start: safe, buf: buf)
         let now = Date().timeIntervalSinceReferenceDate
 
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
+
+        // Apply the per-channel correction learned from earlier forward jumps
+        // so a persistent PTS discontinuity is corrected once, not per buffer.
+        let shift = (channel == .mic) ? micShift : sysShift
+        var safe = max(0, atSamplePos - shift)  // v3 P4#2: clamp negative offsets from PTS race
+
+        // Channel-local baseline: using the other channel's (possibly already
+        // clamped) position would under-correct a jump both channels share and
+        // bake a permanent skew into micShift/sysShift.
+        let ownEnd = (channel == .mic) ? mic.last?.end : sys.last?.end
+        let known = max(committed, ownEnd ?? 0)
+        if safe > known + maxForwardJumpSamples {
+            let clamped = known + maxForwardJumpSamples
+            Log.warning(
+                "AlignedRingBuffer: clamped forward PTS jump of \((safe - known) / 16_000)s to \(maxForwardJumpSamples / 16_000)s.",
+                category: "capture"
+            )
+            if channel == .mic { micShift += safe - clamped } else { sysShift += safe - clamped }
+            safe = clamped
+        }
+        let chunk = Chunk(start: safe, buf: buf)
 
         switch channel {
         case .mic:
@@ -188,7 +229,13 @@ final class AlignedRingBuffer {
 
     // MARK: - Internal flush (must be called under lock)
 
-    private func _flushAligned(forceFlush: Bool) -> AVAudioPCMBuffer? {
+    private func _flushAligned(forceFlush requestedForce: Bool) -> AVAudioPCMBuffer? {
+        // Backlog bound: a stalled drain (hole, one channel dead) must not let
+        // the queues hold unlimited audio. Force the flush once either queue
+        // is more than `maxBacklogSamples` ahead of the committed cursor.
+        let tail = max(mic.last?.end ?? committed, sys.last?.end ?? committed)
+        let forceFlush = requestedForce || (tail - committed) > maxBacklogSamples
+
         // Step 1: find the "end" position of the first chunk in each channel.
         // If a channel has no data, use committedCursor as its end.
         let micEnd = mic.first?.end ?? committed
@@ -224,8 +271,10 @@ final class AlignedRingBuffer {
         if !micCovers || !sysCovers {
             guard forceFlush else { return nil }
             // Under force-flush, pad the missing range with silence.
-            if !micCovers { silencePad(into: &mic, from: committed, to: target) }
-            if !sysCovers { silencePad(into: &sys, from: committed, to: target) }
+            // Pad only the leading hole so real audio in the first chunk is
+            // preserved (fillChannel lets the earliest chunk win).
+            if !micCovers { silencePad(into: &mic, from: committed, to: min(target, mic.first?.start ?? target)) }
+            if !sysCovers { silencePad(into: &sys, from: committed, to: min(target, sys.first?.start ?? target)) }
         }
 
         // Step 5: build the output buffer.
@@ -273,7 +322,7 @@ final class AlignedRingBuffer {
     private func chunkCovers(_ queue: [Chunk], from: Int, to: Int) -> Bool {
         var cursor = from
         for chunk in queue {
-            if chunk.start > cursor { return false }
+            if chunk.start > cursor + holeToleranceSamples { return false }
             if chunk.end > cursor { cursor = chunk.end }
             if cursor >= to { return true }
         }
@@ -282,6 +331,7 @@ final class AlignedRingBuffer {
 
     /// Appends a silence chunk covering `[from, to)` to `queue`.
     private func silencePad(into queue: inout [Chunk], from: Int, to: Int) {
+        guard to > from else { return }
         let frameCount = AVAudioFrameCount(to - from)
         guard frameCount > 0,
               let silenceBuf = AVAudioPCMBuffer(
