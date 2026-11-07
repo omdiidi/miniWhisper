@@ -435,7 +435,7 @@ async def users_mint(request: Request, user_id: int) -> HTMLResponse:
 # programs (Buzz, MacWhisper, Open WebUI, etc.) that talk to /v1/audio/*.
 # Under the hood: same wispralt.users row + role='employee', but with
 # kind='integration' which both (a) hides them from /admin/users and
-# (b) blocks them from /me/* and /telemetry/* via forbid_integration_kind.
+# (b) blocks them from /me/* via forbid_integration_kind.
 
 
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")

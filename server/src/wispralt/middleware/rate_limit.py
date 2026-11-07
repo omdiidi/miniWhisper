@@ -5,7 +5,6 @@ No Redis; uses in-memory defaultdict[str, deque[float]] per route group.
 Independent windows:
   - /transcribe/dictate  : 60 requests per 60-second window.
   - /readyz/*, /healthz  : probe window.
-  - /telemetry/*         : telemetry window.
 
 The deques are never pruned for removed IPs; on a single-user Mac mini this is
 acceptable (one real IP, a handful of load-balancer IPs at most).
@@ -68,11 +67,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         per IP per 60-second rolling window.  Cloudflare's typical health-check
         cadence is one probe every 5–10s, so 120/min comfortably accommodates
         legitimate monitoring while bounding probe-flood damage.
-    telemetry_per_min:
-        Maximum ``/telemetry/*`` batch requests per IP per 60-second rolling
-        window.  Cloud-fallback drain from a Swift client is bursty (one batch
-        per drain cycle) so 10/min is comfortably above expected use while
-        bounding abuse from a leaked Bearer token.
     trust_forwarded_headers:
         When True (default), read CF-Connecting-IP / X-Forwarded-For for the
         real client IP.  The deployment model is Cloudflare Tunnel so this is
@@ -85,21 +79,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         *,
         dictate_per_min: int = 60,
         probe_per_min: int = 120,
-        telemetry_per_min: int = 10,
         trust_forwarded_headers: bool = True,
     ) -> None:
         super().__init__(app)
         self.dictate_window = 60.0
         self.probe_window = 60.0
-        self.telemetry_window = 60.0
         self.dictate_max = dictate_per_min
         self.probe_max = probe_per_min
-        self.telemetry_max = telemetry_per_min
         self.trust_forwarded_headers = trust_forwarded_headers
         # Separate deque-per-IP registries for the route groups
         self._dictate: dict[str, deque[float]] = defaultdict(deque)
         self._probe: dict[str, deque[float]] = defaultdict(deque)
-        self._telemetry: dict[str, deque[float]] = defaultdict(deque)
 
     async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[type-arg]
         path = request.url.path
@@ -116,14 +106,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if len(self._dictate[ip]) >= self.dictate_max:
                 return self._429(int(self.dictate_window))
             self._dictate[ip].append(now)
-
-        elif path.startswith("/telemetry/"):
-            # Authed but bursty drain from Swift clients. Throttle per-IP to
-            # bound damage from a leaked Bearer token (~10 batches/min).
-            self._prune(self._telemetry[ip], now - self.telemetry_window)
-            if len(self._telemetry[ip]) >= self.telemetry_max:
-                return self._429(int(self.telemetry_window))
-            self._telemetry[ip].append(now)
 
         elif path.startswith("/readyz") or path == "/healthz":
             # Unauthenticated probes — must be throttled separately so a

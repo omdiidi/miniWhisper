@@ -1,7 +1,7 @@
 """
 test_integration_kind_guards.py — :func:`forbid_integration_kind` coverage.
 
-The /me/* and /telemetry/* surfaces are human-employee-only — integration
+The /me/* surface is human-employee-only — integration
 keys (``kind='integration'``) must be 403'd. /v1/* is the OPPOSITE: it's the
 surface integration keys are FOR, so we also exercise the negative
 invariant (integration kind allowed through to /v1).
@@ -37,7 +37,6 @@ from wispralt.middleware import openai_errors
 from wispralt.middleware.cors import install_cors
 from wispralt.ratelimit_per_token import init_rate_limit_state
 from wispralt.routes import me as me_routes
-from wispralt.routes import telemetry as telemetry_routes
 from wispralt.routes.v1_transcriptions import router as v1_router
 from wispralt.users.store import User
 
@@ -137,37 +136,6 @@ class TestMeHistoryGuard:
         # 200 is the happy path (empty rows render the base template).
         assert resp.status_code != 403, resp.text
         assert resp.status_code == 200, resp.text
-
-
-# ── /telemetry/cloud-dictation ───────────────────────────────────────────────
-
-
-class TestTelemetryGuard:
-    def test_telemetry_dictation_blocks_integration_kind(self) -> None:
-        app = FastAPI()
-        app.add_middleware(_RequestIdMiddleware)
-        app.include_router(telemetry_routes.router)
-        app.state.db_pool = object()
-        app.state.job_store = MagicMock()
-        _override_user(app, kind="integration")
-
-        with TestClient(app) as client:
-            resp = client.post(
-                "/telemetry/cloud-dictation",
-                json={
-                    "dictations": [
-                        {
-                            "client_dedup_id": "11111111-1111-1111-1111-111111111111",
-                            "text": "hello",
-                            "dictated_at": 1_700_000_000.0,
-                            "word_count": 1,
-                            "client_app_version": "0.4.6",
-                        },
-                    ],
-                },
-                headers={"Authorization": "Bearer test"},
-            )
-        assert resp.status_code == 403, resp.text
 
 
 # ── /me/login: must remain unauthenticated ────────────────────────────────────

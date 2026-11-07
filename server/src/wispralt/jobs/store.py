@@ -205,7 +205,7 @@ class JobStore:
             "CREATE INDEX IF NOT EXISTS idx_dictations_api_key_created"
             " ON dictations(api_key_id, created_at)"
         )
-        # Plan A history + cloud-fallback telemetry. Idempotent ALTERs run
+        # Plan A history + client dedup columns. Idempotent ALTERs run
         # AFTER the dictations CREATE TABLE so existing prod DBs (which lack
         # these columns) are migrated forward. For a brand-new DB the CREATE
         # TABLE above produces the legacy schema and these ALTERs immediately
@@ -875,49 +875,6 @@ class JobStore:
         else:
             return False
         return cur.rowcount > 0
-
-    def insert_cloud_fallback_dictation(
-        self,
-        *,
-        api_key_id: int,
-        text: str,
-        dictated_at: float,
-        word_count: int,
-        client_app_version: str | None,
-        client_dedup_id: str,
-    ) -> int | None:
-        """Persist one cloud-fallback dictation (i.e. the user dictated while
-        the mini was unreachable and the Swift client transcribed via
-        OpenRouter directly). ``dictated_at`` is the user-reported epoch of
-        the dictation's actual occurrence (NOT the ingest time) and becomes
-        ``created_at`` so the history feed and weekly-insights cron see the
-        event in its true time window.
-
-        Idempotency: ``client_dedup_id`` is the client-supplied UUID; the
-        partial unique index ``idx_dictations_client_dedup`` enforces dedup
-        on the database. Returns the new row's ``id`` on insert, or ``None``
-        if a row with the same ``client_dedup_id`` already exists.
-        """
-        with self._lock:
-            cur = self.con.execute(
-                "INSERT INTO dictations("
-                " api_key_id, created_at, duration_ms, text, word_count,"
-                " client_app_version, smart_format_applied,"
-                " source, client_dedup_id"
-                ") VALUES(?,?,NULL,?,?,?,0,'cloud_fallback',?)"
-                " ON CONFLICT(client_dedup_id)"
-                " WHERE client_dedup_id IS NOT NULL"
-                " DO NOTHING",
-                (
-                    api_key_id,
-                    dictated_at,
-                    text,
-                    word_count,
-                    client_app_version,
-                    client_dedup_id,
-                ),
-            )
-            return int(cur.lastrowid) if cur.rowcount > 0 else None
 
     def insert_streaming_dictation_idempotent(
         self,

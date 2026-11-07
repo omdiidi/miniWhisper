@@ -68,13 +68,11 @@ from wispralt.routes import (
     admin,
     admin_data,
     admin_ui,
-    dev_faults,
     dictate,
     health,
 )
 from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
-from wispralt.routes import telemetry as telemetry_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
 from wispralt.routes import v1_models, v1_transcriptions
 from wispralt.smart_format.mercury_client import MercuryClient
@@ -764,9 +762,7 @@ def create_app() -> FastAPI:
     # /transcribe/dictate — auth applied per-route via Depends(require_api_key).
     app.include_router(dictate.router)
     # /transcribe/dictate/stream/* — additive streaming path; same auth as
-    # /transcribe/dictate. CRITICAL ORDERING: registered BEFORE dev_faults
-    # below so the production handlers win when no `?fault=` query param is
-    # set (mirrors the legacy /transcribe/dictate vs dev_faults precedence).
+    # /transcribe/dictate.
     app.include_router(dictate_stream_routes.router)
     # /admin/* legacy JSON endpoints (rotate-key, /metrics) — auth per-route.
     app.include_router(admin.router)
@@ -784,25 +780,11 @@ def create_app() -> FastAPI:
     app.include_router(transcribe_file_routes.router)
     # /me — JSON identity self-management (any authenticated role).
     app.include_router(me_routes.router)
-    # /telemetry/cloud-dictation — Swift client cloud-fallback dictation sync.
-    #     Bearer-auth (cookie-only rejected). Rate-limited 10 batches/min/IP via
-    #     RateLimitMiddleware.
-    app.include_router(telemetry_routes.router)
     # /v1/audio/transcriptions — OpenAI-compat shim.
     app.include_router(v1_transcriptions.router)
     # /v1/models — OpenAI-compat static model list. Open WebUI + enterprise
     # clients probe this before transcribing.
     app.include_router(v1_models.router)
-
-    # Dev-only fault injection. Mounted ONLY when WISPRALT_DEV_FAULTS=1 AND
-    # the host is non-prod. Used to verify the Swift client's offline-signature
-    # classifier never trips on origin 5xx-with-X-Request-Id.
-    if dev_faults.is_dev_faults_enabled():
-        logger.warning(
-            "Mounting dev_faults router (WISPRALT_DEV_FAULTS=1). "
-            "MUST NOT be enabled on prod-mini."
-        )
-        app.include_router(dev_faults.router)
 
     # Re-shape errors on /v1/* paths to OpenAI envelope. Native routes keep their
     # default {"detail": ...} shape. Must run AFTER include_router calls.

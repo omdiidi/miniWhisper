@@ -283,11 +283,11 @@ async def require_api_key_v1(request: Request) -> User:
 async def forbid_integration_kind(
     user: User = Depends(require_api_key),
 ) -> User:
-    """Dep for /me/* and /telemetry/* — rejects integration-kind tokens.
+    """Dep for /me/* — rejects integration-kind tokens.
 
     Integration keys (``kind='integration'``) are minted for third-party
     programs talking to /v1/audio/transcriptions. They should NOT have
-    access to dictation history or user-event telemetry — those are
+    access to dictation history or other per-user data — those are
     human-only surfaces.
 
     NOTE: do NOT chain this after :func:`require_api_key_v1` — /v1 is
@@ -297,7 +297,7 @@ async def forbid_integration_kind(
         raise HTTPException(
             status_code=403,
             detail=(
-                "Integration keys cannot access /me or /telemetry — "
+                "Integration keys cannot access /me — "
                 "use /v1/audio/transcriptions only"
             ),
         )

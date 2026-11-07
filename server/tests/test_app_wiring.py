@@ -32,8 +32,8 @@ _MEETING_READYZ = "/readyz/" + "meeting"
 
 @pytest.fixture
 def routes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, frozenset[str]]]:
-    # dev_faults reads the environment at create_app() time; enabling it
-    # makes later "no /dev/*" assertions meaningful.
+    # The removed dev-faults router read this env var at create_app() time;
+    # setting it keeps the "no /dev/*" assertion meaningful against a regrowth.
     monkeypatch.setenv("WISPRALT_DEV_FAULTS", "1")
     app = create_app()
     return [
@@ -73,3 +73,18 @@ def test_file_job_routes_present(routes: list[tuple[str, frozenset[str]]]) -> No
 
 def test_no_meeting_routes_remain(routes: list[tuple[str, frozenset[str]]]) -> None:
     assert [p for p, _ in routes if p.startswith(_MEETING_PREFIX)] == []
+
+
+_TELEMETRY_PREFIX = "/" + "telemetry"
+_DEV_PREFIX = "/" + "dev"
+
+
+def test_no_telemetry_or_dev_routes(routes: list[tuple[str, frozenset[str]]]) -> None:
+    # The fixture sets WISPRALT_DEV_FAULTS=1, so a lingering dev-faults mount
+    # would show up here.
+    offenders = [
+        p for p, _ in routes
+        if p.startswith(_TELEMETRY_PREFIX) or p.startswith(_DEV_PREFIX + "/")
+        or p == _DEV_PREFIX
+    ]
+    assert offenders == []
