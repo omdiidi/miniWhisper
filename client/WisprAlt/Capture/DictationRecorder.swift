@@ -58,11 +58,6 @@ extension Notification.Name {
 /// - `frameCounter` and `writeError` are guarded by `OSAllocatedUnfairLock`
 ///   for safe access from the tap callback and `stop()`.
 ///
-/// ## Mic mutual exclusion
-/// `start()` returns `false` if `MeetingRecorder.shared.isActive` is `true`,
-/// because both recorders cannot share the input node simultaneously. The
-/// caller should present a brief UI toast explaining the no-op.
-///
 /// ## Lifetime
 /// Typical usage: create once; call `start()` on FN key-down, `stop()` on
 /// FN key-up. `stop()` is `async` so the file read off disk doesn't block
@@ -72,7 +67,6 @@ final class DictationRecorder {
     // MARK: - Errors
 
     enum DictationError: Error, LocalizedError {
-        case meetingRecordingActive
         case engineStartFailed(Error)
         case notRecording
         case writeFailed(Error)
@@ -80,8 +74,6 @@ final class DictationRecorder {
 
         var errorDescription: String? {
             switch self {
-            case .meetingRecordingActive:
-                return "Cannot start dictation while meeting recording is active."
             case .engineStartFailed(let err):
                 return "AVAudioEngine failed to start: \(err.localizedDescription)"
             case .notRecording:
@@ -340,17 +332,10 @@ final class DictationRecorder {
 
     /// Starts microphone capture.
     ///
-    /// - Returns: `false` with an info log if meeting recording is active (mic exclusion).
-    ///   `true` on success.
+    /// - Returns: `true` on success (or if already recording).
     /// - Throws: `DictationError.engineStartFailed` if the audio engine cannot start.
     @discardableResult
     func start() throws -> Bool {
-        // Mic mutual exclusion: no-op when meeting recording is in progress.
-        if MeetingRecorder.shared.isActive {
-            Log.info("DictationRecorder: start() suppressed — MeetingRecorder is active.", category: "capture")
-            return false
-        }
-
         guard !isRecording else { return true }
 
         // Always start with a clean swallow flag. If a previous session armed it

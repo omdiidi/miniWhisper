@@ -16,9 +16,9 @@ enum ServerError: Error, LocalizedError {
     /// `retryAfter` is the value of the `Retry-After` header in seconds, if present.
     case rateLimited(retryAfter: TimeInterval?)
 
-    /// Server returned HTTP 429 with body "meeting in progress" — a meeting job is already
-    /// running on the server and only one may run at a time.
-    case meetingInProgress
+    /// Server returned HTTP 429 with `code=file_job_busy` — a file transcription job is
+    /// already running (or still finishing after a cancel) and only one may run at a time.
+    case fileJobInProgress
 
     /// Server returned HTTP 413 — the upload payload exceeded the server limit.
     case uploadTooLarge
@@ -51,12 +51,12 @@ enum ServerError: Error, LocalizedError {
                 return String(format: "Too many requests. Retry in %.0f seconds.", seconds)
             }
             return "Too many requests. Please wait before trying again."
-        case .meetingInProgress:
-            return "A meeting is already being processed on the server. Wait for it to finish before submitting a new recording."
+        case .fileJobInProgress:
+            return "The previous file job is still finishing on the server. Wait for it to finish, then try again."
         case .uploadTooLarge:
-            return "The recording is too large for the server to accept. Check the server MAX_UPLOAD_BYTES setting."
+            return "The file is too large for the server to accept. Check the server MAX_UPLOAD_BYTES setting."
         case .uploadTruncated:
-            return "The upload appears incomplete or corrupted. Please try recording again."
+            return "The upload appears incomplete or corrupted. Please try again."
         case .server(let status, let body):
             if let body {
                 return "Server error \(status): \(body)"

@@ -3,7 +3,7 @@ import Foundation
 /// Three-step chunked upload client for files >50 MB.
 ///
 /// Why: Cloudflare's free/pro/biz plans enforce a 100 MB request-body limit
-/// per request. A 200 MB audio file (or 4 h meeting) would 413 at the edge
+/// per request. A 200 MB audio or video file would 413 at the edge
 /// before reaching the origin. Splitting into 50 MiB chunks keeps every
 /// individual request well under the limit; the server reassembles in its
 /// staging dir and routes the assembled file through the EXISTING
@@ -42,13 +42,12 @@ enum ChunkedUploader {
     /// `/init` response — if the server's value differs we trust it.
     static let defaultChunkSize = 50 * 1024 * 1024
     /// Threshold above which the caller should pick this path instead of the
-    /// single-shot `MeetingAPI.submitFile`.
+    /// single-shot `FileJobAPI.submitFile`.
     static let chunkThreshold: Int64 = 50 * 1024 * 1024
 
     // MARK: - Wire models
 
     private struct InitRequest: Encodable {
-        let mode: String
         let total_bytes: Int64
         let chunk_count: Int
         let original_filename: String
@@ -70,7 +69,6 @@ enum ChunkedUploader {
     ///
     /// - Parameters:
     ///   - fileURL: Local file to upload.
-    ///   - mode: Server-side processing mode (`"file"` or `"meeting"`).
     ///   - progress: Called on the main queue with overall fraction in `[0,1]`.
     ///   - sessionRegistered: Called ONCE with the URLSession used for the
     ///     entire upload so the caller can `invalidateAndCancel()` it on cancel.
@@ -78,7 +76,6 @@ enum ChunkedUploader {
     ///   unrecoverable failures.
     static func upload(
         fileURL: URL,
-        mode: String,
         progress: @escaping @Sendable (Double) -> Void,
         sessionRegistered: (@Sendable (URLSession) -> Void)? = nil,
         phaseHandler: (@Sendable (ChunkedPhase) -> Void)? = nil
@@ -129,7 +126,6 @@ enum ChunkedUploader {
                 url: baseURL.appendingPathComponent("/transcribe/file/chunked/init"),
                 apiKey: apiKey,
                 body: InitRequest(
-                    mode: mode,
                     total_bytes: fileSize,
                     chunk_count: Self.chunkCount(for: fileSize, chunkSize: defaultChunkSize),
                     original_filename: fileURL.lastPathComponent

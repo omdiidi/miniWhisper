@@ -25,10 +25,10 @@ private struct GlassCard<Content: View>: View {
 /// Main settings panel hosted in the menubar popover.
 ///
 /// Layout is user-priority ordered:
-///   1. Quick Actions — admin portal + meetings folder shortcuts
+///   1. Quick Actions — file transcription, admin portal + transcripts folder shortcuts
 ///   2. Connection status with a working Test button
 ///   3. Hotkey timing + launch-at-login (frequently-tweaked)
-///   4. Meetings folder picker
+///   4. Transcripts folder picker
 ///   5. Advanced (collapsed) — server URL, API key, key export/import
 struct SettingsView: View {
     @EnvironmentObject private var settings: Settings
@@ -59,9 +59,9 @@ struct SettingsView: View {
     /// (TCC denied / Terminal missing) and fell back to copying the install
     /// command to the clipboard. Listens for `.updaterFallbackToClipboard`.
     @State private var updateFallbackToastVisible: Bool = false
-    /// Shown for ~5s when the user pressed "Install now…" while a meeting was
-    /// recording. Listens for `.updaterMeetingActive`.
-    @State private var updateMeetingActiveToastVisible: Bool = false
+    /// Shown for ~5s when the user pressed "Install now…" while a dictation
+    /// or file job was in progress. Listens for `.updaterDictationBusy`.
+    @State private var updateBusyToastVisible: Bool = false
 
     // Identity (display_name) editing state. Tri-state Optional<String> fixes the
     // snap-back bug:
@@ -90,7 +90,7 @@ struct SettingsView: View {
             // Settings flag exists (the old streamingDictation property was removed).
             hotkeySection
             launchAtLoginSection
-            meetingsFolderSection
+            transcriptsFolderSection
             advancedToggleSection
             if showAdvanced {
                 updateSection
@@ -151,8 +151,10 @@ struct SettingsView: View {
         }
     }
 
-    private var meetingsFolderSection: some View {
-        Section("Meetings Folder") {
+    /// Where file-transcription outputs are saved (`Settings.meetingsPath`;
+    /// the property/key name is kept so existing transcripts stay put).
+    private var transcriptsFolderSection: some View {
+        Section("Transcripts Folder") {
             HStack {
                 Text(settings.meetingsPath.path)
                     .lineLimit(1)
@@ -184,30 +186,6 @@ struct SettingsView: View {
                 }
             }
             .help("Minimum FN-hold time before dictation starts.")
-
-            LabeledContent("Triple-tap window (s)") {
-                Stepper(
-                    value: $settings.tripleTapWindow,
-                    in: 0.20...1.00,
-                    step: 0.05
-                ) {
-                    Text(String(format: "%.2f", settings.tripleTapWindow))
-                        .monospacedDigit()
-                }
-            }
-            .help("Maximum time between taps to count as a triple-tap.")
-
-            LabeledContent("Max meeting length (min)") {
-                Stepper(
-                    value: $settings.maxMeetingMinutes,
-                    in: 5...240,
-                    step: 5
-                ) {
-                    Text("\(settings.maxMeetingMinutes)")
-                        .monospacedDigit()
-                }
-            }
-            .help("Maximum meeting recording duration (5–240 min). Default 90.")
         }
     }
 
@@ -331,8 +309,8 @@ struct SettingsView: View {
                     .foregroundStyle(.orange)
                     .transition(.opacity)
             }
-            if updateMeetingActiveToastVisible {
-                Text("Finish your current meeting recording before installing — the installer will quit the app.")
+            if updateBusyToastVisible {
+                Text("Finish your current dictation or file transcription before installing — the installer will quit the app.")
                     .font(.caption)
                     .foregroundStyle(.red)
                     .transition(.opacity)
@@ -345,11 +323,11 @@ struct SettingsView: View {
                 updateFallbackToastVisible = false
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .updaterMeetingActive)) { _ in
-            updateMeetingActiveToastVisible = true
+        .onReceive(NotificationCenter.default.publisher(for: .updaterDictationBusy)) { _ in
+            updateBusyToastVisible = true
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
-                updateMeetingActiveToastVisible = false
+                updateBusyToastVisible = false
             }
         }
     }
@@ -442,9 +420,8 @@ struct SettingsView: View {
         } header: { Text("Quality") }
     }
 
-    /// Input mic picker — applies ONLY to WisprAlt's own dictation. Meeting
-    /// recording uses the macOS system default (SCStream has no per-stream
-    /// device API). The picker shows live AVCaptureDevice discovery results.
+    /// Input mic picker — applies ONLY to WisprAlt's own dictation. The picker
+    /// shows live AVCaptureDevice discovery results.
     private var inputMicSection: some View {
         Section("Input Mic") {
             Picker("", selection: micSelectionBinding) {
@@ -457,7 +434,7 @@ struct SettingsView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .help("Choose which mic WisprAlt uses for dictation. Meeting recording always uses the macOS system default.")
+            .help("Choose which mic WisprAlt uses for dictation.")
         }
         .onAppear {
             availableMics = MicEnumerator.availableInputs()
@@ -620,7 +597,7 @@ struct SettingsView: View {
             // Gain a security-scoped bookmark for sandboxed access (future hardened runtime use).
             _ = url.startAccessingSecurityScopedResource()
             settings.meetingsPath = url
-            Log.info("Meetings folder set to: \(url.path)", category: "settings")
+            Log.info("Transcripts folder set to: \(url.path)", category: "settings")
         case .failure(let error):
             Log.error("Folder picker failed: \(error)", category: "settings")
         }
@@ -634,7 +611,6 @@ struct SettingsView: View {
     /// Probes in parallel:
     ///   - /healthz                  — server process alive at all
     ///   - /readyz/dictation         — Parakeet model loaded
-    ///   - /readyz/meeting           — meeting pipeline RAM-ready
     ///   - /me (authenticated)       — API key + Supabase user lookup work
     ///
     /// Surfaces a single status line color-coded green/orange/red.
@@ -653,12 +629,10 @@ struct SettingsView: View {
             do {
                 async let healthOK = client.healthz()
                 async let dictationReady = client.readyz(endpoint: "dictation")
-                async let meetingReady = client.readyz(endpoint: "meeting")
                 async let meAuth = MeAPI.get()      // verifies API key end-to-end
 
                 let h = try await healthOK
                 let d = try await dictationReady
-                let m = try await meetingReady
                 let me = try await meAuth           // throws .unauthorized on bad key
 
                 await MainActor.run {
@@ -669,24 +643,14 @@ struct SettingsView: View {
                         return
                     }
                     let who = me.display_name ?? me.label ?? "you"
-                    if d.ok && m.ok {
+                    if d.ok {
                         connectionFeedback = d.degraded
-                            ? "Connected as \(who) — dictation degraded (meeting using memory)"
-                            : "Connected as \(who) — dictation + meeting ready."
+                            ? "Connected as \(who) — dictation degraded (file job using memory)"
+                            : "Connected as \(who) — dictation ready."
                         connectionFeedbackKind = d.degraded ? .warning : .success
                         return
                     }
-                    if d.ok && !m.ok {
-                        connectionFeedback = "Connected as \(who) — meeting pipeline still loading."
-                        connectionFeedbackKind = .warning
-                        return
-                    }
-                    if !d.ok && m.ok {
-                        connectionFeedback = "Connected as \(who) — dictation pipeline still loading."
-                        connectionFeedbackKind = .warning
-                        return
-                    }
-                    connectionFeedback = "Connected as \(who) — pipelines still loading."
+                    connectionFeedback = "Connected as \(who) — dictation pipeline still loading."
                     connectionFeedbackKind = .warning
                 }
             } catch ServerError.unauthorized {
@@ -714,21 +678,12 @@ struct SettingsView: View {
         NSWorkspace.shared.open(url)
         Log.info("Opened portal: \(url.absoluteString)", category: "settings")
     }
-
-    /// Reveal the meetings folder in Finder.
-    private func openMeetingsFolder() {
-        let url = settings.meetingsPath
-        // Make sure the directory exists; opening a non-existent path silently no-ops.
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(url)
-        Log.info("Opened meetings folder: \(url.path)", category: "settings")
-    }
 }
 
 // MARK: - QuickActionsSection
 
-/// Top-of-popover Section. Owns two `LastTranscriptCaptionViewModel` instances
-/// (meetings + custom transcriptions) so they can be `@StateObject`-bound,
+/// Top-of-popover Section. Owns the custom-transcriptions
+/// `LastTranscriptCaptionViewModel` so it can be `@StateObject`-bound,
 /// which is impossible inside `SettingsView`'s computed `quickActionsSection`.
 ///
 /// Lifetime mirrors the popover: watchers `start()` in `.onAppear`, `stop()`
@@ -758,21 +713,11 @@ private struct QuickActionsSection: View {
         recordingState.activeJobID ?? recordingState.serverFinishingJobID
     }
 
-    // Known limitation: the watcher folder URLs below are captured ONCE at
+    // Known limitation: the watcher folder URL below is captured ONCE at
     // struct-init time. If the user changes `Settings.shared.meetingsPath`
-    // mid-session, the watchers keep pointing at the OLD URL until the popover
-    // is destroyed and recreated. Acceptable: meetings-path changes are rare
-    // and the popover is `.transient`, so reopening it picks up the new path.
-    @StateObject private var meetingViewModel = LastTranscriptCaptionViewModel(
-        folderURL: Settings.shared.meetingsPath,
-        lookup: {
-            CustomTranscriptionsStore.newestMeetingTranscript().flatMap {
-                try? $0.resourceValues(forKeys: [.contentModificationDateKey])
-                    .contentModificationDate
-            }
-        }
-    )
-
+    // mid-session, the watcher keeps pointing at the OLD URL until the popover
+    // is destroyed and recreated. Acceptable: transcripts-folder changes are
+    // rare and the popover is `.transient`, so reopening it picks up the new path.
     @StateObject private var customViewModel = LastTranscriptCaptionViewModel(
         folderURL: CustomTranscriptionsStore.directoryURL,
         lookup: {
@@ -821,28 +766,8 @@ private struct QuickActionsSection: View {
             .help(
                 recordingState.serverFinishingJobID != nil
                     ? "A previous transcription is still finishing on the server. New uploads are blocked until it completes."
-                    : "Pick any audio or video file. WisprAlt transcodes it locally and runs it through the meeting pipeline."
+                    : "Pick any audio or video file. WisprAlt extracts the audio locally and the server transcribes it."
             )
-
-            // Last-meeting copy + age on one row.
-            HStack(spacing: 6) {
-                Button("Copy last meeting", systemImage: "doc.on.clipboard") {
-                    performCopy(button: "meeting", source: CustomTranscriptionsStore.newestMeetingTranscript)
-                }
-                .buttonStyle(.bordered)
-                .disabled(meetingViewModel.lastModified == nil)
-                .help(meetingViewModel.lastModified == nil
-                      ? "No meeting transcripts yet."
-                      : "Copy the most recent meeting transcript to the clipboard.")
-                Spacer(minLength: 8)
-                LastTranscriptCaption(viewModel: meetingViewModel)
-            }
-            if let toast = copyToast, toast.button == "meeting" {
-                Text(toast.message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .transition(.opacity)
-            }
 
             // Last-custom copy + age on one row.
             HStack(spacing: 6) {
@@ -864,8 +789,8 @@ private struct QuickActionsSection: View {
                     .transition(.opacity)
             }
 
-            // v0.4.6 ordering: Open File Transcriptions sits right above Open Meetings
-            // Folder (the two "show me my outputs" buttons paired). Open Portal moved
+            // v0.4.6 ordering: Open File Transcriptions sits right above Open
+            // Transcripts Folder (the two "show me my outputs" buttons paired). Open Portal moved
             // to the bottom of the list (least-frequently-clicked of the three).
             Button("Open File Transcriptions", systemImage: "folder.badge.questionmark") {
                 let url = CustomTranscriptionsStore.directoryURL
@@ -879,11 +804,11 @@ private struct QuickActionsSection: View {
             .buttonStyle(.bordered)
             .help("Opens the File Transcriptions folder in Finder.")
 
-            Button("Open Meetings Folder", systemImage: "folder") {
+            Button("Open Transcripts Folder", systemImage: "folder") {
                 let url = settings.meetingsPath
                 try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
                 NSWorkspace.shared.open(url)
-                Log.info("Opened meetings folder: \(url.path)", category: "settings")
+                Log.info("Opened transcripts folder: \(url.path)", category: "settings")
             }
             .buttonStyle(.bordered)
             .help("Opens \(settings.meetingsPath.path) in Finder.")
@@ -918,15 +843,13 @@ private struct QuickActionsSection: View {
             .help(
                 settings.serverURL == nil
                     ? "Set a Server URL under Advanced first."
-                    : "Opens your personal dictation + meeting history in the browser."
+                    : "Opens your personal dictation + transcription history in the browser."
             )
         }
         .onAppear {
-            meetingViewModel.start()
             customViewModel.start()
         }
         .onDisappear {
-            meetingViewModel.stop()
             customViewModel.stop()
         }
         .sheet(isPresented: $showingServerLogSheet) {
@@ -1147,7 +1070,7 @@ private struct QuickActionsSection: View {
 
 // MARK: - ServerLogSheet
 
-/// Modal sheet rendering `MeetingAPI.fetchServerLog(_:)` output for an
+/// Modal sheet rendering `FileJobAPI.fetchServerLog(_:)` output for an
 /// in-flight (or recently-cancelled) job. The job id is fetched lazily
 /// through `jobIDProvider` so the sheet can re-read it on Refresh and after
 /// `recordingState.activeJobID` flips to `serverFinishingJobID`.
@@ -1204,7 +1127,7 @@ private struct ServerLogSheet: View {
         loadError = nil
         defer { isLoading = false }
         do {
-            logText = try await MeetingAPI.fetchServerLog(JobID(raw: raw))
+            logText = try await FileJobAPI.fetchServerLog(JobID(raw: raw))
         } catch let error as ServerError {
             if case .server(let status, _) = error, status == 403 {
                 loadError = "Server logs are admin-only. Ask your administrator for help."

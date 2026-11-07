@@ -11,10 +11,6 @@ import UniformTypeIdentifiers
 /// This class is intentionally NSObject only — not ObservableObject — because it
 /// drives AppKit directly. SwiftUI views that need state observe Settings or
 /// other ObservableObjects injected from AppDelegate.
-///
-/// Mic mutual exclusion (v3 delta):
-///   `tryStartDictation()` returns false and logs a warning toast if `isMeetingActive` is true.
-///   The `meetingActive` flag is kept in sync with `MeetingRecorder.shared.isActive`.
 final class MenuBarController: NSObject {
     // MARK: - Mode state machine
 
@@ -22,7 +18,6 @@ final class MenuBarController: NSObject {
     enum Mode {
         case idle
         case dictating
-        case meetingRecording
         case converting
         case uploading
         case processing
@@ -33,14 +28,23 @@ final class MenuBarController: NSObject {
         didSet { updateIcon() }
     }
 
-    // MARK: - Meeting active flag
-    // Kept in sync with MeetingRecorder.shared.isActive.
-    // Exposed as `isMeetingActive` computed property so the rest of the app
-    // reads a stable interface.
-    var meetingActive: Bool = false
+    // MARK: - Busy signal (update gate)
 
-    /// True when a meeting recording is in progress. Used for mic mutual exclusion.
-    var isMeetingActive: Bool { meetingActive }
+    /// Number of dictation transcription Tasks still running after the FN key
+    /// was released. `dictationStop()` increments it BEFORE setting
+    /// `mode = .idle` and the spawned Task's first statement is
+    /// `defer { dictationsInFlight -= 1 }`, so there is no main-actor turn in
+    /// which a finishing dictation reads as not-busy. Main-thread only.
+    var dictationsInFlight: Int = 0
+
+    /// True while a dictation is recording or still transcribing/injecting, or
+    /// a file upload / server job is in flight. `UpdateChecker` and
+    /// `SparkleController` refuse to relaunch the app while this is true, so an
+    /// update can never kill a dictation or an in-flight file job.
+    var isBusy: Bool {
+        [.dictating, .converting, .uploading, .processing].contains(mode)
+            || dictationsInFlight > 0
+    }
 
     // MARK: - Sparkle update error
 
@@ -68,10 +72,6 @@ final class MenuBarController: NSObject {
     /// Owned dictation recorder — created once and reused across dictation sessions.
     let dictationRecorder = DictationRecorder()
 
-    // MARK: - Meeting filename rename support
-    var meetingRecordingStart: Date?
-    var meetingStartFileURL: URL?
-
     // MARK: - Status item
 
     let statusItem: NSStatusItem
@@ -97,19 +97,16 @@ final class MenuBarController: NSObject {
     /// observers with no cleanup path.
     var didResignActiveObserver: NSObjectProtocol?
 
-    // MARK: - Pending-uploads drain triggers
+    // MARK: - Debounced toasts
 
     /// Process-local last-shown timestamp for debounced toasts. 10-min window
     /// per kind so flapping connectivity doesn't spam the user.
     private enum ToastKind: String {
-        case meetingOffline
         case fallbackUnavailable
     }
     private var lastToastShown: [ToastKind: Date] = [:]
     private static let toastDebounceSec: TimeInterval = 600
 
-    /// Held so the timer survives across foreground/background transitions.
-    var pendingUploadsDrainTimer: Timer?
     /// Held to remove the foreground observer on deinit.
     var didBecomeActiveObserver: NSObjectProtocol?
     /// Token for the `.dictationMaxDurationReached` observer; removed in deinit.
@@ -153,61 +150,27 @@ final class MenuBarController: NSObject {
         configureStatusItem()
         configurePopover()
         updateIcon()
-        configureMeetingCapObservers()
+        configureObservers()
         configureDictationCapObserver()
         configureFirstLaunchObserver()
-        configurePendingUploadsDrainTriggers()
+        configureFallbackQueueDrainTrigger()
     }
 
-    /// Wire up the three automatic drain triggers for `PendingUploadsQueue`:
-    ///   - app foreground (`NSApplication.didBecomeActiveNotification`)
-    ///   - 120s repeating timer
-    ///   (the third trigger is "successful dictation" — fired inline from
-    ///    `dictationStop()` after the inject lands.)
-    ///
-    /// All three coalesce inside `PendingUploadsQueue.drain()` via the
-    /// drain coordinator so concurrent triggers don't stack up.
-    func configurePendingUploadsDrainTriggers() {
-        // Foreground trigger.
+    /// App-foreground drain trigger for `DictationFallbackQueue`
+    /// (`NSApplication.didBecomeActiveNotification`), so any OpenRouter-served
+    /// dictations from offline mode sync to the origin as soon as the user
+    /// refocuses the app. The queue's drain coordinator coalesces concurrent
+    /// triggers.
+    func configureFallbackQueueDrainTrigger() {
         didBecomeActiveObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
         ) { _ in
             Task.detached(priority: .utility) {
-                await PendingUploadsQueue.shared.drain()
-            }
-            // Plan A §A8: cloud-fallback dictation queue shares this
-            // foreground trigger so any OpenRouter-served dictations
-            // from offline mode sync to the origin as soon as the user
-            // refocuses the app.
-            Task.detached(priority: .utility) {
                 await DictationFallbackQueue.shared.drain()
             }
         }
-
-        // 120s timer trigger. `Timer.scheduledTimer` adds itself to the
-        // current run loop in `.common` mode so it survives event-tracking
-        // (e.g. user holding down a menu).
-        pendingUploadsDrainTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { _ in
-            Task.detached(priority: .utility) {
-                await PendingUploadsQueue.shared.drain()
-            }
-        }
-        if let timer = pendingUploadsDrainTimer {
-            RunLoop.main.add(timer, forMode: .common)
-        }
-    }
-
-    /// Fire the meeting-offline toast, debounced per-kind (10 min cooldown).
-    /// Wording is the brief's locked phrasing.
-    @MainActor
-    func showOfflineMeetingToast() {
-        guard shouldShowToast(.meetingOffline) else { return }
-        AppNotifications.notify(
-            title: "WisprAlt — Server Offline",
-            body: "Meeting will upload when it's back. Recording is saved locally."
-        )
     }
 
     /// Fire the dictation-fallback-unavailable toast (Worker also down).
@@ -231,43 +194,22 @@ final class MenuBarController: NSObject {
         return true
     }
 
-    /// Hook reserved for a future menubar `(N pending)` indicator. Currently
-    /// a no-op — the status item uses a transient popover, not a menu, so
-    /// surfacing per-state badges requires a popover-side overhaul outside
-    /// the scope of the offline-fallback feature.
-    func refreshPendingMenu() {}
+    // MARK: - Observers
 
-    // MARK: - C13: Recording cap observers
-
-    func configureMeetingCapObservers() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleMeetingMaxDurationReached),
-            name: .meetingMaxDurationReached,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleMeetingApproachingCap),
-            name: .meetingApproachingCap,
-            object: nil
-        )
+    func configureObservers() {
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleDictationConfigChanged),
             name: .dictationConfigChanged,
             object: nil
         )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleMeetingConfigChanged),
-            name: .meetingConfigChanged,
-            object: nil
-        )
     }
 
     deinit {
         if let token = didResignActiveObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+        if let token = didBecomeActiveObserver {
             NotificationCenter.default.removeObserver(token)
         }
         if let token = dictationMaxDurationObserver {

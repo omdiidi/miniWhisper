@@ -24,8 +24,6 @@ final class Settings: ObservableObject {
         static let serverURL = "serverURL"
         static let meetingsPath = "meetingsPath"
         static let holdMinDuration = "holdMinDuration"
-        static let tripleTapWindow = "tripleTapWindow"
-        static let maxMeetingMinutes = "maxMeetingMinutes"
         static let preferredInputDeviceUID = "preferredInputDeviceUID"
         static let smartFormatting = "smartFormatting"
         static let displayName = "displayName"  // mirror of server-side display_name; source of truth is server
@@ -56,8 +54,11 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// Local directory where completed meeting transcripts are saved.
-    /// Defaults to ~/Documents/WisprAlt/Meetings.
+    /// Local directory where completed file transcripts are saved
+    /// (custom transcriptions land in its `Custom Transcriptions` subfolder).
+    /// Defaults to ~/Documents/WisprAlt/Meetings. The property name, its
+    /// UserDefaults key and the folder name are kept so existing user data
+    /// stays where it is.
     @Published var meetingsPath: URL {
         didSet {
             defaults.set(meetingsPath.path, forKey: Key.meetingsPath)
@@ -74,32 +75,6 @@ final class Settings: ObservableObject {
                 return
             }
             defaults.set(holdMinDuration, forKey: Key.holdMinDuration)
-        }
-    }
-
-    /// Window (seconds) within which three FN taps must occur to trigger meeting recording. Default 0.40.
-    /// Clamped to [0.20, 0.80] on set.
-    @Published var tripleTapWindow: Double {
-        didSet {
-            let clamped = min(max(tripleTapWindow, 0.20), 0.80)
-            if clamped != tripleTapWindow {
-                tripleTapWindow = clamped
-                return
-            }
-            defaults.set(tripleTapWindow, forKey: Key.tripleTapWindow)
-        }
-    }
-
-    /// Maximum meeting recording duration in minutes. Default 90.
-    /// Clamped to [5, 240] on set.
-    @Published var maxMeetingMinutes: Int {
-        didSet {
-            let clamped = min(max(maxMeetingMinutes, 5), 240)
-            if clamped != maxMeetingMinutes {
-                maxMeetingMinutes = clamped
-                return
-            }
-            defaults.set(maxMeetingMinutes, forKey: Key.maxMeetingMinutes)
         }
     }
 
@@ -172,8 +147,6 @@ final class Settings: ObservableObject {
         } ?? Settings.defaultMeetingsPath()
 
         let storedHold = suite.object(forKey: Key.holdMinDuration) as? Double ?? 0.30
-        let storedTriple = suite.object(forKey: Key.tripleTapWindow) as? Double ?? 0.40
-        let storedMaxMeetingMinutes = suite.object(forKey: Key.maxMeetingMinutes) as? Int ?? 90
         let storedPreferredInputUID = suite.string(forKey: Key.preferredInputDeviceUID)
         let storedSmart = suite.object(forKey: Key.smartFormatting) as? Bool ?? false
         let storedName = suite.string(forKey: Key.displayName)
@@ -196,8 +169,6 @@ final class Settings: ObservableObject {
         // assign directly via stored property (bypasses didSet observers).
         self._meetingsPath = Published(initialValue: storedMeetingsPath)
         self._holdMinDuration = Published(initialValue: storedHold)
-        self._tripleTapWindow = Published(initialValue: storedTriple)
-        self._maxMeetingMinutes = Published(initialValue: storedMaxMeetingMinutes)
         self._preferredInputDeviceUID = Published(initialValue: storedPreferredInputUID)
         self._smartFormatting = Published(initialValue: storedSmart)
         self._displayName = Published(initialValue: storedName)

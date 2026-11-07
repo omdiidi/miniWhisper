@@ -28,19 +28,17 @@ extension MenuBarController {
     /// Throws on failure; never enqueues for offline retry — caller decides.
     ///
     /// Deadline scales with the source's audio duration (probed via AVAsset)
-    /// so a 5-minute clip and a 4-hour meeting both get realistic budgets.
-    /// Multiplier accounts for mlx-whisper + Pyannote on Mac mini M4 running
-    /// at roughly 0.3-0.5× realtime for stereo diarization. On timeout we
-    /// LEAVE the server-side job in place so the user can recover/poll it
-    /// later — deleting it would throw away an in-flight transcription.
-    /// Used by both the meeting upload path (`processMeetingUpload`) and
-    /// the custom-transcription path (`processCustomTranscriptionUpload`).
+    /// so a 5-minute clip and a 4-hour recording both get realistic budgets.
+    /// The multiplier is a generous ceiling for mlx-whisper on the Mac mini.
+    /// On timeout we LEAVE the server-side job in place so the user can
+    /// recover/poll it later — deleting it would throw away an in-flight
+    /// transcription. Called by the custom-transcription path
+    /// (`processCustomTranscriptionUpload`).
     @MainActor
     func runFileTranscriptionJob(
         sourceURL: URL,
         outputDirectory: URL,
-        stem: String,
-        mode: String
+        stem: String
     ) async throws {
         // --- Step 0: extract audio if the source is a video container ---
         // A 200 MB MP4 typically becomes a ~15 MB .m4a — often dropping below
@@ -120,7 +118,6 @@ extension MenuBarController {
                 )
                 jobID = try await ChunkedUploader.upload(
                     fileURL: uploadURL,
-                    mode: mode,
                     progress: { [weak self] fraction in
                         Task { @MainActor [weak self] in
                             guard let self else { return }
@@ -146,9 +143,8 @@ extension MenuBarController {
                     }
                 )
             } else {
-                jobID = try await MeetingAPI.submitFile(
+                jobID = try await FileJobAPI.submitFile(
                     uploadURL,
-                    mode: mode,
                     progress: { [weak self] fraction in
                         guard let self else { return }
                         self.recordingState.uploadFraction = fraction
@@ -204,7 +200,7 @@ extension MenuBarController {
         pollLoop: while true {
             if Date() > pollDeadline {
                 Log.error("File poll timed out for job \(jobID) after \(Int(deadlineSeconds))s — server-side job left in place for manual recovery.", category: "transcribe")
-                throw MeetingProcessingError.pollTimedOut
+                throw FileJobError.pollTimedOut
             }
             try await Task.sleep(nanoseconds: 5_000_000_000)
             let status = try await pollWithBackoff(jobID)
@@ -217,7 +213,7 @@ extension MenuBarController {
                     // The user cancelled; the server confirmed it. Silent end.
                     throw CancellationError()
                 }
-                throw MeetingProcessingError.serverFailed(reason)
+                throw FileJobError.serverFailed(reason)
             case .pending:
                 continue
             case .running(let progress, let serverFinishing):
@@ -252,12 +248,12 @@ extension MenuBarController {
         }
         let baseURL = outputDirectory.appendingPathComponent(stem)
         for fmt in formatsToDownload {
-            let data = try await MeetingAPI.download(jobID, format: fmt)
+            let data = try await FileJobAPI.download(jobID, format: fmt)
             try data.write(to: baseURL.appendingPathExtension(fmt), options: .atomic)
         }
 
         // --- Cleanup ---
-        try await MeetingAPI.delete(jobID)
+        try await FileJobAPI.delete(jobID)
         recordingState.activeJobID = nil
         UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
     }
@@ -273,7 +269,7 @@ extension MenuBarController {
         var lastError: Error?
         for attempt in 0..<(backoffsNs.count + 1) {
             do {
-                return try await MeetingAPI.poll(jobID)
+                return try await FileJobAPI.poll(jobID)
             } catch let urlError as URLError {
                 lastError = urlError
                 Log.warning(
@@ -384,18 +380,18 @@ extension MenuBarController {
         if let raw = recordingState.activeJobID {
             let jobID = JobID(raw: raw)
             do {
-                let status = try await MeetingAPI.cancel(jobID)
+                let status = try await FileJobAPI.cancel(jobID)
                 if status == 202 || status == 204 {
                     recordingState.serverFinishingJobID = nil
                 } else {
                     Log.warning(
-                        "MeetingAPI.cancel(\(raw)) returned unexpected HTTP \(status).",
+                        "FileJobAPI.cancel(\(raw)) returned unexpected HTTP \(status).",
                         category: "transcribe"
                     )
                 }
             } catch {
                 Log.warning(
-                    "MeetingAPI.cancel(\(raw)) failed: \(error.localizedDescription)",
+                    "FileJobAPI.cancel(\(raw)) failed: \(error.localizedDescription)",
                     category: "transcribe"
                 )
             }
@@ -437,7 +433,7 @@ extension MenuBarController {
 
     /// Drain a recovered job. Polls until done/failed and writes a synthetic
     /// "resumed" notification on completion. No download is performed —
-    /// recovery is best-effort; the user can manually open the meetings
+    /// recovery is best-effort; the user can manually open the transcripts
     /// folder if outputs were written elsewhere.
     ///
     /// Note: a resumed job has lost its caller-known `outputDirectory` and
@@ -507,9 +503,16 @@ extension MenuBarController {
     /// on `ChunkedUploaderError` cases so the user sees a specific cause
     /// (file-too-large vs init vs chunk vs finalize) and falls back to the
     /// raw `localizedDescription` for everything else (URLError, ServerError,
-    /// `MeetingAPI.submitFile` failures, …).
+    /// `FileJobAPI.submitFile` failures, …).
     @MainActor
     func uploadErrorMessage(for error: Error) -> String {
+        let error = Self.unwrapFinalizeServerError(error)
+        if case ServerError.fileJobInProgress = error {
+            return error.localizedDescription
+        }
+        if case ServerError.server(status: 429, _) = error {
+            return error.localizedDescription
+        }
         if let chunked = error as? ChunkedUploaderError {
             switch chunked {
             case .fileTooLarge:
@@ -530,11 +533,24 @@ extension MenuBarController {
         return "Upload failed: \(error.localizedDescription)"
     }
 
+    /// The server's busy 429 (`code=file_job_busy` / `insufficient_memory`)
+    /// arrives at chunked FINALIZE, which `ChunkedUploader` wraps as
+    /// `.finalizeFailed(error)`. Unwrap a `ServerError` from there so the
+    /// display sites show the server's own message ("previous file job is
+    /// still finishing", the low-memory text) instead of a generic wrapper.
+    static func unwrapFinalizeServerError(_ error: Error) -> Error {
+        if case ChunkedUploaderError.finalizeFailed(let inner) = error, inner is ServerError {
+            return inner
+        }
+        return error
+    }
+
     /// Map a thrown transcription error to a user-facing message. Shared
-    /// between the meeting and custom-transcription catch paths so
-    /// `ServerError.unauthorized` always surfaces the same actionable hint.
+    /// by the file-transcription catch paths so `ServerError.unauthorized`
+    /// always surfaces the same actionable hint.
     @MainActor
     func formatTranscriptionError(_ error: Error) -> String {
+        let error = Self.unwrapFinalizeServerError(error)
         if case ServerError.unauthorized = error {
             return "Authentication failed — re-paste your API key in Settings."
         }
@@ -613,9 +629,9 @@ extension MenuBarController {
     }
 
     /// Uploads a custom-transcription source file (original container, no
-    /// client-side transcoding) via `POST /transcribe/file`. Mirrors
-    /// `processMeetingUpload` but skips the offline-queue path: custom
-    /// transcriptions are always user-initiated and don't get retried later.
+    /// client-side transcoding) via `POST /transcribe/file`. There is no
+    /// offline queue: custom transcriptions are always user-initiated and
+    /// don't get retried later.
     @MainActor
     func processCustomTranscriptionUpload(
         sourceURL: URL,
@@ -629,13 +645,9 @@ extension MenuBarController {
             try await runFileTranscriptionJob(
                 sourceURL: sourceURL,
                 outputDirectory: outputDirectory,
-                stem: stem,
-                mode: "file"
+                stem: stem
             )
 
-            // Harmless even though custom transcripts live in subfolders the
-            // store doesn't index — keeps consistency with the meeting path.
-            TranscriptStore.shared.refresh()
             NotificationCenter.default.post(name: .wisprAltTranscriptWritten, object: nil)
 
             AppNotifications.notify(title: "Custom Transcription Complete", body: stem)
@@ -654,6 +666,23 @@ extension MenuBarController {
             Log.error("Custom transcription failed: \(message)", category: "transcribe")
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)
             mode = .idle
+        }
+    }
+}
+
+// MARK: - Errors
+
+/// Terminal failures of a server-side file transcription job.
+enum FileJobError: Error, LocalizedError {
+    case serverFailed(String)
+    case pollTimedOut
+
+    var errorDescription: String? {
+        switch self {
+        case .serverFailed(let reason):
+            return "Server-side processing failed: \(reason)"
+        case .pollTimedOut:
+            return "Server didn't respond in time; check /metrics for job status."
         }
     }
 }

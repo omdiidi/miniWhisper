@@ -96,42 +96,29 @@ extension MenuBarController {
     func updateIcon() {
         guard let button = statusItem.button else { return }
 
-        switch mode {
-        case .meetingRecording:
-            let composite = renderRecComposite()
-            button.image = composite
-            button.contentTintColor = nil
-            button.attributedTitle = NSAttributedString(string: "")
-            button.title = ""
-            button.imagePosition = .imageOnly
-            button.toolTip = "WisprAlt — Meeting Recording"
-
-        default:
-            let (symbolName, accessibilityLabel): (String, String) = {
-                switch mode {
-                case .idle:             return ("mic", "WisprAlt — Idle")
-                case .dictating:        return ("mic.fill", "WisprAlt — Dictating")
-                case .converting:       return ("arrow.triangle.2.circlepath", "WisprAlt — Converting…")
-                case .uploading:        return ("icloud.and.arrow.up", "WisprAlt — Uploading")
-                case .processing:       return ("waveform", "WisprAlt — Processing")
-                case .done:             return ("checkmark.circle", "WisprAlt — Done")
-                case .meetingRecording: return ("mic", "WisprAlt")  // unreachable
-                }
-            }()
-            let baseImage = NSImage(
-                systemSymbolName: symbolName,
-                accessibilityDescription: accessibilityLabel
-            )
-            baseImage?.isTemplate = true
-            button.image = updateBadgeVisible
-                ? Self.compositeDot(on: baseImage)
-                : baseImage
-            button.contentTintColor = nil
-            button.attributedTitle = NSAttributedString(string: "")
-            button.title = ""
-            button.imagePosition = .imageOnly
-            button.toolTip = accessibilityLabel
-        }
+        let (symbolName, accessibilityLabel): (String, String) = {
+            switch mode {
+            case .idle:       return ("mic", "WisprAlt — Idle")
+            case .dictating:  return ("mic.fill", "WisprAlt — Dictating")
+            case .converting: return ("arrow.triangle.2.circlepath", "WisprAlt — Converting…")
+            case .uploading:  return ("icloud.and.arrow.up", "WisprAlt — Uploading")
+            case .processing: return ("waveform", "WisprAlt — Processing")
+            case .done:       return ("checkmark.circle", "WisprAlt — Done")
+            }
+        }()
+        let baseImage = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: accessibilityLabel
+        )
+        baseImage?.isTemplate = true
+        button.image = updateBadgeVisible
+            ? Self.compositeDot(on: baseImage)
+            : baseImage
+        button.contentTintColor = nil
+        button.attributedTitle = NSAttributedString(string: "")
+        button.title = ""
+        button.imagePosition = .imageOnly
+        button.toolTip = accessibilityLabel
     }
 
     /// Compose an SF Symbol with an orange dot in the upper-right corner.
@@ -194,46 +181,6 @@ extension MenuBarController {
             // Bring app to front so the popover keyboard-focuses correctly.
             NSApp.activate(ignoringOtherApps: true)
         }
-    }
-
-    // MARK: - Composite REC icon
-
-    func renderRecComposite() -> NSImage {
-        let dotSize: CGFloat = 8
-        let dotGap: CGFloat = 3
-        let verticalPadding: CGFloat = 1  // descender clearance
-        let font = NSFont.systemFont(ofSize: 11, weight: .bold)
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.systemRed,
-        ]
-        let text = NSAttributedString(string: "REC", attributes: attrs)
-        let textSize = text.size()
-        let canvasHeight = ceil(textSize.height) + verticalPadding * 2
-        let canvasWidth = dotSize + dotGap + ceil(textSize.width) + 2
-        let img = NSImage(
-            size: NSSize(width: canvasWidth, height: canvasHeight),
-            flipped: false
-        ) { _ in
-            let rect = NSRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight)
-            let dotRect = NSRect(
-                x: 0,
-                y: (rect.height - dotSize) / 2,
-                width: dotSize,
-                height: dotSize
-            )
-            NSColor.systemRed.setFill()
-            NSBezierPath(ovalIn: dotRect).fill()
-            text.draw(in: NSRect(
-                x: dotSize + dotGap,
-                y: verticalPadding,
-                width: ceil(textSize.width),
-                height: ceil(textSize.height)
-            ))
-            return true
-        }
-        img.isTemplate = false  // pre-rendered red, not a template
-        return img
     }
 }
 

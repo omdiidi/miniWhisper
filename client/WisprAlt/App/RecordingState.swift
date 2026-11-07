@@ -83,8 +83,6 @@ final class RecordingState: ObservableObject {
         "ffmpeg_decode": "Decoding audio",
         "transcribe_load": "Loading transcription model",
         "transcribe": "Transcribing",
-        "diarize_load": "Loading speaker model",
-        "diarize": "Identifying speakers",
         "merge": "Finalizing transcript",
         "output_write": "Writing outputs",
     ]

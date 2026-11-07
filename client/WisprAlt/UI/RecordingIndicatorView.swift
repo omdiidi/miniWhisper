@@ -8,9 +8,9 @@ enum RecordingPhase: Equatable {
     case idle
     /// FN held; mic is actively capturing dictation. `startedAt` used for elapsed display.
     case recording(Date)
-    /// Meeting WAV is being uploaded. `fraction` is in `[0.0, 1.0]`.
+    /// A picked file is being uploaded. `fraction` is in `[0.0, 1.0]`.
     case uploading(Double)
-    /// Server is processing the uploaded meeting. `startedAt` used for elapsed timer.
+    /// Server is processing the uploaded file. `startedAt` used for elapsed timer.
     case processing(Date)
     /// Pipeline finished. Shown briefly before returning to idle.
     case done

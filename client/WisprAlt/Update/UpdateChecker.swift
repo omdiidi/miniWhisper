@@ -119,17 +119,18 @@ final class UpdateChecker {
     /// fall back to copying the command to the pasteboard and posting
     /// `.updaterFallbackToClipboard` so a caller can render a toast.
     ///
-    /// Refuses to run during an active meeting recording — install.sh kills
-    /// the running app, which would lose in-progress meeting audio. Posts
-    /// `.updaterMeetingActive` so a caller can show a "finish meeting first"
-    /// toast.
+    /// Refuses to run while the app is busy (`MenuBarController.isBusy`: a
+    /// dictation recording or still transcribing, or a file upload / job in
+    /// flight) — install.sh kills the running app, which would lose that
+    /// work. Posts `.updaterDictationBusy` so a caller can show a "finish
+    /// first" message.
     func triggerInstall() {
-        if MenuBarController.shared?.isMeetingActive == true {
+        if MenuBarController.shared?.isBusy == true {
             Log.warning(
-                "UpdateChecker: refusing to install during active meeting.",
+                "UpdateChecker: refusing to install while a dictation or file job is in progress.",
                 category: "update"
             )
-            NotificationCenter.default.post(name: .updaterMeetingActive, object: nil)
+            NotificationCenter.default.post(name: .updaterDictationBusy, object: nil)
             return
         }
         // Hardcoded so a compromised UpdateChecker can't inject a
@@ -247,8 +248,8 @@ extension Notification.Name {
     /// Terminal and paste" toast.
     static let updaterFallbackToClipboard = Notification.Name("co.wispralt.updaterFallbackToClipboard")
 
-    /// Posted when `UpdateChecker.triggerInstall()` was invoked while a
-    /// meeting recording is active. Install is refused so in-progress audio
-    /// isn't lost when install.sh kills the app.
-    static let updaterMeetingActive = Notification.Name("co.wispralt.updaterMeetingActive")
+    /// Posted when `UpdateChecker.triggerInstall()` was invoked while the app
+    /// is busy (`MenuBarController.isBusy`). Install is refused so an
+    /// in-progress dictation or file job isn't lost when install.sh kills the app.
+    static let updaterDictationBusy = Notification.Name("co.wispralt.updaterDictationBusy")
 }

@@ -11,7 +11,7 @@ struct MeResponse: Decodable {
 
 /// Namespace for the `/me` self-service endpoint.
 ///
-/// Every call follows the same pattern as `DictationAPI` and `MeetingAPI`:
+/// Every call follows the same pattern as `DictationAPI` and `FileJobAPI`:
 /// build via `ServerClient.shared.buildRequest`, execute via
 /// `ServerClient.shared.execute`, destructure the `(Data, HTTPURLResponse)` tuple,
 /// then decode `data` with `JSONDecoder`.
@@ -21,7 +21,7 @@ enum MeAPI {
         let request = try ServerClient.shared.buildRequest(path: "/me", method: "GET")
         // ServerClient.execute returns (Data, HTTPURLResponse) — destructure both
         // so the tuple isn't fed to JSONDecoder. This is the same pattern used in
-        // DictationAPI.swift and MeetingAPI.swift.
+        // DictationAPI.swift and FileJobAPI.swift.
         let (data, _) = try await ServerClient.shared.execute(request)
         do {
             return try JSONDecoder().decode(MeResponse.self, from: data)

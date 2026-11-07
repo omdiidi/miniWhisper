@@ -2,18 +2,20 @@ import Foundation
 
 /// Central HTTP client for the WisprAlt server.
 ///
-/// - `session` is used for short dictation requests (low latency, default configuration).
-/// - `backgroundSession` is used for large meeting uploads (resumable, background transfer).
+/// - `session` is used for short requests (dictation, poll, download, delete).
+///   Large file uploads build their own delegate session in `FileJobAPI` /
+///   `ChunkedUploader`.
 ///
 /// Error mapping:
 ///   - 401 → `.unauthorized`
 ///   - 413 → `.uploadTooLarge`
 ///   - 422 → `.uploadTruncated`
-///   - 429 with body "meeting in progress" → `.meetingInProgress`
-///   - other 429 → `.rateLimited(retryAfter:)`
+///   - 429 with `code=file_job_busy` → `.fileJobInProgress`
+///   - 429 with `code=insufficient_memory` → `.server(status: 429, body: <server text>)`
+///   - 429 without `code` (rate-limit middleware) → `.rateLimited(retryAfter:)`
 ///   - other 4xx/5xx → `.server(status:body:)`
 ///   - `URLError.networkConnectionLost` / `.timedOut` → one retry for dictation only.
-///     Meeting uploads (large files) are NEVER retried blindly.
+///     File uploads (large files) are NEVER retried blindly.
 final class ServerClient {
     // MARK: - Singleton
 
@@ -38,9 +40,6 @@ final class ServerClient {
     /// Default session for dictation (small payloads, low latency).
     private let session: URLSession
 
-    /// Background session for meeting uploads (resumable, survives app suspend).
-    let backgroundSession: URLSession
-
     // MARK: - Init
 
     private init() {
@@ -48,13 +47,6 @@ final class ServerClient {
         defaultConfig.timeoutIntervalForRequest = 30
         defaultConfig.timeoutIntervalForResource = 120
         self.session = URLSession(configuration: defaultConfig)
-
-        let bgConfig = URLSessionConfiguration.background(
-            withIdentifier: "co.wispralt.meeting-upload"
-        )
-        bgConfig.isDiscretionary = false
-        bgConfig.sessionSendsLaunchEvents = true
-        self.backgroundSession = URLSession(configuration: bgConfig)
     }
 
     // MARK: - Request builder
@@ -124,9 +116,9 @@ final class ServerClient {
     /// Performs a data task, mapping HTTP errors to `ServerError`.
     ///
     /// Retries once on `URLError.networkConnectionLost` or `.timedOut` when
-    /// `retryOnReset` is true (dictation only — never for meeting uploads).
+    /// `retryOnReset` is true (dictation only — never for file uploads).
     /// Transient URLError codes that warrant a single retry for dictation requests.
-    /// Meeting uploads (large files) are NEVER retried blindly — see submit() in MeetingAPI.
+    /// File uploads (large files) are NEVER retried blindly — see `FileJobAPI.submitFile`.
     private static let retryableURLErrorCodes: Set<URLError.Code> = [
         .networkConnectionLost,
         .timedOut,
@@ -217,11 +209,20 @@ final class ServerClient {
             }
             throw ServerError.uploadTruncated
         case 429:
-            // Distinguish "meeting in progress" from generic rate limit.
-            if let bodyStr = bodyString,
-               bodyStr.lowercased().contains("meeting in progress")
+            // The file-job runner's busy 429s carry a machine `code` field
+            // (`{"error", "retry_after_s", "code"}`); the rate-limit
+            // middleware's 429s do not. Branch on the code, never on text.
+            if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+               let code = json["code"] as? String
             {
-                throw ServerError.meetingInProgress
+                switch code {
+                case "file_job_busy":
+                    throw ServerError.fileJobInProgress
+                case "insufficient_memory":
+                    throw ServerError.server(status: 429, body: json["error"] as? String ?? bodyString)
+                default:
+                    break
+                }
             }
             let retryAfter = response.value(forHTTPHeaderField: "Retry-After")
                 .flatMap { TimeInterval($0) }
@@ -239,7 +240,7 @@ final class ServerClient {
     static let miniHealthWindowSec: TimeInterval = 30
 
     /// Maximum age of the most-recent body-byte ACK (when observable, e.g.
-    /// from `MeetingAPI`'s `UploadSessionDelegate.didSendBodyData`) for a
+    /// from `FileJobAPI`'s `UploadSessionDelegate.didSendBodyData`) for a
     /// `URLError.timedOut` to be treated as "no connectivity" instead of
     /// "throttled but progressing."
     static let byteACKMaxAgeSec: TimeInterval = 5
@@ -319,10 +320,10 @@ final class ServerClient {
 
     /// Calls `/readyz/{endpoint}` and returns the ok flag plus whether dictation is degraded.
     ///
-    /// The `X-Dictation-Degraded: true` response header signals that a meeting job is currently
+    /// The `X-Dictation-Degraded: true` response header signals that a file job (or a model load) is currently
     /// consuming most server memory and dictation latency may be elevated.
     ///
-    /// - Parameter endpoint: `"dictation"` or `"meeting"`.
+    /// - Parameter endpoint: `"dictation"` or `"db"`.
     func readyz(endpoint: String) async throws -> (ok: Bool, degraded: Bool) {
         let request = try buildRequest(path: "/readyz/\(endpoint)")
         let (_, http) = try await execute(request)

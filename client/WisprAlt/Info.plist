@@ -27,7 +27,7 @@
 	<key>NSAppleEventsUsageDescription</key>
 	<string>WisprAlt sends text to other applications.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>WisprAlt records your voice for dictation and meeting transcription.</string>
+	<string>WisprAlt records your voice for dictation.</string>
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
 	<key>SUEnableAutomaticChecks</key>

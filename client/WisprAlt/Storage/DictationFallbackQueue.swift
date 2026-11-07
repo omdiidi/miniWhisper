@@ -23,8 +23,7 @@ import Darwin
 ///   - successful online dictation (MenuBarController.dictationStop)
 ///
 /// Concurrent drain calls are coalesced into one in-flight task by
-/// `DictationFallbackDrainCoordinator` (mirrors `PendingUploadsQueue`'s
-/// drain coordinator). Items that fail 5 times — or sit in the queue more
+/// `DictationFallbackDrainCoordinator`. Items that fail 5 times — or sit in the queue more
 /// than 7 days — move to a `failed/` sibling directory so they don't retry
 /// forever and don't get silently lost.
 final class DictationFallbackQueue {
@@ -393,8 +392,7 @@ final class DictationFallbackQueue {
         return try? JSONDecoder().decode(Entry.self, from: data)
     }
 
-    /// Atomic write: `.tmp` → fsync → rename → fsync parent dir. Same
-    /// crash-safety pattern as PendingUploadsQueue.
+    /// Atomic write: `.tmp` → fsync → rename → fsync parent dir.
     private func writeEntry(_ entry: Entry) throws {
         let dest = dir.appendingPathComponent("\(entry.client_dedup_id).json")
         try writeEntry(entry, at: dest)

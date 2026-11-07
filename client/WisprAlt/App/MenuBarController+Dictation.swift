@@ -58,22 +58,6 @@ extension MenuBarController {
             )
         }
     }
-
-    // MARK: - Mic mutual exclusion (v3 delta)
-
-    /// Attempt to start dictation. Returns false and logs a warning toast if a meeting is active.
-    @discardableResult
-    func tryStartDictation() -> Bool {
-        guard !isMeetingActive else {
-            Log.warning(
-                "Dictation start ignored — meeting recording is active.",
-                category: "dictation"
-            )
-            showToast("Dictation unavailable while meeting recording is active.")
-            return false
-        }
-        return true
-    }
 }
 
 // MARK: - FNKeyEventsDelegate
@@ -82,7 +66,6 @@ extension MenuBarController: FNKeyEventsDelegate {
 
     /// Called on the main actor by FNKeyMonitor when FN has been held ≥ holdThreshold.
     @MainActor func dictationStart() {
-        guard tryStartDictation() else { return }
         mode = .dictating
         do {
             try dictationRecorder.start()
@@ -96,6 +79,10 @@ extension MenuBarController: FNKeyEventsDelegate {
     /// Called on the main actor by FNKeyMonitor when FN is released after a confirmed hold.
     @MainActor func dictationStop() {
         guard mode == .dictating else { return }
+        // Count the transcription Task as in flight BEFORE leaving `.dictating`
+        // so `isBusy` never reads false between the two (update gate). The
+        // Task's first statement is the matching `defer` decrement.
+        dictationsInFlight += 1
         // Set idle immediately so the icon stops flashing.
         mode = .idle
 
@@ -113,6 +100,7 @@ extension MenuBarController: FNKeyEventsDelegate {
         let targetPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         Task { @MainActor in
+            defer { dictationsInFlight -= 1 }
             // Latency breakdown timestamps — surfaces the ~3-5s multi-sentence
             // hunch by isolating network+upload+inference vs AX-inject. Filter
             // OSLog with: `log show --last 5m --predicate 'subsystem == "co.wispralt"
@@ -167,17 +155,12 @@ extension MenuBarController: FNKeyEventsDelegate {
                     )
                 )
 
-                // Successful dictation is one of the four PendingUploadsQueue
-                // drain triggers. Detached + utility priority so it doesn't
-                // contend with the next dictation if the user FN-holds again
-                // immediately.
-                Task.detached(priority: .utility) {
-                    await PendingUploadsQueue.shared.drain()
-                }
-                // Plan A §A8: also drain cloud-fallback queue on online
+                // Plan A §A8: drain the cloud-fallback queue on online
                 // dictation success — a successful online dictation proves
                 // the origin is reachable, so this is the best moment to
-                // flush any queued OpenRouter-served dictations.
+                // flush any queued OpenRouter-served dictations. Detached +
+                // utility priority so it doesn't contend with the next
+                // dictation if the user FN-holds again immediately.
                 Task.detached(priority: .utility) {
                     await DictationFallbackQueue.shared.drain()
                 }
@@ -197,12 +180,6 @@ extension MenuBarController: FNKeyEventsDelegate {
                 AppNotifications.notify(
                     title: "Dictation Failed",
                     body: "Could not write audio to disk: \(underlying.localizedDescription)"
-                )
-            } catch DictationRecorder.DictationError.meetingRecordingActive {
-                Log.info("Dictation suppressed — meeting recording is active.", category: "dictation")
-                AppNotifications.notify(
-                    title: "Dictation Unavailable",
-                    body: "A meeting is recording — release the meeting first."
                 )
             } catch {
                 // When the fallback path itself fails (mini AND Worker

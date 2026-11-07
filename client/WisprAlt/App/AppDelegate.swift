@@ -26,21 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Ask the user once for permission to post local notifications. Without
         // this call every UNUserNotificationCenter request silently fails on
-        // macOS 13+ (secure-field skip notification, meeting cap warnings, …).
+        // macOS 13+ (secure-field skip notification, file-transcription results, …).
         // Idempotent — macOS suppresses re-prompts after the first decision.
         AppNotifications.requestAuthorization()
-
-        // Defensive cleanup: an earlier build attempted to override the macOS
-        // system default input device for meetings. We dropped that approach
-        // in favor of WisprAlt-only mic selection. If a stale crash-recovery
-        // key from that build survives in UserDefaults, restore + clear it
-        // so the user's system default isn't permanently changed.
-        if let savedUID = UserDefaults.standard.string(forKey: "pendingMeetingDefaultInputUID"),
-           let savedID = MicEnumerator.audioDeviceID(forUID: savedUID) {
-            _ = MicEnumerator.setSystemDefaultInputDevice(savedID)
-            Log.warning("Cleaned up stale system-default override from prior build. Restored UID \(savedUID).", category: "audio")
-            UserDefaults.standard.removeObject(forKey: "pendingMeetingDefaultInputUID")
-        }
 
         // Register for launch-at-login via SMAppService ON FIRST LAUNCH ONLY,
         // gated by a UserDefaults flag so the user's later "off" toggle persists.
@@ -91,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menuBarController.resumeInFlightJobIfNeeded()
         }
 
-        // Sparkle auto-update controller (honours meeting-guard gate).
+        // Sparkle auto-update controller (honours the isBusy update gate).
         sparkleController = SparkleController()
         sparkleController.menuBarController = menuBarController
 
@@ -115,7 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Run the sequential 4-permission wizard asynchronously so the menubar item
+        // Run the sequential 3-permission wizard asynchronously so the menubar item
         // appears before the first TCC dialog.
         Task { @MainActor in
             let results = await PermissionGate.checkAll()
@@ -141,7 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Private helpers
 
     private func logPermissionResults(_ results: [PermissionStatus]) {
-        let names = ["Accessibility", "Input Monitoring", "Microphone", "Screen Recording"]
+        let names = ["Accessibility", "Input Monitoring", "Microphone"]
         for (i, status) in results.enumerated() {
             let name = i < names.count ? names[i] : "Permission \(i + 1)"
             switch status {
