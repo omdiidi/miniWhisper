@@ -20,8 +20,17 @@ class UploadTruncatedError(Exception):
     """Raised when the uploaded file is shorter than its declared WAV header size."""
 
 
-class MeetingInProgressError(Exception):
-    """Raised when a new meeting job is submitted while one is already running."""
+class FileJobInProgressError(Exception):
+    """Raised when a file job cannot start (one already running, or low memory).
+
+    ``code`` is the machine-readable reason carried in the 429 body so the
+    client can branch without matching on the message text:
+    ``"file_job_busy"`` or ``"insufficient_memory"``.
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class AudioTooLongError(CorruptAudioError):

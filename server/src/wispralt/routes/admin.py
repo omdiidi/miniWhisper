@@ -9,9 +9,8 @@ POST /admin/rotate-key  (bearer auth with *current* key)
     body (v3 delta P4#6 security requirement).
 
 GET /metrics  (bearer auth)
-    Returns structured observability data for parakeet, meeting pipeline,
-    memory, and disk.  Meeting fields read from app.state placeholders that
-    Phase 2 will populate; they default to safe zeros.
+    Returns structured observability data for parakeet, the file-job
+    pipeline (under the legacy ``meeting`` key), memory, and disk.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ from .. import auth, observability
 from ..auth import require_admin
 from ..config import settings
 from ..jobs.runner import PHASE_LABELS
-from ..files import pipeline as meeting_pipeline
+from ..files import pipeline as files_pipeline
 from ..ops import env_writer
 from ..ops.env_writer import find_env_path
 from ..users import store as users_store
@@ -165,8 +164,8 @@ async def rotate_key(request: Request) -> JSONResponse:
 async def metrics(request: Request) -> JSONResponse:
     """Return observability snapshot.
 
-    All ``meeting.*`` fields are populated from ``app.state`` attributes that
-    Phase 2 will wire up; they default to safe zero/null values here.
+    The ``meeting.*`` block reports the file-job runner and the files
+    pipeline (the key name stays ``meeting`` until the portal relabel).
 
     Fields
     ------
@@ -178,9 +177,9 @@ async def metrics(request: Request) -> JSONResponse:
     parakeet.last_inference_at
         ISO-8601 timestamp of the most recent inference, or null.
     meeting.active
-        True if a meeting pipeline job is currently running.
+        True if a file job is currently running.
     meeting.completed_24h / failed_24h
-        Job counts from the last 24 hours (Phase 2 wires these from JobStore).
+        File-job counts from the last 24 hours (JobStore).
     meeting.current_eta_s
         Estimated seconds until the active job completes, or null.
     memory.rss_mb
@@ -205,12 +204,12 @@ async def metrics(request: Request) -> JSONResponse:
     except OSError:
         free_gb = 0
 
-    # Phase 2: read directly from MeetingRunner and JobStore where available.
-    meeting_runner = getattr(request.app.state, "meeting_runner", None)
+    # Read directly from FileJobRunner and JobStore where available.
+    file_runner = getattr(request.app.state, "file_runner", None)
     job_store = getattr(request.app.state, "job_store", None)
 
-    meeting_active: bool = meeting_runner.active if meeting_runner is not None else False
-    active_job_id: str | None = meeting_runner.active_job_id if meeting_runner is not None else None
+    file_job_active: bool = file_runner.active if file_runner is not None else False
+    active_job_id: str | None = file_runner.active_job_id if file_runner is not None else None
 
     completed_24h: int = job_store.count_24h("done") if job_store is not None else 0
     failed_24h: int = job_store.count_24h("failed") if job_store is not None else 0
@@ -219,7 +218,7 @@ async def metrics(request: Request) -> JSONResponse:
     current_eta_s: int | None = None
     last_inference_at: str | None = getattr(request.app.state, "parakeet_last_inference_at", None)
 
-    _meeting_warm, _meeting_loading = meeting_pipeline.state()
+    _files_warm, _files_loading = files_pipeline.state()
 
     # Staging count from filesystem
     staging_count_live: int
@@ -241,15 +240,15 @@ async def metrics(request: Request) -> JSONResponse:
                 "last_inference_at": last_inference_at,
             },
             "meeting": {
-                "active": meeting_active,
+                "active": file_job_active,
                 "active_job_id": active_job_id,
                 "completed_24h": completed_24h,
                 "failed_24h": failed_24h,
                 "current_eta_s": current_eta_s,
-                "models_warm": _meeting_warm,
-                "models_loading": _meeting_loading,
-                "idle_seconds": round(meeting_pipeline.idle_seconds(), 1),
-                "idle_eviction_threshold_s": settings.meeting_idle_eviction_seconds,
+                "models_warm": _files_warm,
+                "models_loading": _files_loading,
+                "idle_seconds": round(files_pipeline.idle_seconds(), 1),
+                "idle_eviction_threshold_s": settings.file_model_idle_eviction_seconds,
                 "eviction_failures_total": observability.eviction_failures_total.value,
             },
             "memory": {
@@ -357,7 +356,7 @@ async def admin_server_log(request: Request, job_id: str) -> PlainTextResponse:
     """Return up to ~100 log lines bracketing the job_id's first and last
     appearance in ``server.log``.
 
-    Includes inter-id lines (ffmpeg stderr, pyannote warnings, etc.) that
+    Includes inter-id lines (ffmpeg stderr, library warnings, etc.) that
     fall in that range so the operator sees the full neighborhood. Plain
     text response — the client renders it as monospace in the View Server
     Log sheet.

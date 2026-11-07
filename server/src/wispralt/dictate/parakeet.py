@@ -238,7 +238,7 @@ class ParakeetService:
             raise AudioTooLongError(
                 f"Audio too long: {len(samples) / TARGET_SR:.1f}s "
                 f"(max {MAX_SAMPLES / TARGET_SR:.0f}s). For longer audio, use "
-                f"meeting recording (FN-triple-tap)."
+                f"Transcribe file in the menu bar."
             )
         if len(samples) < MIN_SAMPLES:
             logger.debug(

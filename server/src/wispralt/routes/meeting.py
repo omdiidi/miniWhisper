@@ -1,10 +1,13 @@
 """
-routes/meeting.py — Meeting transcription endpoints.
+routes/meeting.py — File-job poll/download/delete endpoints (legacy URL prefix).
 
-POST   /transcribe/meeting              Submit a WAV for background transcription.
 GET    /transcribe/meeting/{job_id}     Poll job status.
 GET    /transcribe/meeting/{job_id}/download/{fmt}  Stream a completed output file.
 DELETE /transcribe/meeting/{job_id}     Clean up job + output files.
+
+These poll/download/delete routes serve /transcribe/file jobs (the client
+still polls these URLs); they move onto the /transcribe/file router in the
+next commit. The meeting submit route is gone.
 
 All endpoints require Bearer authentication (via ``Depends(require_api_key)``).
 
@@ -16,18 +19,14 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-import time
-
 from ..auth import require_api_key
-from ..config import settings
-from .._errors import MeetingInProgressError
-from ..jobs.runner import PHASE_LABELS, MeetingRunner
-from ..ops import staging
+from ..jobs.runner import PHASE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -43,70 +42,6 @@ _MEDIA_TYPES: dict[str, str] = {
     "vtt": "text/vtt",
     "txt": "text/plain",
 }
-
-
-def _runner(request: Request) -> MeetingRunner:
-    return request.app.state.meeting_runner  # type: ignore[no-any-return]
-
-
-# ── POST /transcribe/meeting ───────────────────────────────────────────────────
-
-
-@router.post("", summary="Submit a meeting WAV for background transcription")
-async def submit_meeting(
-    request: Request,
-    file: UploadFile,
-    content_md5: str | None = Header(None, alias="Content-MD5"),
-    content_length: int | None = Header(None, alias="Content-Length"),
-) -> JSONResponse:
-    """Accept a 2-channel WAV upload and enqueue it for transcription.
-
-    Returns
-    -------
-    202 ``{"job_id": str, "status": "pending"}``
-    413  Upload exceeds MAX_UPLOAD_BYTES.
-    422  WAV header invalid or Content-MD5 mismatch.
-    429  A meeting job is already in progress or RAM is insufficient.
-    507  Insufficient storage.
-    """
-    # Fast pre-flight size check from Content-Length header
-    if content_length is not None and content_length > settings.max_upload_bytes:
-        raise HTTPException(413, "Upload too large")
-
-    runner = _runner(request)
-
-    wav_path, _ = await staging.stream_to_staging(
-        file,
-        settings.max_upload_bytes,
-        settings.staging_dir,
-        content_md5,
-    )
-
-    # Phase 1 transcript-storage: capture client version + owning api_key_id
-    # at submit time so they survive worker crashes and restart re-enqueue.
-    client_version = request.headers.get("X-WisprAlt-Client-Version")
-    user = getattr(request.state, "user", None)
-    api_key_id = (
-        int(user.id)
-        if user is not None and hasattr(user, "id") and int(user.id) >= 0
-        else None
-    )
-    try:
-        jid = await runner.submit_or_429(
-            wav_path,
-            client_version=client_version,
-            api_key_id=api_key_id,
-        )
-    except MeetingInProgressError as exc:
-        staging.cleanup(wav_path)
-        return JSONResponse(
-            {"error": str(exc), "retry_after_s": 60},
-            status_code=429,
-            headers={"Retry-After": "60"},
-        )
-
-    logger.info("Meeting job %s submitted.", jid)
-    return JSONResponse({"job_id": jid, "status": "pending"}, status_code=202)
 
 
 # ── GET /transcribe/meeting/{job_id} ──────────────────────────────────────────

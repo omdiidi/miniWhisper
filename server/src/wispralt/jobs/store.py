@@ -1,5 +1,5 @@
 """
-jobs/store.py — SQLite-backed job repository for WisprAlt meeting transcription.
+jobs/store.py — SQLite-backed job repository for WisprAlt file transcription.
 
 Design decisions (v3 deltas P4#4 + P5#2):
 - WAL mode + NORMAL synchronous: durability with reduced fsync latency.
@@ -45,13 +45,12 @@ class Job:
     output_dir: Optional[str]
     wav_path: str
     attempts: int = 0      # C9: incremented each time the job is set to running
-    # File-job flag: when the source upload was mono (custom transcription),
-    # the meeting pipeline runs its single-channel branch instead of the
-    # stereo mic/system one. Defaulted to 0 in SQL via in-place ALTER.
+    # Legacy flag (always written True now; every file job is mono-transcribed).
+    # Defaulted to 0 in SQL via in-place ALTER; the column stays.
     force_single_channel: bool = False
     # NEW (Phase 3) — observability + intent. All idempotent ALTERs in __init__.
-    # request_mode: file | meeting (set at submit time; distinct from `mode`
-    # which is set on completion to remote | in_person | None).
+    # request_mode: always "file" for new rows; legacy rows may say "meeting".
+    # Distinct from `mode`, which is set on completion ("single").
     request_mode: Optional[str] = None
     phase: Optional[str] = None
     phase_started_at: Optional[float] = None
@@ -102,14 +101,14 @@ def _row_to_job(row: tuple, cursor: sqlite3.Cursor) -> Job:
 
 
 class JobStore:
-    """Thread-safe SQLite repository for meeting transcription jobs.
+    """Thread-safe SQLite repository for file transcription jobs.
 
     Usage::
 
         store = JobStore(Path("~/.wispralt/jobs.db").expanduser())
-        jid = store.create("/tmp/wispralt/abc.wav")
+        jid = store.create("/tmp/wispralt/abc.m4a")
         store.set_running(jid)
-        store.set_done(jid, "remote", "/var/meetings")
+        store.set_done_if_not_cancelled(jid, "single", "/var/outputs")
         job = store.get(jid)  # -> Job
     """
 
@@ -150,11 +149,8 @@ class JobStore:
         except sqlite3.OperationalError:
             pass  # column already exists
 
-        # /transcribe/file: track whether the canonical WAV should run through
-        # the pipeline's single-channel branch. NO discriminator `kind` column —
-        # the file extension of `wav_path` is the only discriminator
-        # (.wav → already-transcoded → _run_pipeline; non-.wav → pre-transcode
-        # source → _run_source).
+        # Legacy column: always written True now (every file job is mono).
+        # Kept so old databases keep migrating cleanly.
         try:
             self.con.execute(
                 "ALTER TABLE jobs ADD COLUMN force_single_channel INTEGER NOT NULL DEFAULT 0"
@@ -310,17 +306,14 @@ class JobStore:
         self,
         wav_path: str,
         *,
-        request_mode: str = "meeting",
+        request_mode: str = "file",
         client_app_version: str | None = None,
         api_key_id: int | None = None,
     ) -> str:
         """Insert a new pending job and return its UUID.
 
-        ``request_mode`` encodes the caller's intent (``file`` or ``meeting``)
-        and is the source of truth for diarization routing in
-        :class:`MeetingRunner._run_source`. Defaulted to ``meeting`` so the
-        legacy ``submit_or_429`` path (called only by /transcribe/meeting POST)
-        keeps working without an explicit flag.
+        ``request_mode`` is always ``file`` for new rows (the column stays for
+        legacy rows and the portal labels; relabelled in a later pass).
 
         ``client_app_version`` (Phase 1 transcript-storage) records the
         submitting client's app version at submit time. Survives worker
@@ -348,23 +341,35 @@ class JobStore:
         )
         return jid
 
-    def set_running(self, jid: str) -> None:
-        """Transition a job from pending → running.  Increments `attempts`."""
-        self._exec(
-            "UPDATE jobs SET status='running', started_at=?, attempts=attempts+1 WHERE id=?",
+    def set_running(self, jid: str) -> bool:
+        """Atomically transition pending → running.  Increments `attempts`.
+
+        Only a ``pending`` row with no cancel request moves, so a DELETE that
+        flagged cancel before the worker started can never be overtaken.
+        Returns True iff the row changed.
+        """
+        cur = self._exec(
+            "UPDATE jobs SET status='running', started_at=?, attempts=attempts+1"
+            " WHERE id=? AND status='pending' AND cancel_requested=0",
             time.time(),
             jid,
         )
+        return cur.rowcount == 1
 
-    def set_done(
+    def set_done_if_not_cancelled(
         self,
         jid: str,
         mode: str,
         output_dir: str,
         *,
         transcript_text: str | None = None,
-    ) -> None:
-        """Transition a job from running → done.
+    ) -> bool:
+        """Atomically transition running → done unless cancel was requested.
+
+        One UPDATE guarded by ``status='running' AND cancel_requested=0``, so
+        no interleaving with a cancel (or the watchdog writing ``failed``) can
+        leave a ``done`` row behind. Returns True iff the row changed; on
+        False the caller discards the outputs.
 
         ``transcript_text`` (Phase 1 transcript-storage) is the plain-text
         transcript derived from the pipeline's segment list. When provided
@@ -377,10 +382,10 @@ class JobStore:
         worker crash mid-pipeline.
         """
         word_count = len(transcript_text.split()) if transcript_text else None
-        self._exec(
+        cur = self._exec(
             "UPDATE jobs SET status='done', mode=?, output_dir=?,"
             " finished_at=?, transcript_text=?, word_count=?"
-            " WHERE id=?",
+            " WHERE id=? AND status='running' AND cancel_requested=0",
             mode,
             output_dir,
             time.time(),
@@ -388,6 +393,7 @@ class JobStore:
             word_count,
             jid,
         )
+        return cur.rowcount == 1
 
     def insert_dictation(
         self,
@@ -1086,16 +1092,15 @@ class JobStore:
         return [_row_to_job(row, cur) for row in rows]
 
     def list_pending_ids(self) -> list[str]:
-        """Return the IDs of all pending jobs. Used by MeetingRunner.reenqueue_pending."""
+        """Return the IDs of all pending jobs. Used by FileJobRunner.reenqueue_pending."""
         cur = self._exec("SELECT id FROM jobs WHERE status='pending'")
         return [row[0] for row in cur.fetchall()]
 
     def list_pending_ids_with_mode(self) -> list[tuple[str, str, Optional[str]]]:
         """Return ``(id, wav_path, request_mode)`` for every pending job.
 
-        Used by :meth:`MeetingRunner.reenqueue_pending` to route on both the
-        file extension AND the explicit submit-time intent. ``request_mode``
-        may be ``None`` for rows created before Phase 3.
+        Used by :meth:`FileJobRunner.reenqueue_pending`, which re-runs every
+        pending row as a file job; ``request_mode`` is informational only.
         """
         cur = self._exec(
             "SELECT id, wav_path, request_mode FROM jobs"
@@ -1126,7 +1131,7 @@ class JobStore:
     def set_cancel_requested(self, jid: str) -> None:
         """Flag the job for cooperative cancellation. Cancel mid-ffmpeg is
         honored by ``transcode_to_canonical_wav``'s ``cancel_cb`` poll;
-        cancel mid-transcribe/diarize is advisory (the executor cannot be
+        cancel mid-transcribe is advisory (the executor cannot be
         interrupted). The UI uses this flag to show a 'finishing on server'
         banner."""
         self._exec("UPDATE jobs SET cancel_requested=1 WHERE id=?", jid)
@@ -1203,17 +1208,9 @@ class JobStore:
                 " WHERE status='running'"
             )
 
-            # Backfill request_mode for legacy rows so the runner's mode-aware
-            # routing has a value to consult. Derivation rule matches the
-            # previous file-extension-based routing in reenqueue_pending:
-            #   .wav → meeting (legacy /transcribe/meeting POST)
-            #   any other extension → file (/transcribe/file source upload)
+            # Backfill request_mode for legacy rows. Every job is a file job
+            # now; the column stays for the portal labels.
             try:
-                self.con.execute(
-                    "UPDATE jobs SET request_mode='meeting'"
-                    " WHERE request_mode IS NULL"
-                    " AND lower(substr(wav_path, -4)) = '.wav'"
-                )
                 self.con.execute(
                     "UPDATE jobs SET request_mode='file'"
                     " WHERE request_mode IS NULL"

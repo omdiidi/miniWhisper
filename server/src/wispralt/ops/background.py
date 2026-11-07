@@ -126,20 +126,20 @@ async def daily_sweep_loop(
             logger.exception("Daily sweep failed; retrying tomorrow")
 
 
-async def eviction_loop(app: FastAPI, meeting_runner, meeting_pipeline) -> None:
-    """Release meeting models after ``meeting_idle_eviction_seconds`` idle."""
-    threshold = float(settings.meeting_idle_eviction_seconds)
+async def eviction_loop(app: FastAPI, file_runner, files_pipeline) -> None:
+    """Release the file model after ``file_model_idle_eviction_seconds`` idle."""
+    threshold = float(settings.file_model_idle_eviction_seconds)
     while not getattr(app.state, "shutting_down", False):
         try:
             await asyncio.sleep(60.0)
-            if meeting_runner.active:
+            if file_runner.active:
                 continue
             evicted = await asyncio.to_thread(
-                meeting_pipeline.evict_if_idle, threshold
+                files_pipeline.evict_if_idle, threshold
             )
             if evicted:
                 logger.info(
-                    "Idle eviction released meeting models (idle threshold %.0fs).",
+                    "Idle eviction released the file model (idle threshold %.0fs).",
                     threshold,
                 )
         except asyncio.CancelledError:

@@ -156,7 +156,7 @@ def verify_env_perms(path: Path) -> bool:
     if not mode_ok:
         logger.warning(
             "SECURITY WARNING: %s has mode %o, expected 0600. "
-            "Other processes may be able to read your HF_TOKEN and API key. "
+            "Other processes may be able to read your API key and other secrets. "
             "Fix with: chmod 600 %s",
             path,
             mode,

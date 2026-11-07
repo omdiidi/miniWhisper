@@ -3,15 +3,16 @@ routes/transcribe_file.py — Container-agnostic transcription endpoint.
 
 POST /transcribe/file accepts any audio/video container (m4a, mp3, mp4, mov,
 wav, aac, flac, opus, ogg, webm, m4v, caf, aiff). The route streams the upload
-to staging in its original container, then hands it to the meeting runner's
-file-source path (`submit_source_or_429`) which runs ffprobe + ffmpeg + the
-existing pipeline in the background.
+to staging in its original container, then hands it to the file-job runner
+(`submit_source_or_429`) which runs ffprobe + ffmpeg + the mono Whisper
+pipeline in the background.
 
-Mode is now an EXPLICIT submit-time form field: ``mode=file`` (default —
-single-speaker) or ``mode=meeting`` (diarized). This replaces the previous
-channel-count heuristic so a mono meeting recording is transcribed AND
-diarized correctly. FastAPI auto-validates the enum value and returns a
-structured 422 on invalid input.
+There is no ``mode`` field: every job is a single-speaker file job. An
+undeclared ``mode`` form field from an old client is ignored by FastAPI, and
+chunked finalize ignores any ``mode`` key left in a pre-upgrade ``meta.json``.
+
+Busy 429 bodies are ``{"error", "retry_after_s": 60, "code"}`` where ``code``
+is ``file_job_busy`` or ``insufficient_memory`` (FileJobInProgressError.code).
 
 Auth: ``Bearer`` via ``Depends(require_api_key)``.
 Usage telemetry: route-key ``transcribe/file`` is registered in
@@ -38,7 +39,6 @@ import psutil
 from fastapi import (
     APIRouter,
     Depends,
-    Form,
     Header,
     HTTPException,
     Request,
@@ -47,10 +47,10 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .._errors import MeetingInProgressError
+from .._errors import FileJobInProgressError
 from ..auth import require_api_key
 from ..config import settings
-from ..jobs.runner import MeetingRunner, ProcessingMode
+from ..jobs.runner import FileJobRunner
 from ..ops import staging
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,6 @@ _UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{22}$")  # exact `token_urlsafe(16)` 
 class ChunkedInitRequest(BaseModel):
     """Body for ``POST /transcribe/file/chunked/init``."""
 
-    mode: ProcessingMode = Field(default=ProcessingMode.FILE)
     total_bytes: int = Field(..., gt=0)
     chunk_count: int = Field(..., gt=0, le=_MAX_CHUNKS)
     original_filename: str = Field(..., min_length=1, max_length=512)
@@ -129,15 +128,23 @@ def _require_owner(request: Request, meta: dict) -> None:
         raise HTTPException(403, "Upload owned by a different API key")
 
 
-def _runner(request: Request) -> MeetingRunner:
-    return request.app.state.meeting_runner  # type: ignore[no-any-return]
+def _runner(request: Request) -> FileJobRunner:
+    return request.app.state.file_runner  # type: ignore[no-any-return]
+
+
+def _busy_response(exc: FileJobInProgressError) -> JSONResponse:
+    """429 for a busy/low-memory runner. ``code`` lets the client branch."""
+    return JSONResponse(
+        {"error": str(exc), "retry_after_s": 60, "code": exc.code},
+        status_code=429,
+        headers={"Retry-After": "60"},
+    )
 
 
 @router.post("", summary="Submit any audio/video file for transcription")
 async def submit_file(
     request: Request,
     file: UploadFile,
-    mode: ProcessingMode = Form(ProcessingMode.FILE),
     content_length: int | None = Header(None, alias="Content-Length"),
 ) -> JSONResponse:
     """Accept any supported container and enqueue a transcription job.
@@ -147,9 +154,9 @@ async def submit_file(
     202 ``{"job_id": str, "status": "pending"}``
     413  Upload exceeds MAX_UPLOAD_BYTES.
     415  Unsupported source extension.
-    422  ffprobe / ffmpeg rejected the source (no audio stream, decode failed)
-         OR ``mode`` was not a valid ``ProcessingMode`` value.
-    429  A meeting/file job is already in progress or RAM is insufficient.
+    422  ffprobe / ffmpeg rejected the source (no audio stream, decode failed).
+    429  A file job is already in progress (``code=file_job_busy``) or RAM is
+         insufficient (``code=insufficient_memory``).
     503  Server low on memory (<4 GiB available) — try again in 60s.
     507  Insufficient storage on the staging filesystem.
     """
@@ -208,22 +215,14 @@ async def submit_file(
         # request.
         jid = await runner.submit_source_or_429(
             src_path,
-            request_mode=mode,
             client_version=client_version,
             api_key_id=api_key_id,
         )
-    except MeetingInProgressError as exc:
+    except FileJobInProgressError as exc:
         src_path.unlink(missing_ok=True)
-        return JSONResponse(
-            {"error": str(exc), "retry_after_s": 60},
-            status_code=429,
-            headers={"Retry-After": "60"},
-        )
+        return _busy_response(exc)
 
-    logger.info(
-        "File job %s submitted (source=%s, mode=%s).",
-        jid, src_path.name, mode.value,
-    )
+    logger.info("File job %s submitted (source=%s).", jid, src_path.name)
     return JSONResponse({"job_id": jid, "status": "pending"}, status_code=202)
 
 
@@ -327,7 +326,6 @@ async def init_chunked(
         raise HTTPException(500, "upload_id collision; retry")
 
     meta = {
-        "mode": req.mode.value,
         "total_bytes": req.total_bytes,
         "chunk_count": req.chunk_count,
         "original_filename": req.original_filename,
@@ -577,19 +575,13 @@ async def finalize_chunked(
         raise HTTPException(500, "Assembled size mismatch")
 
     # Submit to runner using the same path as the single-shot route. The
-    # MeetingInProgressError branch mirrors transcribe_file.py:128-134 so a
-    # 429 still cleans up the assembled file (R-C).
+    # FileJobInProgressError branch mirrors submit_file so a 429 still cleans
+    # up the assembled file (R-C). Any ``mode`` key in a pre-upgrade meta.json
+    # is ignored: every job is a file job.
     runner = _runner(request)
     # Phase 1 transcript-storage: read client version that was captured at
     # /init (more robust than the live header — survives mid-upload client
     # upgrade). api_key_id is already ownership-verified above.
-    try:
-        mode_enum = ProcessingMode(meta["mode"])
-    except (KeyError, ValueError) as exc:
-        out_path.unlink(missing_ok=True)
-        shutil.rmtree(chunked_dir, ignore_errors=True)
-        raise HTTPException(422, "meta.json missing or has invalid mode") from exc
-
     client_version = meta.get("client_app_version")
     try:
         meta_api_key_id = int(meta.get("api_key_id", -999))
@@ -599,24 +591,19 @@ async def finalize_chunked(
     try:
         jid = await runner.submit_source_or_429(
             out_path,
-            request_mode=mode_enum,
             client_version=client_version,
             api_key_id=api_key_id,
         )
-    except MeetingInProgressError as exc:
+    except FileJobInProgressError as exc:
         out_path.unlink(missing_ok=True)
         shutil.rmtree(chunked_dir, ignore_errors=True)
-        return JSONResponse(
-            {"error": str(exc), "retry_after_s": 60},
-            status_code=429,
-            headers={"Retry-After": "60"},
-        )
+        return _busy_response(exc)
 
     # Success: chunked dir is now empty (parts already unlinked) — just rmtree
     # to drop meta.json + the dir itself.
     shutil.rmtree(chunked_dir, ignore_errors=True)
     logger.info(
-        "Chunked upload %s finalized → job %s (bytes=%d, mode=%s).",
-        upload_id, jid, total_bytes, mode_enum.value,
+        "Chunked upload %s finalized → job %s (bytes=%d).",
+        upload_id, jid, total_bytes,
     )
     return JSONResponse({"job_id": jid, "status": "pending"}, status_code=202)

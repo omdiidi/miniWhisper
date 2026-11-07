@@ -16,7 +16,6 @@ from typing import Any
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
 # wispralt import so the tests work on a bare dev box without a .env.
-os.environ.setdefault("HF_TOKEN", "stub")
 os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
 os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")

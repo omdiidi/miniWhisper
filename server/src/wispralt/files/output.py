@@ -1,5 +1,5 @@
 """
-meeting/output.py — Atomic transcript writers (JSON, SRT, VTT, TXT).
+files/output.py — Atomic transcript writers (JSON, SRT, VTT, TXT).
 
 All four formats are written via a tempfile-in-same-dir → os.replace pattern
 so that readers never see a partially written file.

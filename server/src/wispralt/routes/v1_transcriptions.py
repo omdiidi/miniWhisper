@@ -144,8 +144,7 @@ async def create_transcription(
     if model == _DIARIZE_MODEL:
         return _openai_error(
             request,
-            f"Model '{_DIARIZE_MODEL}' is not available on this endpoint. "
-            "For diarization, use the native /transcribe/meeting async API.",
+            f"Model '{_DIARIZE_MODEL}' is not available on this server.",
             "invalid_request_error",
             "model_not_found",
             404,
@@ -201,7 +200,7 @@ async def create_transcription(
         return _openai_error(
             request,
             f"Audio file exceeds {cap // (1024 * 1024)} MB cap on /v1/audio/transcriptions. "
-            "For longer audio, use the native /transcribe/meeting async endpoint.",
+            "For longer audio, use the native /transcribe/file async endpoint.",
             "invalid_request_error",
             "file_too_large",
             413,

@@ -1,4 +1,4 @@
-"""meeting/mlx_whisper_loader.py — mlx-whisper one-shot loader (Phase 1 swap).
+"""files/mlx_whisper_loader.py — mlx-whisper one-shot loader (Phase 1 swap).
 
 One-shot transcribe (preserves Whisper's cross-window prompting). Progress
 reporting via ``tqdm.auto.tqdm.update`` monkey-patch with a wall-clock
@@ -45,7 +45,7 @@ def load() -> None:
     """Warm the mlx-whisper model with a 1-second silence transcribe.
 
     Sets ``_loaded = True`` on success. Subsequent calls are no-ops. Called
-    from the meeting executor thread on first meeting job via
+    from the file-job executor thread on the first file job via
     ``pipeline._ensure_models_loaded()``.
     """
     global _loaded
@@ -111,9 +111,8 @@ def transcribe_channel(
     audio_16k:
         1-D float32 PCM array sampled at 16 kHz.
     word_timestamps:
-        Pass-through to mlx_whisper. True for meeting mode (needed for
-        speaker-boundary segment splits in merge.assign_speakers_segments);
-        False for file mode (~20 % perf savings).
+        Pass-through to mlx_whisper. File jobs pass False (~20 % perf
+        savings; no word-level boundaries are needed).
     progress_cb:
         Optional ``(phase: str, idx: int, total: int) -> None``. Phase is
         always ``"transcribe"`` from this module. Exceptions raised by

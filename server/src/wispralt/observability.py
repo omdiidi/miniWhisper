@@ -200,18 +200,18 @@ streaming_sessions_opened_total = _MonotonicCounter()
 streaming_sessions_finalized_total = _MonotonicCounter()
 streaming_sessions_aborted_total = _LabeledCounter()
 
-# Cumulative count of meeting eviction self-check failures. In-process;
+# Cumulative count of file-model eviction self-check failures. In-process;
 # resets on restart by design (CRITICAL log persists to server.err.log,
-# and /readyz/meeting exposes mlx_active_mb as the cross-cutting invariant).
+# and /admin/metrics exposes mlx_active_mb as the cross-cutting invariant).
 eviction_failures_total = _MonotonicCounter()
 
 
 def mlx_active_mb() -> int:
     """Return MLX active memory in MB; 0 on any failure.
 
-    Callers (eviction self-check, /readyz/meeting) tolerate 0 as 'unknown'
+    Callers (eviction self-check, /admin/metrics) tolerate 0 as 'unknown'
     rather than 500-ing the endpoint. Lazy MLX import preserved with except
-    guard so the no-auth /readyz/meeting endpoint NEVER raises on MLX drift.
+    guard so an observability endpoint NEVER raises on MLX drift.
     """
     try:
         import mlx.core as _mx

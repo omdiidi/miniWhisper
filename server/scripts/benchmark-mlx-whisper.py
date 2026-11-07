@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Phase 0 spike: benchmark mlx-whisper on the prod-mini against a real file.
 
-Separately times ffmpeg_decode, transcribe, and (optionally) pyannote diarize.
+Separately times ffmpeg_decode and transcribe (mono, no word timestamps —
+the same settings file jobs use).
 Samples RSS via psutil every 2 s while the heavy steps run.
 
 Usage:
-    python3 benchmark-mlx-whisper.py --input /path/to/audio.m4a --mode file
-    python3 benchmark-mlx-whisper.py --input /path/to/audio.m4a --mode meeting
+    python3 benchmark-mlx-whisper.py --input /path/to/audio.m4a
 
 Outputs a single JSON line to stdout with all timings + peak RSS. Exit non-zero
 on any failure.
@@ -174,31 +174,9 @@ def run_transcribe(audio_16k: np.ndarray, word_timestamps: bool) -> dict:
     )
 
 
-def run_diarize(audio_16k: np.ndarray, hf_token: str | None) -> tuple[int, dict]:
-    """Returns (num_speakers, diarization annotation). Loads pyannote on demand."""
-    import torch
-    from pyannote.audio import Pipeline
-
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
-    )
-    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-    pipeline.to(device)
-
-    # Pyannote expects a dict with waveform + sample_rate; in-memory path.
-    waveform_t = torch.from_numpy(audio_16k).unsqueeze(0)
-    annotation = pipeline({"waveform": waveform_t, "sample_rate": 16000})
-    speakers = set()
-    for _, _, speaker in annotation.itertracks(yield_label=True):
-        speakers.add(speaker)
-    return len(speakers), {"num_speakers": len(speakers)}
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--mode", required=True, choices=["file", "meeting"])
     parser.add_argument("--out", type=Path, default=None, help="JSON output path; default stdout")
     args = parser.parse_args()
 
@@ -208,17 +186,14 @@ def main() -> int:
 
     result: dict = {
         "input": str(args.input),
-        "mode": args.mode,
         "model": WHISPER_MODEL,
         "audio_duration_s": None,
         "ffmpeg_decode_s": None,
         "transcribe_s": None,
-        "pyannote_s": None,
         "wall_clock_s": None,
         "realtime_ratio": None,
         "peak_rss_mb": None,
         "segments_count": None,
-        "speakers_detected": None,
         "error": None,
     }
 
@@ -244,24 +219,10 @@ def main() -> int:
             audio_16k = load_wav_to_numpy(wav_path)
 
             # transcribe
-            word_ts = args.mode == "meeting"
             t0 = time.monotonic()
-            transcribe_result = run_transcribe(audio_16k, word_timestamps=word_ts)
+            transcribe_result = run_transcribe(audio_16k, word_timestamps=False)
             result["transcribe_s"] = round(time.monotonic() - t0, 2)
             result["segments_count"] = len(transcribe_result.get("segments", []))
-
-            # pyannote (meeting mode only)
-            if args.mode == "meeting":
-                hf_token = os.environ.get("HF_TOKEN")
-                if not hf_token:
-                    print(
-                        "WARNING: HF_TOKEN not set; pyannote may fail to download model",
-                        file=sys.stderr,
-                    )
-                t0 = time.monotonic()
-                n_speakers, _ = run_diarize(audio_16k, hf_token)
-                result["pyannote_s"] = round(time.monotonic() - t0, 2)
-                result["speakers_detected"] = n_speakers
 
         result["wall_clock_s"] = round(time.monotonic() - wall_t0, 2)
         if result["transcribe_s"]:

@@ -1,5 +1,5 @@
 """
-ops/staging.py — Staging-directory management for meeting WAV uploads.
+ops/staging.py — Staging-directory management for file-job uploads.
 
 Responsibilities:
 - Stream an upload to disk in 1 MB chunks with disk-space pre/mid-checks (P5#10).
@@ -389,8 +389,8 @@ async def stream_to_staging_raw(
 def ffprobe_channel_count(source: Path) -> int:
     """Return the audio channel count of *source* via ffprobe.
 
-    Used by the /transcribe/file worker to decide between mono (custom
-    transcription) and stereo (meeting) pipelines.
+    Used by the /transcribe/file worker to pick the canonical WAV channel
+    count (mono stays mono; anything else is staged as stereo).
 
     Raises
     ------
@@ -464,7 +464,6 @@ def transcode_to_canonical_wav(
     target_channels: int,
     sample_rate: int = 16_000,
     cancel_cb: Optional[Callable[[], bool]] = None,
-    pad_mono_to_stereo_silent: bool = False,
 ) -> Path:
     """Run ffmpeg to convert *source* → canonical 16 kHz PCM WAV.
 
@@ -477,17 +476,6 @@ def transcode_to_canonical_wav(
     point at the canonical WAV — otherwise a crash between rename and row
     update would orphan the canonical WAV while leaving the row pointing at
     a deleted source.
-
-    Parameters
-    ----------
-    pad_mono_to_stereo_silent
-        When True AND target_channels=2, applies an ffmpeg pan filter that
-        copies the source mono channel into ch0 and explicitly zeros ch1.
-        Caller is responsible for verifying the source IS mono via ffprobe
-        — passing this for a stereo source would silence the right channel.
-        Used by the meeting-mode + mono-source path so the pipeline's
-        in-person branch (gated on `is_silent_robust(ch2)`) fires and runs
-        pyannote-on-ch1, producing per-speaker labels instead of "You"/"Other".
 
     Raises
     ------
@@ -518,15 +506,9 @@ def transcode_to_canonical_wav(
         "-map", "0:a:0",         # explicit: same audio track ffprobe inspected
         "-vn",
     ]
-    if pad_mono_to_stereo_silent and target_channels == 2:
-        # Pan filter: ch0 = source ch0, ch1 = explicit silence (0 * source ch0).
-        # This is what `is_silent_robust(ch2)` in the pipeline expects so the
-        # in-person branch fires for mono meeting recordings.
-        cmd += ["-af", "pan=stereo|c0=c0|c1=0*c0"]
-    else:
-        # Standard channel up/down-mix (ffmpeg duplicates mono to both
-        # channels when going 1→2; sums L+R when going 2→1).
-        cmd += ["-ac", str(target_channels)]
+    # Standard channel up/down-mix (ffmpeg duplicates mono to both channels
+    # when going 1→2; sums L+R when going 2→1).
+    cmd += ["-ac", str(target_channels)]
     cmd += [
         "-ar", str(sample_rate),
         "-acodec", "pcm_s16le",

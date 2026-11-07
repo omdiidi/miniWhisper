@@ -1,31 +1,37 @@
 """
-jobs/runner.py — In-process meeting transcription runner.
+jobs/runner.py — In-process file transcription runner.
 
 Design decisions (v3 deltas P4#3 + P5#1 + P5#11):
 - One job at a time: asyncio.Semaphore(1) prevents concurrent submissions.
-- Dedicated ThreadPoolExecutor(max_workers=1): keeps meeting work isolated from
-  the default asyncio thread pool used by other I/O tasks.
+- Dedicated ThreadPoolExecutor(max_workers=1): keeps file-job work isolated
+  from the default asyncio thread pool used by other I/O tasks.
 - OOM guard: reject a new job if less than 2 GiB RAM is available before
-  starting (the meeting pipeline needs ~7 GB for all models + inference).
+  starting.
 - Staging WAV is always cleaned up in the ``finally`` block (R1#2), regardless
   of success or failure.
 - reenqueue_pending(): called at startup after recover_orphans() to re-run any
-  pending jobs whose WAV files survived the previous restart.
+  pending jobs whose source files survived the previous restart.
 
-Phase 2 + 3 deltas:
-- ``ProcessingMode`` enum encodes submit-time intent (file | meeting).
-- ``request_mode`` column on the jobs row is the source of truth for
-  diarization routing — replaces the ad-hoc ``channel_count == 1 → mono``
-  heuristic that misclassified mono meetings as single-speaker.
+Phase deltas:
 - ``_phase()`` wraps the seams that ARE wrappable (ffprobe + ffmpeg_decode):
   real ``asyncio.wait_for`` timeouts, real abort. The in-pipeline phases
-  (transcribe / diarize / merge / output_write) cannot be interrupted because
-  the executor thread is owned by mlx-whisper; per-phase budgets there are
+  (transcribe / merge / output_write) cannot be interrupted because the
+  executor thread is owned by mlx-whisper; per-phase budgets there are
   enforced by ``_phase_watchdog`` which is HONEST about its limitations: it
   marks the row failed for UI purposes but does NOT release the semaphore.
   New submissions still 429 until the executor returns naturally.
 - ``cancel_cb`` is wired into ``staging.transcode_to_canonical_wav`` (Popen
   poll loop) so cancel-mid-decode works cleanly.
+
+Cancel rule (atomic, see ``JobStore.set_running`` /
+``JobStore.set_done_if_not_cancelled``):
+- Cancel before start: ``set_running`` refuses a cancelled row, so the
+  pipeline never runs and the job ends ``failed: cancelled by user``.
+- Cancel mid-transcribe: Whisper finishes the whole file (one call), then
+  ``set_done_if_not_cancelled`` refuses the row, the outputs are removed and
+  the job ends ``failed: cancelled by user`` with ``transcript_text`` NULL.
+- Exception path: outputs are removed (``write_outputs_atomic`` can leave
+  earlier formats behind when a later write fails).
 """
 
 from __future__ import annotations
@@ -35,14 +41,14 @@ import functools
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from enum import Enum
 from pathlib import Path
 
 import psutil
 
-from .._errors import MeetingInProgressError
+from .._errors import FileJobInProgressError
 from ..config import settings
-from ..files import pipeline as meeting_pipeline
+from ..files import pipeline as files_pipeline
+from ..files.output import remove_job_outputs
 from ..ops import staging
 from .store import JobStore
 
@@ -50,22 +56,7 @@ logger = logging.getLogger(__name__)
 
 _2GiB = 2 * 1024**3
 
-
-class ProcessingMode(str, Enum):
-    """Submit-time intent for a transcription job.
-
-    - ``FILE``: voice memo / interview / lecture / podcast — single speaker by
-      default; pipeline runs the single-channel branch and skips diarization.
-    - ``MEETING``: 2-party (or N-party) meeting recording — pipeline runs the
-      stereo or in-person branch with pyannote diarization.
-
-    Distinct from the existing ``Job.mode`` column (remote | in_person | None)
-    which is set by the pipeline on completion to describe what it actually
-    detected. ``request_mode`` is the caller's INTENT at submit time.
-    """
-
-    FILE = "file"
-    MEETING = "meeting"
+_CANCELLED = "cancelled by user"
 
 
 # Per-phase wall budgets (seconds). Scalar entries are absolute; callable
@@ -75,11 +66,9 @@ class ProcessingMode(str, Enum):
 PHASE_BUDGETS: dict[str, float | object] = {
     "ffprobe": 30,
     "ffmpeg_decode": 600,
-    # Cold-start tax: first job pays MLX + pyannote load.
+    # Cold-start tax: first job pays the MLX load.
     "transcribe_load": 120,
     "transcribe": (lambda d: d * 4 + 120),
-    "diarize_load": 120,
-    "diarize": (lambda d: d * 2.0 + 60),
     "merge": 60,
     "output_write": 30,
 }
@@ -93,20 +82,18 @@ PHASE_LABELS: dict[str, str] = {
     "ffmpeg_decode": "Decoding audio",
     "transcribe_load": "Loading transcription model",
     "transcribe": "Transcribing",
-    "diarize_load": "Loading speaker model",
-    "diarize": "Identifying speakers",
     "merge": "Finalizing transcript",
     "output_write": "Writing outputs",
 }
 
 
-class MeetingRunner:
-    """Single-meeting-at-a-time runner backed by a dedicated thread executor.
+class FileJobRunner:
+    """Single-file-job-at-a-time runner backed by a dedicated thread executor.
 
     Lifecycle::
 
-        runner = MeetingRunner(store)
-        jid = runner.submit_or_429(wav_path)   # raises MeetingInProgressError if busy
+        runner = FileJobRunner(store)
+        jid = await runner.submit_source_or_429(src_path)  # FileJobInProgressError if busy
         # ... poll store.get(jid).status ...
 
     At startup, after ``JobStore.recover_orphans()``::
@@ -116,12 +103,12 @@ class MeetingRunner:
 
     def __init__(self, store: JobStore) -> None:
         self.store = store
-        # Dedicated single-thread pool — isolates heavy meeting I/O + CPU from
+        # Dedicated single-thread pool — isolates heavy file-job I/O + CPU from
         # the default pool used by asyncio.to_thread for lighter tasks.
         self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="wispralt-meeting"
+            max_workers=1, thread_name_prefix="wispralt-files"
         )
-        # Semaphore enforces at-most-one concurrent meeting job.
+        # Semaphore enforces at-most-one concurrent file job.
         self._semaphore = asyncio.Semaphore(1)
         self._active_job_id: str | None = None
         # C8: submit lock prevents TOCTOU race between the semaphore check,
@@ -132,7 +119,7 @@ class MeetingRunner:
 
     @property
     def active(self) -> bool:
-        """True while a meeting job is currently running."""
+        """True while a file job is currently running."""
         return self._semaphore.locked()
 
     @property
@@ -142,98 +129,58 @@ class MeetingRunner:
 
     # ── public methods ─────────────────────────────────────────────────────────
 
-    async def submit_or_429(
-        self,
-        wav_path: Path,
-        *,
-        client_version: str | None = None,
-        api_key_id: int | None = None,
-    ) -> str:
-        """Create a job and fire-and-forget its execution coroutine.
-
-        Legacy /transcribe/meeting POST entry point. Persists
-        ``request_mode=MEETING`` so the row matches the route's intent
-        without a route-side change.
-
-        ``client_version`` + ``api_key_id`` (Phase 1 transcript-storage) are
-        persisted on the original ``store.create`` so they survive worker
-        crashes and restart-driven re-enqueues. Pass ``api_key_id=None`` for
-        break-glass admin requests (user.id < 0) — those rows skip capture
-        at the route level.
-
-        Raises MeetingInProgressError (which the route converts to HTTP 429) if:
-        - A job is already running (semaphore locked), OR
-        - Available RAM is below 2 GiB (P5#11 OOM guard).
-        """
-        async with self._submit_lock:
-            if self._semaphore.locked():
-                raise MeetingInProgressError(
-                    "Another meeting is currently being transcribed"
-                )
-            if psutil.virtual_memory().available < _2GiB:
-                raise MeetingInProgressError(
-                    "Insufficient memory to start a new meeting job; try again later"
-                )
-
-            jid = self.store.create(
-                str(wav_path),
-                request_mode=ProcessingMode.MEETING.value,
-                client_app_version=client_version,
-                api_key_id=api_key_id,
-            )
-            asyncio.create_task(self._run_pipeline(jid, wav_path))
-            return jid
-
     async def submit_source_or_429(
         self,
         src_path: Path,
-        request_mode: ProcessingMode,
         *,
         client_version: str | None = None,
         api_key_id: int | None = None,
     ) -> str:
-        """Like :meth:`submit_or_429` but the input is a NOT-YET-TRANSCODED source.
+        """Create a job for a NOT-YET-TRANSCODED source and fire-and-forget it.
 
         Used by /transcribe/file: the source is staged in its original
         container; the worker (:meth:`_run_source`) runs ffprobe + ffmpeg
-        before handing the canonical WAV to the existing pipeline.
+        before handing the canonical WAV to the pipeline.
 
-        ``request_mode`` (ProcessingMode.FILE | ProcessingMode.MEETING) is
-        persisted on the row and threaded through to the pipeline. It
-        replaces the channel-count heuristic for deciding whether to skip
-        diarization.
+        ``client_version`` + ``api_key_id`` are persisted on the original
+        ``store.create`` so they survive worker crashes and restart-driven
+        re-enqueues. Pass ``api_key_id=None`` for break-glass admin requests.
+
+        Raises FileJobInProgressError (the route converts it to HTTP 429 with
+        ``code`` in the body) if:
+        - A job is already running (semaphore locked) → ``file_job_busy``, OR
+        - Available RAM is below 2 GiB (P5#11 OOM guard) → ``insufficient_memory``.
         """
         async with self._submit_lock:
             if self._semaphore.locked():
-                raise MeetingInProgressError(
-                    "Another meeting is currently being transcribed"
+                raise FileJobInProgressError(
+                    "file job in progress: another file is currently being transcribed",
+                    code="file_job_busy",
                 )
             if psutil.virtual_memory().available < _2GiB:
-                raise MeetingInProgressError(
-                    "Insufficient memory to start a new meeting job; try again later"
+                raise FileJobInProgressError(
+                    "file job in progress: insufficient memory to start a new"
+                    " file job; try again later",
+                    code="insufficient_memory",
                 )
 
             jid = self.store.create(
                 str(src_path),
-                request_mode=request_mode.value,
                 client_app_version=client_version,
                 api_key_id=api_key_id,
             )
-            asyncio.create_task(self._run_source(jid, src_path, request_mode))
+            asyncio.create_task(self._run_source(jid, src_path))
             return jid
 
     async def reenqueue_pending(self) -> None:
-        """Re-enqueue pending jobs whose source/WAV files survived the last restart.
+        """Re-enqueue pending jobs whose source files survived the last restart.
 
         Called once at startup after ``JobStore.recover_orphans()`` returns its
         "requeue" list.  Each job is submitted as a new asyncio task; the
         semaphore ensures they run one at a time.
 
-        Routing is by file extension AND ``request_mode``:
-        - ``.wav`` extension → already-transcoded → ``_run_pipeline``.
-        - any other extension → pre-transcode source → ``_run_source`` with the
-          persisted ``request_mode`` (legacy rows backfilled by
-          :meth:`JobStore.recover_orphans`).
+        Every pending row (including legacy ``.wav`` rows) goes through
+        :meth:`_run_source`, which re-probes and transcodes it.
 
         C9: Jobs with attempts >= 3 are skipped and immediately failed to
         prevent unbounded poison-pill re-enqueue loops.
@@ -245,7 +192,7 @@ class MeetingRunner:
                 len(rows),
                 [r[0] for r in rows],
             )
-        for jid, wav_path, req_mode_str in rows:
+        for jid, src_path, _request_mode in rows:
             job = self.store.get(jid)
             if job is None:
                 continue
@@ -257,80 +204,28 @@ class MeetingRunner:
                 )
                 self.store.set_failed(jid, "max retries exceeded")
                 continue
-
-            try:
-                req_mode = ProcessingMode(req_mode_str or "meeting")
-            except ValueError:
-                logger.warning(
-                    "[%s] Unknown request_mode=%r; defaulting to MEETING",
-                    jid, req_mode_str,
-                )
-                req_mode = ProcessingMode.MEETING
-
-            path = Path(wav_path)
-            ext = path.suffix.lower()
-            if ext == ".wav":
-                asyncio.create_task(self._run_pipeline(
-                    job.id,
-                    path,
-                    force_single_channel=bool(job.force_single_channel),
-                ))
-            else:
-                asyncio.create_task(self._run_source(job.id, path, req_mode))
+            asyncio.create_task(self._run_source(job.id, Path(src_path)))
 
     # ── private ───────────────────────────────────────────────────────────────
-
-    async def _run_pipeline(
-        self,
-        jid: str,
-        wav_path: Path,
-        *,
-        force_single_channel: bool = False,
-    ) -> None:
-        """Acquire the semaphore, run the pipeline in the executor, update store.
-
-        Legacy entry point (/transcribe/meeting POST already has a canonical
-        WAV on disk). It acquires the semaphore around
-        :meth:`_run_pipeline_inner`. The /transcribe/file path goes through
-        :meth:`_run_source`, which acquires the semaphore ITSELF for the full
-        ffprobe + ffmpeg + pipeline window and calls ``_run_pipeline_inner``
-        directly to avoid double-acquisition.
-        """
-        async with self._semaphore:
-            # Legacy meeting submissions know their audio duration only after
-            # the pipeline runs; pass 0.0 → watchdog uses the absolute scalar
-            # path of any callable budgets (3600s default in practice for
-            # transcribe).  A future delta could ffprobe up front.
-            await self._run_pipeline_inner(
-                jid,
-                wav_path,
-                force_single_channel=force_single_channel,
-                request_mode=ProcessingMode.MEETING,
-                audio_duration_s=0.0,
-            )
 
     async def _run_pipeline_inner(
         self,
         jid: str,
         wav_path: Path,
-        *,
-        force_single_channel: bool = False,
-        request_mode: ProcessingMode = ProcessingMode.MEETING,
-        audio_duration_s: float = 0.0,
     ) -> None:
         """Pipeline body without semaphore acquisition.
 
-        The caller MUST hold ``self._semaphore`` for the duration of this
-        call. Threads ``progress_cb`` + ``cancel_cb`` to the pipeline so the
-        client UI can render per-phase progress and the user can request
-        cooperative cancellation. Guards ``set_done`` against the case where
-        the watchdog already wrote ``failed`` while the executor was running.
+        The caller (:meth:`_run_source`) MUST hold ``self._semaphore`` and
+        owns the pending → running transition. Threads ``progress_cb`` +
+        ``cancel_cb`` to the pipeline so the client UI can render per-phase
+        progress. Applies the atomic cancel rule on completion and removes
+        outputs on every path that does not end ``done``.
         """
+        output_dir = Path(settings.meeting_output_dir)
         self._active_job_id = jid
         try:
-            self.store.set_running(jid)
             self.store.update_phase(jid, "transcribe_load")
-            logger.info("[%s] Meeting job started.", jid)
+            logger.info("[%s] File transcription started.", jid)
 
             progress_cb = lambda phase, idx, total: self._on_progress(  # noqa: E731
                 jid, phase, idx, total
@@ -345,39 +240,36 @@ class MeetingRunner:
             transcript = await loop.run_in_executor(
                 self._executor,
                 functools.partial(
-                    meeting_pipeline.transcribe_meeting,
+                    files_pipeline.transcribe_file,
                     wav_path,
-                    settings.meeting_output_dir,
+                    output_dir,
                     jid,
-                    settings.silence_threshold,
-                    force_single_channel=force_single_channel,
-                    request_mode=request_mode.value,
                     progress_cb=progress_cb,
                     cancel_cb=cancel_cb,
                     phase_setter_cb=phase_setter_cb,
                 ),
             )
 
-            # Guard: watchdog or cancel may have already set the row to
-            # failed while the executor was finishing up. Don't flip a
-            # failed row back to done.
+            # Guard: the watchdog may have already set the row to failed
+            # while the executor was finishing up. Don't flip a failed row
+            # back to done, and don't leave its outputs behind.
             current = self.store.get(jid)
             if current is not None and current.status == "failed":
                 logger.warning(
                     "[%s] executor returned post-failure (%s); discarding result",
                     jid, current.error,
                 )
+                remove_job_outputs(output_dir, jid)
                 return
 
             mode: str = transcript.get("mode", "unknown")
 
-            # Phase 1 transcript-storage: derive plain text from segments and
-            # persist on the row. ``transcribe_meeting`` returns segments,
-            # NOT a top-level "text" field (see meeting/pipeline.py:_build_transcript).
-            # Fallback: read the pipeline's <output_dir>/<job_id>.txt file in
-            # case segments are empty or shaped unexpectedly. NULL is the
-            # contract when neither produces text (mid-pipeline failure or
-            # silence-only audio).
+            # Derive plain text from segments and persist on the row.
+            # ``transcribe_file`` returns segments, NOT a top-level "text"
+            # field (see files/pipeline.py:_build_transcript). Fallback: read
+            # the pipeline's <output_dir>/<job_id>.txt file in case segments
+            # are empty or shaped unexpectedly. NULL is the contract when
+            # neither produces text (silence-only audio).
             segments = transcript.get("segments") or []
             transcript_text = " ".join(
                 (seg.get("text") or "").strip()
@@ -385,7 +277,7 @@ class MeetingRunner:
                 if isinstance(seg, dict)
             ).strip()
             if not transcript_text:
-                txt_path = Path(settings.meeting_output_dir) / f"{jid}.txt"
+                txt_path = output_dir / f"{jid}.txt"
                 if txt_path.exists():
                     try:
                         transcript_text = txt_path.read_text(encoding="utf-8")
@@ -396,20 +288,40 @@ class MeetingRunner:
                         )
                         transcript_text = ""
 
-            self.store.set_done(
+            # Atomic cancel rule: one UPDATE ... WHERE status='running' AND
+            # cancel_requested=0. On False nothing may survive as done.
+            if not self.store.set_done_if_not_cancelled(
                 jid,
                 mode,
-                str(settings.meeting_output_dir),
+                str(output_dir),
                 transcript_text=transcript_text or None,
-            )
-            logger.info("[%s] Meeting job done (mode=%s).", jid, mode)
+            ):
+                remove_job_outputs(output_dir, jid)
+                if self.store.check_cancel_requested(jid):
+                    self.store.set_failed(jid, _CANCELLED)
+                    logger.info("[%s] File job cancelled by user; result discarded.", jid)
+                else:
+                    logger.warning(
+                        "[%s] File job no longer running at completion; result discarded.",
+                        jid,
+                    )
+                return
+            logger.info("[%s] File job done (mode=%s).", jid, mode)
 
         except Exception as exc:
             error_repr = repr(exc)
             current = self.store.get(jid)
+            if current is None or current.status != "done":
+                # write_outputs_atomic can leave earlier formats behind when a
+                # later write fails; never leave partial outputs for a job
+                # that did not finish.
+                remove_job_outputs(output_dir, jid)
             if current is None or current.status not in ("done", "failed"):
-                self.store.set_failed(jid, error_repr)
-            logger.exception("[%s] Meeting job failed: %s", jid, error_repr)
+                if self.store.check_cancel_requested(jid):
+                    self.store.set_failed(jid, _CANCELLED)
+                else:
+                    self.store.set_failed(jid, error_repr)
+            logger.exception("[%s] File job failed: %s", jid, error_repr)
 
         finally:
             self._active_job_id = None
@@ -420,14 +332,14 @@ class MeetingRunner:
         self,
         jid: str,
         src_path: Path,
-        request_mode: ProcessingMode,
     ) -> None:
         """Worker for /transcribe/file submissions.
 
         Sequence: ffprobe (channels) → ffprobe (duration) → ffmpeg transcode
-        → existing pipeline. Status uses the existing ``running`` value (set
-        via ``set_running``) — no new ``transcoding`` status (would require
-        updating every status consumer).
+        → pipeline. Status uses the existing ``running`` value (set via
+        ``set_running``, the ONLY pending → running transition per attempt)
+        — no new ``transcoding`` status (would require updating every status
+        consumer).
 
         Phase markers via :meth:`_phase` make ffprobe + ffmpeg_decode
         independently observable AND independently abortable: each is its
@@ -435,7 +347,7 @@ class MeetingRunner:
         hung ffmpeg cannot eat the executor forever.
 
         The watchdog spawned via ``asyncio.create_task`` covers the
-        in-pipeline phases (transcribe / diarize / merge / output_write).
+        in-pipeline phases (transcribe / merge / output_write).
         It is HONEST about its limitations: it sets the row to failed when a
         phase exceeds 2× budget, but does NOT release the semaphore — the
         ``async with self._semaphore`` here is awaiting the executor and
@@ -454,12 +366,20 @@ class MeetingRunner:
             watchdog_task: asyncio.Task[None] | None = None
             try:
                 self._active_job_id = jid
-                self.store.set_running(jid)
+                # Atomic: refuses a row whose cancel was requested before the
+                # worker got here, so a cancelled job can never start.
+                if not self.store.set_running(jid):
+                    src_path.unlink(missing_ok=True)
+                    if self.store.check_cancel_requested(jid):
+                        self.store.set_failed(jid, _CANCELLED)
+                        logger.info("[%s] File job cancelled before start.", jid)
+                    else:
+                        logger.warning(
+                            "[%s] File job not pending at start; skipping.", jid
+                        )
+                    return
                 self.store.update_phase(jid, "starting")
-                logger.info(
-                    "[%s] File job started: %s (request_mode=%s)",
-                    jid, src_path, request_mode.value,
-                )
+                logger.info("[%s] File job started: %s", jid, src_path)
 
                 # Phase 1: ffprobe channels — REAL timeout, REAL abort.
                 channel_count = await self._phase(
@@ -475,30 +395,9 @@ class MeetingRunner:
                 )
                 self.store.update_audio_duration(jid, audio_duration_s)
 
-                # Channel target: stereo for legacy meeting compatibility (the
-                # pipeline's in-person branch handles silent-ch2 correctly).
-                # File-mode mono inputs: keep target_channels=1 to skip the
-                # silent-ch2 handling entirely.
-                if (
-                    request_mode == ProcessingMode.FILE
-                    and channel_count == 1
-                ):
-                    target_channels = 1
-                else:
-                    target_channels = 2
-
-                # When MEETING mode + mono source, request that ffmpeg pad the
-                # second canonical-WAV channel with explicit silence (rather
-                # than duplicating ch0 into ch1). Without this, the pipeline's
-                # `is_silent_robust(ch2)` returns False because ffmpeg's
-                # default `-ac 2` from mono input fills BOTH channels — so the
-                # remote branch fires and transcribes the audio twice, with
-                # "You"/"Other" labels instead of pyannote speaker labels.
-                pad_mono_silent = (
-                    request_mode == ProcessingMode.MEETING
-                    and channel_count == 1
-                    and target_channels == 2
-                )
+                # Mono stays mono; anything else is staged as stereo and the
+                # pipeline's _load_mono averages the channels (the only downmix).
+                target_channels = 1 if channel_count == 1 else 2
 
                 # Phase 2: ffmpeg_decode — REAL timeout, REAL abort, cancel-aware.
                 cancel_cb = lambda: self.store.check_cancel_requested(jid)  # noqa: E731
@@ -509,21 +408,16 @@ class MeetingRunner:
                         src_path,
                         target_channels=target_channels,
                         cancel_cb=cancel_cb,
-                        pad_mono_to_stereo_silent=pad_mono_silent,
                     ),
                 )
 
-                # The actual fix for "all Speaker 1": derive force_single from
-                # request_mode, not from channel count. A mono meeting (single
-                # mic, multiple speakers) will now keep diarization enabled.
-                force_single = (request_mode == ProcessingMode.FILE)
-
-                # Durability boundary: persist canonical wav_path + flag
-                # BEFORE deleting the source.
+                # Durability boundary: persist canonical wav_path BEFORE
+                # deleting the source. force_single_channel is always True
+                # now (every file job is mono-transcribed); the column stays.
                 self.store.update_after_transcode(
                     jid,
                     wav_path=str(wav_path),
-                    force_single_channel=force_single,
+                    force_single_channel=True,
                 )
                 src_path.unlink(missing_ok=True)
 
@@ -534,19 +428,13 @@ class MeetingRunner:
                     self._phase_watchdog(jid, audio_duration_s)
                 )
 
-                await self._run_pipeline_inner(
-                    jid,
-                    wav_path,
-                    force_single_channel=force_single,
-                    request_mode=request_mode,
-                    audio_duration_s=audio_duration_s,
-                )
+                await self._run_pipeline_inner(jid, wav_path)
 
             except staging.StagingCancelled:
                 logger.info("[%s] cancelled mid-decode by user", jid)
                 current = self.store.get(jid)
                 if current is None or current.status not in ("done", "failed"):
-                    self.store.set_failed(jid, "cancelled by user")
+                    self.store.set_failed(jid, _CANCELLED)
                 src_path.unlink(missing_ok=True)
             except asyncio.TimeoutError:
                 # Already set_failed inside _phase().

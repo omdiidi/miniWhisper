@@ -2,9 +2,10 @@
 middleware/rate_limit.py — Per-IP rolling-window rate limiter (P5#6).
 
 No Redis; uses in-memory defaultdict[str, deque[float]] per route group.
-Two independent windows:
+Independent windows:
   - /transcribe/dictate  : 60 requests per 60-second window.
-  - /transcribe/meeting POST : 4 requests per 3600-second window.
+  - /readyz/*, /healthz  : probe window.
+  - /telemetry/*         : telemetry window.
 
 The deques are never pruned for removed IPs; on a single-user Mac mini this is
 acceptable (one real IP, a handful of load-balancer IPs at most).
@@ -62,8 +63,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     ----------
     dictate_per_min:
         Maximum dictation requests per IP per 60-second rolling window.
-    meeting_per_hour:
-        Maximum meeting POST submissions per IP per 3600-second rolling window.
     probe_per_min:
         Maximum unauthenticated probe requests (``/readyz/*``, ``/healthz``)
         per IP per 60-second rolling window.  Cloudflare's typical health-check
@@ -85,24 +84,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         app,  # type: ignore[type-arg]  # Starlette ASGI app; no generic needed
         *,
         dictate_per_min: int = 60,
-        meeting_per_hour: int = 4,
         probe_per_min: int = 120,
         telemetry_per_min: int = 10,
         trust_forwarded_headers: bool = True,
     ) -> None:
         super().__init__(app)
         self.dictate_window = 60.0
-        self.meeting_window = 3600.0
         self.probe_window = 60.0
         self.telemetry_window = 60.0
         self.dictate_max = dictate_per_min
-        self.meeting_max = meeting_per_hour
         self.probe_max = probe_per_min
         self.telemetry_max = telemetry_per_min
         self.trust_forwarded_headers = trust_forwarded_headers
         # Separate deque-per-IP registries for the route groups
         self._dictate: dict[str, deque[float]] = defaultdict(deque)
-        self._meeting: dict[str, deque[float]] = defaultdict(deque)
         self._probe: dict[str, deque[float]] = defaultdict(deque)
         self._telemetry: dict[str, deque[float]] = defaultdict(deque)
 
@@ -121,12 +116,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if len(self._dictate[ip]) >= self.dictate_max:
                 return self._429(int(self.dictate_window))
             self._dictate[ip].append(now)
-
-        elif path.startswith("/transcribe/meeting") and request.method == "POST":
-            self._prune(self._meeting[ip], now - self.meeting_window)
-            if len(self._meeting[ip]) >= self.meeting_max:
-                return self._429(int(self.meeting_window))
-            self._meeting[ip].append(now)
 
         elif path.startswith("/telemetry/"):
             # Authed but bursty drain from Swift clients. Throttle per-IP to
@@ -169,7 +158,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 },
             )
         # PRESERVE existing native shape — do NOT change to {"detail": ...}.
-        # Existing /transcribe/dictate and /transcribe/meeting consumers depend on this.
+        # Existing native (/transcribe/*) consumers depend on this.
         return JSONResponse(
             status_code=429,
             headers=headers,

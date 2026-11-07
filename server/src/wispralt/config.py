@@ -29,7 +29,6 @@ class Settings(BaseSettings):
     )
 
     # Secrets — never logged or serialized
-    hf_token: SecretStr
     wispralt_api_key: SecretStr
 
     # Supabase Postgres URL for multi-tenant auth + usage events.
@@ -45,36 +44,32 @@ class Settings(BaseSettings):
     job_db_path: Path
     staging_dir: Path
 
-    # Audio analysis
-    silence_threshold: float = 0.002
-
     # Upload guard (default 2 GiB)
     max_upload_bytes: int = 2_147_483_648
 
     # Rate-limit values (M6) — configurable from .env
     dictate_rate_per_min: int = 60
-    meeting_rate_per_hour: int = 4
 
-    # Idle-eviction for meeting models. After this many seconds with no meeting
-    # activity (no submission, no in-flight job), unload mlx-whisper + Pyannote
-    # AND call mx.metal.clear_cache() to actually return MLX's unified-memory
-    # pool to the OS (drops RSS from ~6-9 GB to ~3 GB). Next meeting pays the
-    # cold-load cost again (~3s kernel recompile + weight load).
-    # Set to 0 to disable eviction (models stay warm forever — old behavior).
-    # Default 60s (1 min) — aggressive because meetings are infrequent on
-    # this deployment; raise to 300+ if you do meetings in clusters.
-    meeting_idle_eviction_seconds: int = 60
+    # Idle-eviction for the file transcription model. After this many seconds
+    # with no file-job activity (no in-flight job), unload mlx-whisper AND call
+    # mx.clear_cache() to actually return MLX's unified-memory pool to the OS
+    # (drops RSS from ~6-9 GB to ~3 GB). The next file job pays the cold-load
+    # cost again (~3s kernel recompile + weight load).
+    # Set to 0 to disable eviction (model stays warm forever — old behavior).
+    # Default 60s (1 min) — aggressive because file jobs are infrequent on
+    # this deployment; raise to 300+ if you transcribe files in clusters.
+    file_model_idle_eviction_seconds: int = 60
 
     # Eviction self-check thresholds (added by the 2026-05-19 invariant-gates plan).
     # Probe-verified 2026-05-19 that mx.metal.get_active_memory() is synchronous
     # with mx.clear_cache() — no async sampling needed.
     meeting_eviction_delta_floor_mb: int = 1000
-    # A real eviction releases ~1500 MB of meeting-model active memory.
+    # A real eviction releases ~1500 MB of file-model (Whisper) active memory.
     # Today's bug had delta=0. Floor of 1000 catches the bug AND partial-release
     # regressions (e.g., a future library leaking 500 MB while clearing 1000).
 
     meeting_eviction_pre_active_gate_mb: int = 1500
-    # Parakeet baseline (~1218) + 300 MB headroom = definitively meeting-model-loaded.
+    # Parakeet baseline (~1218) + 300 MB headroom = definitively file-model-loaded.
     # Excludes cold-start, partial-load failures. Gate prevents false-positives
     # when there was nothing meaningful to evict.
 

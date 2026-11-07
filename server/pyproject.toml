@@ -7,12 +7,8 @@ dependencies = [
     # ML — dictation
     "parakeet-mlx==0.5.1",
     "mlx>=0.22.1,<0.32.0",
-    # ML — meeting pipeline
+    # ML — file transcription (torch arrives only transitively via mlx-whisper)
     "mlx-whisper==0.4.2",
-    "pyannote.audio==3.3.2",
-    # torch pinned: torchaudio 2.7+ removes AudioMetaData and breaks pyannote
-    "torch==2.6.0",
-    "torchaudio==2.6.0",
     # Web framework
     "fastapi==0.115.0",
     "uvicorn[standard]==0.30.0",
@@ -26,16 +22,11 @@ dependencies = [
     "librosa>=0.11.0,<0.12.0",
     # numpy 2.x required by parakeet-mlx; <2.3 for compatibility ceiling
     "numpy>=2.0,<2.3",
-    # HuggingFace — model download + gated-repo validation.
-    # PINNED FLOOR/CEILING: pyannote-3.1 still calls hf_hub_download(use_auth_token=...)
-    # which was removed in hf_hub 1.13. transformers needs is_offline_mode which is
-    # only in hf_hub >=0.31. So pin to the 1.12.x line. Bump pyannote first if
-    # you want to relax this.
+    # HuggingFace — pinned for mlx-whisper model fetch (the 1.12.x line is the
+    # known-good one; relax deliberately, not as a side effect).
     "huggingface_hub>=1.12.0,<1.13",
     # OOM guard (v3 delta)
     "psutil>=6.0",
-    # Implicit dep of pyannote.audio.utils.metric (imports matplotlib at module load)
-    "matplotlib>=3.8",
     # Postgres (Supabase) — multi-tenant auth + usage events
     "asyncpg>=0.29,<0.31",
     # Server-rendered admin UI templates
@@ -57,18 +48,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wispralt"]
-
-# ── torch CPU-only wheel source ───────────────────────────────────────────────
-# Using the PyTorch CPU index avoids pulling the CUDA-fat wheel (~2.5 GB).
-# uv respects [tool.uv.sources] when resolving; pip users must add the index manually.
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchaudio = { index = "pytorch-cpu" }
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 # ── ruff config ───────────────────────────────────────────────────────────────
 [tool.ruff]

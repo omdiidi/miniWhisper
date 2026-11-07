@@ -8,10 +8,10 @@ Startup sequence (Phase 2 / Task 13b)
 3.  Sweep old staging WAVs (> 24 h) left over from a previous run.
 4.  Instantiate JobStore (SQLite WAL, P4#4) and run orphan recovery (P5#2).
     Log {"requeue": [...], "failed": [...]}.
-5.  Instantiate MeetingRunner; re-enqueue surviving pending jobs.
+5.  Instantiate FileJobRunner; re-enqueue surviving pending jobs.
 6.  Instantiate ParakeetService and call .load() (loads weights + warmup JIT).
-7.  Install compat shims; re-enqueue pending jobs (meeting models load lazily
-    on first job, not at startup).
+7.  Re-enqueue pending jobs (the file model loads lazily on the first job,
+    not at startup).
 8.  Register SIGTERM handler (P5#5): mark running jobs failed, set shutting_down,
     call sys.exit(0) so launchd ExitTimeOut=15 can observe a clean exit code.
 9.  Expose state on app.state for routes and health endpoints.
@@ -56,11 +56,10 @@ from wispralt.insights.cron import (
     _seconds_until_next_fire,
     run_weekly_insights,
 )
-from wispralt.jobs.runner import MeetingRunner
+from wispralt.jobs.runner import FileJobRunner
 from wispralt.jobs.store import JobStore
 from wispralt.ops import background
 from wispralt.ops.logging_setup import configure_file_logging
-from wispralt.files import install_compat_shims
 from wispralt.middleware import openai_errors
 from wispralt.middleware.rate_limit import RateLimitMiddleware
 from wispralt.ops import staging
@@ -232,9 +231,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "Startup transcript sweep failed; daily timer will retry"
         )
 
-    # 5. Meeting runner — re-enqueue any pending jobs that survived the restart.
-    meeting_runner = MeetingRunner(job_store)
-    app.state.meeting_runner = meeting_runner
+    # 5. File-job runner — re-enqueue any pending jobs that survived the restart.
+    file_runner = FileJobRunner(job_store)
+    app.state.file_runner = file_runner
     app.state.shutting_down = False
 
     # Phase 1 transcript-storage: holds strong refs to in-flight
@@ -321,28 +320,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("InsightsClient init skipped — OPENROUTER_API_KEY unset")
 
-    # 7. Install compat shims at startup so the deep-patch over sys.modules hits
-    #    pyannote/torch references before any user code runs. The shim
-    #    is idempotent and re-invoked from pipeline._ensure_models_loaded() to
-    #    close the long window between startup and first meeting.
-    install_compat_shims()
-
-    # 7b. Re-enqueue any pending jobs from prior runs. The first one to execute
-    #     will lazy-load mlx-whisper + Pyannote inside the executor thread.
+    # 7. Re-enqueue any pending jobs from prior runs. The first one to execute
+    #    will lazy-load mlx-whisper inside the executor thread.
     try:
-        await meeting_runner.reenqueue_pending()
+        await file_runner.reenqueue_pending()
     except Exception:  # noqa: BLE001 — never let re-enqueue crash startup
-        logger.exception("Meeting reenqueue_pending failed; continuing startup")
+        logger.exception("File-job reenqueue_pending failed; continuing startup")
 
     # 7c. Idle-eviction background task. Every minute, ask the pipeline to
-    #     unload meeting models if they've been idle past the configured
-    #     threshold (default 300s). Skipped entirely when threshold is 0.
-    from wispralt.files import pipeline as meeting_pipeline
+    #     unload the file model if it has been idle past the configured
+    #     threshold (default 60s). Skipped entirely when threshold is 0.
+    from wispralt.files import pipeline as files_pipeline
 
     app.state.eviction_task = None
-    if settings.meeting_idle_eviction_seconds > 0:
+    if settings.file_model_idle_eviction_seconds > 0:
         app.state.eviction_task = asyncio.create_task(
-            background.eviction_loop(app, meeting_runner, meeting_pipeline)
+            background.eviction_loop(app, file_runner, files_pipeline)
         )
 
     # 7d. Phase 1 transcript-storage: daily sweep loop. Re-runs the same
@@ -351,7 +344,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #     transient SQLite error never kills the task.
     app.state.transcript_sweep_task = asyncio.create_task(
         background.daily_sweep_loop(
-            app, job_store, lambda jid: meeting_runner.active_job_id == jid
+            app, job_store, lambda jid: file_runner.active_job_id == jid
         )
     )
 
@@ -608,12 +601,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 # Track only request-creating endpoints, NOT status-poll GETs that the
-# client may hammer every few seconds.  /transcribe/meeting POST creates a
-# job; /transcribe/meeting/{id} GET is the poll path — exclude it by also
-# filtering on request.method.
+# client may hammer every few seconds.  /transcribe/file POST creates a
+# job; the per-job GET is the poll path — exclude it by also filtering on
+# request.method.
 TRACKED_ROUTES = frozenset([
     "transcribe/dictate",
-    "transcribe/meeting",
     "transcribe/file",
     "v1/audio",
     "v1/models",  # OpenAI-compat model-list probes
@@ -625,7 +617,6 @@ TRACKED_METHODS = frozenset({"POST"})
 # Keeps "v1/audio" from emitting an unhelpful "audio" kind via the default split.
 _KIND_MAP = {
     "transcribe/dictate": "dictate",
-    "transcribe/meeting": "meeting",
     "transcribe/file": "file",
     "v1/audio": "v1_dictate",
     "v1/models": "v1_models",
@@ -711,9 +702,9 @@ def create_app() -> FastAPI:
         title="WisprAlt Server",
         version="0.1.0",
         description=(
-            "Self-hosted dictation and meeting-transcription server. "
+            "Self-hosted dictation and file-transcription server. "
             "Parakeet TDT 0.6B v2 (MLX) for dictation; "
-            "mlx-whisper + Pyannote + DeepFilterNet for meeting transcription."
+            "mlx-whisper for uploaded-file transcription."
         ),
         lifespan=lifespan,
         # Disable OpenAPI docs in production — no route leakage via /docs.
@@ -738,7 +729,6 @@ def create_app() -> FastAPI:
     app.add_middleware(
         RateLimitMiddleware,
         dictate_per_min=settings.dictate_rate_per_min,
-        meeting_per_hour=settings.meeting_rate_per_hour,
         trust_forwarded_headers=settings.trust_forwarded_headers,
     )
 
@@ -790,7 +780,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_ui.authed_router)
     # /admin/data — Phase 2 admin Data tab (weekly insights + drill-down).
     app.include_router(admin_data.router)
-    # /transcribe/meeting — Phase 2 meeting endpoints.
+    # /transcribe/meeting/{id} — file-job poll/download/delete (legacy prefix;
+    # moves onto the /transcribe/file router next).
     app.include_router(meeting_routes.router)
     # /transcribe/file — container-agnostic submission (ffmpeg-transcoded).
     app.include_router(transcribe_file_routes.router)
