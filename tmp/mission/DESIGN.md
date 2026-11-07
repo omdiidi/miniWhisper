@@ -1,4 +1,4 @@
-# Target design v5 (Part 1, 2026-11-07, after review rounds 1-4)
+# Target design v6 (Part 1, 2026-11-07, after review rounds 1-5)
 
 Owner rule: clean, concise, future-proof, reusable; no abstraction for show.
 Review reports:
@@ -6,6 +6,7 @@ Review reports:
 - r2: /var/folders/mc/6xd4rvtd7d7gwmq5_lp37vjh0000gn/T//codex-review.AM5XaP/report-final.md
 - r3: /var/folders/mc/6xd4rvtd7d7gwmq5_lp37vjh0000gn/T//codex-review.EwuKzI/report-final.md
 - r4: /var/folders/mc/6xd4rvtd7d7gwmq5_lp37vjh0000gn/T//codex-review.lpv2Ae/report-final.md
+- r5: /var/folders/mc/6xd4rvtd7d7gwmq5_lp37vjh0000gn/T//codex-review.OvgtJi/report-final.md
 
 Context: single user, the old host was wiped, so there is no live install to stay compatible with. Simplify accordingly.
 
@@ -70,8 +71,8 @@ Context: single user, the old host was wiped, so there is no live install to sta
   - Final failure: a retry entry `pending-retry/<id>/` is written. It holds:
     - the audio, in the captured mode's format: m4a for Online, 16 kHz mono WAV for Local (which `/transcribe/dictate`'s soundfile decoder reads);
     - metadata: dedup id, mode, Local host URL, model actually used, timestamp.
-  - Retry entries have **no cap** (≈2.4 MB per 10-minute entry). They are removed only after a successful retry or an explicit "Discard". The menu shows "Retry N pending".
-  - A retry uses its recorded mode and **always a file model**: the picked model if it is a file model, otherwise `gpt-transcribe`. A Local retry goes to its recorded host; if that differs from the current host, the Retry item names both and lets the user choose.
+  - Retry entries have **no cap** (≈2.4 MB per 10-minute Online m4a entry; ≈19 MB per 10-minute Local WAV entry). They are removed only after a successful retry or an explicit "Discard". The menu shows "Retry N pending".
+  - A retry uses its recorded mode and **always a file model**: the picked model if it is a file model, otherwise `gpt-transcribe`. A Local retry goes **only to the current host** (the device key is per current host). If the recorded host differs, the Retry item says so and offers "Send to current host" or "Discard".
 - The old `DictationFallbackQueue` folder is left untouched. It is absent on the owner's Mac, and the app never deletes it. The new code stops reading it.
 - `isMeetingActive` gates, handled in **Part 2** together with the meeting removal so every commit compiles:
   - The dictation-start gate at +Dictation.swift:67 is deleted.
@@ -127,7 +128,7 @@ Context: single user, the old host was wiped, so there is no live install to sta
 - The server's 34 safety vectors are ported to `mercury_vectors.json` (XCTest).
 - Policy:
   - opt-in toggle, with "Sends transcript text to OpenRouter" shown beside it;
-  - key in Keychain `co.wispralt.mercury`;
+  - key in Keychain under the existing `co.wispralt.openrouter` service (no migration);
   - skips dictations under 20 words;
   - 2.5 s budget;
   - 70-110 % word-ratio guard;
@@ -160,7 +161,7 @@ Context: single user, the old host was wiped, so there is no live install to sta
   - `status` and the portal show the setting and what it would purge.
 - **Backups:**
   - Backups live outside `data_dir` (default `~/WisprAlt-Backups/`). `restore` and `uninstall --purge-data` refuse a location inside `data_dir`.
-  - A backup is a plain directory, so restore extracts nothing and path traversal is impossible.
+  - A backup is a plain directory, so restore extracts nothing; restore still resolves every path, refuses symlinks, and verifies each stays inside the backup root (a backup may come from another machine).
   - Backups are **offline**: stop services → `VACUUM INTO` snapshot plus a copy of job outputs and staged inputs → manifest (counts, hashes, relative paths) → start services. Nothing can change mid-backup, and no maintenance flag is needed.
   - `restore`: stop services → automatic pre-restore backup → validate the copy (`PRAGMA integrity_check` and the manifest) → swap `data_dir` atomically and remove stale `-wal`/`-shm` files → restart. Any failure rolls back.
   - `update` backs up before migrating. A `setup` rerun never rotates working keys.
@@ -251,6 +252,34 @@ Context: single user, the old host was wiped, so there is no live install to sta
 - **Dry run:** per-source counts (new, duplicate, malformed, unmatched owner). Nothing is written.
 - **Resume:** `import_runs` checkpoints. The report states counts, the earliest record, and that no dictation text survives the wipe. Nothing is fabricated.
 
+## 5a. Requirements assigned to part plans (from review rounds 1-5; each part plan must satisfy and test them)
+- **Part 3 (client):**
+  - **Injection.** When only the pid matches, inject only if the focused window title is unchanged; otherwise use the clipboard. Capture the target at FN press (deliberate change from release-time; stated in the plan).
+  - **Realtime.** One overall deadline covers connect + drain + commit + completion, scaled to audio length, then falls back to the file path. Recovery runs only on transient or socket errors.
+  - **Pre-flight.** One max-length (10 min) clip per model kind, under $0.25 total. The catalog gains `maxOutputTokens`; chunk length and maximum dictation length are derived from it. Flag truncation when the word count is implausibly low for the audio duration.
+  - **File jobs.**
+    - Cancel removes the job folder only after the server confirms `DELETE /transcribe/file/{id}`.
+    - Delete the folder after the final atomic write.
+    - In Online mode, SRT/VTT controls are disabled with an explanation.
+  - **Server interaction.**
+    - From Part 3 on, the client stops sending `smart_format`.
+    - The menu shows "transcribing N" while results queue.
+    - Local-provider tests run against a stub server.
+- **Part 4 (server):**
+  - **Dedup.** The lookup is scoped to the caller's `user_id` and runs before any stream-session lookup. Ids are lowercased. A cross-user collision returns 409. Exit test: a real client↔server dedup round-trip, including a finalize replay after the session expired.
+  - **Job recovery.** On restart, requeue running jobs whose staged input still exists.
+  - **Restore.** Path containment check (as §2.1).
+  - **Schema.** Imported transcript files become `jobs` rows with `source`, timestamped from the JSON metadata or else the file mtime, flagged `estimated`.
+- **Part 5 (CLI):**
+  - **Setup.** `setup` downloads and checksums the models, `doctor` runs a tiny warm-up transcription, then `setup` opens the portal. It shows the retention choice once.
+  - **Update.** `update` stops the services, reinstalls the tool venv, and re-bootstraps launchd.
+- **Part 6 (portal):** implements spec §9 in full, including searchable history (SQLite FTS5, scoped by `user_id`) with tests.
+- **Part 7 (import):**
+  - **Source labels.** Each Supabase table gets its own `source` label (`supabase.usage_events`, `supabase.fallback_events`, `supabase.users`). Assert duplicate = 0 on the first run.
+  - **Columns.** Export every non-credential column, including `kind`, `label`, `created_at`, `last_seen_at` and `notes`. Map `kind` to the local user or key kind.
+  - **Integrity.** A per-table checksum computed in Postgres (`md5(string_agg(row_to_json(t)::text, '' ORDER BY id))`) is stored in `counts.json` and verified on import. Export is paged by key.
+- **Part 8:** isolated test root and end-state statement (§7).
+
 ## 6. Inventory tables (required in part plans)
 - **Part 2:** KEEP / DELETE / RENAME table covering:
   - client: `App/`, `Audio/`, `Capture/`, `Hotkeys/`, `Inject/`, `Server/`, `Storage/`, `UI/`, `Update/`, `Util/`;
@@ -275,12 +304,12 @@ Every part updates the docs its changed files map to in docs/OVERVIEW.md. A basi
 
 Each spec §12 scenario maps to a named test or manual step in the Part 8 report.
 
-Part 8 cleanup runs `wispralt uninstall --purge-data --no-backup` on the test install. It then checks that none of the following remain:
-- the pinned `HF_HOME` model directory and any WisprAlt models in `~/.cache/huggingface`;
-- `~/WisprAlt-Backups`;
+Part 8 end-to-end runs use an **isolated test root**: a test `data_dir`, a test backup dir, and a test client Application Support root, set via env override. Part 8 cleanup runs `wispralt uninstall --purge-data --no-backup` against that test install only. It removes only the test root plus the artifacts listed in its `install-state.json`, and never touches the owner's real backups, retry entries, `co.wispralt` or `co.wispralt.openai`. It then checks that none of the following test-created artifacts remain:
+- the pinned `HF_HOME` model directory;
 - the uv tool dir and `~/.local/bin/wispralt`;
-- `~/Library/LaunchAgents/co.wispralt.*`;
-- `~/Library/Logs/WisprAlt`;
-- client `spool/`, `pending-retry/` and job folders;
+- `~/Library/LaunchAgents/co.wispralt.*` created by the test;
+- the test logs;
 - build DerivedData;
-- test-only Keychain items (never `co.wispralt.openai`).
+- test-only Keychain items.
+
+The Part 8 plan also states the end state on the owner's Mac: which app build is installed, in which mode, with which Keychain items untouched.
