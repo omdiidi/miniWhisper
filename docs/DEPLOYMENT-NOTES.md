@@ -12,7 +12,7 @@ This document captures the issues actually encountered the first time someone bo
 
 **Root cause:** the original pin set was unsatisfiable on Apple Silicon with Python 3.11.
 
-**Fix applied:** dropped `deepfilternet` from `server/pyproject.toml` and stubbed `server/src/wispralt_server/audio/denoise.py` to a no-op. Meeting transcription still works (Pyannote diarization + WhisperX is unaffected); only the explicit denoise pass is skipped. Mic input that is already clean transcribes identically.
+**Fix applied:** dropped `deepfilternet` from `server/pyproject.toml` and stubbed `server/src/wispralt/audio/denoise.py` to a no-op. Meeting transcription still works (Pyannote diarization + WhisperX is unaffected); only the explicit denoise pass is skipped. Mic input that is already clean transcribes identically.
 
 **Trade-off accepted:** slightly noisier audio in low-SNR meeting recordings. Re-add DeepFilterNet later if needed via a separate venv invoked over subprocess.
 
@@ -30,7 +30,7 @@ This document captures the issues actually encountered the first time someone bo
 
 **Root cause:** PyTorch 2.6 flipped `weights_only=True` as the default for `torch.load`, which breaks loading of the legacy pyannote checkpoint format (the tensors are wrapped in pickled objects).
 
-**Fix applied:** patched `server/src/wispralt_server/meeting/__init__.py` to monkey-patch `torch.load` with `weights_only=False` only during pyannote pipeline init, then restore the default.
+**Fix applied:** patched `server/src/wispralt/files/__init__.py` to monkey-patch `torch.load` with `weights_only=False` only during pyannote pipeline init, then restore the default.
 
 ### Pyannote 0.5+ renamed `use_auth_token` → `token`
 

@@ -151,7 +151,7 @@ required.
   `client_dedup_id`, drains to `POST /telemetry/cloud-dictation` on
   app foreground + successful online dictation. See "Telemetry sync"
   above.
-- `server/src/wispralt_server/routes/telemetry.py` — Plan A ingest
+- `server/src/wispralt/routes/telemetry.py` — Plan A ingest
   endpoint (`POST /telemetry/cloud-dictation`). Bearer-only, rate-limited
   to 10 batches/min/IP, batches of up to 200 dictations each.
 - `client/WisprAlt/App/MenuBarController.swift` — meeting-offline toast,
@@ -159,7 +159,7 @@ required.
   fallback-unavailable toast. Plan A adds two cloud-fallback-queue drain
   triggers: `didBecomeActive` observer + post-successful-online-dictation
   hook.
-- `server/src/wispralt_server/routes/dev_faults.py` — dev-only
+- `server/src/wispralt/routes/dev_faults.py` — dev-only
   `?fault=503` injection so we can verify the classifier doesn't trip on
   origin 5xx-with-X-Request-Id. Mounted only when `WISPRALT_DEV_FAULTS=1`
   AND host is non-prod.

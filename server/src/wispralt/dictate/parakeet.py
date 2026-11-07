@@ -41,7 +41,7 @@ MIN_SAMPLES = 1_600
 # against decode-amplification (1KB body decoding to many minutes) and single-
 # thread executor starvation. Read once at import to avoid per-request settings
 # attribute lookup on the hot path.
-from wispralt_server.config import settings as _settings
+from wispralt.config import settings as _settings
 MAX_SAMPLES = TARGET_SR * _settings.dictation_max_duration_s
 # Clear the MLX cache after every clip longer than this, else every Nth request.
 CACHE_CLEAR_MIN_SAMPLES = TARGET_SR * 30
@@ -230,7 +230,7 @@ class ParakeetService:
             aligned_tokens is the parakeet-mlx AlignedToken list when the model
             returned per-token alignment, or None when only a Hypothesis was returned.
         """
-        from wispralt_server._errors import AudioTooLongError
+        from wispralt._errors import AudioTooLongError
 
         t0 = time.perf_counter()
 

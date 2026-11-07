@@ -50,13 +50,13 @@ import mlx.core as mx
 import numpy as np
 import soundfile as sf
 
-from wispralt_server import observability
-from wispralt_server.config import settings
-from wispralt_server.meeting import deepfilter as _df_mod
-from wispralt_server.meeting import diarize as _diarize_mod
-from wispralt_server.meeting import install_compat_shims
-from wispralt_server.meeting import mlx_whisper_loader as _mlx_mod
-from wispralt_server.meeting.merge import (
+from wispralt import observability
+from wispralt.config import settings
+from wispralt.files import deepfilter as _df_mod
+from wispralt.files import diarize as _diarize_mod
+from wispralt.files import install_compat_shims
+from wispralt.files import mlx_whisper_loader as _mlx_mod
+from wispralt.files.merge import (
     assign_speakers_segments,
     build_speakers_table,
     label_all,
@@ -64,8 +64,8 @@ from wispralt_server.meeting.merge import (
     merge_two_channels,
     relabel_in_person,
 )
-from wispralt_server.meeting.output import write_outputs_atomic
-from wispralt_server.meeting.silence import is_silent_robust
+from wispralt.files.output import write_outputs_atomic
+from wispralt.files.silence import is_silent_robust
 
 logger = logging.getLogger(__name__)
 
@@ -293,10 +293,10 @@ def _load_channels(wav_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
 
     Raises
     ------
-    wispralt_server._errors.CorruptAudioError
+    wispralt._errors.CorruptAudioError
         If soundfile cannot decode the file.
     """
-    from wispralt_server._errors import CorruptAudioError
+    from wispralt._errors import CorruptAudioError
 
     # `sf.read` on a path can raise the same family as the bytes path
     # (LibsndfileError, OSError, EOFError, ValueError, MemoryError); map all
@@ -326,10 +326,10 @@ def _load_mono(wav_path: Path) -> tuple[np.ndarray, int]:
 
     Raises
     ------
-    wispralt_server._errors.CorruptAudioError
+    wispralt._errors.CorruptAudioError
         If soundfile cannot decode the file.
     """
-    from wispralt_server._errors import CorruptAudioError
+    from wispralt._errors import CorruptAudioError
 
     try:
         audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
@@ -351,7 +351,7 @@ def _resample_to_16k(audio: np.ndarray, src_sr: int) -> np.ndarray:
     Delegates to ``audio.safe_resample`` so librosa errors map to
     CorruptAudioError consistently across dictate and meeting paths.
     """
-    from wispralt_server.audio import safe_resample
+    from wispralt.audio import safe_resample
 
     return safe_resample(audio, src_sr, 16_000)
 

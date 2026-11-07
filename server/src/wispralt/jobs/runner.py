@@ -42,7 +42,7 @@ import psutil
 
 from .._errors import MeetingInProgressError
 from ..config import settings
-from ..meeting import pipeline as meeting_pipeline
+from ..files import pipeline as meeting_pipeline
 from ..ops import staging
 from .store import JobStore
 

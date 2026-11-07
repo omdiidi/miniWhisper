@@ -21,7 +21,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
-# wispralt_server import so the tests work on a bare dev box without a .env.
+# wispralt import so the tests work on a bare dev box without a .env.
 os.environ.setdefault("HF_TOKEN", "stub")
 os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
@@ -35,11 +35,11 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from wispralt_server import auth as auth_mod
-from wispralt_server.auth import require_api_key
-from wispralt_server.routes import admin_ui
-from wispralt_server.users import store as users_store
-from wispralt_server.users.store import User, UserProfile
+from wispralt import auth as auth_mod
+from wispralt.auth import require_api_key
+from wispralt.routes import admin_ui
+from wispralt.users import store as users_store
+from wispralt.users.store import User, UserProfile
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 

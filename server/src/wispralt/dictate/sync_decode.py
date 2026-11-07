@@ -18,8 +18,8 @@ import tempfile
 
 import numpy as np
 
-from wispralt_server import audio as _audio
-from wispralt_server._errors import CorruptAudioError, DecodeTimeoutError, UnsupportedAudioError
+from wispralt import audio as _audio
+from wispralt._errors import CorruptAudioError, DecodeTimeoutError, UnsupportedAudioError
 
 TARGET_SR = 16_000
 TIMEOUT_S = 60

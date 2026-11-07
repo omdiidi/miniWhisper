@@ -15,7 +15,7 @@ from unittest.mock import patch
 import threading
 import time
 import pytest
-from wispralt_server.meeting import pipeline as p
+from wispralt.files import pipeline as p
 
 
 def _reset_state() -> None:

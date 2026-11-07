@@ -66,7 +66,7 @@ generate_plist() {
     <key>ProgramArguments</key>
     <array>
         <string>${UVICORN}</string>
-        <string>wispralt_server.main:app</string>
+        <string>wispralt.main:app</string>
         <string>--host</string>
         <string>127.0.0.1</string>
         <string>--port</string>

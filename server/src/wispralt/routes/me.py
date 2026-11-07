@@ -34,26 +34,26 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
-from wispralt_server import auth as auth_mod
-from wispralt_server.auth import (
+from wispralt import auth as auth_mod
+from wispralt.auth import (
     forbid_integration_kind,
     set_csrf_cookie,
     set_session_cookie,
     verify_csrf,
 )
-from wispralt_server.config import settings
-from wispralt_server.constants import MAX_DISPLAY_NAME_LEN
-from wispralt_server.insights.timewindow import (
+from wispralt.config import settings
+from wispralt.constants import MAX_DISPLAY_NAME_LEN
+from wispralt.insights.timewindow import (
     epoch_for_range,
     last_full_iso_week,
 )
-from wispralt_server.users import store as users_store
-from wispralt_server.web.htmx import is_htmx
-from wispralt_server.web.templates_env import templates
+from wispralt.users import store as users_store
+from wispralt.web.htmx import is_htmx
+from wispralt.web.templates_env import templates
 
 if TYPE_CHECKING:
-    from wispralt_server.jobs.store import JobStore
-    from wispralt_server.users.store import User
+    from wispralt.jobs.store import JobStore
+    from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 

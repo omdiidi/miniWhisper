@@ -15,7 +15,7 @@ import os
 from typing import Any
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
-# wispralt_server import so the tests work on a bare dev box without a .env.
+# wispralt import so the tests work on a bare dev box without a .env.
 os.environ.setdefault("HF_TOKEN", "stub")
 os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
@@ -27,10 +27,10 @@ from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.testclient import TestClient
 
-from wispralt_server.auth import require_api_key_v1
-from wispralt_server.middleware import openai_errors
-from wispralt_server.routes.v1_models import router as v1_models_router
-from wispralt_server.users.store import User
+from wispralt.auth import require_api_key_v1
+from wispralt.middleware import openai_errors
+from wispralt.routes.v1_models import router as v1_models_router
+from wispralt.users.store import User
 
 
 class _RequestIdMiddleware(BaseHTTPMiddleware):

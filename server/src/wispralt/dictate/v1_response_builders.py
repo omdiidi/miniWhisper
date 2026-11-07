@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from wispralt_server.meeting.output import _seconds_to_srt, _seconds_to_vtt
+from wispralt.files.output import _seconds_to_srt, _seconds_to_vtt
 
 # Look back over the last few tokens' joined text for a sentence-end.
 # Parakeet emits subword tokens — a single token rarely ends in [.!?].

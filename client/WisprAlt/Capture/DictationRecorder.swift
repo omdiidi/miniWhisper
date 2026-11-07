@@ -473,7 +473,7 @@ final class DictationRecorder {
         //
         // Channel count: we keep the native channel count rather than forcing
         // mono. Mono downmix happens server-side via `np.mean(axis=1)` in
-        // `wispralt_server/audio.py`, which is the mathematically correct
+        // `wispralt/audio.py`, which is the mathematically correct
         // average. AVAudioConverter's default channel-mix on macOS sums
         // channels without averaging — that bug is exactly what produced the
         // peak=3.974 floats we just removed.

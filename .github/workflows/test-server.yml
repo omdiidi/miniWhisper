@@ -59,7 +59,7 @@ jobs:
       - name: Stub Apple-Silicon-only dependencies
         run: |
           # parakeet-mlx and mlx are Apple-Silicon-only. Provide minimal
-          # stubs so `import wispralt_server.dictate.parakeet` succeeds in
+          # stubs so `import wispralt.dictate.parakeet` succeeds in
           # CI; the tests under tests/ never call into the real model.
           mkdir -p ci-stubs/parakeet_mlx ci-stubs/mlx ci-stubs/mlx/core
           cat > ci-stubs/parakeet_mlx/__init__.py <<'PY'

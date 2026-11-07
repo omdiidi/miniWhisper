@@ -67,7 +67,7 @@ If you just need to read state and the user is sitting at the mini, the fastest 
   the rest of WisprAlt keeps working. Per-spend protection lives in
   the OpenRouter dashboard's monthly-cap setting. Setup + threat model:
   [docs/FALLBACK.md](docs/FALLBACK.md). Dev-only `?fault=503` injection
-  lives in `server/src/wispralt_server/routes/dev_faults.py` and is
+  lives in `server/src/wispralt/routes/dev_faults.py` and is
   mounted only when `WISPRALT_DEV_FAULTS=1` AND the host is not the
   configured prod-mini hostname.
 - Secrets: `HF_TOKEN` and `WISPRALT_API_KEY` in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.

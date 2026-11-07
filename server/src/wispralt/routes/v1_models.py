@@ -21,14 +21,14 @@ import logging
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from wispralt_server.auth import require_api_key_v1
-from wispralt_server.constants import (
+from wispralt.auth import require_api_key_v1
+from wispralt.constants import (
     OPENAI_COMPAT_VERSION,
     OPENAI_KNOWN_MODELS,
     OPENAI_KNOWN_MODELS_CREATED,
     OPENAI_KNOWN_MODELS_OWNED_BY,
 )
-from wispralt_server.users.store import User
+from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 

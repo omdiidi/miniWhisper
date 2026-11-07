@@ -8,8 +8,8 @@ Server-rendered Jinja2 dashboard at `https://transcribe.<your-domain>/admin/*`.
 Lets the operator mint tokens, revoke users, browse usage events, and export
 CSV without ever touching the database directly.
 
-Source: `server/src/wispralt_server/routes/admin_ui.py` +
-`server/src/wispralt_server/admin/templates/*.html.j2`.
+Source: `server/src/wispralt/routes/admin_ui.py` +
+`server/src/wispralt/admin/templates/*.html.j2`.
 
 ---
 

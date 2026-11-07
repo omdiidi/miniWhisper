@@ -24,25 +24,25 @@ import time
 from fastapi import APIRouter, Depends, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from wispralt_server._errors import (
+from wispralt._errors import (
     AudioTooLongError,
     CorruptAudioError,
     DecodeTimeoutError,
     UnsupportedAudioError,
 )
-from wispralt_server.config import settings
-from wispralt_server.constants import (
+from wispralt.config import settings
+from wispralt.constants import (
     OPENAI_COMPAT_SIZE_CAP,
     OPENAI_COMPAT_VERSION,
 )
-from wispralt_server.dictate.sync_decode import decode_to_pcm
-from wispralt_server.dictate.v1_response_builders import (
+from wispralt.dictate.sync_decode import decode_to_pcm
+from wispralt.dictate.v1_response_builders import (
     build_srt,
     build_verbose_json,
     build_vtt,
 )
-from wispralt_server.ratelimit_per_token import rate_limit_v1_per_token
-from wispralt_server.users.store import User
+from wispralt.ratelimit_per_token import rate_limit_v1_per_token
+from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 

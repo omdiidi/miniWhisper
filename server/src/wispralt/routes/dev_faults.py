@@ -12,7 +12,7 @@ keep this in a SEPARATE router so the production ``dictate.py`` has zero new
 branches — the entire surface only exists when the env flag is set.
 
 Usage (dev only):
-    WISPRALT_DEV_FAULTS=1 uvicorn wispralt_server.main:app --reload
+    WISPRALT_DEV_FAULTS=1 uvicorn wispralt.main:app --reload
     curl -X POST 'http://localhost:8000/transcribe/dictate?fault=503' ...
 """
 

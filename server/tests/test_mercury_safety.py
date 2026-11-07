@@ -15,7 +15,7 @@ The new rail is intentionally looser to allow filler removal and light list
 formatting; the strong system prompt is now the primary guard.
 """
 
-from wispralt_server.smart_format.mercury_client import (
+from wispralt.smart_format.mercury_client import (
     _extract_text,
     _is_within_length_window,
     _word_count,

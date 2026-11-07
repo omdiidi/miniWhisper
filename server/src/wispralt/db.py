@@ -28,7 +28,7 @@ import logging
 
 import asyncpg
 
-from wispralt_server.config import settings
+from wispralt.config import settings
 
 logger = logging.getLogger(__name__)
 

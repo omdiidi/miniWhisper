@@ -21,9 +21,9 @@ from unittest.mock import AsyncMock, MagicMock
 import asyncpg
 import pytest
 
-from wispralt_server.usage.events import UsageEvent
-from wispralt_server.usage.queue import UsageEventQueue
-from wispralt_server.usage.writer import _flush
+from wispralt.usage.events import UsageEvent
+from wispralt.usage.queue import UsageEventQueue
+from wispralt.usage.writer import _flush
 
 
 def _make_event(user_id: int, *, kind: str = "dictate", status: int = 200) -> UsageEvent:
@@ -136,7 +136,7 @@ class TestUsageEventQueue:
         # private attr but is the cleanest way to exercise overflow
         # without enqueuing 1000 events.
         q._q = asyncio.Queue(maxsize=3)
-        with caplog.at_level(logging.WARNING, logger="wispralt_server.usage.queue"):
+        with caplog.at_level(logging.WARNING, logger="wispralt.usage.queue"):
             q.offer(_make_event(1))
             q.offer(_make_event(2))
             q.offer(_make_event(3))
@@ -215,7 +215,7 @@ class TestFlushForeignKeyRetry:
             _make_event(2),
             _make_event(-1),  # second offender
         ]
-        with caplog.at_level(logging.WARNING, logger="wispralt_server.usage.writer"):
+        with caplog.at_level(logging.WARNING, logger="wispralt.usage.writer"):
             await _flush(pool, batch)  # type: ignore[arg-type]
 
         # Two executemany calls: first FK-bombs, second is the survivor retry.

@@ -17,13 +17,13 @@ from typing import Callable
 import asyncpg
 from fastapi import FastAPI
 
-from wispralt_server import db, observability
-from wispralt_server.config import settings
-from wispralt_server.jobs.store import JobStore
-from wispralt_server.meeting.output import remove_job_outputs, sweep_stale_tmp
-from wispralt_server.ops import staging
-from wispralt_server.ops.logging_setup import RepeatedFailureLogger
-from wispralt_server.usage import writer as usage_writer
+from wispralt import db, observability
+from wispralt.config import settings
+from wispralt.jobs.store import JobStore
+from wispralt.files.output import remove_job_outputs, sweep_stale_tmp
+from wispralt.ops import staging
+from wispralt.ops.logging_setup import RepeatedFailureLogger
+from wispralt.usage import writer as usage_writer
 
 logger = logging.getLogger(__name__)
 

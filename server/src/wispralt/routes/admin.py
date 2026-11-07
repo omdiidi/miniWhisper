@@ -32,7 +32,7 @@ from .. import auth, observability
 from ..auth import require_admin
 from ..config import settings
 from ..jobs.runner import PHASE_LABELS
-from ..meeting import pipeline as meeting_pipeline
+from ..files import pipeline as meeting_pipeline
 from ..ops import env_writer
 from ..ops.env_writer import find_env_path
 from ..users import store as users_store

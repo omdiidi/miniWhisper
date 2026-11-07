@@ -82,16 +82,16 @@ The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port
 
 | Component | File | Responsibility |
 |---|---|---|
-| **FastAPI app** | `server/src/wispralt_server/main.py` | Single uvicorn worker. Lifespan: validates `.env` permissions (warns if not 0600), loads Parakeet, runs `JobStore.recover_orphans()`, sweeps staging, calls `install_compat_shims()` (idempotent torch.load + HF kwarg patches), then `await meeting_runner.reenqueue_pending()` directly. **Meeting models are NOT loaded here** — `bootstrap_models` was removed; mlx-whisper + Pyannote load lazily on the first meeting job via `pipeline._ensure_models_loaded()`. Registers SIGTERM handler, mounts routers. |
-| **ParakeetService** | `server/src/wispralt_server/dictate/parakeet.py` | Warm-resident `mlx-community/parakeet-tdt-0.6b-v2` (float32 — bfloat16 caused a `[matmul] (128,257) vs (514,51)` shape error on first inference). Single `ThreadPoolExecutor(max_workers=1)` serializes all inference (MLX is not thread-safe per model instance). Warmup JIT pass at startup. Defensive return-type handling: checks `hasattr(result, 'text')` vs list of `AlignedToken`. Tracks p50/p95 latency percentiles over last 100 calls. **Audio decode boundary**: `_sync_transcribe` wraps `soundfile.read` in `try/except (LibsndfileError, RuntimeError) → CorruptAudioError` so malformed uploads convert to HTTP 422 (via the route handler) instead of leaking as 500. |
-| **MeetingRunner** | `server/src/wispralt_server/jobs/runner.py` | `asyncio.Semaphore(1)` enforces one meeting at a time. Dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="wispralt-meeting")` isolates meeting CPU work from the default asyncio thread pool. OOM guard: rejects if `psutil.virtual_memory().available < 2 GiB`. Staging WAV always cleaned up in `finally` block. `reenqueue_pending()` called at startup for jobs whose WAVs survived a restart. |
-| **JobStore** | `server/src/wispralt_server/jobs/store.py` | SQLite WAL mode (`PRAGMA journal_mode=WAL; synchronous=NORMAL`). Thread-safe via `threading.Lock`. Job lifecycle: `pending → running → done | failed`. `recover_orphans()`: marks `running` jobs as `failed`; marks `pending` jobs with missing WAV as `failed`; leaves `pending` jobs with existing WAV for `reenqueue_pending()`. |
-| **MeetingPipeline** | `server/src/wispralt_server/meeting/pipeline.py` | Orchestrates: `_ensure_models_loaded()` (lazy first-call load) → load channels → in-person detection (`silence.py`) → denoise no-op (`deepfilter.py` is a stub, see note below) → **mlx-whisper turbo** (`mlx_whisper_loader.py`; `word_timestamps=True` for meeting mode, `False` for file mode) → Pyannote MPS diarization (`diarize.py`, meeting mode only) → merge/label via `merge.assign_speakers_segments` (word-aware splits when word timestamps are present; largest-overlap fallback when not) → atomic output write (`output.py`). Emits `phase_start`/`phase_done` structured logs at every seam; threads `progress_cb`/`cancel_cb` from the runner into the loaders. Returns locked v3 transcript dict.
+| **FastAPI app** | `server/src/wispralt/main.py` | Single uvicorn worker. Lifespan: validates `.env` permissions (warns if not 0600), loads Parakeet, runs `JobStore.recover_orphans()`, sweeps staging, calls `install_compat_shims()` (idempotent torch.load + HF kwarg patches), then `await meeting_runner.reenqueue_pending()` directly. **Meeting models are NOT loaded here** — `bootstrap_models` was removed; mlx-whisper + Pyannote load lazily on the first meeting job via `pipeline._ensure_models_loaded()`. Registers SIGTERM handler, mounts routers. |
+| **ParakeetService** | `server/src/wispralt/dictate/parakeet.py` | Warm-resident `mlx-community/parakeet-tdt-0.6b-v2` (float32 — bfloat16 caused a `[matmul] (128,257) vs (514,51)` shape error on first inference). Single `ThreadPoolExecutor(max_workers=1)` serializes all inference (MLX is not thread-safe per model instance). Warmup JIT pass at startup. Defensive return-type handling: checks `hasattr(result, 'text')` vs list of `AlignedToken`. Tracks p50/p95 latency percentiles over last 100 calls. **Audio decode boundary**: `_sync_transcribe` wraps `soundfile.read` in `try/except (LibsndfileError, RuntimeError) → CorruptAudioError` so malformed uploads convert to HTTP 422 (via the route handler) instead of leaking as 500. |
+| **MeetingRunner** | `server/src/wispralt/jobs/runner.py` | `asyncio.Semaphore(1)` enforces one meeting at a time. Dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="wispralt-meeting")` isolates meeting CPU work from the default asyncio thread pool. OOM guard: rejects if `psutil.virtual_memory().available < 2 GiB`. Staging WAV always cleaned up in `finally` block. `reenqueue_pending()` called at startup for jobs whose WAVs survived a restart. |
+| **JobStore** | `server/src/wispralt/jobs/store.py` | SQLite WAL mode (`PRAGMA journal_mode=WAL; synchronous=NORMAL`). Thread-safe via `threading.Lock`. Job lifecycle: `pending → running → done | failed`. `recover_orphans()`: marks `running` jobs as `failed`; marks `pending` jobs with missing WAV as `failed`; leaves `pending` jobs with existing WAV for `reenqueue_pending()`. |
+| **MeetingPipeline** | `server/src/wispralt/files/pipeline.py` | Orchestrates: `_ensure_models_loaded()` (lazy first-call load) → load channels → in-person detection (`silence.py`) → denoise no-op (`deepfilter.py` is a stub, see note below) → **mlx-whisper turbo** (`mlx_whisper_loader.py`; `word_timestamps=True` for meeting mode, `False` for file mode) → Pyannote MPS diarization (`diarize.py`, meeting mode only) → merge/label via `merge.assign_speakers_segments` (word-aware splits when word timestamps are present; largest-overlap fallback when not) → atomic output write (`output.py`). Emits `phase_start`/`phase_done` structured logs at every seam; threads `progress_cb`/`cancel_cb` from the runner into the loaders. Returns locked v3 transcript dict.
 
 **Lazy model load (`_ensure_models_loaded`).** First meeting after server start pays a 5–30s one-time cost while mlx-whisper + Pyannote are loaded into RAM; subsequent meetings are zero-cost (warm). Single-flight is enforced by a module-level `threading.RLock` (`_load_lock`) with double-checked-locking around `_meeting_models_ready`; an `RLock` (not plain `Lock`) prevents deadlock if any future telemetry decorator wraps `load()` and re-enters from the same thread. The lazy loader also re-invokes `install_compat_shims()` (idempotent) to close the long-window race where any module imported between startup and first meeting could bind un-shimmed `torch.load` references. On partial failure (e.g. `_diarize_mod.load()` raises after `_mlx_mod.load()` succeeded) the except block calls `reset()` on each loader to null its module-level singletons, then `gc.collect()` as a hint, before re-raising — this prevents the next retry from double-allocating ~2.5–3 GB of mlx-whisper while the previous instance is still referenced. **Best-effort caveat:** dropping the Python reference does NOT guarantee immediate RAM reclaim — PyTorch holds C-level handles, MLX unified memory caches Metal backing pages, traceback frames retain locals until they unwind, and the OS allocator can keep slabs cached. `pipeline.evict_if_idle` calls `mx.metal.clear_cache()` + `mx.metal.reset_peak_memory()` to force MLX to release cached pages back to the unified pool (post-Phase 10; see `docs/CHANGELOG-2026-05-10.md`). The reset prevents reference accumulation across retries; OS-level reclaim is now bounded by the clear_cache call rather than indefinite. Observability snapshot is exposed via `pipeline.state() -> (warm, loading)` for `/readyz/meeting` and `/admin/metrics`. |
-| **meeting/__init__** | `server/src/wispralt_server/meeting/__init__.py` | Package init that runs **two import-time compat shims** before any submodule loads checkpoints: (1) monkeypatches `torch.load` / `torch.serialization.load` to force `weights_only=False` (required for trusted HF checkpoints since PyTorch 2.6 default flipped to `weights_only=True`, blocking `omegaconf.ListConfig` and other pickled objects in pyannote); (2) intercepts `huggingface_hub.{hf_hub_download, snapshot_download}` to translate the removed `use_auth_token=` kwarg → `token=` (pyannote.audio 3.3.2 still calls the legacy name). |
-| **RateLimitMiddleware** | `server/src/wispralt_server/middleware/rate_limit.py` | In-memory per-IP rolling-window limiter. Two windows: `/transcribe/dictate` 60 req/60s; `POST /transcribe/meeting` 4 req/3600s. Returns 429 with `Retry-After` header. |
-| **staging / env_writer** | `server/src/wispralt_server/ops/` | `staging.py` manages the staging directory; startup sweep removes orphaned WAVs older than 24h. `env_writer.py` atomically rewrites `.env` key-value pairs via tempfile-in-same-dir + `os.replace`, preserving mode 0600. |
+| **files/__init__** | `server/src/wispralt/files/__init__.py` | Package init that runs **two import-time compat shims** before any submodule loads checkpoints: (1) monkeypatches `torch.load` / `torch.serialization.load` to force `weights_only=False` (required for trusted HF checkpoints since PyTorch 2.6 default flipped to `weights_only=True`, blocking `omegaconf.ListConfig` and other pickled objects in pyannote); (2) intercepts `huggingface_hub.{hf_hub_download, snapshot_download}` to translate the removed `use_auth_token=` kwarg → `token=` (pyannote.audio 3.3.2 still calls the legacy name). |
+| **RateLimitMiddleware** | `server/src/wispralt/middleware/rate_limit.py` | In-memory per-IP rolling-window limiter. Two windows: `/transcribe/dictate` 60 req/60s; `POST /transcribe/meeting` 4 req/3600s. Returns 429 with `Retry-After` header. |
+| **staging / env_writer** | `server/src/wispralt/ops/` | `staging.py` manages the staging directory; startup sweep removes orphaned WAVs older than 24h. `env_writer.py` atomically rewrites `.env` key-value pairs via tempfile-in-same-dir + `os.replace`, preserving mode 0600. |
 
 ---
 
@@ -113,7 +113,7 @@ Meeting mode on a mono source still routes through the existing in-person branch
 
 ## MLX Whisper
 
-WhisperX (CTranslate2 CPU int8 + wav2vec2 alignment) was replaced wholesale by [`mlx-community/whisper-large-v3-turbo`](https://huggingface.co/mlx-community/whisper-large-v3-turbo) in `server/src/wispralt_server/meeting/mlx_whisper_loader.py`. The model runs on Apple Neural Engine via MLX unified memory.
+WhisperX (CTranslate2 CPU int8 + wav2vec2 alignment) was replaced wholesale by [`mlx-community/whisper-large-v3-turbo`](https://huggingface.co/mlx-community/whisper-large-v3-turbo) in `server/src/wispralt/files/mlx_whisper_loader.py`. The model runs on Apple Neural Engine via MLX unified memory.
 
 | Item | Value |
 |---|---|
@@ -229,7 +229,7 @@ Cloudflare's free / pro / business plans cap inbound request bodies at **100 MB*
 
 **Step 0 — Audio extraction (`client/WisprAlt/Capture/AudioExtractor.swift`).** Before deciding which upload path to take, the client passes the user-picked URL to `AudioExtractor.extractAudioIfVideo(_:)`. If the asset has BOTH a video and an audio track, it runs `AVAssetExportSession` with `AVAssetExportPresetPassthrough` and writes just the audio track to a temp `.m4a` (or `.mp4` fallback when the source codec isn't AAC-compatible). A 200 MB MP4 typically becomes a ~15 MB audio file — often dropping under the chunking threshold entirely and letting the existing single-shot `/transcribe/file` path serve the request. The extractor never throws: any probe / export failure returns the original URL so the upload still proceeds.
 
-**Step 1 — Chunked upload (`client/WisprAlt/Server/ChunkedUploader.swift` ↔ `server/src/wispralt_server/routes/transcribe_file.py`).** If `uploadSize > 50 MiB`, the client switches from `MeetingAPI.submitFile` (multipart single-shot) to `ChunkedUploader.upload`. The three-step wire protocol is:
+**Step 1 — Chunked upload (`client/WisprAlt/Server/ChunkedUploader.swift` ↔ `server/src/wispralt/routes/transcribe_file.py`).** If `uploadSize > 50 MiB`, the client switches from `MeetingAPI.submitFile` (multipart single-shot) to `ChunkedUploader.upload`. The three-step wire protocol is:
 
 1. `POST /transcribe/file/chunked/init` with JSON `{mode, total_bytes, chunk_count, original_filename}` → server returns `{upload_id, chunk_size}` (22-char `secrets.token_urlsafe(16)`) and creates `staging/chunked/<upload_id>/meta.json` recording the caller's `user.id`.
 2. `POST /transcribe/file/chunked/<upload_id>/<chunk_index>` with raw bytes (`application/octet-stream`, NOT multipart) for each 50 MiB chunk. The body is streamed via `request.stream()` to `chunk-NNNN.part.tmp`, then atomically renamed on success. `Content-Length` is mandatory and validated against bytes-written (corrupt chunks → 400). The path declares `{chunk_index:int}` — Starlette's `:int` converter constrains this segment to digits so `/finalize` cannot match the chunk route. Without this constraint, Starlette's registration-order matching sent every `/finalize` request into the wildcard chunk handler with `chunk_index="finalize"`; Pydantic int-coerce then produced a RequestValidationError → 422 with `{"detail":[…]}`, which the client surfaced as the misleading "appears incomplete or corrupted" banner.
@@ -293,8 +293,8 @@ The former `Settings.streamingDictation` UserDefaults flag has been removed from
 
 The server side is intentionally small and lives in two new modules:
 
-- `server/src/wispralt_server/dictate/streaming_session.py` hosts `StreamingSession` (dataclass: `sid`, `api_key_id`, `status ∈ {active, finalizing, done, aborted, expired}`, `partial_texts: list[str | None]`, `pending_tasks: dict[int, asyncio.Task]`, `cumulative_audio_ms`, `last_seen`, `lock: asyncio.Lock`) and `StreamingSessionStore` (the in-process registry).
-- `server/src/wispralt_server/routes/dictate_stream.py` exposes the two HTTP surfaces. See [API.md → `POST /transcribe/dictate/stream/...`](API.md#post-transcribedictatestreamsession_idchunkindex) for wire-level details.
+- `server/src/wispralt/dictate/streaming_session.py` hosts `StreamingSession` (dataclass: `sid`, `api_key_id`, `status ∈ {active, finalizing, done, aborted, expired}`, `partial_texts: list[str | None]`, `pending_tasks: dict[int, asyncio.Task]`, `cumulative_audio_ms`, `last_seen`, `lock: asyncio.Lock`) and `StreamingSessionStore` (the in-process registry).
+- `server/src/wispralt/routes/dictate_stream.py` exposes the two HTTP surfaces. See [API.md → `POST /transcribe/dictate/stream/...`](API.md#post-transcribedictatestreamsession_idchunkindex) for wire-level details.
 
 **Capacity caps (in-process, intentionally tight):**
 
@@ -470,8 +470,8 @@ break-glass branch
        401 Invalid bearer / 503 Auth temporarily unavailable
 ```
 
-Source: `server/src/wispralt_server/auth.py` +
-`server/src/wispralt_server/users/{cache.py,store.py}`.
+Source: `server/src/wispralt/auth.py` +
+`server/src/wispralt/users/{cache.py,store.py}`.
 
 Key invariants:
 
@@ -524,7 +524,7 @@ The admin UI's user list renders `display_name (label)` when both are populated,
 ```
 
 Source:
-`server/src/wispralt_server/usage/{events.py,queue.py,writer.py}` +
+`server/src/wispralt/usage/{events.py,queue.py,writer.py}` +
 `observability.py` (singleton) + `main.py` (drainer task lifecycle).
 
 Why fire-and-forget:
@@ -570,8 +570,8 @@ to isolate API traffic.
 └─────────────────────────────────────────────────────┘
 ```
 
-Source: `server/src/wispralt_server/routes/admin_ui.py` +
-`server/src/wispralt_server/admin/templates/*.html.j2`.
+Source: `server/src/wispralt/routes/admin_ui.py` +
+`server/src/wispralt/admin/templates/*.html.j2`.
 
 Three-router pattern (be720a1 split out `me_router`):
 
@@ -736,7 +736,7 @@ captured transcripts into per-employee + team summaries every Sunday night.
 The render loop (`Data portal` below) is what employees and admins see in the
 browser.
 
-Source: `server/src/wispralt_server/insights/{__init__.py, client.py, prompts.py, cron.py}`
+Source: `server/src/wispralt/insights/{__init__.py, client.py, prompts.py, cron.py}`
 and the `weekly_insights` table + 5 helpers in `jobs/store.py`.
 
 ### Schedule
@@ -821,7 +821,7 @@ CREATE INDEX idx_weekly_insights_generated ON weekly_insights(generated_at);
 `upsert_weekly_insight` uses `ON CONFLICT (iso_year, iso_week, scope, api_key_id)
 DO UPDATE` so a re-run for the same week overwrites the previous row
 idempotently — useful for catchup, manual re-runs via the
-`python -m wispralt_server.insights.cron --manual` entrypoint, and prompt
+`python -m wispralt.insights.cron --manual` entrypoint, and prompt
 iteration during development.
 
 Per-person `insight_json` schema:
@@ -884,8 +884,8 @@ Team `insight_json` schema:
 The render loop. All three surfaces share the same base template + vendored
 JS so a single design language covers admin + employee views.
 
-Source: `server/src/wispralt_server/routes/{me.py, admin_data.py}` +
-`server/src/wispralt_server/admin/templates/{me_login, me_insights, data,
+Source: `server/src/wispralt/routes/{me.py, admin_data.py}` +
+`server/src/wispralt/admin/templates/{me_login, me_insights, data,
 _insight_cards, _stats_grid_partial}.html.j2`.
 
 ### Surfaces
@@ -975,8 +975,8 @@ download an individual transcript as `.txt` or `.json`. Sits in the same
 sidebar as `/me/insights` and inherits the data-portal frosted-glass
 treatment.
 
-Source: `server/src/wispralt_server/routes/me.py` (handlers) +
-`server/src/wispralt_server/admin/templates/{me_history, _me_history_body,
+Source: `server/src/wispralt/routes/me.py` (handlers) +
+`server/src/wispralt/admin/templates/{me_history, _me_history_body,
 _me_history_page, _me_history_row, _me_history_row_expanded}.html.j2`
 (render). Design lineage:
 `tmp/ready-plans/2026-05-15-plan-a-me-history-and-cloud-telemetry.md`.
@@ -1105,7 +1105,7 @@ Source: `client/WisprAlt/Storage/DictationFallbackQueue.swift` (queue +
 drain) + `client/WisprAlt/Server/DictationAPI.swift` (enqueue at the
 OpenRouter success site) + `client/WisprAlt/App/MenuBarController.swift`
 (drain triggers) on the client side;
-`server/src/wispralt_server/routes/telemetry.py` (ingest) +
+`server/src/wispralt/routes/telemetry.py` (ingest) +
 `JobStore.insert_cloud_fallback_dictation` on the server side.
 
 ### Data lineage

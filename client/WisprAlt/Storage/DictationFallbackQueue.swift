@@ -31,7 +31,7 @@ final class DictationFallbackQueue {
     static let shared = DictationFallbackQueue()
 
     /// Maximum batch size — must stay ≤ the server's `CloudDictationBatch`
-    /// max_length of 200 (see server/src/wispralt_server/routes/telemetry.py).
+    /// max_length of 200 (see server/src/wispralt/routes/telemetry.py).
     private static let batchLimit = 200
 
     /// Maximum drain attempts before moving an item to `failed/`.

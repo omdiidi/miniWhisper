@@ -302,7 +302,7 @@ def write_outputs_atomic(
     OSError
         For all other filesystem errors.
     """
-    from wispralt_server._errors import DiskFullError
+    from wispralt._errors import DiskFullError
 
     output_dir.mkdir(parents=True, exist_ok=True)
     base = output_dir / job_id

@@ -32,9 +32,9 @@ import psutil
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from wispralt_server import db
-from wispralt_server.meeting import pipeline as meeting_pipeline
-from wispralt_server.observability import mlx_active_mb
+from wispralt import db
+from wispralt.files import pipeline as meeting_pipeline
+from wispralt.observability import mlx_active_mb
 
 router = APIRouter()
 

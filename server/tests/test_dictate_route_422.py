@@ -21,9 +21,9 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from wispralt_server._errors import CorruptAudioError
-from wispralt_server.config import settings
-from wispralt_server.routes.dictate import router as dictate_router
+from wispralt._errors import CorruptAudioError
+from wispralt.config import settings
+from wispralt.routes.dictate import router as dictate_router
 
 
 def _build_test_app(transcribe_side_effect: Any) -> FastAPI:
@@ -45,7 +45,7 @@ def _build_test_app(transcribe_side_effect: Any) -> FastAPI:
     app.include_router(dictate_router)
 
     # Override the bearer-auth dependency so we can hit the route without a key.
-    from wispralt_server.auth import require_api_key
+    from wispralt.auth import require_api_key
 
     app.dependency_overrides[require_api_key] = lambda: None
     return app
@@ -97,7 +97,7 @@ class TestRouteCorruptAudioContract:
         # Send an actual body larger than max_upload_bytes — the route should
         # 413 either via the Content-Length pre-check or via the
         # post-read-length check.  Use a small max via settings override.
-        from wispralt_server.config import settings as live_settings
+        from wispralt.config import settings as live_settings
         original = live_settings.max_upload_bytes
         try:
             # Temporarily shrink the cap so we can test it without uploading GBs.

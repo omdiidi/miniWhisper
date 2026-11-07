@@ -15,7 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Re-export verify_env_perms from ops.env_writer so callers that import it
 # from config continue to work without a duplicate definition.
-from wispralt_server.ops.env_writer import verify_env_perms as verify_env_perms  # noqa: F401
+from wispralt.ops.env_writer import verify_env_perms as verify_env_perms  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -189,5 +189,5 @@ class Settings(BaseSettings):
     insights_catchup_enabled: bool = False
 
 
-# Module-level singleton — import as ``from wispralt_server.config import settings``
+# Module-level singleton — import as ``from wispralt.config import settings``
 settings = Settings()

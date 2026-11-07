@@ -43,29 +43,29 @@ from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from wispralt_server import db, observability
-from wispralt_server.config import settings, verify_env_perms
-from wispralt_server.dictate.parakeet import ParakeetService
-from wispralt_server.dictate.streaming_session import (
+from wispralt import db, observability
+from wispralt.config import settings, verify_env_perms
+from wispralt.dictate.parakeet import ParakeetService
+from wispralt.dictate.streaming_session import (
     StreamingSessionStore,
     _streaming_sweeper,
 )
-from wispralt_server.insights.client import InsightsClient
-from wispralt_server.insights.cron import (
+from wispralt.insights.client import InsightsClient
+from wispralt.insights.cron import (
     _maybe_catchup,
     _seconds_until_next_fire,
     run_weekly_insights,
 )
-from wispralt_server.jobs.runner import MeetingRunner
-from wispralt_server.jobs.store import JobStore
-from wispralt_server.ops import background
-from wispralt_server.ops.logging_setup import configure_file_logging
-from wispralt_server.meeting import install_compat_shims
-from wispralt_server.middleware import openai_errors
-from wispralt_server.middleware.rate_limit import RateLimitMiddleware
-from wispralt_server.ops import staging
-from wispralt_server.ops.env_writer import find_env_path
-from wispralt_server.routes import (
+from wispralt.jobs.runner import MeetingRunner
+from wispralt.jobs.store import JobStore
+from wispralt.ops import background
+from wispralt.ops.logging_setup import configure_file_logging
+from wispralt.files import install_compat_shims
+from wispralt.middleware import openai_errors
+from wispralt.middleware.rate_limit import RateLimitMiddleware
+from wispralt.ops import staging
+from wispralt.ops.env_writer import find_env_path
+from wispralt.routes import (
     admin,
     admin_data,
     admin_ui,
@@ -73,16 +73,16 @@ from wispralt_server.routes import (
     dictate,
     health,
 )
-from wispralt_server.routes import dictate_stream as dictate_stream_routes
-from wispralt_server.routes import me as me_routes
-from wispralt_server.routes import meeting as meeting_routes
-from wispralt_server.routes import telemetry as telemetry_routes
-from wispralt_server.routes import transcribe_file as transcribe_file_routes
-from wispralt_server.routes import v1_models, v1_transcriptions
-from wispralt_server.smart_format.mercury_client import MercuryClient
-from wispralt_server.usage import writer as usage_writer
-from wispralt_server.usage.events import UsageEvent
-from wispralt_server.users import store as users_store
+from wispralt.routes import dictate_stream as dictate_stream_routes
+from wispralt.routes import me as me_routes
+from wispralt.routes import meeting as meeting_routes
+from wispralt.routes import telemetry as telemetry_routes
+from wispralt.routes import transcribe_file as transcribe_file_routes
+from wispralt.routes import v1_models, v1_transcriptions
+from wispralt.smart_format.mercury_client import MercuryClient
+from wispralt.usage import writer as usage_writer
+from wispralt.usage.events import UsageEvent
+from wispralt.users import store as users_store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -337,7 +337,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 7c. Idle-eviction background task. Every minute, ask the pipeline to
     #     unload meeting models if they've been idle past the configured
     #     threshold (default 300s). Skipped entirely when threshold is 0.
-    from wispralt_server.meeting import pipeline as meeting_pipeline
+    from wispralt.files import pipeline as meeting_pipeline
 
     app.state.eviction_task = None
     if settings.meeting_idle_eviction_seconds > 0:
@@ -481,7 +481,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Initialize per-token rate-limit state for /v1/* routes. Idempotent.
     # Imported locally to avoid a top-of-module cycle with the auth/users modules.
-    from wispralt_server.ratelimit_per_token import init_rate_limit_state
+    from wispralt.ratelimit_per_token import init_rate_limit_state
 
     init_rate_limit_state(app)
 
@@ -749,7 +749,7 @@ def create_app() -> FastAPI:
     # Access-Control-Allow-Origin so browser clients see real errors instead of
     # opaque CORS failures. Imported locally to keep the top-of-module import
     # block focused on hot-path dependencies.
-    from wispralt_server.middleware.cors import install_cors
+    from wispralt.middleware.cors import install_cors
 
     install_cors(app)
 

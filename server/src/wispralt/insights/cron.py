@@ -33,19 +33,19 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from wispralt_server.config import settings
-from wispralt_server.insights.client import (
+from wispralt.config import settings
+from wispralt.insights.client import (
     InsightsClient,  # noqa: F401 — re-exported for `__main__` smoke
     InsightsError,
     RateLimitedError,
 )
-from wispralt_server.insights.prompts import (
+from wispralt.insights.prompts import (
     PERSON_SYSTEM_PROMPT,
     PERSON_USER_PROMPT_TEMPLATE,
     TEAM_SYSTEM_PROMPT,
     TEAM_USER_PROMPT_TEMPLATE,
 )
-from wispralt_server.insights.timewindow import (
+from wispralt.insights.timewindow import (
     iso_week_epoch_bounds,
     last_full_iso_week,
 )
@@ -512,13 +512,13 @@ async def _maybe_catchup(app) -> None:
 
 if __name__ == "__main__":
     # Manual smoke gate (d) — run one cron pass without booting FastAPI/uvicorn.
-    # `python -m wispralt_server.insights.cron --manual`
+    # `python -m wispralt.insights.cron --manual`
     import argparse
     from pathlib import Path
     from types import SimpleNamespace
 
-    from wispralt_server import db as db_module
-    from wispralt_server.jobs.store import JobStore
+    from wispralt import db as db_module
+    from wispralt.jobs.store import JobStore
 
     parser = argparse.ArgumentParser(
         description="Manual weekly-insights cron runner (smoke gate d)."

@@ -4,7 +4,7 @@ title: API Reference
 
 # API Reference
 
-Complete HTTP API contract for the WisprAlt server. Implemented in `server/src/wispralt_server/routes/`.
+Complete HTTP API contract for the WisprAlt server. Implemented in `server/src/wispralt/routes/`.
 
 ---
 
@@ -341,8 +341,8 @@ canonical reference: **[OPENAI-COMPAT.md](OPENAI-COMPAT.md)**.
   deliberately ignores `X-Smart-Format`. Third-party callers that want
   cleanup hit `/transcribe/dictate` directly.
 
-Sources: `server/src/wispralt_server/routes/v1_transcriptions.py`,
-`server/src/wispralt_server/routes/v1_models.py`.
+Sources: `server/src/wispralt/routes/v1_transcriptions.py`,
+`server/src/wispralt/routes/v1_models.py`.
 
 ---
 
@@ -409,7 +409,7 @@ Update the calling user's own `display_name`. The `label` and `role` are not use
 
 The token cache is **not** invalidated on `display_name` change because the auth `User` object only carries `(id, label, role)` — `display_name` is fetched fresh from `wispralt.users` each time the client opens its Identity section.
 
-Source: `server/src/wispralt_server/routes/me.py`.
+Source: `server/src/wispralt/routes/me.py`.
 
 ---
 
@@ -443,9 +443,9 @@ on identical `created_at` is `id DESC`.
 | 404 | Caller has zero non-deleted dictations. |
 | 503 | SQLite job store transiently unavailable. |
 
-Source: `server/src/wispralt_server/routes/me.py` +
+Source: `server/src/wispralt/routes/me.py` +
 `JobStore.get_most_recent_dictation(api_key_id)` in
-`server/src/wispralt_server/jobs/store.py`.
+`server/src/wispralt/jobs/store.py`.
 
 ---
 
@@ -455,7 +455,7 @@ Source: `server/src/wispralt_server/routes/me.py` +
 
 Renders the employee token-paste form (`me_login.html.j2`). Chicken-and-egg counterpart to `/admin/login` — must be reachable without the cookie it sets. Returns `200` with `text/html`.
 
-Source: `server/src/wispralt_server/routes/me.py` (Phase 2).
+Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 ---
 
@@ -483,7 +483,7 @@ Validate a pasted token and set the session cookie. Mirrors `POST /admin/login` 
 
 See [ARCHITECTURE.md → Data portal](ARCHITECTURE.md#data-portal) for the rationale behind sharing the cookie between admin + employee surfaces.
 
-Source: `server/src/wispralt_server/routes/me.py` (Phase 2).
+Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 ---
 
@@ -515,7 +515,7 @@ Per-employee weekly insights page. Returns the most recent `weekly_insights` row
 
 The hallucination disclaimer ("AI-generated, may be inaccurate") is rendered inline on each insight card — see [ARCHITECTURE.md → Weekly insights](ARCHITECTURE.md#weekly-insights) for the two-tier scrub policy that backs it.
 
-Source: `server/src/wispralt_server/routes/me.py` (Phase 2).
+Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 ---
 
@@ -551,7 +551,7 @@ Personal transcript archive — the calling user's own dictations + meetings + c
 | 422 | `range` is not one of the accepted values. |
 | 503 | Postgres pool unavailable. |
 
-Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ---
 
@@ -583,7 +583,7 @@ Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `
 | 401 | Missing or invalid bearer. |
 | 404 | Unknown kind, unknown row_id, soft-deleted, or owned by another user. |
 
-Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ---
 
@@ -609,7 +609,7 @@ Soft-delete one owned row. Flips `deleted_at = NOW()` on the underlying row; dow
 | 403 | CSRF token missing or mismatched. |
 | 404 | Unknown kind, unknown row_id, already-deleted, or owned by another user. |
 
-Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ---
 
@@ -625,7 +625,7 @@ Restore one soft-deleted row by clearing `deleted_at`. Returns the compact row p
 
 **Errors:** Same as `DELETE /me/history/{kind}/{row_id}`.
 
-Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ---
 
@@ -651,7 +651,7 @@ Download one owned transcript as plain text or JSON. Returns a streaming respons
 | 401 | Missing or invalid bearer. |
 | 404 | Unknown kind, unknown fmt, unknown row_id, soft-deleted, or owned by another user. |
 
-Source: `server/src/wispralt_server/routes/me.py` (Plan A).
+Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ---
 
@@ -682,7 +682,7 @@ Admin Data tab. Renders the team `weekly_insights` row (most recent completed IS
 | 422 | `range` is not one of the accepted values. |
 | 503 | Postgres pool unavailable. |
 
-Source: `server/src/wispralt_server/routes/admin_data.py` (Phase 2).
+Source: `server/src/wispralt/routes/admin_data.py` (Phase 2).
 
 ---
 
@@ -721,7 +721,7 @@ Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip �
 - Server logs one `INFO` line per trigger: `Manual insights run started by admin_id=<id> for W<nn> (user=<label>)`. Operators distinguish manual vs scheduled runs by grepping for this prefix.
 - Fire-and-forget tasks are NOT durable across SIGTERM — see `docs/ADMIN.md` for the re-click recovery path.
 
-Source: `server/src/wispralt_server/routes/admin_data.py`.
+Source: `server/src/wispralt/routes/admin_data.py`.
 
 ---
 
@@ -779,7 +779,7 @@ A repeat batch with the same `client_dedup_id`s returns `{inserted: 0, received:
 | 429 | Per-IP telemetry rate limit (10 batches per 60-second window) exceeded. Includes `Retry-After: 60`. |
 | 503 | Postgres pool unavailable. |
 
-Source: `server/src/wispralt_server/routes/telemetry.py` (Plan A).
+Source: `server/src/wispralt/routes/telemetry.py` (Plan A).
 
 ---
 
@@ -1084,8 +1084,8 @@ Structured server observability snapshot.
 
 The `/admin/*` routes (other than `/admin/rotate-key` and `/admin/login`) render **HTML** via Jinja2 templates, not JSON. They are intended for browser navigation; curl/Postman work too but you'll get markup back.
 
-Source: `server/src/wispralt_server/routes/admin_ui.py` +
-`server/src/wispralt_server/admin/templates/*.html.j2`.
+Source: `server/src/wispralt/routes/admin_ui.py` +
+`server/src/wispralt/admin/templates/*.html.j2`.
 
 **Auth split (be720a1):** Three routers under the same `/admin` prefix.
 

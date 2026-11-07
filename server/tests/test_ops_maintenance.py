@@ -16,10 +16,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from wispralt_server import db
-from wispralt_server.jobs.store import JobStore
-from wispralt_server.ops import background, staging
-from wispralt_server.ops.logging_setup import RepeatedFailureLogger
+from wispralt import db
+from wispralt.jobs.store import JobStore
+from wispralt.ops import background, staging
+from wispralt.ops.logging_setup import RepeatedFailureLogger
 
 DAY = 86400
 
@@ -238,7 +238,7 @@ def test_retention_uses_persisted_dir_and_blocks_traversal(tmp_path: Path) -> No
 def test_configure_file_logging_is_idempotent(tmp_path: Path) -> None:
     import logging.handlers
 
-    from wispralt_server.ops.logging_setup import configure_file_logging
+    from wispralt.ops.logging_setup import configure_file_logging
 
     root = logging.getLogger()
     saved = list(root.handlers)

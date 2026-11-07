@@ -62,7 +62,7 @@ This is the only test that intentionally exercises the **honest limitation** doc
 
 ### SRT / VTT / TXT output-format regression
 
-File mode (`request_mode=file`) emits segments **without a `words[]` array** — `mlx_whisper.transcribe` is called with `word_timestamps=False` for performance. The output formatters in `server/src/wispralt_server/meeting/output.py` must never index `seg["words"]` in the SRT/VTT/TXT branches. To pin this:
+File mode (`request_mode=file`) emits segments **without a `words[]` array** — `mlx_whisper.transcribe` is called with `word_timestamps=False` for performance. The output formatters in `server/src/wispralt/files/output.py` must never index `seg["words"]` in the SRT/VTT/TXT branches. To pin this:
 
 1. Run row #4 (5-min file mode).
 2. Diff the SRT, VTT, and TXT outputs against the post-swap golden (recorded from a known-good mlx-whisper run on the same input; the original goldens were captured from the last WhisperX run before Phase 10).

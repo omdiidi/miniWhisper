@@ -16,8 +16,8 @@ boundary is deterministic.
 
 from __future__ import annotations
 
-from wispralt_server.users.cache import TokenCache
-from wispralt_server.users.store import User
+from wispralt.users.cache import TokenCache
+from wispralt.users.store import User
 
 
 def _make_user(uid: int) -> User:
@@ -30,7 +30,7 @@ class TestPutAndGet:
     def test_put_then_get_returns_same_user(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         fake_now = [1000.0]
         monkeypatch.setattr(
-            "wispralt_server.users.cache.time.monotonic", lambda: fake_now[0]
+            "wispralt.users.cache.time.monotonic", lambda: fake_now[0]
         )
         cache = TokenCache()
         user = _make_user(1)
@@ -48,7 +48,7 @@ class TestTTL:
     def test_get_after_ttl_returns_none(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         fake_now = [1000.0]
         monkeypatch.setattr(
-            "wispralt_server.users.cache.time.monotonic", lambda: fake_now[0]
+            "wispralt.users.cache.time.monotonic", lambda: fake_now[0]
         )
         cache = TokenCache()
         cache.put("hash-A", _make_user(1))
@@ -67,7 +67,7 @@ class TestTTL:
         # stay tight for long-lived processes.
         fake_now = [1000.0]
         monkeypatch.setattr(
-            "wispralt_server.users.cache.time.monotonic", lambda: fake_now[0]
+            "wispralt.users.cache.time.monotonic", lambda: fake_now[0]
         )
         cache = TokenCache()
         cache.put("hash-A", _make_user(1))
@@ -83,7 +83,7 @@ class TestLRUEviction:
     def test_overflow_evicts_oldest(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         fake_now = [1000.0]
         monkeypatch.setattr(
-            "wispralt_server.users.cache.time.monotonic", lambda: fake_now[0]
+            "wispralt.users.cache.time.monotonic", lambda: fake_now[0]
         )
         cache = TokenCache()
         # Fill exactly to capacity + 1; oldest should be evicted on the
@@ -103,7 +103,7 @@ class TestLRUEviction:
         # in favor of an older, untouched entry.
         fake_now = [1000.0]
         monkeypatch.setattr(
-            "wispralt_server.users.cache.time.monotonic", lambda: fake_now[0]
+            "wispralt.users.cache.time.monotonic", lambda: fake_now[0]
         )
         cache = TokenCache()
         # Fill to capacity.
@@ -124,7 +124,7 @@ class TestInvalidate:
     def test_invalidate_removes_entry(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         fake_now = [1000.0]
         monkeypatch.setattr(
-            "wispralt_server.users.cache.time.monotonic", lambda: fake_now[0]
+            "wispralt.users.cache.time.monotonic", lambda: fake_now[0]
         )
         cache = TokenCache()
         cache.put("hash-A", _make_user(1))

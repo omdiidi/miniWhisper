@@ -23,10 +23,10 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from wispralt_server.auth import forbid_integration_kind
+from wispralt.auth import forbid_integration_kind
 
 if TYPE_CHECKING:
-    from wispralt_server.users.store import User
+    from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 

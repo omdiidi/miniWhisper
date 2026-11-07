@@ -33,7 +33,7 @@ cp .env.example .env
 # fill in .env values
 chmod 600 .env
 uv sync
-uv run uvicorn wispralt_server.main:app --port 8000 --workers 1
+uv run uvicorn wispralt.main:app --port 8000 --workers 1
 ```
 
 The server **must** run with `--workers 1` — multiple workers would load duplicate

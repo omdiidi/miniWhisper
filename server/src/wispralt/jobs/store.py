@@ -27,8 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from wispralt_server._errors import UploadTruncatedError
-from wispralt_server.ops.staging import validate_wav_completeness
+from wispralt._errors import UploadTruncatedError
+from wispralt.ops.staging import validate_wav_completeness
 
 logger = logging.getLogger(__name__)
 

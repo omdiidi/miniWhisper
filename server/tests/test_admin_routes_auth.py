@@ -22,10 +22,10 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from wispralt_server.auth import require_admin, require_api_key
-from wispralt_server.routes import admin_ui
-from wispralt_server.users import store as users_store
-from wispralt_server.users.store import User
+from wispralt.auth import require_admin, require_api_key
+from wispralt.routes import admin_ui
+from wispralt.users import store as users_store
+from wispralt.users.store import User
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────

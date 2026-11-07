@@ -28,9 +28,9 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-from wispralt_server.auth import require_api_key
-from wispralt_server.users.cache import TokenCache
-from wispralt_server.users.store import User, hash_token
+from wispralt.auth import require_api_key
+from wispralt.users.cache import TokenCache
+from wispralt.users.store import User, hash_token
 
 
 # ── fake Request helper ────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ def _clear_token_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     Otherwise residual entries from a prior test could short-circuit the
     Postgres / break-glass paths we want to exercise.
     """
-    from wispralt_server import auth as auth_mod
+    from wispralt import auth as auth_mod
 
     monkeypatch.setattr(auth_mod, "token_cache", TokenCache())
 
@@ -192,7 +192,7 @@ class TestBreakGlassDoesNotApplyWhenPostgresHealthy:
             return real_user
 
         # Patch the store lookup to return a real user.
-        from wispralt_server import auth as auth_mod
+        from wispralt import auth as auth_mod
 
         monkeypatch.setattr(auth_mod._store_mod, "lookup", _fake_lookup)
 

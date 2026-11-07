@@ -25,7 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
-# wispralt_server import so the tests work on a bare dev box without a .env.
+# wispralt import so the tests work on a bare dev box without a .env.
 os.environ.setdefault("HF_TOKEN", "stub")
 os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
@@ -39,18 +39,18 @@ from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.testclient import TestClient
 
-from wispralt_server._errors import (
+from wispralt._errors import (
     AudioTooLongError,
     CorruptAudioError,
 )
-from wispralt_server.auth import require_api_key_v1
-from wispralt_server.middleware import openai_errors
-from wispralt_server.middleware.cors import install_cors
-from wispralt_server.ratelimit_per_token import (
+from wispralt.auth import require_api_key_v1
+from wispralt.middleware import openai_errors
+from wispralt.middleware.cors import install_cors
+from wispralt.ratelimit_per_token import (
     init_rate_limit_state,
 )
-from wispralt_server.routes.v1_transcriptions import router as v1_router
-from wispralt_server.users.store import User
+from wispralt.routes.v1_transcriptions import router as v1_router
+from wispralt.users.store import User
 
 if TYPE_CHECKING:
     import pytest
@@ -451,7 +451,7 @@ class TestPayloadAndDecodeFailures:
         # Force the decode helper to raise CorruptAudioError. Patch the
         # `decode_to_pcm` symbol imported into the route module (not the
         # source module) — `from X import Y` rebinds Y locally.
-        from wispralt_server.routes import v1_transcriptions as v1_route_mod
+        from wispralt.routes import v1_transcriptions as v1_route_mod
 
         def _raise(_b: bytes) -> Any:
             raise CorruptAudioError("Cannot decode audio: garbage")

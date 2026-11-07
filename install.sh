@@ -230,7 +230,7 @@ should_skip_install() {
 # ───────────────────────────────────────────────────────────────────────────────
 # quit_all_installs — graceful AppleScript-quit by bundle id, then escalate to
 # SIGTERM and finally SIGKILL. Narrow pkill/pgrep pattern (co.wispralt.WisprAlt,
-# NOT co.wispralt) so we don't accidentally kill the mini's wispralt_server or
+# NOT co.wispralt) so we don't accidentally kill the mini's wispralt or
 # cloudflared processes on a dev box running both client and server.
 # ───────────────────────────────────────────────────────────────────────────────
 quit_all_installs() {

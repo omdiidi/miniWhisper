@@ -34,9 +34,9 @@ import asyncpg
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import Response
 
-from wispralt_server.users import cache as _cache_mod
-from wispralt_server.users import store as _store_mod
-from wispralt_server.users.store import User
+from wispralt.users import cache as _cache_mod
+from wispralt.users import store as _store_mod
+from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def _load_key_from_env() -> str:
     pydantic-settings fails (e.g. minimal test environments).
     """
     try:
-        from wispralt_server.config import settings
+        from wispralt.config import settings
 
         return settings.wispralt_api_key.get_secret_value()
     except (ImportError, ValueError, RuntimeError):

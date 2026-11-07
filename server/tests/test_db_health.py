@@ -19,7 +19,7 @@ from typing import Any
 import asyncpg
 import pytest
 
-from wispralt_server import db
+from wispralt import db
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

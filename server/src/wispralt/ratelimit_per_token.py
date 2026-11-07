@@ -21,8 +21,8 @@ import time
 
 from fastapi import Depends, HTTPException, Request
 
-from wispralt_server.auth import require_api_key_v1
-from wispralt_server.users.store import User
+from wispralt.auth import require_api_key_v1
+from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 

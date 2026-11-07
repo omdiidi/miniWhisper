@@ -14,7 +14,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 
-from wispralt_server._errors import CorruptAudioError
+from wispralt._errors import CorruptAudioError
 
 # Re-export so callers can import from either location without breakage.
 __all__ = [

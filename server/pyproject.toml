@@ -1,7 +1,7 @@
 [project]
-name = "wispralt-server"
+name = "wispralt"
 version = "0.1.0"
-description = "WisprAlt — self-hosted dictation and meeting-transcription server"
+description = "WisprAlt — self-hosted dictation and file-transcription server"
 requires-python = ">=3.11,<4.0"
 dependencies = [
     # ML — dictation
@@ -56,7 +56,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/wispralt_server"]
+packages = ["src/wispralt"]
 
 # ── torch CPU-only wheel source ───────────────────────────────────────────────
 # Using the PyTorch CPU index avoids pulling the CUDA-fat wheel (~2.5 GB).
@@ -80,7 +80,7 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "TCH"]
 ignore = ["E501"]  # line-length enforced by formatter
 
 [tool.ruff.lint.isort]
-known-first-party = ["wispralt_server"]
+known-first-party = ["wispralt"]
 
 # ── pyright config ────────────────────────────────────────────────────────────
 [tool.pyright]

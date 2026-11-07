@@ -22,12 +22,12 @@ a future code path is preserved.
 
 Usage from `main.py:lifespan`::
 
-    from wispralt_server.meeting import install_compat_shims
+    from wispralt.files import install_compat_shims
     install_compat_shims()  # idempotent
 
 Or, for one-shot scoped use::
 
-    from wispralt_server.meeting import trusted_load_context
+    from wispralt.files import trusted_load_context
     with trusted_load_context():
         # ... pyannote / mlx-whisper checkpoint load happens here
 """
