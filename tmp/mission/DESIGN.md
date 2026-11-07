@@ -1,156 +1,212 @@
-# Target design v3 (Part 1, 2026-11-07, after review rounds 1-2)
+# Target design v4 (Part 1, 2026-11-07, after review rounds 1-3)
 
 Owner rule: clean, concise, future-proof, reusable; no abstraction for show.
 Review reports:
 - r1: /var/folders/mc/6xd4rvtd7d7gwmq5_lp37vjh0000gn/T//codex-review.tF2k3K/report-final.md
 - r2: /var/folders/mc/6xd4rvtd7d7gwmq5_lp37vjh0000gn/T//codex-review.AM5XaP/report-final.md
+- r3: /var/folders/mc/6xd4rvtd7d7gwmq5_lp37vjh0000gn/T//codex-review.EwuKzI/report-final.md
 
 Context: single user, the old host was wiped, so there is no live install to stay compatible with. Simplify accordingly.
+
+**What history survives:** the old host's SQLite (all dictation and file-job text) was on the wiped mini, and no copy exists. Supabase holds metadata only (users, usage_events, fallback_events). The client has no fallback-queue folder on this Mac. So dictation text cannot be recovered. The import (§5) brings back accounts, usage statistics and any transcript files the owner still has, and says so plainly.
 
 ## 1. Client
 
 ### 1.1 Mode
-- `Settings.mode: online | local`. Default **online**.
-- One-time migration on first launch of the new build: if a saved `serverURL` answers `GET /healthz` within 3 s, choose **local**. Otherwise choose **online** and show a notice ("previous server unreachable — using Online"). The decision is persisted and never re-derived. (The owner's saved URL `https://transcribe.integrateapi.ai` points at the wiped host, so this lands on Online.)
+- `Settings.mode: online | local`. Default **online**, including on upgrade. There is no probe of the saved URL: the owner's saved URL points at the wiped host, and probing a reused hostname could route audio elsewhere. Local is chosen only explicitly or through a `wispralt://join` link.
 - Menu bar: an "Online (OpenAI)" / "Local server" picker and a status line (mode, key present or "key missing", host reachable).
 - Online mode hides server-only UI: `MeAPI.get` at launch (AppDelegate.swift:110), DisplayNameSheet, `/me` links, the server health check.
-- A mode change applies to the next dictation. Each dictation and retry entry records the mode and model it was captured with. A Local host that is unreachable is a hard failure, shown as a toast. There is no cross-provider fallback.
+- A mode change applies to the next dictation. Each dictation and retry entry records the mode it was captured with. An unreachable Local host is a hard failure, shown as a toast. There is no cross-provider fallback.
 
-### 1.2 Audio pipeline (corrects v2: the recorder is NOT canonical)
+### 1.2 Audio pipeline
 - `DictationRecorder` keeps capturing at the device's native rate and channel count (DictationRecorder.swift:117-123, 417-432).
-- New: the recorder **spools the full recording to disk** as it captures (`spool/<dictationId>.caf`, native PCM). It is the single owner of the full recording, and memory stays bounded (commit 84a7d8b).
-- New `MonoResampler` (WisprAltCore, pure Swift): averages channels to mono, then resamples (16 kHz for file/Local, the Realtime rate for live). It never uses `AVAudioConverter` for downmix (it sums channels and caused the peak-3.97 bug). Unit-tested with a 48 kHz stereo fixture, asserting peak ≤ 1.0 and the correct duration.
-- New `AACEncoder` (app target, AVAssetReader → AVAssetWriter): spool or any file → m4a, 16 kHz mono, 32 kbps (600 s ≈ 2.4 MB). It reads via `MonoResampler` output. It replaces AudioExtractor's passthrough for every OpenAI upload. AudioExtractor stays only for Local file uploads, where the server transcodes.
+- New: the recorder **spools the full recording to disk** as it captures (`spool/<dictationId>.caf`, native PCM). It is the single owner of the full recording, and memory stays bounded.
+  - The spool is deleted once the dictation succeeds or its retry entry has been written.
+  - On launch, any orphan spool becomes a retry entry, so audio is never silently dropped.
+- New `MonoResampler` (WisprAltCore, pure Swift): averages channels to mono, then resamples (16 kHz for file/Local, the Realtime rate for live). It never uses `AVAudioConverter` for downmix, because that sums channels and caused the peak-3.97 bug.
+  - Unit-tested with a 48 kHz stereo 1 kHz sine fixture.
+  - The test asserts output RMS within ±1 dB of the input channel, a dominant frequency of 1 kHz ±1 %, the correct duration, and peak ≤ 1.0. Silence cannot pass.
+- New `AACEncoder` (app target, AVAssetReader → AVAssetWriter):
+  - Converts the spool or any file to m4a, 16 kHz mono, 32 kbps (600 s ≈ 2.4 MB), reading through `MonoResampler`.
+  - Used for every OpenAI upload. AudioExtractor (passthrough) stays only for Local file uploads, where the server transcodes.
+  - Part 3 runs an assumption test that AVAssetWriter accepts these settings and that `gpt-transcribe` accepts the resulting m4a.
 
 ### 1.3 Dictation provider seam
 - Lives in `WisprAltCore` (testable):
   ```
   protocol DictationProvider {               // NEW instance per dictation, created at start() from the captured mode
+    var inputSampleRate: Int? { get }         // rate append() expects; nil = provider ignores live frames
     func start()                              // non-blocking; may open a socket in the background
-    func append(_ frames: MonoFrames)         // already resampled to the provider's declared rate
+    func append(_ frames: MonoFrames)
     func finish(spool: URL) async throws -> DictationResult
     func cancel()
   }
-  struct DictationResult { text; formatting: applied|skipped(reason)|failed(reason)|off }
+  struct DictationResult { text; modelUsed; formatting: applied|skipped(reason)|failed(reason)|off }
   ```
 - `LocalServerProvider`:
-  - Today's VAD chunk stream (`/transcribe/dictate/stream`, 16 kHz mono after resample, since the server already accepts it), with a whole-file `/transcribe/dictate` fallback.
-  - Every request carries the dictation's `X-Client-Dedup-Id`. The id is generated at `start()` and persisted with any retry entry, so fallback, auto-retry and manual retry never double-count.
-- `OpenAIFileProvider` ignores frames. `finish` runs AACEncoder(spool) and makes one POST to `/v1/audio/transcriptions`.
+  - The VAD chunk stream to `/transcribe/dictate/stream` (16 kHz mono after resampling), with a whole-file `/transcribe/dictate` fallback.
+  - Every request carries the dictation's dedup id, a lowercase UUIDv4 generated at `start()` and persisted with any retry entry. It is sent on both the stream and whole-file routes.
+  - The server writes no new `dictations` **or** `usage_events` row for a dedup id it has already seen.
+- `OpenAIFileProvider` ignores frames. `finish` runs AACEncoder on the spool and makes one POST to `/v1/audio/transcriptions`.
 - `OpenAIRealtimeProvider`:
-  - `start()` opens the WebSocket in the background. Frames arriving before it is open are queued in order.
+  - `start()` opens the WebSocket in the background. Frames that arrive first are queued in order.
   - A single serial sender sends base64 PCM16 `input_audio_buffer.append`, with turn detection off.
-  - `finish` drains the queue, sends `commit`, and awaits the transcription `completed` event for at most 15 s, then closes the socket on success, error or cancel.
-  - If the socket never opened (short press), or it errors or times out, the dictation goes through `OpenAIFileProvider` with `gpt-transcribe`. This is same-vendor recovery of the same audio, not the removed cross-provider ladder.
-  - Event names, the rate and the per-commit audio limit are set by the Part 3 pre-flight against **both** live models, including one 2-minute clip. If the commit limit is below 600 s, the provider commits at VAD pauses and joins the results.
-- Concurrency: the next FN press starts a new recorder session as soon as the previous spool is closed (bounded wait of 2 s). Transcriptions run concurrently, but **results are delivered in start order**. Each result is injected into the app that was frontmost when its own dictation started.
+  - `finish` drains the queue, sends `commit`, and waits at most 15 s for the transcription `completed` event. It then closes the socket on success, error or cancel.
+  - Recovery: if the socket never opened (short press), or it errors or times out, the same audio goes through `OpenAIFileProvider` with `gpt-transcribe`. This is same-vendor recovery, not the removed cross-provider ladder. The result records `modelUsed`.
+  - Build it in two steps:
+    - First, commit-on-release only.
+    - Then, only if the Part 3 pre-flight shows a per-commit limit under 600 s, commit at VAD pauses. Each completion is mapped to its committed `item_id`, and the results are joined in commit order.
+  - The pre-flight covers both live models and includes one 2-minute clip.
+- Concurrency and delivery:
+  - The next FN press starts a new recorder session once the previous spool is closed (bounded wait of 2 s).
+  - Transcriptions run concurrently, and results are delivered in start order. A 30 s head deadline lets later results go ahead of a stuck one.
+  - A result is injected only if the app that was frontmost when its dictation started is still frontmost. Otherwise, and for every manual retry, the text goes to history and the clipboard with a toast. A Part 3 assumption test confirms the target-app check.
 - Errors:
-  - Transient (transport failure, 5xx, 429 with backoff) → one automatic retry.
-  - Permanent (401/403/400/`model_not_found`) → no retry. `model_not_found` resets the model to `gpt-transcribe` and shows a toast.
-  - Final failure → the m4a and its metadata (dedup id, mode, model, timestamp) go to `pending-retry/`, up to 20 entries. Never auto-deleted. Removed only after a successful retry or an explicit "Discard". The menu shows "Retry N pending".
-- The old `DictationFallbackQueue` data on upgrade: queued items already have text, so they move into DictationHistory and the old directory is deleted. Its `failed/` name is not reused.
+  - Transient (transport failure, 5xx, 429 with backoff): one automatic retry.
+  - Permanent (401/403/400/`model_not_found`): no retry. `model_not_found` resets the picker to the default of that kind (`gpt-transcribe` or `gpt-live-transcribe`) and shows a toast.
+  - Final failure: a retry entry `pending-retry/<id>/` is written. It holds:
+    - the audio, in the captured mode's format: m4a for Online, 16 kHz mono WAV for Local (which `/transcribe/dictate`'s soundfile decoder reads);
+    - metadata: dedup id, mode, model actually used, timestamp.
+  - Retry entries have **no cap** (≈2.4 MB per 10-minute entry). They are removed only after a successful retry or an explicit "Discard". The menu shows "Retry N pending". A retry uses its recorded mode and the *current* model setting.
+- The old `DictationFallbackQueue` folder is left untouched. It is absent on the owner's Mac, and the app never deletes it. The new code stops reading it.
+- `isMeetingActive` gates (SparkleController.swift:66, UpdateChecker.swift:127, +Dictation.swift:67) become "defer while a dictation is recording or transcribing". This lands in **Part 2**, together with the meeting removal, so every commit compiles.
 
 ### 1.4 Model catalog
-- `OpenAIModels.swift` (WisprAltCore) is a static table. Each entry has: id, kind (file|live), $/min, status + retire date, capability flags (prompt, keywords, languages, stream, response formats, max duration/commit), `verifiedOn`. Prices are re-checked against OpenAI's pricing page in Part 3.
-- The picker shows each model with its price in small secondary text and a "retires Feb 26, 2027" tag. Default `gpt-transcribe`. The diarize model is omitted. Request builders send only the fields a model's flags allow.
+- `OpenAIModels.swift` (WisprAltCore) is a static table.
+  - Each entry has: id, kind (file|live), $/min, status and retire date, capability flags (prompt, keywords, languages, stream, response formats, max duration/commit), and `verifiedOn`.
+  - Prices are re-checked against OpenAI's pricing page in Part 3.
+- The picker shows each model with its price in small secondary text and a "retires Feb 26, 2027" tag. Default `gpt-transcribe`. The diarize model is omitted.
+- Request builders send only the fields a model's flags allow.
+- File transcription uses the picked model if it is a file model, otherwise `gpt-transcribe`.
 
-### 1.5 Online file transcription
-- AACEncoder produces the audio. It is split by duration (catalog max, conservative default 20 min) at the lowest-energy point within ±10 s of each boundary, and each chunk gets the previous chunk's last ~200 characters as `prompt`.
-- A job folder holds `manifest.json` and `chunk-N.txt`. A relaunch resumes and skips finished chunks. Final TXT/JSON are written atomically, only once every chunk has succeeded. Cancel deletes the folder.
-- **Stated limitation:** Online produces TXT and JSON only. `gpt-transcribe` returns no timestamps, and `whisper-1` retires 2027-02-26. SRT/VTT remain in Local mode. The UI says so.
+### 1.5 File transcription jobs
+- Online:
+  - AACEncoder produces the audio. It is split by duration (catalog maximum, conservative default 20 min) at the lowest-energy point within ±10 s of each boundary.
+  - Each chunk gets the previous chunk's last ~200 characters as `prompt`.
+- Both modes share one job folder holding `manifest.json`: mode, server job id (Local), output dir and stem, chunk states, plus `chunk-N.txt` for Online.
+  - A relaunch resumes: Online skips finished chunks; Local resumes polling and downloads the results. This fixes audit #11 (+Transcription.swift:211).
+  - Final outputs are written atomically (tmp + rename) only after everything has succeeded. Cancel deletes the folder.
+- **Stated limitation:** Online produces TXT and JSON only, because `gpt-transcribe` returns no timestamps and `whisper-1` retires 2027-02-26. SRT/VTT stay in Local mode. The UI says so.
 
 ### 1.6 Secrets, logging, transport
-- The OpenAI key lives in Keychain `co.wispralt.openai` (account `default`), read once at launch or when set, then held in memory. A denied read shows "key missing". It is entered through a SecureField or `security add-generic-password -U -s co.wispralt.openai -a default -w` (docs warn about a one-time access prompt per signed build). It never goes into CLI args, URLs or logs.
-- Client logging is metadata only (lengths, durations, status, model). `Logger` stops marking messages public (Logger.swift:13-26). Remove the text logging at DictationAPI.swift:188-190 and +Dictation.swift:152. Local key export is removed (KeychainHelper.swift:175-196).
-- Local URLs: `https://` anywhere, and `http://` to loopback. Plain `http://` to any other host requires an explicit per-host toggle ("Allow unencrypted connection to <host> — your key and audio are visible on this network"). Docs recommend HTTPS via Tailscale (`tailscale serve`) or the optional tunnel. Enforced in Settings validation and ServerClient. `NSAllowsLocalNetworking` goes in Info.plist, and the exact ATS keys are confirmed by a Part 3 assumption test.
+- The OpenAI key lives in Keychain `co.wispralt.openai` (account `default`).
+  - It is read once, at launch or when set, then cached in memory. A denied read shows "key missing".
+  - Enter it through a SecureField, or with `security add-generic-password -U -s co.wispralt.openai -a default -w`. The docs warn about a one-time access prompt per signed build.
+  - It never appears in CLI args, URLs or logs.
+- Client logs are metadata only. `Logger` stops marking messages public (Logger.swift:13-26). The text logging at DictationAPI.swift:188-190 and +Dictation.swift:152 is removed. Local key export is removed (KeychainHelper.swift:175-196).
+- Local URLs:
+  - `https://` works anywhere; `http://` works to loopback.
+  - Plain `http://` to any other host needs an explicit per-host toggle that warns the key and audio are visible on the network.
+  - The docs recommend `tailscale serve` HTTPS or the optional tunnel.
+  - Enforced in Settings validation and in ServerClient.
+  - Info.plist gets `NSAllowsLocalNetworking`. The exact ATS keys are confirmed by a Part 3 assumption test.
 
 ### 1.7 `wispralt://` join link
-- `CFBundleURLTypes` and the handler are added in Part 3. The only supported form is `wispralt://join?host=<url>&invite=<id>`.
-- The app shows a confirmation sheet naming the host. On approval it redeems the invite over the transport rules in §1.6 (`POST /invites/redeem`) and receives a device key, which it stores in Keychain `co.wispralt`.
-- Invites are single-use with a 10-minute TTL, so the id is useless once redeemed or expired. Nothing else is configurable via URL.
+- `CFBundleURLTypes` and the handler are added in Part 3. Part 3 tests the handler against a stub redeem endpoint; the real end-to-end test comes in Part 4/8.
+- The only form is `wispralt://join?host=<url>&invite=<id>`.
+  - A confirmation sheet names the host.
+  - On approval, the app redeems the invite (`POST /invites/redeem`) under the §1.6 transport rules and gets a device key, stored in Keychain `co.wispralt`.
+- Invites are single-use and expire after 10 minutes. Nothing else can be configured through a URL.
 
 ### 1.8 Client history
-- `DictationHistory` holds the last 20 dictations (text, time, mode) in Application Support with mode 0600. It is protected at rest by FileVault, not by an iOS-style data-protection class.
+- `DictationHistory` keeps the last 20 dictations (text, time, mode) in Application Support, file mode 0600, protected at rest by FileVault.
 - Settings: keep for 7 days (default) / 30 days / off, plus "Clear history". "Copy last dictation" reads from it.
-- In Local mode the server `dictations` table is the system of record for analytics. The client history is a convenience cache.
+- In Local mode the server `dictations` table is the system of record for analytics.
+- **Stated limitation:** Online dictations never reach a host, so Data & Insights covers Local usage only.
 
 ### 1.9 Mercury smart formatting (pending owner decision pd:1, assumption applied)
-- **One implementation, in the client** (`WisprAltCore/Mercury`), used in both modes. The server copy is removed in Part 4.
-- The server's 34 safety vectors are ported to `mercury_vectors.json` and run in XCTest.
+- One implementation, in the client (`WisprAltCore/Mercury`), used in both modes. Server Mercury is ignored from Part 3 onward and removed in Part 4. `X-Smart-Format` is documented as removed for Local HTTP callers. The host needs no OpenRouter key.
+- The server's 34 safety vectors are ported to `mercury_vectors.json` (XCTest).
 - Policy:
   - opt-in toggle, with "Sends transcript text to OpenRouter" shown beside it;
   - key in Keychain `co.wispralt.mercury`;
   - skips dictations under 20 words;
   - 2.5 s budget;
-  - keeps the 70-110 % word-ratio guard;
-  - on any failure, returns the raw text.
-- The result status (applied / skipped: reason / failed: reason) shows in the caption.
-- The Part 3 benchmark measures latency and the applied rate over 20 real dictations and tunes the thresholds.
-- Sparkle and the update checker: the `isMeetingActive` gates (SparkleController.swift:66, UpdateChecker.swift:127, +Dictation.swift:67) become "defer while a dictation is recording or transcribing".
+  - 70-110 % word-ratio guard;
+  - any failure returns the raw text;
+  - the result status shows in the caption.
+- The Part 3 benchmark (20 real dictations) tunes the thresholds.
 
 ## 2. Local host (server)
 
 ### 2.1 Database
 - One SQLite file per host: `<data_dir>/wispralt.db`, WAL mode, `busy_timeout=5000`.
-- Repository layer: a short-lived connection per call or per thread. Every write is `BEGIN IMMEDIATE`.
-- JobStore state transitions stay single-transaction (the semantics of today's lock at store.py:122). Write errors are typed and never swallowed, with no drop-on-failure usage writer. Tests cover a concurrent usage write during a long job transaction.
+  - Short-lived connection per call or per thread. Writes use `BEGIN IMMEDIATE`.
+  - JobStore transitions run in a single transaction.
+  - Write errors are typed and never swallowed; there is no drop-on-failure usage writer.
+  - Tests cover a concurrent usage write during a long job transaction.
 - Tables:
   - `schema_migrations`
-  - `users`
-  - `api_keys` (user_id FK, sha256 `token_hash` UNIQUE, kind, role)
+  - `settings` (config metadata)
+  - `users` (+`source`, `source_id`, `disabled_at`)
+  - `api_keys` (user_id FK, sha256 `token_hash` UNIQUE, kind, role, `revoked_at`)
   - `invites`
   - `usage_events`
   - `dictations`
-  - `jobs`
+  - `jobs` (`deleted_at` soft delete)
   - `weekly_insights` (non-null `scope_key`)
   - `import_runs`
-- `source` and `source_id` exist only on `dictations`, `jobs`, `usage_events` and `weekly_insights`, the tables that receive imports.
-- Paths are stored relative to `data_dir`.
-- **Retention:** default 0 (keep forever) for dictations, jobs, usage and insights.
-  - Purging is opt-in per table: `wispralt retention set dictations 90`, with a mandatory `--preview` count first.
-  - Imported rows (`source != 'live'`) are never purged unless `--include-imported` is passed.
-  - The current policy and how many rows each policy would purge are shown in `status` and the portal.
-- **Backup:** `wispralt backup` sets a maintenance flag (the job worker and sweeps pause), then:
-  - snapshots the database with `VACUUM INTO`;
-  - tars the job outputs and staged inputs (`wav_path`);
-  - writes a manifest (counts, hashes, relative paths);
-  - clears the flag.
-- **Restore:**
-  1. stop services;
-  2. take an automatic pre-restore backup;
-  3. extract to a temp dir and run `PRAGMA integrity_check` and the manifest check;
-  4. swap `data_dir` atomically and remove stale `-wal`/`-shm` files;
-  5. restart, and roll back to the pre-restore backup on any failure.
-- `update` backs up before any migration. A `setup` rerun never rotates working keys.
+- `source` and `source_id` columns exist only on tables that receive imports. Paths are stored relative to `data_dir`.
+- **Retention:** default 0, meaning keep forever. This is a stated tradeoff: the old default was 90 days, and the owner asked never to destroy history silently.
+  - Purging is opt-in per table (`wispralt retention set <table> <days>`), with a mandatory `--preview` count first.
+  - Imported rows are never purged without `--include-imported`.
+  - `status` and the portal show the policy and how many rows would be purged.
+- **Job deletes:** API deletes only set `deleted_at`. The sweeper removes the files, and it pauses during backup, so a snapshot never refers to files that a concurrent request has removed.
+- **Backups:**
+  - Backups live outside `data_dir` (default `~/WisprAlt-Backups/`). `restore` and `uninstall --purge-data` refuse a location inside `data_dir`.
+  - `backup`: set the maintenance flag (the worker and sweeper pause) → `VACUUM INTO` snapshot → tar of job outputs and staged inputs → manifest (counts, hashes, relative paths) → clear the flag.
+  - `restore`: stop services → automatic pre-restore backup → extract to a temp dir, then run `PRAGMA integrity_check` and check the manifest → swap `data_dir` atomically and remove stale `-wal`/`-shm` files → restart. Any failure rolls back.
+  - `update` backs up before migrating. A `setup` rerun never rotates working keys.
 
 ### 2.2 Runtime
-- Package: `wispralt` (renamed from `wispralt_server` in one mechanical commit at the start of Part 2, together with `meeting/` → `files/`, so there is one sweep).
-  - The base install has the CLI, API, DB and portal.
-  - The `host` extra adds `parakeet-mlx` and `mlx-whisper` as lazy imports.
-  - A CI smoke test imports the base without MLX.
-- Modules: `dictation/` and `files/`, plain modules with no backend switch. `doctor` explains unsupported hardware.
-- Routes: `/transcribe/file` (+chunked) stays. Poll, download and delete move from `routes/meeting.py` to `/transcribe/file/{id}`, with owner-or-admin checks.
-  - No `/transcribe/meeting` alias: there is no live install, and the docs (API.md, INTEGRATION-GUIDE.md, OPENAI-COMPAT.md) are updated in the same part.
+- Package `wispralt`: the rename from `wispralt_server`, together with `meeting/` → `files/`, is one mechanical commit at the start of Part 2.
+  - Until Part 4, the renamed server still uses its Postgres-backed `db.py`/`users/`/`usage/`, and tests stay green with the existing mocks.
+  - The base install holds the CLI, API, DB and portal. The `host` extra adds `parakeet-mlx` and `mlx-whisper` (lazy imports).
+  - An import smoke test without MLX runs as a local pytest from Part 4 and in CI from Part 8.
+- Modules: `dictation/` (Parakeet) and `files/` (mono **MLX Whisper large-v3-turbo**).
+  - Whisper stays as the file model: it is the only model here with segment timestamps for SRT/VTT, and it is proven on long files.
+  - No backend switch. `doctor` explains unsupported hardware.
+- Removed with meetings:
+  - pyannote, torch, torchaudio, matplotlib;
+  - the `HF_TOKEN` setting (config.py:32) and its setup prompt;
+  - the `mode=meeting` parameter and the `request_mode` meeting default (store.py:313, pipeline.py:390);
+  - diarize/silence/merge/deepfilter, and the torch shims.
+- Routes:
+  - `/transcribe/file` (plus chunked) stays.
+  - Poll, download and delete move from `routes/meeting.py` to `/transcribe/file/{id}`, with owner-or-admin checks.
+  - There is no `/transcribe/meeting` alias. API.md, INTEGRATION-GUIDE.md and OPENAI-COMPAT.md are updated in the same part.
   - `/v1` returns `model_not_found` for unknown models.
-  - The `uid<0` break-glass key is removed: it was a Postgres-outage escape hatch and is moot with SQLite.
+  - The `uid<0` break-glass key is removed.
 - Security: no key printing (admin.py:128), CSRF on every cookie mutation, chunk-index verification, metadata-only logs.
 
 ## 3. CLI + install
-- `wispralt` (argparse):
+- `wispralt` (argparse) commands:
   - `setup [--role host|client|both] [--non-interactive ...]`
   - `status`, `doctor`, `start|stop|restart`
-  - `users`, `keys`, `invite` (prints a `wispralt://join` link and a QR)
+  - `users`, `keys`, `invite` (prints a `wispralt://join` link)
   - `import [--dry-run]`, `backup`, `restore`, `retention`, `update`
   - `uninstall [--purge-data]`
   - `tunnel` (optional)
 - No secret ever passes in argv. The OpenAI key is entered in the app.
-- `install-state.json` records what `setup` created, separating `artifacts` (plists, venv, model dirs) from `data` (`data_dir`). Plain `uninstall` removes only artifacts. `--purge-data` first runs `backup` (unless `--no-backup`), then deletes the data.
-- launchd: user agents in `gui/$UID`, rendered from templates. `restart` re-bootstraps when a plist has changed. Old `co.wispralt.server` and cloudflared plists are detected and removed (they are artifacts of the wiped install). `doctor` warns that user agents run only while the user is logged in.
-- `install.sh`: Homebrew, ffmpeg and uv, then `uv tool install <this clone>[host]`, then `wispralt setup`. No quarantine stripping. A signed and notarized DMG ships when credentials exist; otherwise the build is local with documented first-launch approval. Install from a tagged release is a later option.
+- `install-state.json` records what `setup` created, split into `artifacts` (plists, venv, model dirs) and `data` (`data_dir`).
+  - Plain `uninstall` removes only the artifacts.
+  - `--purge-data` first runs `backup` (unless `--no-backup`) and then deletes the data.
+- launchd: user agents in `gui/$UID`, rendered from templates.
+  - `restart` re-bootstraps when a plist has changed.
+  - Old `co.wispralt.server` and cloudflared plists are detected and removed.
+  - `doctor` warns that user agents run only while you are logged in.
+- `install.sh`:
+  - Steps: Homebrew, ffmpeg and uv → `uv tool install <clone>/server` (base only) → `wispralt setup`.
+  - `setup` adds the `[host]` extra only for the host or both role, after `doctor` confirms Apple Silicon.
+  - It never strips the quarantine attribute.
+  - Building the client locally needs full Xcode and an Apple Development signing identity. `doctor` checks for both and reports what is missing (an owner prerequisite).
+  - Signed and notarized DMG when credentials exist; otherwise a local build with documented first-launch approval.
 
 ## 4. Portal + insights
 - FastAPI + Jinja + local HTMX/Alpine, redesigned.
-- First-admin token shown once in the terminal. Invites are one-time with a 10-minute TTL. Keys are shown once.
+  - The first-admin token is shown once, in the terminal.
+  - Invites are one-time with a 10-minute TTL. Keys are shown once.
+- Access: every user has a personal view of their own data. The team view is admin-only. Both are enforced by `user_id`/role in the repository queries, not only in templates, and tested, including source-id links.
 - Monitoring:
   - host, uptime/restarts, versions/updates;
   - CPU, memory, disk;
@@ -158,42 +214,48 @@ Context: single user, the old host was wiped, so there is no live install to sta
   - latency and error rates;
   - DB health, network;
   - clients: active (a request in the last 2 min) vs last seen.
-- Data tab: measured stats are computed locally and always shown. AI insights are optional (explicit provider, cost cap, privacy note), with each claim linked to its source ids, plus rerun and backfill.
+- Data tab:
+  - Measured stats are computed locally and always shown.
+  - AI insights are optional: explicit provider, cost cap, privacy note.
+  - Each claim links to its source ids. Rerun and backfill are supported.
 
 ## 5. Import (Part 7)
 - **Sources:**
-  - Supabase: a read-only export of users, token hashes, usage, and `fallback_events` (imported as legacy).
-  - The previous SQLite file (`dictations`, `jobs`, `weekly_insights`).
-  - Transcript files (TXT/JSON/SRT/VTT).
-- **Supabase access:** read-only SQL via the Supabase MCP `execute_sql`, SELECT-only, or a connection string the owner stores in Keychain `co.wispralt.supabase-import`. Every session sets `default_transaction_read_only=on`. If the project is paused, stop and ask the owner, because resuming it changes state.
-- **Identity mapping:**
-  - Each Supabase `users` row becomes a `users` row (same id) plus one `api_keys` row (its `token_hash`).
-  - The SQLite `api_key_id` column (which holds `users.id`, store.py:330,394) maps to `user_id`.
-  - Unmatched ids go to a `legacy-unknown` user and are listed in the report.
-  - Imports never collide with keys issued before the import: matching is by `token_hash`.
-- **Dedup across all sources:** sha256 of the normalized text plus the `created_at` minute when known (text-only for undated files). No mtime.
-- **Dry run:** per-source counts (new, duplicate, malformed, unmatched owner), with no writes.
-- **Resume:** each run is recorded in `import_runs` with a checkpoint. The report states counts, the earliest record, and gaps left by earlier retention. Nothing is fabricated.
+  - Supabase, via a read-only export: users (identity, display name, role, `revoked_at`), `usage_events`, and `fallback_events` (imported as legacy usage).
+  - Transcript files the owner points at: the client's transcript folder (`Settings.meetingsPath`, TranscriptStore.swift:22) and any TXT/JSON/SRT/VTT.
+  - An old SQLite file only if one is found. None is known to exist.
+- **Supabase access:**
+  - Read-only SELECT via the Supabase MCP (started in read-only mode if supported, with every session setting `default_transaction_read_only=on`), or a connection string the owner stores in Keychain `co.wispralt.supabase-import`.
+  - Part 7 assumption-tests that the read-only setting holds.
+  - If the project is paused, stop and ask the owner, because resuming it changes state.
+- **Identity:**
+  - Imported users get **new** local ids, with the old id kept in `users.source_id`. Every imported foreign key goes through an old-to-new map.
+  - **No credentials are imported**. Users revoked in Supabase are imported as `disabled_at`, and devices rejoin by invite.
+- **Dedup:**
+  - Re-imports are idempotent on a unique `(source, source_id)`.
+  - Transcript files dedup on a sha256 of the file content, scoped to the owner.
+  - There is no cross-source text dedup, because Supabase holds no text.
+- **Dry run:** per-source counts (new, duplicate, malformed, unmatched owner). Nothing is written.
+- **Resume:** `import_runs` checkpoints. The report states counts, the earliest record, and that no dictation text survives the wipe. Nothing is fabricated.
 
 ## 6. Inventory tables (required in part plans)
-- Part 2: a KEEP / DELETE / RENAME table covering:
-  - client `Server/`, `Storage/`, `Capture/`, `Hotkeys/`, `Update/`, `UI/`;
-  - server `meeting/`, `routes/`, `jobs/`;
-  - the SQLite-touched server files `db.py`, `auth.py`, `users/`, `usage/`, `admin/`, `insights/`, `ops/`, `migrations/`, `routes/telemetry.py`, `routes/dev_faults.py`, CI and tests (the deletions belonging to Part 4 are marked as such).
-- Part 5: a RETIRE / KEEP / FOLD-INTO-CLI table covering `scripts/*.sh`, `.claude/commands/*`, CLAUDE.md conventions, and the docs/OVERVIEW map.
+- **Part 2:** KEEP / DELETE / RENAME table covering:
+  - client: `Server/`, `Storage/`, `Capture/`, `Hotkeys/`, `Update/`, `UI/`;
+  - server: `meeting/`, `routes/`, `jobs/`;
+  - the SQLite-touched server files: `db.py`, `auth.py`, `users/`, `usage/`, `admin/`, `insights/`, `ops/`, `migrations/`, `routes/telemetry.py`, `routes/dev_faults.py`, CI and tests. Part 4 deletions are marked as such.
+- **Part 5:** RETIRE / KEEP / FOLD-INTO-CLI table covering `scripts/*.sh`, `.claude/commands/*`, the CLAUDE.md conventions and the docs/OVERVIEW map.
 
 ## 7. Sequencing and tests
-1. **Part 2:** a mechanical rename commit (package + `files/`), then the meeting/fallback removals. File transcription tests stay green at every commit.
-2. **Part 3:** real-API pre-flight first (gpt-transcribe; both live models, plus one 2-min clip; ATS; Keychain prompt). Then the audio pipeline, the provider seam, catalog, picker, join link, Mercury and history.
+1. **Part 2:** a mechanical rename commit, then the meeting/fallback removals and the `isMeetingActive` replacement. File transcription tests stay green at every commit.
+2. **Part 3:** real-API pre-flight first: gpt-transcribe; both live models plus a 2-minute clip; the AAC m4a check; ATS; the Keychain prompt; the injection target check. Then the audio pipeline, provider seam, catalog, picker, join-link handler, Mercury and history.
 3. **Part 4:** SQLite repositories, `import_rows`, invites, retention, backup/restore core, security fixes.
-4. **Part 5:** CLI + install.
-5. **Part 6:** portal + insights.
+4. **Part 5:** CLI and install.
+5. **Part 6:** portal and insights.
 6. **Part 7:** import.
-7. **Part 8:** release, E2E, cleanup.
+7. **Part 8:** release, E2E and cleanup.
 
-**Spend cap:**
-- `@real-openai` tests use clips of 10 s or less, at most 3 calls per model, plus one 2-min live clip.
-- A running cost tally is printed. The suite aborts above $1 cumulative, with the mission total at or under ~$5.
+**Spend cap:** `@real-openai` tests use clips of 10 s or less, at most 3 calls per model, plus one 2-minute live clip.
+- A running cost tally is printed. The suite aborts above $1 cumulative; the mission total stays at or under about $5.
 - With no key, the tests report BLOCKED.
 
-macOS CI arrives in Part 8. Every spec §12 scenario maps to a named test or manual step in the Part 8 report. Part 8 cleanup is `wispralt uninstall --purge-data --no-backup` on the test install, followed by a check that no LaunchAgents, models, venvs or DBs remain.
+macOS CI arrives in Part 8. Each spec §12 scenario maps to a named test or manual step in the Part 8 report. Part 8 cleanup runs `wispralt uninstall --purge-data --no-backup` on the test install, then checks that no LaunchAgents, models, venvs or DBs remain.
