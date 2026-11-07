@@ -177,7 +177,7 @@ async def metrics(request: Request) -> JSONResponse:
     parakeet.last_inference_at
         ISO-8601 timestamp of the most recent inference, or null.
     meeting.active
-        True if a file job is currently running.
+        True if a file job is queued or running.
     meeting.completed_24h / failed_24h
         File-job counts from the last 24 hours (JobStore).
     meeting.current_eta_s

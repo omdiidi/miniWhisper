@@ -1,6 +1,6 @@
 # Testing
 
-This file documents the regression suites run before merge / release. Unit tests live under `server/tests/` and `client/Tests/WisprAltCoreTests/` and are wired into CI by `.github/workflows/ci.yml` (server pytest on Ubuntu, client `swift build && swift test` on macOS). The **end-to-end transcription matrix** below was the gating regression suite for the MLX-Whisper swap and Phase 10 deletion of WhisperX; it now serves as the standing regression matrix for any future transcription-stack changes. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md) for the historical swap.
+This file documents the regression suites run before merge / release. Unit tests live under `server/tests/` and `client/Tests/WisprAltCoreTests/` and are wired into CI by `.github/workflows/ci.yml` (server pytest on Ubuntu, client `swift build && swift test` on macOS; locally `scripts/test-client.sh`). The **end-to-end transcription matrix** below was the gating regression suite for the MLX-Whisper swap and Phase 10 deletion of WhisperX; it now serves as the standing regression matrix for any future transcription-stack changes. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md) for the historical swap.
 
 ## 4-Run Transcription Matrix
 
@@ -86,5 +86,7 @@ This section describes the rollback strategy that was in place during Phases 1�
 | `server/tests/test_auth_break_glass.py` | Postgres-unreachable → env-var bearer → admin path |
 | `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | 11-row injection truth table |
 | `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | 5-case secure-field refusal pin |
+| `client/Tests/WisprAltCoreTests/FileJobContractTests.swift` | `FileJobContract.cancelledByUserReason` matches the server's cancel reason |
+| `client/Tests/WisprAltCoreTests/TranscriptsFolderDefaultTests.swift` | transcripts-folder default: stored path wins, existing `Meetings` kept, else `Transcripts` |
 
-Run with `pytest server/tests/` and `cd client && swift test`. CI runs both suites on every PR via `.github/workflows/ci.yml` (see [CONTRIBUTING.md](CONTRIBUTING.md#continuous-integration)).
+Client tests use **Swift Testing** (`import Testing`, `@Test`, `#expect`); the test target builds in Swift 5 language mode. Run them with `scripts/test-client.sh` (`swift build` + `swift test`; on a CommandLineTools-only Mac it adds the `-F`/`-rpath` flags for the CLT `Testing.framework` and turns off cross-import overlays, because the CLT copy of `_Testing_Foundation` has no module; it exports `WISPRALT_KEYCHAIN_TESTS=1` unless `CI` is set). Server tests: `pytest server/tests/` (locally `tmp/mission/part2/run-pytest.sh`). CI runs both suites on every PR via `.github/workflows/ci.yml` (see [CONTRIBUTING.md](CONTRIBUTING.md#continuous-integration)).

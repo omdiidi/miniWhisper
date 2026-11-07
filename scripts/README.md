@@ -93,6 +93,9 @@ export TEAM_ID="XXXXXXXXXX"
 Optional: set `SPARKLE_ED_PRIVATE_KEY` to a key file path to generate an
 appcast snippet at `client/build/appcast-snippet.xml`.
 
+### `test-client.sh`
+Builds the client and runs its Swift Testing suite (`swift build && swift test` in `client/`). On a CommandLineTools-only Mac it adds the flags that find the CLT `Testing.framework`. Exports `WISPRALT_KEYCHAIN_TESTS=1` unless `CI` is set. See `docs/TESTING.md`.
+
 ### `uninstall-client.sh`
 Run on the **client** Mac (not the server). Removes:
 1. Quits the running WisprAlt app

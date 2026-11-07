@@ -958,7 +958,7 @@ Structured server observability snapshot.
 | `parakeet.queue_depth` | Requests currently waiting for the single-thread executor |
 | `parakeet.last_inference_at` | ISO-8601 timestamp of most recent inference, or `null` |
 | `meeting.*` | The **file-job** block. The `meeting` key name is kept from the meeting era until a later schema pass. |
-| `meeting.active` | `true` while a file job is running |
+| `meeting.active` | `true` while a file job is queued or running |
 | `meeting.active_job_id` | UUID of the currently running job, or `null` |
 | `meeting.completed_24h` / `failed_24h` | Job counts from the last 24 hours |
 | `meeting.current_eta_s` | Estimated seconds until active job completes, or `null` |

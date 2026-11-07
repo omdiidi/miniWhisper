@@ -101,7 +101,7 @@ From Claude Code, use `/docs-check` to diff the file-to-doc map against recent e
 `.github/workflows/ci.yml` runs on every pull request and on pushes to `main` that touch `server/**`, `client/**` or the workflow itself. It has two jobs:
 
 - **server** (ubuntu-latest, Python 3.11): installs `ffmpeg` and the minimal test dependencies, stubs the Apple-Silicon-only MLX modules (`parakeet_mlx`, `mlx.core`), then runs `cd server && pytest tests/ -v`. No Hugging Face token is needed. `tmp/mission/part2/run-pytest.sh` reproduces this job locally.
-- **client** (macos-latest): `cd client && swift build && swift test`.
+- **client** (macos-latest): `cd client && swift build && swift test` (Swift Testing). `scripts/test-client.sh` reproduces it locally, including on a CommandLineTools-only Mac.
 
 `build-client.yml` (signed release build) and `lint-install.yml` (installer lint) are separate.
 

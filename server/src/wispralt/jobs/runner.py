@@ -2,7 +2,9 @@
 jobs/runner.py — In-process file transcription runner.
 
 Design decisions (v3 deltas P4#3 + P5#1 + P5#11):
-- One job at a time: asyncio.Semaphore(1) prevents concurrent submissions.
+- One job at a time: admission (``_workers``, checked under ``_submit_lock``)
+  rejects a second submission while a job is queued or running; the
+  asyncio.Semaphore(1) only serialises execution of admitted workers.
 - Dedicated ThreadPoolExecutor(max_workers=1): keeps file-job work isolated
   from the default asyncio thread pool used by other I/O tasks.
 - OOM guard: reject a new job if less than 2 GiB RAM is available before

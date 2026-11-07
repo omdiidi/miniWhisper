@@ -45,7 +45,7 @@ The following schema is the canonical contract between server output and client 
 
 ## Filename convention
 
-The client saves each file job into its own folder under the output folder chosen in Settings (default `~/Documents/WisprAlt/Meetings/`; the folder keeps its meeting-era name until a later rename):
+The client saves each file job into its own folder under the output folder chosen in Settings (default `~/Documents/WisprAlt/Transcripts/`; a Mac that already has `~/Documents/WisprAlt/Meetings/` keeps using it):
 
 ```
 <output folder>/Custom Transcriptions/<source stem>__<yyyymmdd-HHmmss>/

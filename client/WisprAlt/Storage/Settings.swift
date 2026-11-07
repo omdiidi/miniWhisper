@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import WisprAltCore
 import ServiceManagement
 
 /// Persistent user preferences backed by UserDefaults.
@@ -56,9 +57,10 @@ final class Settings: ObservableObject {
 
     /// Local directory where completed file transcripts are saved
     /// (custom transcriptions land in its `Custom Transcriptions` subfolder).
-    /// Defaults to ~/Documents/WisprAlt/Meetings. The property name, its
-    /// UserDefaults key and the folder name are kept so existing user data
-    /// stays where it is.
+    /// Default (`TranscriptsFolderDefault`): ~/Documents/WisprAlt/Meetings if
+    /// it already exists, else ~/Documents/WisprAlt/Transcripts; the result is
+    /// pinned on first launch so the folder never moves. The property name and
+    /// its UserDefaults key are kept from the meeting era.
     @Published var meetingsPath: URL {
         didSet {
             defaults.set(meetingsPath.path, forKey: Key.meetingsPath)
@@ -142,9 +144,16 @@ final class Settings: ObservableObject {
         self.defaults = suite
 
         // Load persisted values; fall back to defaults.
-        let storedMeetingsPath = suite.string(forKey: Key.meetingsPath).flatMap {
-            URL(fileURLWithPath: $0, isDirectory: true)
-        } ?? Settings.defaultMeetingsPath()
+        let rawMeetingsPath = suite.string(forKey: Key.meetingsPath)
+        let storedMeetingsPath = TranscriptsFolderDefault.resolve(
+            stored: rawMeetingsPath,
+            docs: Settings.documentsDirectory(),
+            exists: { FileManager.default.fileExists(atPath: $0.path) }
+        )
+        if rawMeetingsPath?.isEmpty ?? true {
+            // Pin the resolved default so the folder never moves later.
+            suite.set(storedMeetingsPath.path, forKey: Key.meetingsPath)
+        }
 
         let storedHold = suite.object(forKey: Key.holdMinDuration) as? Double ?? 0.30
         let storedPreferredInputUID = suite.string(forKey: Key.preferredInputDeviceUID)
@@ -194,14 +203,11 @@ final class Settings: ObservableObject {
         return url
     }
 
-    private static func defaultMeetingsPath() -> URL {
-        let docs = FileManager.default.urls(
+    private static func documentsDirectory() -> URL {
+        FileManager.default.urls(
             for: .documentDirectory,
             in: .userDomainMask
         ).first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents")
-        return docs
-            .appendingPathComponent("WisprAlt", isDirectory: true)
-            .appendingPathComponent("Meetings", isDirectory: true)
     }
 }
 

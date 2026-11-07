@@ -64,6 +64,7 @@ final class RecordingState: ObservableObject {
         phaseElapsedS = nil
         audioDurationS = nil
         activeJobID = nil
+        serverFinishingJobID = nil
         isFinalizing = false
     }
 

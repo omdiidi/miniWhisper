@@ -60,7 +60,10 @@ let package = Package(
         .testTarget(
             name: "WisprAltCoreTests",
             dependencies: ["WisprAltCore"],
-            path: "Tests/WisprAltCoreTests"
+            path: "Tests/WisprAltCoreTests",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
         )
     ]
 )

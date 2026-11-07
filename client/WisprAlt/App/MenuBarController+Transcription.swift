@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import WisprAltCore
 
 // MARK: - File transcription: upload, poll, cancel, resume
 
@@ -218,10 +219,14 @@ extension MenuBarController {
                 outputFormats = Array(outputs.keys)
                 break pollLoop
             case .failed(let reason):
-                if reason == Self.cancelledByUserReason {
+                if reason == FileJobContract.cancelledByUserReason {
                     // The user cancelled; the server confirmed it. Silent end.
                     throw CancellationError()
                 }
+                // A server failure is final: never resume this job id.
+                // Timeout / transport errors keep it for the next launch.
+                recordingState.activeJobID = nil
+                UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
                 throw FileJobError.serverFailed(reason)
             case .pending:
                 continue
@@ -347,10 +352,6 @@ extension MenuBarController {
 
     // MARK: - Cancel + resume
 
-    /// Server-side `failed` reason for a job the user cancelled
-    /// (`DELETE /transcribe/file/{id}` → 202, then the runner ends it).
-    static let cancelledByUserReason = "cancelled by user"
-
     /// True for the errors a user-initiated cancel produces: Task
     /// cancellation, a cancelled URLSession task, or the server confirming
     /// the cancel. Callers treat these as a silent end (no error toast).
@@ -412,6 +413,9 @@ extension MenuBarController {
         recordingState.phaseElapsedS = nil
         recordingState.uploadFraction = 0
         recordingState.isFinalizing = false
+        // Leave the processing icon now, not after the network round trip.
+        // A dictation that started meanwhile keeps its icon.
+        if mode != .dictating { mode = .idle }
 
         // 5) Tell the server. 202 = cancel accepted (the server finishes the
         //    cancel itself); 204 = already finished or gone. Either way the
@@ -421,7 +425,10 @@ extension MenuBarController {
             do {
                 let status = try await FileJobAPI.cancel(jobID)
                 if status == 202 || status == 204 {
-                    recordingState.serverFinishingJobID = nil
+                    // Only if it still names this job: a later job may own it now.
+                    if recordingState.serverFinishingJobID == raw {
+                        recordingState.serverFinishingJobID = nil
+                    }
                 } else {
                     Log.warning(
                         "FileJobAPI.cancel(\(raw)) returned unexpected HTTP \(status).",
@@ -435,7 +442,6 @@ extension MenuBarController {
                 )
             }
         }
-        self.mode = .idle
     }
 
     /// On app launch: if UserDefaults remembers an in-flight job id, set it
@@ -498,7 +504,7 @@ extension MenuBarController {
                 case .failed(let reason):
                     // "cancelled by user" is a silent end; anything else is
                     // logged (resume never toasts).
-                    if reason != Self.cancelledByUserReason {
+                    if reason != FileJobContract.cancelledByUserReason {
                         Log.warning("Resumed-job failed: \(reason)", category: "transcribe")
                     }
                     recordingState.activeJobID = nil
@@ -537,6 +543,7 @@ extension MenuBarController {
         // resumes polling it.
         if mode == .processing { mode = .idle }
         recordingState.activeJobID = nil
+        recordingState.serverFinishingJobID = nil
     }
 
     /// Map a thrown upload error to a user-readable banner string. Switches

@@ -99,7 +99,7 @@ After the permission wizard, the app is ready for server configuration.
 3. Collapse advanced settings (you don't need it for daily use). At the top:
    - **Open Portal** — opens `<server>/admin/login` in your browser. Admins land on the global dashboard; employees land on their own usage page. Same button for both roles.
    - **Open File Transcriptions** — reveals the `Custom Transcriptions` folder (one subfolder per file job) in Finder.
-   - **Open Transcripts Folder** — reveals the transcripts folder chosen in Settings (default `~/Documents/WisprAlt/Meetings/`; the name is kept from the meeting era).
+   - **Open Transcripts Folder** — reveals the transcripts folder chosen in Settings (default `~/Documents/WisprAlt/Transcripts/`; a Mac that already has `~/Documents/WisprAlt/Meetings/` keeps using it. The default is saved on first launch, so the folder never moves).
 4. Click **Test Connection** under the **Connection** section. It calls `/healthz`, `/readyz/dictation` and the authenticated `/me` in parallel and shows a single status line:
    - **Green** "Connected as <you> — dictation ready."
    - **Orange** "Connected as <you> — dictation degraded (file job using memory)" or "dictation pipeline still loading"
