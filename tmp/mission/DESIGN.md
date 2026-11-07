@@ -252,7 +252,7 @@ Context: single user, the old host was wiped, so there is no live install to sta
 - **Dry run:** per-source counts (new, duplicate, malformed, unmatched owner). Nothing is written.
 - **Resume:** `import_runs` checkpoints. The report states counts, the earliest record, and that no dictation text survives the wipe. Nothing is fabricated.
 
-## 5a. Requirements assigned to part plans (from review rounds 1-5; each part plan must satisfy and test them)
+## 5a. Requirements assigned to part plans (from review rounds 1-6; each part plan must satisfy and test them)
 - **Part 3 (client):**
   - **Injection.** When only the pid matches, inject only if the focused window title is unchanged; otherwise use the clipboard. Capture the target at FN press (deliberate change from release-time; stated in the plan).
   - **Realtime.** One overall deadline covers connect + drain + commit + completion, scaled to audio length, then falls back to the file path. Recovery runs only on transient or socket errors.
@@ -279,6 +279,24 @@ Context: single user, the old host was wiped, so there is no live install to sta
   - **Columns.** Export every non-credential column, including `kind`, `label`, `created_at`, `last_seen_at` and `notes`. Map `kind` to the local user or key kind.
   - **Integrity.** A per-table checksum computed in Postgres (`md5(string_agg(row_to_json(t)::text, '' ORDER BY id))`) is stored in `counts.json` and verified on import. Export is paged by key.
 - **Part 8:** isolated test root and end-state statement (§7).
+- **Round 6 additions (binding on the named parts):**
+  - **Part 2:** keep the Keychain item `co.wispralt.openrouter` and its accessors, because Mercury uses it. Delete only the audio-fallback callers.
+  - **Part 3:**
+    - Add an injection assumption test with two fields under the same window title. If the target can't be confirmed, fall back to the clipboard.
+    - Serialize clipboard injections, including the restore step.
+    - The one-off pre-flight sits outside the `@real-openai` suite cap, and the $1 abort is reconciled with it.
+    - Word the history protection as "relies on FileVault"; `doctor` reports `fdesetup status`.
+    - Stub the dedup id contract exactly as Part 4 defines it.
+  - **Part 4:** pin the dedup id field (header vs body; stream start vs finalize), and add a test that server `X-Smart-Format` is gone.
+  - **Part 5/6:** key rotation in the CLI and portal.
+  - **Part 7:**
+    - Compute the checksum over the exact exported columns, or drop the md5 for count equality plus a hash of the paged export.
+    - In the dry run, have the operator confirm a mapping from the owner's Supabase user to the local admin.
+    - Store the snapshot outside the repo (`~/WisprAlt-Backups/supabase-snapshot-<date>/`, 0700). It is never deleted.
+  - **Part 8:**
+    - The E2E uses test-scoped Keychain services and UserDefaults, or records and restores their prior state.
+    - A grep gate for personal values (see AUDIT finding 18).
+    - LICENSE and model attribution.
 
 ## 6. Inventory tables (required in part plans)
 - **Part 2:** KEEP / DELETE / RENAME table covering:
