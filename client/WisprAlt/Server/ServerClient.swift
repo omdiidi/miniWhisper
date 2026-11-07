@@ -232,7 +232,7 @@ final class ServerClient {
         }
     }
 
-    // MARK: - Offline-signature classifier (shared with fallback path)
+    // MARK: - Offline-signature classifier (shared with the origin retry)
 
     /// First-attempt elapsed-time threshold before a `URLError.timedOut`
     /// counts as "mini is offline" rather than "user is on bad wifi but

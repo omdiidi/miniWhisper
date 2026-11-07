@@ -133,8 +133,19 @@ echo "=== Step 4: kickstart launchd ==="
 if [ "$SKIP_RESTART" = "1" ]; then
     echo "  SKIP_RESTART=1 → skipping"
 else
-    launchctl kickstart -k "gui/$(id -u)/co.wispralt.server" 2>&1 || true
-    echo "  kickstart fired"
+    PLIST="$HOME/Library/LaunchAgents/co.wispralt.server.plist"
+    if [ -f "$PLIST" ] && ! grep -q '<string>wispralt.main:app</string>' "$PLIST"; then
+        # Plist predates the current module path (the pre-rename package name):
+        # regenerate it, or uvicorn crash-loops on ModuleNotFoundError.
+        echo "  plist targets an old module path; regenerating"
+        bash "$TARGET/scripts/server-launchd.sh" install || {
+            echo "ERROR: LaunchAgent regeneration failed" >&2
+            exit 4
+        }
+    else
+        launchctl kickstart -k "gui/$(id -u)/co.wispralt.server" 2>&1 || true
+        echo "  kickstart fired"
+    fi
 fi
 echo
 

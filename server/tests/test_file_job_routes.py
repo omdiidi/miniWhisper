@@ -275,6 +275,16 @@ def test_delete_done_job_removes_outputs_and_row(make_app, store, out_dir) -> No
     assert not any((out_dir / f"{jid}.{fmt}").exists() for fmt in _FORMATS)
 
 
+def test_delete_keeps_row_when_outputs_cannot_be_removed(
+    make_app, store, out_dir, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jid = _done_job(store, out_dir, owner=OWNER.id)
+    monkeypatch.setattr(transcribe_file_routes, "remove_job_outputs", lambda d, j: False)
+    resp = TestClient(make_app(OWNER)).delete(f"/transcribe/file/{jid}")
+    assert resp.status_code == 500
+    assert store.get(jid) is not None  # kept so a retry / the sweep can clean up
+
+
 # ── real runner ───────────────────────────────────────────────────────────────
 
 

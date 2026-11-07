@@ -797,6 +797,7 @@ Cancel a pending or running job, or remove a finished one. The client calls it t
 | Missing, or owned by someone else | **204** | Nothing (idempotent; no existence leak). |
 | `pending` or `running` | **202** | Cancel is requested. The status is then re-read: if the job finished in the meantime, its outputs and row are removed and the response is **204** instead. |
 | `done` or `failed` | **204** | Outputs (`{job_id}.{json,srt,vtt,txt}`) and the row are removed. |
+| `done` or `failed`, but an output file could not be removed | **500** `{"error"}` | The row is kept so a retried `DELETE` or the retention sweep can finish the cleanup. |
 
 **What a 202 means:**
 

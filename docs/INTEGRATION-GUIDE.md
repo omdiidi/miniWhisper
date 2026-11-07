@@ -26,8 +26,7 @@ For the full WisprAlt-native API (async file jobs, /me, admin), see
   `https://transcribe.integrateapi.ai/admin/keys/new` (admin only), or ask
   your operator to mint one for you (see
   [ADMIN.md → Integration Keys](ADMIN.md#integration-keys)). Integration
-  keys are scoped to `/v1/*` only — they cannot access `/me/*` or
-  `/telemetry/*`. For programs, that's exactly what you want.
+  keys are scoped to `/v1/*` only — they cannot access `/me/*`. For programs, that's exactly what you want.
 
 ---
 

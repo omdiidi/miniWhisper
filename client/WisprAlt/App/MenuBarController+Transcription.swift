@@ -184,6 +184,13 @@ extension MenuBarController {
         activeUploadSession = nil
         recordingState.lastUploadProgressAt = nil
         recordingState.isFinalizing = false
+        // A cancel that landed while the upload was completing already reset
+        // local state; cancel the job the server just created and end silently
+        // instead of re-publishing it as active.
+        if Task.isCancelled {
+            _ = try? await FileJobAPI.cancel(jobID)
+            throw CancellationError()
+        }
         // Make the job id observable + persistent so a process restart can
         // resume polling and the UI can render Cancel + View-server-log.
         recordingState.activeJobID = jobID.raw
@@ -341,6 +348,15 @@ extension MenuBarController {
     static func isCancellation(_ error: Error) -> Bool {
         if error is CancellationError { return true }
         if let urlErr = error as? URLError, urlErr.code == .cancelled { return true }
+        if let chunkErr = error as? ChunkedUploaderError {
+            switch chunkErr {
+            case .initFailed(let underlying), .chunkUploadFailed(let underlying),
+                 .finalizeFailed(let underlying):
+                return isCancellation(underlying)
+            case .invalidFile, .fileTooLarge:
+                return false
+            }
+        }
         return false
     }
 
@@ -426,7 +442,9 @@ extension MenuBarController {
         recordingState.activeJobID = raw
         self.mode = .processing
         self.recordingState.uploadFraction = 0  // clear so "Uploading 100%" stops showing
+        fileJobsInFlight += 1
         activeJobTask = Task { @MainActor [weak self] in
+            defer { self?.fileJobsInFlight -= 1 }
             await self?.resumePollingForJob(JobID(raw: raw))
         }
     }
@@ -497,6 +515,10 @@ extension MenuBarController {
                 category: "transcribe"
             )
         }
+        // Timed out or polling failed: stop presenting the job as processing
+        // (that would keep `isBusy` true and block updates forever). The job id
+        // stays in UserDefaults, so the next launch resumes polling it.
+        if mode == .processing { mode = .idle }
     }
 
     /// Map a thrown upload error to a user-readable banner string. Switches
@@ -564,6 +586,12 @@ extension MenuBarController {
     /// hands off to the async pipeline.
     @MainActor
     func transcribePickedFile() {
+        // One file job at a time: a second Task would overwrite `activeJobTask`
+        // and the shared job state, so Cancel could no longer reach the first.
+        guard fileJobsInFlight == 0 else {
+            Log.info("Transcribe file ignored: a file job is already running.", category: "transcribe")
+            return
+        }
         // Bring the app to front so the modal sheet appears reliably above
         // the menubar popover (which is .transient and will dismiss).
         NSApp.activate(ignoringOtherApps: true)
@@ -583,7 +611,9 @@ extension MenuBarController {
         // Decouple the panel cleanup from the async pipeline. The Task is
         // held in `activeJobTask` so `cancelActiveTranscription()` stops its
         // upload/poll loop.
+        fileJobsInFlight += 1
         activeJobTask = Task { @MainActor [weak self] in
+            defer { self?.fileJobsInFlight -= 1 }
             await self?.handlePickedFile(picked)
         }
     }

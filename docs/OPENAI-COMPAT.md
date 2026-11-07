@@ -257,8 +257,8 @@ Break-glass admin tokens bypass the per-token limit.
 ## Key kinds: employee vs integration
 
 WisprAlt tokens have a `kind` field:
-- **`kind='employee'`** — minted via `/admin/users/new`. For human employees using the macOS client. Has access to `/v1/*`, `/me/*`, `/telemetry/*`, and (if `role='admin'`) `/admin/*`.
-- **`kind='integration'`** — minted via `/admin/keys/new`. For third-party programs. Has access to `/v1/*` ONLY. Blocked from `/me/*` and `/telemetry/*` with a 403 (those surfaces are for humans, not programs).
+- **`kind='employee'`** — minted via `/admin/users/new`. For human employees using the macOS client. Has access to `/v1/*`, `/me/*`, and (if `role='admin'`) `/admin/*`.
+- **`kind='integration'`** — minted via `/admin/keys/new`. For third-party programs. Has access to `/v1/*` ONLY. Blocked from `/me/*` with a 403 (that surface is for humans, not programs).
 
 For drop-in use with `openai-python` or similar, mint a `kind='integration'` key.
 

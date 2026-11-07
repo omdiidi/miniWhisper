@@ -37,6 +37,8 @@ removal or a rename; nothing is added except CI.
 
 - **Package rename.** `server/src/wispralt_server` → `server/src/wispralt`,
   and `meeting/` → `files/`. Run the server with `uvicorn wispralt.main:app`.
+  `scripts/deploy-server.sh` regenerates an existing LaunchAgent whose plist
+  still names the old module, so in-place upgrades keep booting.
 - **File-job routes moved** to `/transcribe/file/{id}` (poll),
   `/transcribe/file/{id}/download/{fmt}` and `DELETE /transcribe/file/{id}`,
   owner-or-admin only (anything else looks missing: 404 / 204). The `mode`
@@ -54,7 +56,8 @@ removal or a rename; nothing is added except CI.
   `words: []`, and file audio no longer passes through the denoise stub.
 - **File model lifecycle.** MLX Whisper loads lazily on the first file job
   and is evicted when idle (`FILE_MODEL_IDLE_EVICTION_SECONDS`, renamed from
-  the meeting-era setting).
+  the meeting-era setting `MEETING_IDLE_EVICTION_SECONDS`, which is now
+  ignored: rename it in an existing `server/.env`).
 - **Update safety.** An update relaunch is refused while the app is busy
   (dictating, uploading or processing a file job, or a dictation in flight).
 - **Admin portal.** Rows stored with `kind='meeting'` are displayed as

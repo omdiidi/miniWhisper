@@ -114,6 +114,12 @@ class FileJobRunner:
         # C8: submit lock prevents TOCTOU race between the semaphore check,
         # store.create, and asyncio.create_task.  All three must be atomic.
         self._submit_lock = asyncio.Lock()
+        # Worker tasks spawned but not yet finished (queued OR running). The
+        # busy check reads this, not ``_semaphore.locked()``: a task created by
+        # one submit has not acquired the semaphore yet when the next submit
+        # runs, so the semaphore alone would admit a second job. The set also
+        # holds strong references so the event loop cannot drop a task.
+        self._workers: set[asyncio.Task[None]] = set()
 
     # ── public properties ──────────────────────────────────────────────────────
 
@@ -148,11 +154,11 @@ class FileJobRunner:
 
         Raises FileJobInProgressError (the route converts it to HTTP 429 with
         ``code`` in the body) if:
-        - A job is already running (semaphore locked) → ``file_job_busy``, OR
+        - A job is already queued or running → ``file_job_busy``, OR
         - Available RAM is below 2 GiB (P5#11 OOM guard) → ``insufficient_memory``.
         """
         async with self._submit_lock:
-            if self._semaphore.locked():
+            if self._workers:
                 raise FileJobInProgressError(
                     "file job in progress: another file is currently being transcribed",
                     code="file_job_busy",
@@ -169,7 +175,7 @@ class FileJobRunner:
                 client_app_version=client_version,
                 api_key_id=api_key_id,
             )
-            asyncio.create_task(self._run_source(jid, src_path))
+            self._spawn(jid, src_path)
             return jid
 
     async def reenqueue_pending(self) -> None:
@@ -204,9 +210,15 @@ class FileJobRunner:
                 )
                 self.store.set_failed(jid, "max retries exceeded")
                 continue
-            asyncio.create_task(self._run_source(job.id, Path(src_path)))
+            self._spawn(job.id, Path(src_path))
 
     # ── private ───────────────────────────────────────────────────────────────
+
+    def _spawn(self, jid: str, src_path: Path) -> None:
+        """Start a worker task for *jid* and track it until it finishes."""
+        task = asyncio.create_task(self._run_source(jid, src_path))
+        self._workers.add(task)
+        task.add_done_callback(self._workers.discard)
 
     async def _run_pipeline_inner(
         self,

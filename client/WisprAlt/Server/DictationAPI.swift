@@ -73,7 +73,7 @@ enum DictationAPI {
             } catch {
                 Log.warning(
                     "DictationAPI: streaming failed (\(error)); falling back with dedup=\(dedupId).",
-                    category: "fallback"
+                    category: "dictation"
                 )
                 await session.abort()
                 // Thread the same dedup id through the origin retry path so the
@@ -113,7 +113,7 @@ enum DictationAPI {
             if !ServerClient.shared.isOfflineSignature(serverAttempt) {
                 throw err
             }
-            Log.info("DictationAPI: origin attempt 1 → offline signature; retrying once.", category: "fallback")
+            Log.info("DictationAPI: origin attempt 1 → offline signature; retrying once.", category: "dictation")
         }
 
         // Attempt 2 — origin retry.
@@ -126,7 +126,7 @@ enum DictationAPI {
             if !ServerClient.shared.isOfflineSignature(serverAttempt) {
                 throw err
             }
-            Log.warning("DictationAPI: origin attempt 2 → offline confirmed; giving up.", category: "fallback")
+            Log.warning("DictationAPI: origin attempt 2 → offline confirmed; giving up.", category: "dictation")
             throw err
         }
     }

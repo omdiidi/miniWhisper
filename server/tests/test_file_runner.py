@@ -295,14 +295,25 @@ async def test_cancel_after_executor_returns_discards_result(
 
 async def test_runner_raises_coded_errors(store: JobStore, monkeypatch: pytest.MonkeyPatch) -> None:
     runner = FileJobRunner(store)
-    await runner._semaphore.acquire()
-    try:
-        with pytest.raises(FileJobInProgressError) as busy:
-            await runner.submit_source_or_429(Path("/tmp/a.m4a"))
-        assert busy.value.code == "file_job_busy"
-        assert str(busy.value).startswith("file job in progress:")
-    finally:
-        runner._semaphore.release()
+    release = asyncio.Event()
+
+    async def held_worker(jid: str, src_path: Path) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_run_source", held_worker)
+    # Back-to-back submits with no await between them: the first worker has
+    # not acquired the semaphore yet, and the second submit must still 429.
+    await runner.submit_source_or_429(Path("/tmp/a.m4a"))
+    with pytest.raises(FileJobInProgressError) as busy:
+        await runner.submit_source_or_429(Path("/tmp/b.m4a"))
+    assert busy.value.code == "file_job_busy"
+    assert str(busy.value).startswith("file job in progress:")
+    release.set()
+    for _ in range(50):
+        if not runner._workers:
+            break
+        await asyncio.sleep(0)
+    assert not runner._workers  # finished worker no longer counts as busy
 
     monkeypatch.setattr(
         runner_mod, "psutil",

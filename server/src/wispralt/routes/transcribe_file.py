@@ -250,7 +250,7 @@ async def submit_file(
 #   3. POST /transcribe/file/chunked/{id}/finalize → returns {job_id}
 #
 # After finalize, the assembled file is fed through the SAME `submit_source_or_429`
-# code path the single-shot route uses — diarization, transcription, and the
+# code path the single-shot route uses — transcription, output writing and the
 # job-poll API are identical from there on. Stale chunked directories older
 # than 1 h are reaped by `staging.sweep_chunked` at startup (see main.py).
 
@@ -787,7 +787,13 @@ def delete_file_job(request: Request, job_id: str) -> Response:
             return Response(status_code=202)
 
     if job.output_dir is not None and not remove_job_outputs(Path(job.output_dir), job_id):
-        logger.warning("File job %s: some outputs could not be removed.", job_id)
+        # Keep the row: it is what lets a retried DELETE or the retention
+        # sweep find and remove the leftover transcript files.
+        logger.warning("File job %s: some outputs could not be removed; row kept.", job_id)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "could not remove job outputs; retry the delete"},
+        )
     store.delete(job_id)
     logger.info("File job %s deleted.", job_id)
     return Response(status_code=204)

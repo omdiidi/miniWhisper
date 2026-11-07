@@ -138,7 +138,7 @@ actor DictationStreamSession {
         for t in inFlight.values { t.cancel() }
         Log.warning(
             "stream session aborted: \(reason) sessionId=\(sessionId)",
-            category: "fallback"
+            category: "dictation"
         )
     }
 
@@ -177,7 +177,7 @@ actor DictationStreamSession {
         if !(200...299).contains(http.statusCode) {
             Log.warning(
                 "stream chunk \(index) → HTTP \(http.statusCode) sessionId=\(sessionId)",
-                category: "fallback"
+                category: "dictation"
             )
             throw StreamingFailure.serverRejected(code: http.statusCode)
         }
@@ -233,7 +233,7 @@ actor DictationStreamSession {
         if !(200...299).contains(http.statusCode) {
             Log.warning(
                 "stream finalize → HTTP \(http.statusCode) sessionId=\(sessionId)",
-                category: "fallback"
+                category: "dictation"
             )
             throw StreamingFailure.serverRejected(code: http.statusCode)
         }

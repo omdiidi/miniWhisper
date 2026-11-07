@@ -109,7 +109,7 @@ This file is the single source of truth for which documentation file covers each
 | `server/tests/test_file_job_routes.py` | [API.md](API.md) — poll/download/DELETE on `/transcribe/file/{id}`: owner-or-admin visibility, 202/204 cancel semantics, coded 429s, chunked finalize ignoring a stale `mode` |
 | `server/tests/test_file_runner.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — runner cancel rules (conditional set_running/set_done, one attempt per run, exception-path output cleanup) |
 | `server/tests/test_files_pipeline.py` | [ARCHITECTURE.md](ARCHITECTURE.md), [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md) — mono pipeline output shape (`model` ASR-only, Speaker 1, no words) and idle eviction |
-| `server/tests/test_app_wiring.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — route table (file-job routes present, meeting/telemetry/dev routes absent) and lifespan wiring |
+| `server/tests/test_app_wiring.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — route table (file-job routes present, meeting/telemetry/dev routes absent); startup wiring is checked by the live-boot step |
 | `server/tests/test_client_url_contract.py` | [API.md](API.md) — server routes match the URLs the Swift client builds |
 | `server/tests/test_ops_maintenance.py` | [ARCHITECTURE.md](ARCHITECTURE.md) — file-job retention sweep, staging sweeps, daily-sweep wiring, db_watcher log dedupe (no MLX/Postgres) |
 | `server/tests/test_dictate_corrupt_audio.py` | [API.md](API.md) — unit tests on the LibsndfileError → CorruptAudioError boundary |

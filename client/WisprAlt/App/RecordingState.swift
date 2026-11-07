@@ -23,7 +23,7 @@ final class RecordingState: ObservableObject {
 
     // MARK: - Per-phase progress (server-driven)
 
-    /// Raw phase name from the server (`ffprobe`, `transcribe`, `diarize`, …).
+    /// Raw phase name from the server (`ffprobe`, `ffmpeg_decode`, `transcribe`, `output_write`).
     @Published var phase: String? = nil
     /// Friendly phase label sent by the server (`"Transcribing"`, …). Falls
     /// back to the local map via `phaseLabelDisplay` when absent.

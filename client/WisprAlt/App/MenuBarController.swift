@@ -37,6 +37,12 @@ final class MenuBarController: NSObject {
     /// which a finishing dictation reads as not-busy. Main-thread only.
     var dictationsInFlight: Int = 0
 
+    /// Number of file-transcription Tasks (pick → upload → poll → download)
+    /// still running. Incremented before the Task is created and decremented
+    /// by the Task's own `defer`, so it cannot be fooled by the shared `mode`
+    /// (a hold-FN dictation rewrites `mode` mid-job). Main-thread only.
+    var fileJobsInFlight: Int = 0
+
     /// True while a dictation is recording or still transcribing/injecting, or
     /// a file upload / server job is in flight. `UpdateChecker` and
     /// `SparkleController` refuse to relaunch the app while this is true, so an
@@ -44,6 +50,7 @@ final class MenuBarController: NSObject {
     var isBusy: Bool {
         [.dictating, .converting, .uploading, .processing].contains(mode)
             || dictationsInFlight > 0
+            || fileJobsInFlight > 0
     }
 
     // MARK: - Sparkle update error
