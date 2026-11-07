@@ -41,7 +41,7 @@ server/.env
 
 # Logs
 *.log
-CLAUDE.local.md
+CLAUDE.local*.md
 
 # Local secrets / setup state (never commit)
 tmp/credentials.txt
@@ -64,3 +64,7 @@ client/Package.resolved
 .claude/settings.local.json
 .claude/cache/
 .claude/sessions/
+MISSION.*.md
+MISSION.*.log
+MISSION.*.banner
+.mission-backups/
