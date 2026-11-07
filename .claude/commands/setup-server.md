@@ -18,20 +18,17 @@ Run these and STOP with an actionable error if any fail:
 
 ## Brief the user on environment variables
 
-Read `server/.env.example` and explain each variable to the user in your own words. The two they must supply manually are:
+Read `server/.env.example` and explain each variable to the user in your own words. The one they must supply manually is:
 
-- **HF_TOKEN** — required. They must:
-  1. Create a HuggingFace account at https://huggingface.co.
-  2. Accept terms on https://huggingface.co/pyannote/speaker-diarization-3.1
-  3. Accept terms on https://huggingface.co/pyannote/segmentation-3.0
-  4. Generate a read token at https://huggingface.co/settings/tokens
 - **Cloudflare Tunnel token** — required. They get this from the Cloudflare Zero Trust dashboard → Networks → Tunnels → Create a tunnel → save the install command (the long string after `cloudflared service install`).
+
+No Hugging Face token is needed: both models (Parakeet for dictation, MLX Whisper for file transcription) are public.
 
 ## Run the orchestrator
 
 `bash scripts/setup-server.sh`
 
-The script handles: ffmpeg install, `uv sync`, model downloads (~5.6GB, with retries and per-model progress), API key generation (chmod 600), Cloudflare Tunnel registration (token via stdin, never written to .env), launchd registration with `ExitTimeOut=15`, and a final `doctor.sh` health check.
+The script handles: ffmpeg install, `uv sync`, model downloads (~2.7GB, with retries and per-model progress), API key generation (chmod 600), Cloudflare Tunnel registration (token via stdin, never written to .env), launchd registration with `ExitTimeOut=15`, and a final `doctor.sh` health check.
 
 ## After completion
 

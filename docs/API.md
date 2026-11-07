@@ -21,19 +21,17 @@ The bearer is sha256-hashed and resolved against `wispralt.users` via the asyncp
 **Unauthenticated endpoints** (probe-style + admin login, no API key required):
 - `GET /healthz` — liveness probe
 - `GET /readyz/dictation` — dictation-pipeline readiness probe
-- `GET /readyz/meeting` — meeting-pipeline readiness probe
 - `GET /admin/login` and `POST /admin/login` — admin UI login form (chicken-and-egg: must be reachable without the cookie it sets)
 - `GET /me/login` and `POST /me/login` — employee portal login form (Phase 2; same chicken-and-egg reason)
 
 These are intentionally open so Kubernetes-style probes, Cloudflare health checks, and external monitoring can poll them without API credentials. The probes expose only ready-flag booleans + free RAM in MB — no user data, no audio, no model output.
 
 **Bearer required:**
-- `POST /transcribe/dictate`, `POST /transcribe/meeting`, `GET /transcribe/meeting/{id}`, `GET /transcribe/meeting/{id}/download/{fmt}`, `DELETE /transcribe/meeting/{id}`
+- `POST /transcribe/dictate`, `POST /transcribe/file` (+ chunked), `GET /transcribe/file/{id}`, `GET /transcribe/file/{id}/download/{fmt}`, `DELETE /transcribe/file/{id}`
 - `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/models/{id}` (OpenAI-compatible drop-in surface — see [OPENAI-COMPAT.md](OPENAI-COMPAT.md))
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
 - `GET /me/dictations/last` (v0.5.0 — caller's most recent non-deleted dictation; powers the "Copy last dictation" menubar button)
-- `POST /telemetry/cloud-dictation` (Plan A — **Bearer-only**, cookie auth is explicitly rejected with 401)
 - `GET /metrics`
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
 - `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
@@ -44,7 +42,7 @@ Every `/transcribe/*` route and `/transcribe/dictate` accept an
 `X-WisprAlt-Client-Version` header. The Swift client sets it on every
 server-bound request (format `"<short>+<build>"`, e.g. `"0.3.1+1"`). The
 value is recorded with the persisted transcript on the row (`jobs.client_app_version`
-for meeting/file, `dictations.client_app_version` for dictation) so the
+for file jobs, `dictations.client_app_version` for dictation) so the
 Phase 2 weekly-insights cron can group captured data by shipped build.
 Missing → stored as NULL. Capture is unconditional and transparent; the
 header is informational only and never affects routing, auth, or rate
@@ -69,11 +67,11 @@ Enforced by `middleware/rate_limit.py` (per-IP, in-memory rolling window):
 | Route group | Limit |
 |---|---|
 | `POST /transcribe/dictate` | 60 requests per 60-second window (configurable: `DICTATE_RATE_PER_MIN`) |
-| `POST /transcribe/meeting` | 4 requests per 3600-second window (configurable: `MEETING_RATE_PER_HOUR`) |
 | `GET /readyz/*`, `GET /healthz` | 120 requests per 60-second window (configurable: `PROBE_RATE_PER_MIN`). Cloudflare's typical 5–10s health-check cadence sits well under this; the cap exists to bound probe-flood damage on the unauthenticated probe endpoints. |
-| `POST /telemetry/*` | 10 requests per 60-second window (configurable: `telemetry_per_min`). Each batch carries up to 200 cloud-fallback dictations, so the ceiling is 2000 dictations/minute per IP. |
 
-Exceeded limits return **429** with a `Retry-After` header (value = window duration in seconds).
+Exceeded limits return **429** with a `Retry-After` header (value = window duration in seconds). These rate-limit 429s carry **no** `code` field; the file-job busy 429s (see [`POST /transcribe/file`](#post-transcribefile)) do, which is how clients tell them apart.
+
+`/transcribe/file` has no per-IP rate limit: the runner allows one file job at a time and rejects the rest with a coded 429.
 
 **Client IP extraction:** When deployed behind Cloudflare Tunnel, rate limits use the real client IP from the `CF-Connecting-IP` header (set by Cloudflare, cannot be spoofed by clients). Falls back to the leftmost `X-Forwarded-For` entry, then the TCP remote address.
 
@@ -104,7 +102,7 @@ Readiness probe for the dictation (Parakeet) endpoint.
 
 | Header | When present |
 |---|---|
-| `X-Dictation-Degraded: true` | A meeting job is currently running (`app.state.meeting_active_flag == True`). Dictation still works but unified memory is under pressure. |
+| `X-Dictation-Degraded: true` | A file job is running (`app.state.file_runner.active`) or the file model is lazy-loading (`files.pipeline.is_loading()`). Dictation still works but unified memory is under pressure. |
 
 **Response 200** — Parakeet is warm and ready:
 ```json
@@ -118,45 +116,7 @@ Readiness probe for the dictation (Parakeet) endpoint.
 
 ---
 
-### `GET /readyz/meeting`
-
-**Auth:** None required.
-
-Readiness probe for the meeting pipeline. Meeting models (mlx-whisper + Pyannote) load lazily on the first meeting job — see [ARCHITECTURE.md → MeetingPipeline](ARCHITECTURE.md#components). This endpoint reports whether the load has happened yet, but **does not gate on it**: the server returns 200 as long as RAM is sufficient, because the lazy loader is wired and will succeed when invoked.
-
-**Contract change (2026-04-29):** previously this endpoint returned 503 until eager bootstrap completed. It now returns 200 from server start onward when RAM is sufficient regardless of whether models are warm. Any external monitor that gated on 503-until-warm must be updated.
-
-**Response body fields (always present, both on 200 and 503):**
-
-| Field | Type | Notes |
-|---|---|---|
-| `available_mb` | int | `psutil.virtual_memory().available` in MiB. |
-| `models_warm` | bool | `True` iff mlx-whisper + Pyannote are resident. False on cold start. |
-| `models_loading` | bool | `True` iff a lazy load is currently in flight (derived from `_load_lock.locked() and not models_warm`). |
-
-**Response 200** — RAM sufficient (≥ 2 GiB), models warm:
-```json
-{ "status": "ok", "available_mb": 9216, "models_warm": true, "models_loading": false }
-```
-
-**Response 200** — RAM sufficient (≥ 2 GiB), models cold (server just started; first meeting will pay the 5–30s lazy-load cost):
-```json
-{ "status": "ok", "available_mb": 9216, "models_warm": false, "models_loading": false }
-```
-
-**Response 503** — insufficient RAM (< 2 GiB available):
-```json
-{ "status": "not_ready", "detail": "Insufficient available memory", "required_mb": 2048, "available_mb": 1800, "models_warm": false, "models_loading": false }
-```
-
-**Interpretation matrix:**
-
-| `status` | `models_warm` | `available_mb` | What it means |
-|---|---|---|---|
-| 200 | true | ≥ 2048 | Steady state — submit and go. |
-| 200 | false | ≥ 2048 | Ready but cold — first meeting will pay 5–30s load. |
-| 503 | true | < 2048 | RAM tight — `runner.submit_or_429` will reject with 429 until RAM frees. |
-| 503 | false | < 2048 | Cold AND tight — first meeting will likely fail OOM guard before loading. Free RAM first. |
+There is no readiness probe for file transcription: the file model (MLX Whisper) loads lazily on the first file job and is evicted when idle, so it is normally cold. `GET /metrics` → `meeting.models_warm` reports its current state. (The meeting readiness probe was removed with the meeting pipeline and now returns 404.)
 
 ---
 
@@ -491,7 +451,7 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 **Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
 
-Per-employee weekly insights page. Returns the most recent `weekly_insights` row with `scope='person'` for the calling user, plus a time-range stats grid (transcript volume, word count, dictation/meeting split) for the selected window.
+Per-employee weekly insights page. Returns the most recent `weekly_insights` row with `scope='person'` for the calling user, plus a time-range stats grid (transcript volume, word count, dictation/file-transcription split) for the selected window.
 
 **Query parameters:**
 
@@ -523,17 +483,17 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 **Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
 
-Personal transcript archive — the calling user's own dictations + meetings + custom file transcriptions in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `api_key_id` AND `deleted_at IS NULL`).
+Personal transcript archive — the calling user's own dictations + file transcriptions (including legacy meeting rows) in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `api_key_id` AND `deleted_at IS NULL`).
 
 **Query parameters:**
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `range` | enum | `30d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all`. Reuses `insights.timewindow.epoch_for_range`. |
-| `kind` | enum \| empty | unset | Either `dictation` or `meeting`. Empty string from a `<select>` is normalized to "no filter". |
+| `kind` | enum \| empty | unset | Either `dictation` or `meeting`. `meeting` is the stored value for every job row (file jobs included) and is **displayed** as "File transcriptions"; the value is migrated in a later schema pass. Empty string from a `<select>` is normalized to "no filter". |
 | `search` | string | unset | Free-text LIKE filter on the transcript body. Strings shorter than **3 chars after `.strip()`** are silently dropped to keep the scan bounded. |
 | `dict_cursor` | opaque | unset | Base64-urlsafe encoded `(created_at, row_id)` tuple for the dictations leg. Malformed → silently restart pagination. |
-| `jobs_cursor` | opaque | unset | Same shape, for the jobs (meeting/file) leg. |
+| `jobs_cursor` | opaque | unset | Same shape, for the jobs (file transcription) leg. |
 
 **Response 200** — full page (`me_history.html.j2`).
 
@@ -565,7 +525,7 @@ Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `
 
 | Field | Type | Notes |
 |---|---|---|
-| `kind` | enum | `dictation` or `meeting`. Anything else → 404. |
+| `kind` | enum | `dictation` or `meeting` (the stored value for job rows; shown as "File transcription"). Anything else → 404. |
 | `row_id` | string | Job UUID for `meeting`, integer row id for `dictation`. |
 
 **Query parameters:**
@@ -725,114 +685,60 @@ Source: `server/src/wispralt/routes/admin_data.py`.
 
 ---
 
-### `POST /telemetry/cloud-dictation`
-
-**Auth:** Bearer required. **Bearer-only** — a cookie-only request with no `Authorization` header is rejected with **401** even if the shared `wispralt_admin_token` cookie would normally satisfy auth. This stops a browser-CSRF abuse where a malicious site that holds the session cookie triggers ingest from a logged-in browser the user didn't initiate.
-
-Ingest a batch of cloud-fallback dictations from a Swift client. The macOS app enqueues every OpenRouter-served dictation locally (see [ARCHITECTURE.md → Cloud-fallback telemetry sync](ARCHITECTURE.md#cloud-fallback-telemetry-sync) for the queue + drain flow) and POSTs in batches once the mini is reachable again. Idempotent via `client_dedup_id` + the partial unique index on `dictations.client_dedup_id`.
-
-**Request:** `application/json`
-
-```json
-{
-  "dictations": [
-    {
-      "client_dedup_id": "1f5b0b71-f8e3-4f6f-9b21-2f6d7c2e9e02",
-      "text": "Hello world, this was dictated while the mini was offline.",
-      "dictated_at": 1747526471.0,
-      "word_count": 11,
-      "client_app_version": "0.3.1+1"
-    }
-  ]
-}
-```
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `dictations` | array | Yes | 1–200 items per batch. |
-| `dictations[].client_dedup_id` | string (UUID) | Yes | 36-char `^[0-9a-fA-F-]{36}$`. A fresh UUIDv4 per dictation; the same id must be used on every retry of the same dictation. |
-| `dictations[].text` | string | Yes | 1–200,000 chars. Whitespace-only entries are silently skipped. |
-| `dictations[].dictated_at` | number | Yes | UTC epoch seconds. Bounds-checked to `[now − 365d, now + 5min]`; out-of-range entries are logged and skipped. |
-| `dictations[].word_count` | integer \| null | No | Optional; defaults to `len(text.split())` when null. |
-| `dictations[].client_app_version` | string \| null | No | Up to 64 chars. Stored on the row for the same Phase 2 attribution as origin-served dictations. |
-
-**Response 200:**
-
-```json
-{ "inserted": 1, "received": 1 }
-```
-
-| Field | Description |
-|---|---|
-| `inserted` | Rows that actually landed (excludes `ON CONFLICT DO NOTHING` dedup conflicts and skipped entries). |
-| `received` | Items that passed pydantic validation. |
-
-A repeat batch with the same `client_dedup_id`s returns `{inserted: 0, received: N}` — the client uses this to confirm the batch is fully drained.
-
-**Errors:**
-
-| Code | Condition |
-|---|---|
-| 401 | Missing bearer header (including the cookie-only case described above). |
-| 403 | Caller is the break-glass admin (`user.id < 0`) — break-glass has no user row to attribute dictations to. |
-| 422 | Body fails pydantic validation (malformed UUID, batch too large, text too long, etc.). |
-| 429 | Per-IP telemetry rate limit (10 batches per 60-second window) exceeded. Includes `Retry-After: 60`. |
-| 503 | Postgres pool unavailable. |
-
-Source: `server/src/wispralt/routes/telemetry.py` (Plan A).
-
----
-
-### `POST /transcribe/meeting`
+### `POST /transcribe/file`
 
 **Auth:** Bearer required.
 
-Submit a 2-channel WAV for background transcription. Returns immediately with a job ID; poll `GET /transcribe/meeting/{job_id}` for status.
+Submit any audio or video container for background transcription with MLX Whisper (one mono stream; stereo is averaged). The route streams the upload to staging in its original container and returns immediately; the runner then runs ffprobe + ffmpeg and the Whisper pipeline. Poll `GET /transcribe/file/{job_id}` for status.
+
+There are no meetings and no `mode` field: every job is a single-speaker file job. An old client that still sends a `mode` form field is ignored (FastAPI drops undeclared fields).
 
 **Request:** `multipart/form-data`
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `file` | UploadFile | Yes | 2-channel 16kHz Float32 WAV (ch1=mic, ch2=system audio). |
-| `Content-MD5` header | string | Yes | Base64-encoded MD5 of the WAV body. Server verifies integrity after streaming to staging. |
-| `Content-Length` header | integer | Recommended | Enables fast pre-flight size check before body is read. |
+| `file` | UploadFile | Yes | Source container. Allowed extensions: `.m4a .mp3 .mp4 .mov .m4v .wav .aac .flac .opus .ogg .webm .caf .aiff`. |
+| `Content-Length` header | integer | Recommended | Enables pre-flight 413 + disk gate (free < `Content-Length × 2` → 507). |
 
-**Response 202:**
-```json
-{ "job_id": "550e8400-e29b-41d4-a716-446655440000", "status": "pending" }
-```
+**Response 202:** `{ "job_id": "...", "status": "pending" }`
 
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer token |
-| 413 | `Content-Length` exceeds `MAX_UPLOAD_BYTES` |
-| 422 | WAV header invalid, or `Content-MD5` mismatch (file corrupt in transit) |
-| 429 | A meeting job is already in progress OR available RAM < 2 GiB. Includes `Retry-After: 60` header. Body: `{"error": "...", "retry_after_s": 60}` |
-| 507 | Insufficient storage: free disk < 1.5× upload size |
+| 413 | Over `MAX_UPLOAD_BYTES` |
+| 415 | Unsupported extension |
+| 422 | ffprobe / ffmpeg rejected the source (no audio stream, decode failed) |
+| 429 | Runner busy. Body `{"error": "...", "retry_after_s": 60, "code": "..."}` plus `Retry-After: 60`. `code` is `file_job_busy` (a file job is already running, or still finishing after a cancel; only one runs at a time) or `insufficient_memory` (< 2 GiB available to start a job). |
+| 503 | Server low on memory (< 4 GiB available at the route boundary) |
+| 507 | Insufficient disk for upload + transcode |
+
+The `code` field is what the macOS client branches on (`file_job_busy` → "previous transcription still finishing"; `insufficient_memory` → the server's message). The per-IP rate limiter's 429s have no `code`.
+
+**Model load:** the file model (MLX Whisper) loads lazily on the first file job and is evicted after `FILE_MODEL_IDLE_EVICTION_SECONDS` (default 60) of idleness, so the first job after an idle spell pays the load cost. The load wall-clock is part of the `running` time (phase `transcribe_load`), not a separate status.
 
 ---
 
-### `GET /transcribe/meeting/{job_id}`
+### `GET /transcribe/file/{job_id}`
 
-**Auth:** Bearer required.
+**Auth:** Bearer required. The caller sees a job only if it owns it (`job.api_key_id == user.id`) or is an admin; legacy jobs with no owner are admin-only. Anything else is **404**, exactly like a missing job, so existence never leaks.
 
-Poll job status. The client should poll every 5 seconds.
+Poll job status. The client polls every few seconds.
 
 **Response 200:**
 ```json
 {
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "done",
-  "mode": "remote",
-  "error": null,
+  "mode": "single",
+  "request_mode": "file",
   "formats": ["json", "srt", "txt", "vtt"],
   "outputs": {
-    "json": "/transcribe/meeting/550e8400-e29b-41d4-a716-446655440000/download/json",
-    "srt":  "/transcribe/meeting/550e8400-e29b-41d4-a716-446655440000/download/srt",
-    "txt":  "/transcribe/meeting/550e8400-e29b-41d4-a716-446655440000/download/txt",
-    "vtt":  "/transcribe/meeting/550e8400-e29b-41d4-a716-446655440000/download/vtt"
+    "json": "/transcribe/file/550e8400-e29b-41d4-a716-446655440000/download/json",
+    "srt":  "/transcribe/file/550e8400-e29b-41d4-a716-446655440000/download/srt",
+    "txt":  "/transcribe/file/550e8400-e29b-41d4-a716-446655440000/download/txt",
+    "vtt":  "/transcribe/file/550e8400-e29b-41d4-a716-446655440000/download/vtt"
   }
 }
 ```
@@ -840,29 +746,28 @@ Poll job status. The client should poll every 5 seconds.
 | Field | Present when |
 |---|---|
 | `status` | Always. Values: `pending`, `running`, `done`, `failed`. |
-| `mode` | When `status == "done"`. Values: `remote`, `in_person`. |
-| `error` | When `status == "failed"`. Human-readable error string. |
+| `mode` / `request_mode` | When recorded on the row. Current jobs are `single` / `file`. |
+| `error` | When `status == "failed"`. A cancelled job reads `cancelled by user`. |
+| `progress` | When `status == "running"`: `phase`, `phase_label`, `chunk_index`, `total_chunks`, optional `phase_elapsed_s`, `audio_duration_s`. |
+| `serverFinishing` | `true` when `status == "running"` and a cancel was requested: the Whisper call is still running and its result will be discarded. |
 | `formats` | When `status == "done"`. Always `["json", "srt", "txt", "vtt"]`. Kept for backward compatibility. |
-| `outputs` | When `status == "done"`. Maps each format name to its download URL path. **Preferred** over `formats` for new clients. |
-| `attempts` | Always. Integer. Number of times this job has been set to `running`. Incremented each attempt. |
+| `outputs` | When `status == "done"`. Maps each format to its download URL. **Preferred** over `formats`. |
 
-**Retry policy:** Jobs that fail are automatically retried up to 3 times by the runner. After 3 failed attempts the job is marked `failed` with `error: "max retries exceeded"` and no further attempts are made.
+**Retry policy:** a job re-enqueued at startup is skipped and marked `failed` (`max retries exceeded`) once it has 3 attempts. Each run counts one attempt.
 
-**Lazy model load on first meeting:** the very first meeting job after a server restart triggers `pipeline._ensure_models_loaded()` (5–30s to load mlx-whisper + Pyannote into RAM). During this window the job's `status` is `running` — the load wall-clock is included in the running duration, not surfaced as a separate state. Subsequent meetings see no extra latency. Clients can pre-flight via `GET /readyz/meeting` (`models_warm: true` means the next meeting will skip the load).
-
-**Response 404** — job not found.
+**Errors:** 400 (malformed `job_id`), 404 (not found or not visible to the caller).
 
 ---
 
-### `GET /transcribe/meeting/{job_id}/download/{fmt}`
+### `GET /transcribe/file/{job_id}/download/{fmt}`
 
-**Auth:** Bearer required.
+**Auth:** Bearer required. Same ownership rule as the poll route.
 
 Stream a completed output file.
 
 **Path parameter `fmt`:** `json`, `srt`, `vtt`, or `txt`.
 
-**Response 200** — streaming file response with appropriate `Content-Type`:
+**Response 200** — streaming file response:
 
 | Format | Content-Type |
 |---|---|
@@ -875,41 +780,30 @@ Stream a completed output file.
 
 | Code | Condition |
 |---|---|
-| 400 | Unknown format string |
-| 404 | Job not found or not yet complete (`status != "done"`) |
-| 410 | Job is `done` but output file missing from disk (e.g. manually deleted) |
+| 400 | Unknown format string, or malformed `job_id` |
+| 404 | Job not found, not visible to the caller, or not yet `done` |
+| 410 | Job is `done` but the output file is missing from disk (e.g. swept by retention) |
 
 ---
 
-### `DELETE /transcribe/meeting/{job_id}`
+### `DELETE /transcribe/file/{job_id}`
 
-**Auth:** Bearer required.
+**Auth:** Bearer required. Same ownership rule as the poll route.
 
-Delete a job record and all associated output files. Called by the client after it has successfully downloaded all four formats.
+Cancel a pending or running job, or remove a finished one. The client calls it to cancel, and after it has downloaded all four formats.
 
-**Response 204** — success (idempotent: returns 204 even if job does not exist).
+| Job state | Response | Effect |
+|---|---|---|
+| Missing, or owned by someone else | **204** | Nothing (idempotent; no existence leak). |
+| `pending` or `running` | **202** | Cancel is requested. The status is then re-read: if the job finished in the meantime, its outputs and row are removed and the response is **204** instead. |
+| `done` or `failed` | **204** | Outputs (`{job_id}.{json,srt,vtt,txt}`) and the row are removed. |
 
-The handler deletes `{job_id}.json`, `{job_id}.srt`, `{job_id}.vtt`, and `{job_id}.txt` from the job's `output_dir`, then removes the database row.
+**What a 202 means:**
 
----
+- A **pending** job never starts: the runner's conditional `set_running` refuses a cancelled row, deletes the staged source and marks the job `failed: cancelled by user`.
+- A **running** job cannot be interrupted mid-transcribe. Whisper transcribes the whole file in one call, so the job keeps the model and the single job slot until that call returns. Only then is the result discarded: `set_done` refuses a cancelled row, the outputs are removed, the job ends `failed: cancelled by user` and `transcript_text` stays NULL. A new submission during that window gets 429 `code=file_job_busy`.
 
-### `POST /transcribe/file`
-
-**Auth:** Bearer required.
-
-Submit any audio or video container for transcription. The server runs ffprobe + ffmpeg to extract a canonical 16 kHz PCM WAV before queuing the job. Returns immediately with a job id; poll `GET /transcribe/meeting/{job_id}` for status (same poll route as `/transcribe/meeting`).
-
-**Request:** `multipart/form-data`
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `file` | UploadFile | Yes | Source container. Allowed extensions: `.m4a .mp3 .mp4 .mov .m4v .wav .aac .flac .opus .ogg .webm .caf .aiff`. |
-| `mode` | string | No | `file` (default — single-speaker) or `meeting` (diarized). Explicit form field; replaces the old channel-count heuristic. |
-| `Content-Length` header | integer | Recommended | Enables pre-flight 413 + disk-gate (free < `Content-Length × 2 → 507`). |
-
-**Response 202:** `{ "job_id": "...", "status": "pending" }`
-
-**Errors:** 413 (over `MAX_UPLOAD_BYTES`), 415 (unsupported extension), 422 (mode invalid OR ffprobe rejected the source), 429 (job already running), 503 (RAM <4 GiB), 507 (disk).
+The client treats 202 and 204 the same: it stops polling and clears its job state at once.
 
 ---
 
@@ -923,16 +817,14 @@ Open a chunked upload to bypass Cloudflare's 100 MB request-body cap on free / p
 
 ```json
 {
-  "mode": "file",
   "total_bytes": 524288000,
   "chunk_count": 10,
-  "original_filename": "meeting-2025-05-13.m4a"
+  "original_filename": "call-2025-05-13.m4a"
 }
 ```
 
 | Field | Type | Notes |
 |---|---|---|
-| `mode` | string | `file` or `meeting`. Same enum as `POST /transcribe/file`. |
 | `total_bytes` | integer | Size of the full file. Must be ≤ `min(MAX_UPLOAD_BYTES, 4_000_000_000)` — the 4 GB hard ceiling keeps the finalize concat inside Cloudflare's 100 s proxy timeout window. |
 | `chunk_count` | integer | `1 ≤ chunk_count ≤ 1000`. Client computes as `ceil(total_bytes / 50 MiB)`. |
 | `original_filename` | string | Used to recover the source extension for the assembled staging file. Suffix must be in the same allowlist as `POST /transcribe/file`. |
@@ -974,15 +866,15 @@ Upload a single chunk's raw bytes.
 
 **Auth:** Bearer required. **Owner must match the user that ran `/init`.**
 
-Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; on transient `MeetingInProgressError` (429) it also cleans up the assembled file so a retry starts fresh.
+Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; on a busy 429 (`FileJobInProgressError`) it also cleans up the assembled file so a retry starts fresh. A `mode` key left in a pre-upgrade `meta.json` is ignored, so such uploads finish as ordinary file jobs.
 
 **Request:** Empty body (`{}`).
 
 **Response 202:** `{ "job_id": "...", "status": "pending" }`
 
-From this point the client polls `GET /transcribe/meeting/{job_id}` exactly as it would for a single-shot `/transcribe/file` upload.
+From this point the client polls `GET /transcribe/file/{job_id}` exactly as it would for a single-shot `/transcribe/file` upload.
 
-**Errors:** 403 (ownership), 404 (upload not found), 409 (missing chunks or size mismatch), 429 (`MeetingInProgressError` — assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
+**Errors:** 403 (ownership), 404 (upload not found), 409 (missing chunks or size mismatch), 429 (same body and `code` as `POST /transcribe/file`; the assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
 
 **Stale-upload TTL:** chunked staging directories whose `meta.json` mtime is older than 1 h are reaped at server startup (and on demand by `ops.staging.sweep_chunked`). Each successful chunk write touches `meta.json` so actively-progressing uploads are never reaped.
 
@@ -1034,7 +926,10 @@ Structured server observability snapshot.
     "failed_24h": 0,
     "current_eta_s": null,
     "models_warm": true,
-    "models_loading": false
+    "models_loading": false,
+    "idle_seconds": 12.4,
+    "idle_eviction_threshold_s": 60,
+    "eviction_failures_total": 0
   },
   "memory": {
     "rss_mb": 731,
@@ -1046,11 +941,11 @@ Structured server observability snapshot.
     "free_gb": 42,
     "staging_count": 0
   },
-  "requests_total": {"transcribe/dictate:200": 312, "transcribe/meeting:202": 4},
+  "requests_total": {"transcribe/dictate:200": 312, "transcribe/file:202": 4},
   "errors_total": {"transcribe/dictate:422": 1},
   "latencies": {
     "transcribe/dictate": {"p50": 143.0, "p95": 198.5, "p99": 240.1},
-    "transcribe/meeting": {"p50": null, "p95": null, "p99": null}
+    "transcribe/file": {"p50": null, "p95": null, "p99": null}
   },
   "process_uptime_seconds": 3712.4
 }
@@ -1061,12 +956,15 @@ Structured server observability snapshot.
 | `parakeet.p50_ms` / `p95_ms` | Percentiles of the last 100 Parakeet inference calls |
 | `parakeet.queue_depth` | Requests currently waiting for the single-thread executor |
 | `parakeet.last_inference_at` | ISO-8601 timestamp of most recent inference, or `null` |
-| `meeting.active` | `true` while a meeting pipeline job is running |
+| `meeting.*` | The **file-job** block. The `meeting` key name is kept from the meeting era until a later schema pass. |
+| `meeting.active` | `true` while a file job is running |
 | `meeting.active_job_id` | UUID of the currently running job, or `null` |
 | `meeting.completed_24h` / `failed_24h` | Job counts from the last 24 hours |
 | `meeting.current_eta_s` | Estimated seconds until active job completes, or `null` |
-| `meeting.models_warm` | `true` iff mlx-whisper + Pyannote are resident (lazy-loaded on first meeting). See [`/readyz/meeting`](#get-readyzmeeting). |
+| `meeting.models_warm` | `true` iff the file model (MLX Whisper) is resident. It loads lazily on the first file job and is evicted when idle. |
 | `meeting.models_loading` | `true` iff a lazy load is currently in flight. |
+| `meeting.idle_seconds` / `idle_eviction_threshold_s` | Seconds since the file model was last used, and the eviction threshold (`FILE_MODEL_IDLE_EVICTION_SECONDS`). |
+| `meeting.eviction_failures_total` | Count of eviction self-checks that found memory not returned. |
 | `memory.rss_mb` | Server process RSS in MiB. **Does NOT include MLX/Metal allocations** on Apple Silicon — unified memory is tracked by Metal separately. Use `mlx_active_mb` + `mlx_cache_mb` to close the gap with what Activity Monitor's "Memory" column reports. |
 | `memory.available_mb` | System available RAM in MiB |
 | `memory.mlx_active_mb` | Bytes currently held by live MLX tensors (Parakeet weights ≈ 1218 MB warm, 0 if model not loaded). Returns 0 if MLX isn't initialized or the API is missing. |

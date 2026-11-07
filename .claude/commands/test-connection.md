@@ -28,18 +28,9 @@ curl -fsS -H "Authorization: Bearer $API_KEY" "$SERVER_URL/readyz/dictation"
 # expect: 200
 ```
 
-Note: a `200` with header `X-Dictation-Degraded: true` means a meeting is currently being processed; dictation latency may be elevated but is still functional. Surface this to the user.
+Note: a `200` with header `X-Dictation-Degraded: true` means a file job is running or the file model is loading; dictation latency may be elevated but is still functional. Surface this to the user.
 
-### 3. Meeting readiness
-
-```bash
-curl -fsS -H "Authorization: Bearer $API_KEY" "$SERVER_URL/readyz/meeting"
-# expect: 200
-```
-
-If `503`, models still loading or available memory < 2GB. Wait and retry. If still 503 after 3 minutes, check the server log.
-
-### 4. Dictation roundtrip
+### 3. Dictation roundtrip
 
 Generate a tiny silent WAV via Python (no ffmpeg dependency):
 
@@ -58,13 +49,13 @@ curl -fsS -H "Authorization: Bearer $API_KEY" \
 
 Empty `text` is correct (silent audio). The point is to verify the full pipeline.
 
-### 5. Metrics
+### 4. Metrics
 
 ```bash
 curl -fsS -H "Authorization: Bearer $API_KEY" "$SERVER_URL/metrics" | python3 -m json.tool
 ```
 
-Pretty-print and surface to user. Highlight: `parakeet.p50_ms`, `meeting.active`, `memory.available_mb`, `disk.free_gb`.
+Pretty-print and surface to user. Highlight: `parakeet.p50_ms`, `meeting.active` (the file-job block), `memory.available_mb`, `disk.free_gb`.
 
 ## Summary
 
@@ -72,7 +63,6 @@ Print a green ✓ / red ✗ table:
 - Tunnel: ✓
 - Auth: ✓
 - Dictation ready: ✓ (degraded? note)
-- Meeting ready: ✓
 - Dictation roundtrip: ✓
 - Metrics: ✓
 

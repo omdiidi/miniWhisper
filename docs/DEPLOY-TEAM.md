@@ -152,7 +152,7 @@ either roll back the commit (`git reset --hard HEAD~1`) or bump VERSION.
    The installer downloads the latest signed DMG from GitHub Releases,
    verifies the SHA256, copies the app to `/Applications`, strips
    quarantine, seeds the API key into the Keychain, and opens the
-   System Settings panes for the four required permissions.
+   System Settings panes for the three required permissions.
 
 The employee's first dictation populates `wispralt.usage_events`; they
 appear on `/admin/users` with a non-null `last_seen_at`.

@@ -38,7 +38,7 @@ SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" bash scripts/build-c
    open /Applications/WisprAlt.app
    ```
    Alternatively: right-click the app in Finder → **Open** → click **Open** in the Gatekeeper dialog. You only need to do this once per version.
-4. The four-step permission wizard starts automatically (see below).
+4. The three-step permission wizard starts automatically (see below).
 
 ### Installing on a friend's Mac
 
@@ -66,7 +66,7 @@ Required for AXUIElement text injection (inserting transcribed text at your curs
 
 ### Step 2 — Input Monitoring
 
-Required for CGEventTap FN-key detection (dictation holds and triple-tap for meetings).
+Required for CGEventTap FN-key detection (dictation holds).
 
 - System Settings > Privacy & Security > Input Monitoring
 - Toggle WisprAlt on.
@@ -76,17 +76,10 @@ After granting Input Monitoring on macOS 14.4 or later, the permission does not 
 
 ### Step 3 — Microphone
 
-Required for AVAudioEngine dictation recording and SCStream microphone capture in meeting mode.
+Required for AVAudioEngine dictation recording.
 
 - System Settings > Privacy & Security > Microphone
 - Toggle WisprAlt on (the system prompt appears automatically; click Allow).
-
-### Step 4 — Screen Recording
-
-Required for capturing system audio (channel 2) during meeting recording via SCStream.
-
-- System Settings > Privacy & Security > Screen Recording
-- Toggle WisprAlt on.
 
 ---
 
@@ -105,10 +98,11 @@ After the permission wizard, the app is ready for server configuration.
    - **API Key** — paste the bearer token and press Return. Stored in the macOS Keychain under service `co.wispralt` and never written to disk as plain text.
 3. Collapse advanced settings (you don't need it for daily use). At the top:
    - **Open Portal** — opens `<server>/admin/login` in your browser. Admins land on the global dashboard; employees land on their own usage page. Same button for both roles.
-   - **Open Meetings Folder** — reveals your meeting transcripts directory in Finder.
-4. Click **Test Connection** under the **Connection** section. It calls `/healthz`, `/readyz/dictation`, `/readyz/meeting` in parallel and shows a single status line:
-   - **Green** "Connected — dictation + meeting ready"
-   - **Orange** "Connected — meeting pipeline still loading" (or similar warming variants)
+   - **Open File Transcriptions** — reveals the `Custom Transcriptions` folder (one subfolder per file job) in Finder.
+   - **Open Transcripts Folder** — reveals the transcripts folder chosen in Settings (default `~/Documents/WisprAlt/Meetings/`; the name is kept from the meeting era).
+4. Click **Test Connection** under the **Connection** section. It calls `/healthz`, `/readyz/dictation` and the authenticated `/me` in parallel and shows a single status line:
+   - **Green** "Connected as <you> — dictation ready."
+   - **Orange** "Connected as <you> — dictation degraded (file job using memory)" or "dictation pipeline still loading"
    - **Red** when the host is unreachable or the API key is rejected
 
 ### Menubar icon states
@@ -117,12 +111,10 @@ After the permission wizard, the app is ready for server configuration.
 |---|---|---|
 | Idle | mic outline | Default |
 | Dictating | mic filled | While holding FN |
-| Meeting recording | red filled dot + bold red **REC** label | Triple-tap FN to start; cannot be missed in a dense menubar |
-| Uploading | upload-cloud | After meeting stops, while uploading |
+| Converting | circular arrows | Preparing a file for upload |
+| Uploading | upload-cloud | While a file uploads ("Transcribe file…") |
 | Processing | waveform | While server is transcribing |
 | Done | checkmark | Briefly, before returning to Idle |
-
-The REC indicator is rendered as a single composite NSImage (NSBezierPath red dot + bold red "REC" attributed text drawn into one bitmap). The earlier image+attributedTitle pair was character-wrapping in cramped menubars (R/E/C stacked vertically); the composite-bitmap approach takes layout decisions away from the menubar layout engine entirely.
 
 ### Picking your input mic
 
@@ -137,29 +129,12 @@ Input Mic
 
 The dropdown lists every input device macOS sees (built-in, AirPods, USB interfaces) plus a "System Default" entry at the top. Selecting a device sets `Settings.preferredInputDeviceUID`.
 
-- **Scope**: this picker affects **dictation only**. Meeting recording always uses the macOS system default input — SCStream has no per-stream mic API, and WisprAlt deliberately does not override the system-wide default (would affect every other app on the system). If you want a specific mic for meetings, set it in System Settings → Sound.
+- **Scope**: this picker affects dictation (the only thing WisprAlt records). WisprAlt deliberately does not override the system-wide default input.
 - **Application**: WisprAlt sets the dictation engine's input via `AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice)` on the AVAudioEngine input node, with no system-wide side effect.
 - **Live changes**: changing the picker mid-idle takes effect on the next dictation. Mid-recording changes don't disturb the active session — the existing audio-device-change abort logic handles legitimate device disconnects (AirPods unplugged etc.).
 - **Permission**: if mic permission is revoked, the dropdown only shows "System Default" with no other options. Re-grant in System Settings → Privacy & Security → Microphone.
 
 Device enumeration lives in `client/WisprAlt/Audio/MicEnumerator.swift` (AVFoundation discovery + CoreAudio HAL property reads).
-
-### Meeting filenames
-
-Saved meetings land in your meetings folder with human-readable names:
-
-```
-Mon Apr 27 2.06pm-2.07pm.wav
-Mon Apr 27 2.06pm-2.07pm.json
-Mon Apr 27 2.06pm-2.07pm.srt
-Mon Apr 27 2.06pm-2.07pm.vtt
-Mon Apr 27 2.06pm-2.07pm.txt
-```
-
-- Format: `EEE MMM d h.mma-h.mma.<ext>` in POSIX (English) locale for stable sorting.
-- Periods instead of colons for filesystem-friendliness across rsync, zip, and Windows.
-- Two meetings ending at the same minute get a `(2)`, `(3)`, etc. suffix.
-- If the rename fails (rare — concurrent file appearance), WisprAlt falls back to the start-only name and logs a warning.
 
 ### Copy your API key
 
@@ -175,7 +150,7 @@ The popover has a **Smart formatting** toggle in the Settings section. When ON, 
 - **Pricing**: per-cleanup is roughly $0.0001 against your operator's OpenRouter credit. Negligible for individual employees; visible in OpenRouter usage if you batch-dictate hundreds of clips.
 - **Privacy note**: smart formatting sends your raw transcript to OpenRouter (cloud). If you handle confidential material, leave the toggle OFF.
 
-The toggle does NOT affect meeting recordings — those run through mlx-whisper server-side and are never routed through Mercury.
+The toggle does NOT affect file transcriptions — those run through mlx-whisper server-side and are never routed through Mercury.
 
 ### Your name
 
@@ -250,33 +225,18 @@ Once you have moved the file to the destination Mac (e.g. via AirDrop or a USB d
 3. Transcribed text is injected at the cursor (AXUIElement primary; clipboard + Cmd+V fallback for Electron apps).
 4. Round-trip latency: ~250–400ms p50.
 
-**Note:** Holding FN while a meeting recording is active is a no-op (with a warning in the log). This is the mic mutual exclusion rule.
+**Note:** an update relaunch is refused while a dictation (or its in-flight upload) or a file job is running, so an update never kills your work.
 
 ---
 
-## Meeting Recording Usage
+## File Transcription Usage
 
-1. Triple-tap the **FN** key within 400ms. The menubar icon changes to a recording circle.
-2. Speak normally. The app captures both your microphone (channel 1) and system audio (channel 2) in a dual-channel 16kHz WAV.
-3. Triple-tap FN again (or click the menubar item) to stop recording.
-4. The UI moves through three explicit states: **Uploading (with %)** → **Processing** → **Done**.
-5. Completed transcripts are saved to `~/Documents/WisprAlt/Meetings/` as `.json`, `.srt`, `.vtt`, and `.txt`.
+1. Click the WisprAlt menubar icon → **Transcribe file…** and pick any audio or video file (m4a, mp3, mp4, mov, wav, aac, flac, opus, ogg, webm, m4v, caf, aiff).
+2. The file is copied into its own folder under `Custom Transcriptions` and uploaded as-is (large files go up in chunks). The UI moves through **Uploading (with %)** → **Processing** → **Done**.
+3. The server transcribes it with MLX Whisper (one mono stream, no speaker labels). The model loads on the first file job, so the first one after an idle spell takes longer.
+4. `.json`, `.srt`, `.vtt` and `.txt` are downloaded next to the source file (see [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md)), then the server copy is deleted. **Copy last custom transcription** puts the newest TXT on the clipboard.
 
-### Recording Limits
-
-Meeting recording is capped at **90 minutes** by default (configurable via Settings → Max meeting length). At the 60-minute mark, a system notification fires warning that the recording will auto-stop in 30 minutes. After the cap is reached, recording stops automatically and the upload begins immediately. You can change the cap (5–240 minutes) in the WisprAlt settings popover.
-
-### In-Person Mode Auto-Detection
-
-If channel 2 (system audio) is silent for more than 90% of 100ms frames during the recording, the server automatically uses single-channel diarization with "Speaker 1", "Speaker 2", … labels instead of "You" / "Other".
-
----
-
-## Speaker Rename (Offline-Capable)
-
-1. Click the WisprAlt menubar icon and select the transcript from the list.
-2. In the Transcript Detail view, click a speaker name and type the new name.
-3. The app atomically rewrites all four local files (JSON, SRT, VTT, TXT) without any server round-trip. This works entirely offline.
+**Cancel** stops the client at once and re-enables **Transcribe file…**. If the server was already transcribing, it finishes that Whisper call before discarding the result; a new file submitted in that window gets "previous transcription still finishing".
 
 ---
 
@@ -346,7 +306,7 @@ What `install.sh` does (full source at the repo root):
    (`defaults write co.wispralt.WisprAlt serverURL ...`). Both are
    skipped silently if the corresponding env var is unset.
 8. Flushes `cfprefsd` so the app reads the new defaults on first launch.
-9. Opens the app — `PermissionGate.swift` walks four macOS permissions.
+9. Opens the app — `PermissionGate.swift` walks three macOS permissions.
 10. Polls (up to 10s) to confirm the app process actually started; warns
     if it didn't (likely a Gatekeeper dialog needing right-click → Open).
 
@@ -374,7 +334,7 @@ bash scripts/build-client-local.sh
 ```
 Output: `client/build/WisprAlt.app`. Copy it to `/Applications/`, strip the quarantine flag (`xattr -dr com.apple.quarantine /Applications/WisprAlt.app`), and open.
 
-**Per-version TCC re-grant:** Each new build changes the binary's cdhash. macOS sees the new binary as a new app and re-prompts for the four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording). This is Apple-enforced behavior — not a bug. See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for the full explanation and the `tccutil reset` recovery commands.
+**Per-version TCC re-grant:** Each new build changes the binary's cdhash. macOS sees the new binary as a new app and re-prompts for the three permissions (Accessibility, Input Monitoring, Microphone). This is Apple-enforced behavior — not a bug. See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for the full explanation and the `tccutil reset` recovery commands.
 
 **Annual cert renewal:** Free Apple Development certs expire after one year. Xcode auto-renews silently while you stay signed in with your Apple ID, but the renewed cert has a new SHA-1 and a new Designated Requirement. This triggers the same TCC re-grant cycle as a binary rebuild — once a year. Expected behavior; not a bug.
 

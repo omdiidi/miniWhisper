@@ -2,6 +2,81 @@
 
 All notable changes to WisprAlt are documented here.
 
+## [Unreleased] - 2026-11-07 — Part 2: removals (meetings, cloud fallback, Hugging Face token)
+
+WisprAlt is now dictation plus file transcription. Everything below is a
+removal or a rename; nothing is added except CI.
+
+### Removed
+
+- **Meetings, end to end.** Server: the meeting submit route
+  (`POST /transcribe/meeting`), the `/readyz/meeting` probe, the diarization
+  pipeline, silence/in-person detection, the denoise stub and the compat
+  shims. Client: the meeting recorder (dual-channel system-audio capture),
+  the FN triple-tap toggle, the transcript list/detail views and local
+  speaker rename, and the Screen Recording permission (the wizard is now
+  three steps). `scripts/smoke-meeting.sh` is gone and `doctor.sh` no
+  longer probes meetings.
+- **OpenRouter audio fallback.** When the Mac mini is offline, dictation now
+  retries the origin once and then shows the normal dictation error toast;
+  there is no cloud rung. The client's offline upload queue and the
+  cloud-fallback telemetry queue are gone, as are the server's
+  `/telemetry/cloud-dictation` ingest route and the dev-only fault injection
+  (`dev_faults`, `scripts/check-watcher.sh`). The `co.wispralt.openrouter`
+  Keychain item **stays**: it is reserved for Mercury smart formatting.
+  `docs/FALLBACK.md` was deleted.
+- **Hugging Face token.** Both models (Parakeet, MLX Whisper) are public.
+  `setup-server.sh` no longer prompts for `HF_TOKEN`, and
+  `download-models.sh` fetches only those two models.
+- **Dependencies.** `pyannote.audio`, `torch`/`torchaudio` pins and
+  `matplotlib` dropped from `server/pyproject.toml` (torch now arrives only
+  transitively through `mlx-whisper`); `huggingface_hub` stays on the
+  1.12.x line. Model downloads shrink from ~5.6 GB to ~2.7 GB.
+
+### Changed
+
+- **Package rename.** `server/src/wispralt_server` → `server/src/wispralt`,
+  and `meeting/` → `files/`. Run the server with `uvicorn wispralt.main:app`.
+- **File-job routes moved** to `/transcribe/file/{id}` (poll),
+  `/transcribe/file/{id}/download/{fmt}` and `DELETE /transcribe/file/{id}`,
+  owner-or-admin only (anything else looks missing: 404 / 204). The `mode`
+  field is gone from `/transcribe/file` and chunked init.
+- **Cancel semantics.** `DELETE` returns **202** for a pending or running
+  job (cancel requested) and **204** once removed. A pending job never
+  starts. A running Whisper call finishes before its result is discarded;
+  the job then ends `failed: cancelled by user` with no outputs. The client
+  clears its job state at once, so "Transcribe file…" is never left
+  disabled.
+- **Busy 429s carry a `code`.** `file_job_busy` or `insufficient_memory`;
+  the client maps them once in `ServerClient`. Rate-limit 429s have none.
+- **Transcript JSON.** `model` now lists the ASR model only (no
+  `diarization` / `denoise` keys), every segment is "Speaker 1" with
+  `words: []`, and file audio no longer passes through the denoise stub.
+- **File model lifecycle.** MLX Whisper loads lazily on the first file job
+  and is evicted when idle (`FILE_MODEL_IDLE_EVICTION_SECONDS`, renamed from
+  the meeting-era setting).
+- **Update safety.** An update relaunch is refused while the app is busy
+  (dictating, uploading or processing a file job, or a dictation in flight).
+- **Admin portal.** Rows stored with `kind='meeting'` are displayed as
+  "File transcription(s)"; the stored value is unchanged.
+- **CI.** `.github/workflows/ci.yml` runs the server suite on Ubuntu (with
+  `ffmpeg` and MLX stubs, no Hugging Face token) and `swift build && swift
+  test` for the client on macOS. It replaces `test-server.yml`.
+
+### Leftovers you can delete by hand
+
+Nothing deletes user data. On other installs these folders may still exist
+and are no longer read:
+
+- `~/Library/Application Support/co.wispralt/pending-uploads/` (the old
+  offline meeting-upload queue, formerly `PendingUploadsQueue`)
+- `~/Library/Application Support/co.wispralt/cloud-fallback-queue/` (the
+  `DictationFallbackQueue` folder, including its `failed/` subfolder)
+
+Both are absent on the owner's Mac (checked 2026-11-07). Meeting
+transcripts already saved under `~/Documents/WisprAlt/Meetings/` stay where
+they are.
+
 ## [0.1.1] - 2026-05-01
 
 ### Fixed

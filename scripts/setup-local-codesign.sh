@@ -2,8 +2,8 @@
 # setup-local-codesign.sh — One-time setup for persistent local code-signing.
 #
 # Why: macOS TCC keys ad-hoc-signed apps by cdhash, which changes on every
-# rebuild. That means re-granting Accessibility, Input Monitoring, Microphone,
-# and Screen Recording every single time you iterate on the client. With a
+# rebuild. That means re-granting Accessibility, Input Monitoring and Microphone
+# every single time you iterate on the client. With a
 # stable self-signed cert in the System trust store, TCC matches on the cert
 # identity instead and grants persist across rebuilds.
 #

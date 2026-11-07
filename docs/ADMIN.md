@@ -219,9 +219,14 @@ incurring a charge.
 
 ### `GET /admin/usage` — Usage drill-down
 
-Filters: `kind` (e.g. `dictate`, `meeting`), `status` (HTTP status),
+Filters: `kind` (e.g. `dictate`, `file`; rows recorded before file jobs were renamed carry `meeting`), `status` (HTTP status),
 `user_id`, `since`, `until`. Paginated 100 per page. Each row links back
 to its user detail.
+
+Meetings were removed in Part 2. Portal pages (`/me/history`, the stats
+grid, the insight split card, the admin data table) now **display** rows
+stored with `kind='meeting'` as **File transcription(s)**; the stored value
+is unchanged until a later schema pass migrates it.
 
 ### `GET /admin/usage.csv` — CSV export
 
@@ -257,7 +262,7 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
 4. The employee pastes the command into Terminal on their Mac. The
    installer downloads the latest signed DMG from GitHub Releases,
    copies the app to `/Applications`, seeds the token into the Keychain,
-   and opens the System Settings panes for the four macOS permissions.
+   and opens the System Settings panes for the three macOS permissions.
 5. Their first dictation populates `usage_events`; they appear on
    `/admin/users` with a non-null `last_seen_at`.
 
@@ -283,8 +288,8 @@ the `kind` column (`'employee'` or `'integration'`).
 - Scoped to `/v1/*` **only**:
   - **CAN** call `POST /v1/audio/transcriptions`, `GET /v1/models`,
     `GET /v1/models/{id}`.
-  - **CANNOT** call `/me/*` or `/telemetry/*` — both return **403**.
-    Those surfaces are for humans (history, insights, personal
+  - **CANNOT** call `/me/*` — it returns **403**.
+    That surface is for humans (history, insights, personal
     portal), not for programs.
 - Subject to a per-token rate limit of 60 requests/60 s, independent
   of the per-IP bucket on `/transcribe/dictate`.
@@ -331,9 +336,8 @@ cache entry. Their next `/v1` request returns **401**.
 |---|---|---|
 | `POST /v1/audio/transcriptions` | yes | yes |
 | `GET /v1/models`, `GET /v1/models/{id}` | yes | yes |
-| `POST /transcribe/dictate`, `POST /transcribe/meeting`, etc. | no (403) | yes |
+| `POST /transcribe/dictate`, `POST /transcribe/file`, `/transcribe/file/{id}`, etc. | no (403) | yes |
 | `GET /me/*` (history, insights, profile) | no (403) | yes |
-| `POST /telemetry/*` | no (403) | yes |
 | `/admin/*` | no | only if `role='admin'` |
 
 The full /v1 contract — error codes, response formats, headers, file
@@ -386,9 +390,8 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 |---|---|---|
 | `WISPRALT_API_KEY` | Yes | First-boot break-glass admin token; seeds the initial admin row in `wispralt.users` if the table is empty. |
 | `SUPABASE_DATABASE_URL` | Yes (multi-tenant) | Postgres connection string for the `wispralt` schema. Without it, multi-token auth and usage events both fall back to break-glass mode. |
-| `HF_TOKEN` | Yes | Pyannote gated-model access. |
 | `SMART_FORMAT_ENABLED` | No | Default `false`. Master switch for server-side smart formatting; must be `true` (AND `OPENROUTER_API_KEY` set) for the toggle to have any effect. Off by default because Mercury timed out at the 600 ms budget on nearly every production request. |
-| `MEETING_JOB_RETENTION_DAYS` | No | Default 90 (0 disables). Daily sweep deletes finished (done/failed) meeting job rows and their `<id>.{txt,srt,vtt,json}` output files older than this. Pending/running jobs are never deleted. |
+| `MEETING_JOB_RETENTION_DAYS` | No | Default 90 (0 disables). Daily sweep deletes finished (done/failed) file job rows (the variable keeps its meeting-era name) and their `<id>.{txt,srt,vtt,json}` output files older than this. Pending/running jobs are never deleted. |
 | `SERVER_LOG_PATH` / `SERVER_LOG_MAX_BYTES` / `SERVER_LOG_BACKUP_COUNT` | No | Rotating application log (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). `/admin/server-log` reads it. launchd's `server.log` / `server.err.log` hold crash output only. |
 | `OPENROUTER_API_KEY` | No | Required (together with `SMART_FORMAT_ENABLED=true`) for the **Smart formatting** toggle; also enables weekly insights. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` and at least `SMART_FORMAT_MIN_WORDS` words (default 80) are post-processed by Mercury 2 — punctuation, casing, filler removal, and light list formatting; meaning preserved. Below the threshold, the call short-circuits to raw. When unset, the toggle is silently a no-op — the server returns raw text and `smart_formatted: false` regardless of the header. Get a key at https://openrouter.ai/keys. |
 | `SMART_FORMAT_MIN_WORDS` | No | Minimum word count for smart-formatting to engage. Default 80. Below this, raw Parakeet output is returned unchanged — short utterances aren't worth the LLM round-trip. |
@@ -403,7 +406,7 @@ Both `kind` values land in the same `wispralt.usage_events` table and
 are folded into the **Dictations 24h / 7d / 30d** tiles on
 `/admin/` and `/admin/users/{id}` because the underlying SQL aggregates
 by user, not by kind. Per-user event lists on `/admin/users/{id}` show
-`v1_dictate` rows alongside `dictate` and `meeting` rows so you can see
+`v1_dictate` rows alongside `dictate` and `file` rows so you can see
 which path generated each request.
 
 To split out third-party traffic, query the table directly:
@@ -431,7 +434,7 @@ expansion without further migrations:
   DROP CONSTRAINT ...` + a new CHECK. The auth middleware already returns
   the `role` string verbatim; the only place that gates on it today is
   `auth.require_admin`.
-- `wispralt.usage_events.kind` — currently `'dictate' | 'meeting'`. New
+- `wispralt.usage_events.kind` — currently `'dictate' | 'file' | 'v1_dictate' | …` (older rows may carry `'meeting'`). New
   event types (`'export'`, `'login'`, `'crm_sync'`, …) just enqueue with
   a new string; no schema change needed.
 

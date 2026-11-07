@@ -64,7 +64,7 @@ Ad-hoc signed builds work only on the machine they were built on and cannot be n
 
 `scripts/setup-local-codesign.sh` generates a self-signed code-signing certificate and trusts it as a System code-signing root. It was originally intended to make TCC permission grants survive client rebuilds.
 
-**Why it doesn't work across rebuilds:** macOS keys self-signed apps in TCC by `cdhash` (a hash of the binary), not by certificate identity. Even with a trusted self-signed cert, each new binary has a new cdhash, so TCC treats it as a new app and re-prompts for all four permissions. The cert helps within a single build (TCC remembers the grant across kill+relaunch of the same binary), but not across rebuilds.
+**Why it doesn't work across rebuilds:** macOS keys self-signed apps in TCC by `cdhash` (a hash of the binary), not by certificate identity. Even with a trusted self-signed cert, each new binary has a new cdhash, so TCC treats it as a new app and re-prompts for all three permissions. The cert helps within a single build (TCC remembers the grant across kill+relaunch of the same binary), but not across rebuilds.
 
 **Current status:** this script is no longer wired into `scripts/build-client-local.sh`. The build flow now uses a free **Apple Development certificate** from Xcode (see [SETUP-CLIENT.md](SETUP-CLIENT.md)), which is required for `SMAppService.mainApp.register()` (login-at-startup). The self-signed cert path cannot support SMAppService.
 
@@ -95,6 +95,15 @@ Every code change must update the documentation files listed for that source fil
 From Claude Code, use `/docs-check` to diff the file-to-doc map against recent edit timestamps and find stale docs.
 
 ---
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main` that touch `server/**`, `client/**` or the workflow itself. It has two jobs:
+
+- **server** (ubuntu-latest, Python 3.11): installs `ffmpeg` and the minimal test dependencies, stubs the Apple-Silicon-only MLX modules (`parakeet_mlx`, `mlx.core`), then runs `cd server && pytest tests/ -v`. No Hugging Face token is needed. `tmp/mission/part2/run-pytest.sh` reproduces this job locally.
+- **client** (macos-latest): `cd client && swift build && swift test`.
+
+`build-client.yml` (signed release build) and `lint-install.yml` (installer lint) are separate.
 
 ## PR Workflow
 

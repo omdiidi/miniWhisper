@@ -5,7 +5,7 @@
 #
 # Removes:
 #   1. Running WisprAlt process (graceful quit via osascript)
-#   2. ~/Documents/WisprAlt/  (local meeting transcripts — with confirmation)
+#   2. ~/Documents/WisprAlt/  (local transcripts — with confirmation)
 #   3. UserDefaults domain: co.wispralt.WisprAlt
 #   4. Keychain item: service co.wispralt
 #   5. /Applications/WisprAlt.app  (moved to Trash via Finder)
@@ -43,14 +43,14 @@ osascript -e 'quit app "WisprAlt"' 2>/dev/null && {
     echo "  WisprAlt was not running (or could not be quit via AppleScript — continuing)."
 }
 
-# ── 2. Remove local meeting transcripts ──────────────────────────────────────
+# ── 2. Remove local transcripts ──────────────────────────────────────
 echo ""
-echo "Step 2: Local meeting transcripts"
+echo "Step 2: Local transcripts"
 WISPRALT_DOCS_DIR="$HOME/Documents/WisprAlt"
 if [[ -d "$WISPRALT_DOCS_DIR" ]]; then
     DIR_SIZE="$(du -sh "$WISPRALT_DOCS_DIR" 2>/dev/null | cut -f1)"
     echo "  Found: $WISPRALT_DOCS_DIR ($DIR_SIZE)"
-    echo "  This contains all your saved meeting transcripts (JSON, SRT, VTT, TXT)."
+    echo "  This contains all your saved transcripts (JSON, SRT, VTT, TXT)."
     read -r -p "  Remove ~/Documents/WisprAlt/ permanently? [y/N] " REMOVE_DOCS
     if [[ "$REMOVE_DOCS" =~ ^[Yy]$ ]]; then
         rm -rf "$WISPRALT_DOCS_DIR"

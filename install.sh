@@ -481,7 +481,7 @@ provision_credentials() {
         tcc_out="$(tccutil reset All "$BUNDLE_ID" 2>&1 || true)"
         if ! grep -Eqi 'successful|reset' <<< "$tcc_out"; then
             local svc
-            for svc in Microphone ListenEvent Accessibility ScreenCapture; do
+            for svc in Microphone ListenEvent Accessibility; do
                 tccutil reset "$svc" "$BUNDLE_ID" 2>/dev/null || true
             done
         fi
@@ -575,14 +575,12 @@ print_next_steps() {
     echo "  WisprAlt $RELEASE_TAG installed."
     echo "════════════════════════════════════════════════════════════════"
     echo ""
-    echo "The app is opening now. You'll see prompts for 4 macOS permissions:"
+    echo "The app is opening now. You'll see prompts for 3 macOS permissions:"
     echo "  1. Accessibility       — required to inject text at the cursor"
     echo "  2. Input Monitoring    — required to detect FN-key holds"
     echo "  3. Microphone          — required to capture your voice"
-    echo "  4. Screen Recording    — required for meeting recordings"
     echo ""
-    echo "After granting all four, hold FN to dictate. Release to inject text."
-    echo "Triple-tap FN quickly to start a meeting recording."
+    echo "After granting all three, hold FN to dictate. Release to inject text."
     echo ""
     # Only WISPRALT_API_KEY_WAS_SET is the meaningful gate — server URL has a
     # default fallback so its presence does NOT mean "ready to dictate".

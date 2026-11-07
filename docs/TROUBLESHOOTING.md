@@ -10,24 +10,22 @@ Each entry follows the format: **Symptom → Diagnosis → Fix**.
 
 ## Server Issues
 
-### HuggingFace token denied (401 during model download)
+### Model download fails
 
-**Symptom:** `download-models.sh` or server startup fails with a 401 or "gated model" error mentioning `pyannote/speaker-diarization-3.1` or `pyannote/segmentation-3.0`.
+**Symptom:** `download-models.sh` exits with "Could not download <repo> after 3 attempts".
 
-**Diagnosis:** Either the token is invalid, or you have not accepted the model license terms for one or both gated models.
+**Diagnosis:** Both models (`mlx-community/parakeet-tdt-0.6b-v2`, `mlx-community/whisper-large-v3-turbo`) are public, so no token or license acceptance is involved. The failure is network access to huggingface.co, a rate limit (HTTP 429), or a full disk.
 
 **Fix:**
-1. Accept terms for both models (must be done while logged in):
-   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-2. Verify your token is valid: `huggingface-cli whoami` (should print your username).
-3. If you regenerated the token after setup, update `HF_TOKEN` in `server/.env` and restart the server.
+1. Check connectivity: `curl -fsSI https://huggingface.co` should return 200.
+2. On HTTP 429, wait a few minutes and re-run `bash scripts/download-models.sh` (downloads resume).
+3. Confirm ≥ 4 GB free on `$HOME` (`df -h ~`).
 
 ---
 
 ### Native wheel build fails (Xcode tools)
 
-**Symptom:** `uv sync` fails with a build error mentioning missing C++ headers, missing compiler, or `clang` not found. (Historically also triggered by `CTranslate2`; that dep was removed in Phase 10 but the symptom can still surface for other native wheels like `torch` or `pyannote`.)
+**Symptom:** `uv sync` fails with a build error mentioning missing C++ headers, missing compiler, or `clang` not found. (Historically also triggered by `CTranslate2`; that dep was removed in Phase 10 but the symptom can still surface for other native wheels like `torch`.)
 
 **Diagnosis:** Xcode Command Line Tools are missing or outdated.
 
@@ -57,30 +55,15 @@ xcode-select --install
 
 ---
 
-### WAV upload fails with 413 (Content Too Large)
+### File upload fails with 413 (Content Too Large)
 
-**Symptom:** Meeting WAV upload returns HTTP 413.
+**Symptom:** "Transcribe file…" fails with HTTP 413.
 
-**Diagnosis:** The recording exceeds `MAX_UPLOAD_BYTES` (default 2 GiB, which covers ~4h of dual-channel 16kHz Float32 audio). Alternatively, the Cloudflare free-tier network-level limit (~100 MB, community-reported) was reached before the server responded.
-
-**Fix:**
-- The client should warn the user at 60 minutes and stop automatically at 90 minutes. A 90-minute recording is ~460 MB.
-- For recordings over ~100 MB, the Cloudflare free tier may truncate the body at the network level before it reaches the server. Consider upgrading your Cloudflare plan or splitting long meetings.
-- Do not increase `MAX_UPLOAD_BYTES` above the Cloudflare limit for your plan — the server limit is moot if Cloudflare drops the connection first.
-
----
-
-### WAV upload fails with 422 "truncated" or MD5 mismatch
-
-**Symptom:** Meeting WAV upload returns HTTP 422 with a message about "truncated" or "Content-MD5 mismatch".
-
-**Diagnosis:** Cloudflare's free-tier body limit (~100 MB, community-reported) silently truncated the upload before it reached the server. The server detects this via `Content-MD5` header verification.
+**Diagnosis:** The file exceeds `MAX_UPLOAD_BYTES` (default 2 GiB), or the chunked-upload ceiling (4 GB). Files over 50 MiB are uploaded in 50 MiB chunks, so Cloudflare's ~100 MB body cap does not apply to them; a 413 from a single-shot upload below 50 MiB points at a proxy in between.
 
 **Fix:**
-1. Test with a short recording (< 10 MB) to confirm the tunnel is working.
-2. If short uploads succeed, the issue is the Cloudflare plan body limit. Options:
-   - Upgrade to a Cloudflare paid plan.
-   - Connect directly (VPN or LAN) when recording sessions expected to exceed 100 MB.
+- For video files the client extracts the audio track first; if a huge file still fails, export just the audio (m4a) and retry.
+- Do not raise `MAX_UPLOAD_BYTES` past what your disk can stage twice (the disk gate needs free ≥ 2× the upload).
 
 ---
 
@@ -98,16 +81,16 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 ---
 
-### 429 "Meeting in progress"
+### 429 "previous transcription still finishing"
 
-**Symptom:** `POST /transcribe/meeting` returns 429 with `{"error": "Another meeting is currently being transcribed"}`.
+**Symptom:** `POST /transcribe/file` (or chunked finalize) returns 429 with `"code": "file_job_busy"`; the client shows "previous transcription still finishing".
 
-**Diagnosis:** WisprAlt processes one meeting at a time (enforced by `asyncio.Semaphore(1)` in `jobs/runner.py`).
+**Diagnosis:** WisprAlt processes one file job at a time (enforced by `asyncio.Semaphore(1)` in `jobs/runner.py`). This includes a job you just cancelled: Whisper transcribes the whole file in one call, so a cancelled running job holds the slot until that call returns, then its result is discarded.
 
 **Fix:**
-1. Check `GET /metrics` for `meeting.active: true` and `meeting.current_eta_s`.
-2. Wait for the current job to complete, then resubmit.
-3. If `meeting.active` is `false` but you still get 429, check `memory.available_mb` — the OOM guard also returns 429 if less than 2 GiB of RAM is free.
+1. Check `GET /metrics` for `meeting.active: true` (the `meeting` block is the file-job block) and `meeting.active_job_id`.
+2. Wait for the current job to finish, then resubmit.
+3. A 429 with `"code": "insufficient_memory"` means less than 2 GiB of RAM is free; check `memory.available_mb`. A 429 with no `code` is the per-IP rate limiter.
 
 ---
 
@@ -116,27 +99,27 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 **Symptom:** Dictation round-trip is consistently > 500ms after warmup.
 
 **Diagnosis steps:**
-1. Check `GET /metrics` for `meeting.active: true` — if a meeting is running, dictation competes for unified memory.
+1. Check `GET /metrics` for `meeting.active: true` — if a file job is running, dictation competes for unified memory.
 2. Check `GET /readyz/dictation` for the `X-Dictation-Degraded: true` header — this confirms memory pressure.
 3. Check `parakeet.p50_ms` in `/metrics` — if > 300ms, the Mac mini may be thermally throttled.
 
 **Fix:**
-- Wait for the meeting job to complete.
-- If consistently slow without a meeting running, check Activity Monitor for other processes consuming unified memory (ML workloads, large Xcode builds, etc.).
+- Wait for the file job to complete (the file model is evicted shortly after).
+- If consistently slow without a file job running, check Activity Monitor for other processes consuming unified memory (ML workloads, large Xcode builds, etc.).
 
 ---
 
 ### Server disk full (507)
 
-**Symptom:** `POST /transcribe/meeting` returns 507. Server log shows "insufficient storage".
+**Symptom:** `POST /transcribe/file` returns 507. Server log shows "insufficient storage".
 
-**Diagnosis:** The staging directory or meeting output directory is on a full or nearly full volume.
+**Diagnosis:** The staging directory or file-job output directory is on a full or nearly full volume.
 
 **Fix:**
 1. Check `GET /metrics` for `disk.free_gb` and `disk.staging_count`.
-2. Clean up stale staging files: `ls -lh $STAGING_DIR` and remove any `.wav` files older than a few days.
-3. Clean up old meeting outputs from `MEETING_OUTPUT_DIR`.
-4. The disk guard requires free space ≥ 1.5× the upload size before accepting a WAV.
+2. Clean up stale staging files: `ls -lh $STAGING_DIR` and remove any files older than a few days.
+3. Clean up old file-job outputs from `MEETING_OUTPUT_DIR` (the retention sweep removes finished jobs after `MEETING_JOB_RETENTION_DAYS`).
+4. The disk guard requires free space ≥ 2× the upload size before accepting a file.
 
 ---
 
@@ -171,8 +154,9 @@ tail -2000 ~/Library/Logs/WisprAlt/wispralt.log \
 2. Investigate WHY the watcher didn't self-heal — almost certainly a missed
    exception class. Search `db.py` and `main.py` for `except asyncpg.PostgresError`
    and consider broadening to `asyncpg.Error`.
-3. After fix, set `WISPRALT_DEV_FAULTS=1` on a STAGING mini, deploy, and run
-   `scripts/check-watcher.sh` to confirm self-healing works end-to-end.
+3. After the fix, confirm self-healing by watching `/readyz/db` go 503 → 200
+   within ~30 s after a real Postgres blip (the dev-only fault-injection probe
+   that used to automate this was removed in Part 2).
 
 ### IMPORTANT: /readyz/db is observability-only
 Do NOT wire `/readyz/db` into Cloudflare origin health-check (use `/healthz`),
@@ -190,7 +174,7 @@ flag instead of verifying the invariant it claimed to enforce.
 - 2026-05-17 (asyncpg): `db.health_check` returned False; the watcher's
   rebuild branch should have run; an over-narrow exception class caused
   the failure to escape into the outer Exception handler instead.
-- 2026-05-19 (mlx-whisper): `evict_if_idle()` logged "released meeting
+- 2026-05-19 (mlx-whisper): `evict_if_idle()` logged "released
   models" and set `models_warm = False`; 2.7 GB of MLX active memory
   stayed resident because mlx_whisper's internal `ModelHolder.model`
   cache survived our reset.
@@ -198,9 +182,9 @@ flag instead of verifying the invariant it claimed to enforce.
 Lesson: every release/cleanup function should ALSO verify its effect.
 Flags are necessary but not sufficient.
 
-### Check recipe — meeting eviction (manual)
+### Check recipe — file-model eviction (manual)
 
-After a meeting finishes and `idle_seconds > 120`:
+After a file job finishes and `idle_seconds > 120`:
 
     TOKEN=$(security find-generic-password -w -s co.wispralt)
     curl -fsS -H "Authorization: Bearer $TOKEN" \
@@ -214,31 +198,16 @@ Expected steady-state (post-eviction, no jobs running):
     meeting.idle_seconds: > 60
     meeting.eviction_failures_total: 0  (cumulative; non-zero = regression)
 
-Also exposed without auth on /readyz/meeting:
-
-    curl -fsS https://transcribe.integrateapi.ai/readyz/meeting | jq .
-    # response includes: mlx_active_mb, models_warm, idle_seconds
-
 If `mlx_active_mb > 2000 AND models_warm=false AND idle_seconds > 120`,
 the eviction invariant is broken. Check
 `~/Library/Logs/WisprAlt/server.err.log` for a CRITICAL line containing
 "Eviction invariant failed".
 
-### Why `mlx_active_mb` is on an unauthenticated endpoint
-
-`/readyz/meeting` is intentionally no-auth so external uptime monitors
-can probe without credential management. Exposing `mlx_active_mb` is
-the cost of buying an outside-the-process observability gate that
-doesn't trust our own logs. The number itself is not sensitive — it
-reveals only that MLX is the runtime (already publicly known per the
-docs) and how much memory a model occupies (also derivable from the
-public mlx-whisper / parakeet-mlx documentation).
-
 ### Tuning the self-check
 
 Two settings control the gate (see `config.py`):
 
-- `meeting_eviction_delta_floor_mb` (default 1000): minimum MB the
+- `meeting_eviction_delta_floor_mb` (default 1000; the name is kept from the meeting era): minimum MB the
   active memory must drop during eviction. Lower if you want stricter
   detection; raise if you see false positives.
 - `meeting_eviction_pre_active_gate_mb` (default 1500): only fire when
@@ -254,7 +223,7 @@ Override at deploy via env vars:
 
 ### FN tap not detected
 
-**Symptom:** Holding FN or triple-tapping FN has no effect. The menubar icon does not change.
+**Symptom:** Holding FN has no effect. The menubar icon does not change.
 
 **Diagnosis:** Input Monitoring permission is not granted, or (on macOS 14.4+) the app has not been restarted after the permission was granted.
 
@@ -331,11 +300,11 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 ---
 
-### Meeting upload progress stuck
+### File upload progress stuck
 
-**Symptom:** The menubar shows "Uploading" for an unusually long time (more than a few minutes for a typical 30-minute meeting).
+**Symptom:** The menubar shows "Uploading" for an unusually long time (more than a few minutes for a typical 30-minute recording).
 
-**Diagnosis:** Either the Cloudflare Tunnel body limit was hit and the upload stalled, or the network connection is slow.
+**Diagnosis:** The network connection is slow or dropped. (Files over 50 MiB go up in chunks, so the Cloudflare body cap is not the cause; a 120 s stall watchdog fails a truly stuck upload.)
 
 **Fix:**
 1. Open Activity Monitor → Network tab; check upload bytes/sec for WisprAlt.
@@ -354,26 +323,16 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 ---
 
-### Speaker rename failed with "name conflict"
+### File job stuck in "Processing" indefinitely
 
-**Symptom:** Attempting to rename a speaker shows an error about a name conflict.
+**Symptom:** The menubar shows "Processing" for far longer than expected, and the job never transitions to done.
 
-**Diagnosis:** The chosen name is already used by another speaker in the same transcript. `TranscriptDocument.renameSpeaker(raw:to:)` throws `.speakerNameConflict` when `display_name` collision is detected.
-
-**Fix:** Choose a unique name that is not already assigned to another speaker in this transcript.
-
----
-
-### Meeting stuck in "Processing" indefinitely
-
-**Symptom:** The menubar shows "Processing" for far longer than expected (more than twice the recording duration), and the job never transitions to done.
-
-**Diagnosis:** The poll loop in `MenuBarController` enforces a deadline of `max(2 × recording_duration, 600 s)`. When the deadline elapses the client automatically cancels the job via `DELETE /transcribe/meeting/{job_id}` and surfaces a `pollTimedOut` error notification. If you see the error, the server-side pipeline likely crashed or was killed mid-run.
+**Diagnosis:** The poll loop in `MenuBarController+Transcription` enforces a deadline of `max(600 s, min(6 h, 3 × audio duration + 300 s))`. When the deadline elapses the client cancels the job via `DELETE /transcribe/file/{job_id}` and surfaces a `pollTimedOut` error notification. If you see the error, the server-side pipeline likely crashed or was killed mid-run.
 
 **Fix:**
 1. Check `GET /metrics` for `meeting.active` and `meeting.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/wispralt.log` for Python tracebacks.
-2. Restart the server (`scripts/server-launchd.sh restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staging WAV.
-3. If the server is healthy but the job consistently times out for long recordings, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
+2. Restart the server (`scripts/server-launchd.sh restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staged source.
+3. If the server is healthy but the job consistently times out for long files, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
 
 ---
 
@@ -391,26 +350,13 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 ---
 
-### Meeting transcript has a "warnings" field with "mono input"
-
-**Symptom:** The downloaded meeting transcript JSON contains a `"warnings"` array with an entry like `"mono input — dual-channel mode unavailable"`. Speaker diarization may be less accurate than expected.
-
-**Diagnosis:** `MeetingRecorder` is supposed to produce a 2-channel WAV (ch1 = mic, ch2 = system audio). The server's `pipeline.py` probes the file at the start of processing and detected only 1 channel. This usually means `SCStream` did not deliver system-audio frames during the recording (e.g. screen capture permission was denied or no system audio was playing), so `AlignedRingBuffer` had nothing to mix into channel 2 and the WAV was written as mono.
-
-**Fix:**
-1. Open **System Settings → Privacy & Security → Screen & System Audio Recording** and confirm WisprAlt is listed and enabled.
-2. On macOS 14.4+, this permission requires a process restart after granting — use the in-app permission wizard (Settings → Permissions).
-3. Re-record the meeting after confirming the permission is active. If system audio is intentionally absent (e.g. in-person meeting with no system playback), the mono path is expected and diarization will run on mic audio only — quality may be lower for multi-speaker scenarios.
-
----
-
 ### Sparkle update not appearing or blocked
 
 **Symptom:** "Check for Updates…" reports no update, or the update sheet is deferred.
 
-**Diagnosis (deferred):** Sparkle updates are intentionally deferred while a meeting recording is active (`SparkleController` checks `MeetingRecorder.isActive`). This is by design to prevent interrupting an in-progress recording.
+**Diagnosis (deferred):** Updates are intentionally deferred while the app is busy (`MenuBarController.isBusy`: dictating, uploading or processing a file job, or a dictation still in flight). This prevents an update relaunch from killing in-progress work.
 
-**Fix (deferred):** Stop the current recording, then check for updates again.
+**Fix (deferred):** Let the dictation or file job finish, then check for updates again.
 
 **Diagnosis (not appearing):** The appcast URL may be unreachable, or the Sparkle EdDSA signature may not match the embedded `SUPublicEDKey` in `Info.plist` (affects self-built versions).
 
@@ -501,7 +447,7 @@ This is a one-time step per version. After the app is approved, all subsequent l
 
 ### TCC prompts returned out of nowhere — I didn't rebuild
 
-**Symptom:** Accessibility, Input Monitoring, Microphone, or Screen Recording prompts appeared even though you haven't installed a new version.
+**Symptom:** Accessibility, Input Monitoring, or Microphone prompts appeared even though you haven't installed a new version.
 
 **Diagnosis:** This is most likely the annual Apple Development certificate renewal. Xcode auto-renews the cert while signed in, but the renewed cert has a new SHA-1 and a new Designated Requirement — macOS TCC sees the next launch as a new app identity.
 
@@ -516,10 +462,9 @@ A "Not Before" date within the past few days confirms a recent renewal.
 ```bash
 tccutil reset Accessibility   co.wispralt.WisprAlt
 tccutil reset ListenEvent     co.wispralt.WisprAlt
-tccutil reset ScreenCapture   co.wispralt.WisprAlt
 tccutil reset Microphone      co.wispralt.WisprAlt
 ```
-Then reopen WisprAlt and grant all four permissions. This happens at most once a year.
+Then reopen WisprAlt and grant all three permissions. This happens at most once a year.
 
 ---
 

@@ -4,7 +4,7 @@ This document captures the issues actually encountered the first time someone bo
 
 ## Server bootstrap (`scripts/setup-server.sh`)
 
-> **Historical context (resolved by Phase 10, 2026-05-10).** The dependency failures below were hit during the WhisperX-era install and have been resolved by the WhisperX → mlx-whisper swap. Both `whisperx` and `ctranslate2` were removed from `pyproject.toml` in Phase 10; DeepFilterNet remains stubbed (see note). These notes are retained as institutional memory for future toolchain bumps. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md).
+> **Historical context (resolved by Phase 10, 2026-05-10, and Part 2, 2026-11-07).** The dependency failures below were hit during the WhisperX-era install and have been resolved by the WhisperX → mlx-whisper swap. Both `whisperx` and `ctranslate2` were removed from `pyproject.toml` in Phase 10; the meeting pipeline (diarization and the DeepFilterNet denoise stub) was removed in Part 2. These notes are retained as institutional memory for future toolchain bumps. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md).
 
 ### Dependency conflict: `numpy` ranges between MLX, WhisperX, and DeepFilterNet
 
@@ -12,31 +12,21 @@ This document captures the issues actually encountered the first time someone bo
 
 **Root cause:** the original pin set was unsatisfiable on Apple Silicon with Python 3.11.
 
-**Fix applied:** dropped `deepfilternet` from `server/pyproject.toml` and stubbed `server/src/wispralt/audio/denoise.py` to a no-op. Meeting transcription still works (Pyannote diarization + WhisperX is unaffected); only the explicit denoise pass is skipped. Mic input that is already clean transcribes identically.
+**Fix applied:** dropped `deepfilternet` from `server/pyproject.toml` and stubbed `server/src/wispralt/audio/denoise.py` to a no-op. At the time, meeting transcription kept working; only the explicit denoise pass was skipped. (The stub itself was deleted with the meeting pipeline in Part 2.) Mic input that is already clean transcribes identically.
 
-**Trade-off accepted:** slightly noisier audio in low-SNR meeting recordings. Re-add DeepFilterNet later if needed via a separate venv invoked over subprocess.
+**Trade-off accepted:** slightly noisier audio on low-SNR recordings.
 
 ### `huggingface-hub` not in declared deps
 
 **Symptom:** `uvicorn` boots but immediately errors with `ImportError: cannot import name 'cached_download' from 'huggingface_hub'` (or similar) when bootstrapping models.
 
-**Root cause:** `parakeet-mlx`, `whisperx`, and `pyannote.audio` all transitively depend on `huggingface_hub`, but with different version ranges, and none of the resolved versions exposed the symbol the resident code expected.
+**Root cause:** `parakeet-mlx`, `whisperx`, and the diarization library all transitively depended on `huggingface_hub`, but with different version ranges, and none of the resolved versions exposed the symbol the resident code expected.
 
 **Fix applied:** added `huggingface-hub>=0.30.2` as an explicit top-level dep in `server/pyproject.toml`.
 
-### `pyannote.audio` with PyTorch 2.6: `torch.load` weights_only default change
+### Pyannote-era fixes (moot since 2026-11-07)
 
-**Symptom:** server crashes on `pipeline = Pipeline.from_pretrained(...)` with `_pickle.UnpicklingError: Weights only load failed`.
-
-**Root cause:** PyTorch 2.6 flipped `weights_only=True` as the default for `torch.load`, which breaks loading of the legacy pyannote checkpoint format (the tensors are wrapped in pickled objects).
-
-**Fix applied:** patched `server/src/wispralt/files/__init__.py` to monkey-patch `torch.load` with `weights_only=False` only during pyannote pipeline init, then restore the default.
-
-### Pyannote 0.5+ renamed `use_auth_token` → `token`
-
-**Symptom:** `Pipeline.from_pretrained(..., use_auth_token=...)` raises `TypeError: from_pretrained() got an unexpected keyword argument 'use_auth_token'`.
-
-**Fix applied:** the patched init in `meeting/__init__.py` now calls `from_pretrained(..., token=hf_token)`.
+Two more entries used to live here: a `torch.load(weights_only=False)` patch for loading the diarization checkpoint under PyTorch 2.6, and a `use_auth_token` → `token` rename shim. Both went away with the meeting pipeline (diarization, Hugging Face token and the compat shims were removed in Part 2; see the root `CHANGELOG.md`).
 
 ### `huggingface-cli` renamed to `hf` in 1.x
 
@@ -46,14 +36,14 @@ This document captures the issues actually encountered the first time someone bo
 
 ## MLX Whisper dependency + model cache
 
-The meeting/file transcription path uses [`mlx-community/whisper-large-v3-turbo`](https://huggingface.co/mlx-community/whisper-large-v3-turbo) on Apple Neural Engine via `mlx_whisper`. Both the Python dependency and the on-disk model cache have version footguns.
+The file transcription path uses [`mlx-community/whisper-large-v3-turbo`](https://huggingface.co/mlx-community/whisper-large-v3-turbo) on Apple Neural Engine via `mlx_whisper`. Both the Python dependency and the on-disk model cache have version footguns.
 
 **Pinned dependencies in `server/pyproject.toml`:**
 
 | Package | Pin | Why |
 |---|---|---|
 | `mlx-whisper` | `==0.4.2` | Hard pin — the tqdm-monkeypatch shape in `mlx_whisper_loader.py` is verified against this exact source. A minor bump can move `tqdm.auto.tqdm.update` and silently break the chunk-progress callback (UI shows no progress; transcription still works). |
-| `huggingface-hub` | `>=1.12.0,<1.13` | Upper-bounded because `pyannote.audio==3.3.2` still calls the removed-in-2.0 `use_auth_token=` kwarg. The compat shim in `meeting/__init__.py install_compat_shims` translates `use_auth_token=` → `token=` at import time, and that shim is verified against the 1.12 surface. Bumping past 1.13 needs a fresh audit of the shim and the pyannote release notes. |
+| `huggingface-hub` | `>=1.12.0,<1.13` | Kept on the known-good 1.12.x line for the mlx-whisper / Parakeet model fetch. The original reason (a diarization library still calling the removed `use_auth_token=` kwarg) left with the meeting pipeline, so the bound can be relaxed, but deliberately and with a model-fetch smoke test, not as a side effect. |
 
 **Model cache:** Hugging Face stores snapshots under `~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo/`. Disk footprint is **~1.6 GB** (the `model.safetensors` weight file alone is ~1.5 GB; tokenizer + config + generation config make up the rest). The prefetch script asserts `model.safetensors > 800 MB` as a sanity check — see the recovery section below.
 
@@ -154,7 +144,7 @@ The setup writes three files containing secrets. None are committed:
 
 | File | Mode | Contains |
 |---|---:|---|
-| `~/wispralt/server/.env` | 0600 | `HF_TOKEN`, `WISPRALT_API_KEY` |
+| `~/wispralt/server/.env` | 0600 | `WISPRALT_API_KEY`, optional `OPENROUTER_API_KEY` (Mercury) |
 | `~/.config/wispralt/cloudflare-token` | 0600 | Cloudflare tunnel token only |
 | `~/.config/wispralt/client-config.txt` | 0600 | `SERVER_URL`, `WISPRALT_API_KEY` (for paste-into-client) |
 
@@ -164,7 +154,7 @@ The setup writes three files containing secrets. None are committed:
 
 After any setup involving copy/paste into shared tools (chat, screen recordings, etc.), rotate:
 
-- **HF token:** revoke at <https://huggingface.co/settings/tokens>, generate a new one, update `server/.env`, restart the FastAPI LaunchAgent.
+- **`OPENROUTER_API_KEY`** (if set, for Mercury smart formatting and insights): rotate at <https://openrouter.ai/keys>, update `server/.env`, restart the FastAPI LaunchAgent.
 - **Cloudflare tunnel token:** in the Zero Trust dashboard → tunnel → Configure → Rotate token. See "Cloudflared LaunchAgent (user-level)" below for the rotation procedure — the steps differ depending on whether your cloudflared version supports `--token-file`.
 - **`WISPRALT_API_KEY`:** `curl -X POST -H "Authorization: Bearer $OLD" $SERVER_URL/admin/rotate-key` returns `{"rotated": true}` and writes the new key to the server log; copy it into the client.
 
@@ -174,11 +164,9 @@ If you build with Swift 6.2 / macOS 26, expect the following compile errors in t
 
 - **`Settings { … }` shadowed by a local `Settings` class** in `WisprAltApp.swift`. Qualify as `SwiftUI.Settings { … }`.
 - **`SPUUpdater` has no `delegate` property** in modern Sparkle 2.x. Pass the delegate to `SPUStandardUpdaterController(updaterDelegate: self, …)` at construction; you cannot mutate it after.
-- **`OSAllocatedUnfairLock` not found**: add `import os.lock` at the top of files that use it (Capture/MeetingRecorder.swift).
-- **`captureMicrophone`, `microphone` (SCStream)** are macOS 15+. If you're targeting 14, gate with `if #available(macOS 15, *)` or bump `Package.swift` `platforms: [.macOS(.v15)]`.
-- **Optional-binding** in `MeetingAPI.swift` and `ServerClient.swift` — Swift 6 enforces this more strictly. Add explicit `if let` unwraps where the source assumed implicit-non-optional.
-- **`isActive` get-only setters** in `MeetingRecorder.swift` — change `private(set) var isActive` to `var isActive` (or wrap setters in a method), or refactor the three call sites to use a separate state machine.
-- **Strict concurrency warnings** under `-strict-concurrency=complete` are noisy but mostly non-blocking; the few real ones live in `TranscriptStore.swift`'s `DispatchQueue.main.async { [weak self] … }` blocks where captured `summaries`/`newIndex` need `let` bindings outside the closure.
+- **`OSAllocatedUnfairLock` not found**: add `import os.lock` at the top of files that use it.
+- **Optional-binding** in `FileJobAPI.swift` and `ServerClient.swift` — Swift 6 enforces this more strictly. Add explicit `if let` unwraps where the source assumed implicit-non-optional.
+- **Strict concurrency warnings** under `-strict-concurrency=complete` are noisy but mostly non-blocking; the few real ones were `DispatchQueue.main.async { [weak self] … }` blocks whose captured values needed `let` bindings outside the closure.
 
 These are documented in `docs/TROUBLESHOOTING.md` under "Client build errors on Swift 6+" once you fix them in your local copy.
 
@@ -228,7 +216,7 @@ The diagnostic that caught it: log the **pre-write float peak** from inside the 
 
 macOS Tahoe (26) keys Apple Development-signed apps in TCC by `cdhash` (a hash of the binary) rather than by team identifier. Only paid **Developer ID** apps get team-identifier-based matching that survives binary changes. This means:
 
-- Every new build → new cdhash → TCC sees a brand-new app → re-prompts for all four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording).
+- Every new build → new cdhash → TCC sees a brand-new app → re-prompts for all three permissions (Accessibility, Input Monitoring, Microphone).
 - Kill + relaunch of the **same build** reuses the existing TCC grants without re-prompting.
 - There is no workaround short of a Developer ID certificate.
 
@@ -239,11 +227,10 @@ After every rebuild, run the canonical TCC reset to clear stale entries before r
 ```bash
 tccutil reset Accessibility   co.wispralt.WisprAlt
 tccutil reset ListenEvent     co.wispralt.WisprAlt
-tccutil reset ScreenCapture   co.wispralt.WisprAlt
 tccutil reset Microphone      co.wispralt.WisprAlt
 ```
 
-Then reopen the app and re-grant all four permissions.
+Then reopen the app and re-grant all three permissions.
 
 **Practical mitigation when iterating:** batch code changes and rebuild once rather than after each edit.
 
@@ -338,7 +325,7 @@ The `/setup-client` slash command runs `xattr -dr` automatically. Friends instal
 
 Free Apple Development certificates auto-renew once per year. Xcode handles renewal silently while you stay signed into your Apple ID in Xcode → Settings → Accounts.
 
-**Why this matters:** the renewed cert has a new SHA-1 → new Designated Requirement → new cdhash. On the next rebuild after renewal, TCC sees the app as a new entity and re-prompts for all four permissions, identical to any other rebuild. Run the standard `tccutil reset` recovery and re-grant.
+**Why this matters:** the renewed cert has a new SHA-1 → new Designated Requirement → new cdhash. On the next rebuild after renewal, TCC sees the app as a new entity and re-prompts for all three permissions, identical to any other rebuild. Run the standard `tccutil reset` recovery and re-grant.
 
 This happens roughly once a year. It is expected behavior, not a bug. If you see unexpected TCC re-prompts without rebuilding, check for a cert renewal:
 

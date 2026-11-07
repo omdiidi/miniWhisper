@@ -14,12 +14,12 @@ The script handles:
 
 1. Python 3.11 and `uv` availability checks
 2. Virtual-environment creation and dependency installation
-3. HuggingFace token validation and gated-model acceptance
-4. Model weight download (~5.6 GB total)
-5. API-key generation and `.env` permissions hardening
-6. Cloudflare Tunnel installation
-7. LaunchAgent registration (auto-starts on login)
-8. End-to-end health check via `doctor.sh`
+3. Model weight download (~2.7 GB total: Parakeet for dictation, MLX Whisper
+   for file transcription; both public, no Hugging Face token needed)
+4. API-key generation and `.env` permissions hardening
+5. Cloudflare Tunnel installation
+6. LaunchAgent registration (auto-starts on login)
+7. End-to-end health check via `doctor.sh`
 
 For a detailed walkthrough see `../docs/SETUP-SERVER.md`.
 

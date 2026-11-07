@@ -12,7 +12,7 @@ two environment variables changed.
 > For the full /v1 surface reference (all response formats, headers, error
 > codes, file formats, key kinds), see [OPENAI-COMPAT.md](OPENAI-COMPAT.md).
 
-For the full WisprAlt-native API (async meetings, /me, admin), see
+For the full WisprAlt-native API (async file jobs, /me, admin), see
 [API.md](API.md).
 
 ---
@@ -184,8 +184,8 @@ with `code: "unsupported_file_type"`. Pre-convert to wav/mp3 locally.
   `code: "audio_too_long"` over the cap.
 - **Sync only.** This endpoint blocks until transcription completes (typically
   <500ms wall-clock for short clips).
-- **For longer audio (meetings, calls)**, use the native async
-  `/transcribe/meeting` endpoint. See [API.md](API.md).
+- **For longer audio (recorded calls, lectures, video)**, use the native async
+  `/transcribe/file` endpoint (employee keys only). See [API.md](API.md).
 - **Per-token rate limit: 60 requests per 60-second window.** Independent of
   the per-IP bucket on `/transcribe/dictate`. Honor `Retry-After` on 429.
 
@@ -259,8 +259,8 @@ expect upstream OpenAI clients to send it.
   at `https://transcribe.integrateapi.ai/admin/keys/new` (or ask your admin).
 - **413 file_too_large**: clip exceeds 25 MB. Chunk the audio client-side or
   use the native async API.
-- **400 audio_too_long**: clip exceeds 15 minutes. Use `/transcribe/meeting`
-  for longer audio.
+- **400 audio_too_long**: clip exceeds 15 minutes. Use the native async
+  `/transcribe/file` for longer audio.
 - **400 unsupported_file_type**: ffmpeg can't decode the file. Pre-convert
   to wav/mp3 locally.
 - **422 invalid_response_format**: the value you sent isn't a recognized
@@ -277,20 +277,20 @@ For server-side debugging see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 - All 5 response formats supported (`json`, `text`, `verbose_json`, `srt`, `vtt`).
 - We always route to Parakeet TDT 0.6B v2 (English, sub-200ms inference). The
   `model` field is accepted for compatibility against the 5 listed model IDs.
-- No diarization on `/v1/*` (use the native `/transcribe/meeting`).
+- No diarization (speaker labels) anywhere; WisprAlt transcribes one mono stream.
 - No translation (Parakeet is English-only).
 - No SSE streaming (`stream=true` → 400 `streaming_unsupported`). Matches
   real OpenAI's whisper-1 behavior.
 
-For diarization + multi-speaker meetings, use the native `/transcribe/meeting`
-async API, which does mlx-whisper + Pyannote with full speaker attribution.
+For long files, use the native async `/transcribe/file` API (mlx-whisper,
+single speaker, JSON/SRT/VTT/TXT outputs).
 
 ---
 
 ## See also
 
 - [OPENAI-COMPAT.md](OPENAI-COMPAT.md) — full /v1 surface reference (canonical)
-- [API.md](API.md) — full WisprAlt-native API reference (async meeting endpoint, `/me`, admin endpoints)
+- [API.md](API.md) — full WisprAlt-native API reference (async file-job endpoints, `/me`, admin endpoints)
 - [SETUP-SERVER.md](SETUP-SERVER.md) — deploy your own WisprAlt server
 - [SETUP-CLIENT.md](SETUP-CLIENT.md) — install the macOS client
 - [ADMIN.md](ADMIN.md) — minting tokens and managing users (incl. [Integration Keys](ADMIN.md#integration-keys))

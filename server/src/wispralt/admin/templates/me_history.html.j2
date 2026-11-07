@@ -1,11 +1,11 @@
 {% extends "base.html.j2" %}
 {% set TAB_LABELS = {'today': 'Today', '7d': '7d', '30d': '30d', '90d': '90d', '1y': '1y', 'all': 'All'} %}
-{% set KIND_LABELS = [('', 'All'), ('dictation', 'Dictations'), ('meeting', 'Meetings')] %}
+{% set KIND_LABELS = [('', 'All'), ('dictation', 'Dictations'), ('meeting', 'File transcriptions')] %}
 {% block title %}My History · Wispralt{% endblock %}
 {% block content %}
 <div class="data-page">
   <h2>My History</h2>
-  <p class="muted">Your dictations and meetings — search, expand, download, or remove. Deleting a row excludes it from future weekly insights.</p>
+  <p class="muted">Your dictations and file transcriptions — search, expand, download, or remove. Deleting a row excludes it from future weekly insights.</p>
 
   <nav x-data="{ active: '{{ range }}' }"
        @range-changed.window="active = $event.detail"

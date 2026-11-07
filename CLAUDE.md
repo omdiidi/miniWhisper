@@ -51,25 +51,13 @@ If you just need to read state and the user is sitting at the mini, the fastest 
 
 - Repository pattern: database queries in repository functions, business logic in services, validation at route boundaries only.
 - No generic `except Exception` — use typed errors.
-- No model loading per dictation request; dictation models are resident at startup. Meeting models load lazily on the first meeting job (async batch — load cost is invisible).
-- No Redis. Meeting jobs/dictation transcripts live in a SQLite job store; users, tokens and usage events live in Postgres (Supabase, via asyncpg).
-- No server-side speaker rename — client-only, atomic local rewrite.
+- No model loading per dictation request; dictation models are resident at startup. The file model (MLX Whisper) loads lazily on the first file job and is evicted when idle (async batch — load cost is invisible).
+- No Redis. File jobs/dictation transcripts live in a SQLite job store; users, tokens and usage events live in Postgres (Supabase, via asyncpg).
 - Cloudflared tunnel token: stored in `~/.config/wispralt/cloudflare-token` (mode 0600)
   outside the repo. Read by the cloudflared LaunchAgent via `--token-file`. Never
   committed, never logged. The legacy `sudo cloudflared service install` flow is
   abandoned because its plist is broken on macOS 14/15. Rotation: see
   docs/DEPLOYMENT-NOTES.md.
-- Cloud fallback: when the Mac mini is offline, dictation falls back
-  directly to OpenRouter's `openai/whisper-large-v3-turbo` from the
-  Swift client. No server, no Worker. Each install holds the OpenRouter
-  API key in the Keychain at `co.wispralt.openrouter`. If the key is
-  not set, the client surfaces the existing dictation error toast and
-  the rest of WisprAlt keeps working. Per-spend protection lives in
-  the OpenRouter dashboard's monthly-cap setting. Setup + threat model:
-  [docs/FALLBACK.md](docs/FALLBACK.md). Dev-only `?fault=503` injection
-  lives in `server/src/wispralt/routes/dev_faults.py` and is
-  mounted only when `WISPRALT_DEV_FAULTS=1` AND the host is not the
-  configured prod-mini hostname.
-- Secrets: `HF_TOKEN` and `WISPRALT_API_KEY` in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
+- Secrets: `WISPRALT_API_KEY` (and the optional `OPENROUTER_API_KEY` for Mercury smart formatting) in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
 
 @CLAUDE.local.md

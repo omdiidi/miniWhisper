@@ -9,7 +9,7 @@
 #   2. Python 3.11 check
 #   3. Homebrew check + install ffmpeg
 #   4. uv venv + uv sync (server Python deps)
-#   5. server/.env from .env.example if missing; prompt for HF_TOKEN
+#   5. server/.env from .env.example if missing
 #   6. download-models.sh
 #   7. generate-api-key.sh
 #   8. setup-cloudflared.sh
@@ -127,33 +127,6 @@ if ! grep -q "^OPENROUTER_TIMEOUT_MS=" "$ENV_FILE" 2>/dev/null; then
     printf 'OPENROUTER_TIMEOUT_MS=1500\n' >> "$ENV_FILE"
 fi
 chmod 600 "$ENV_FILE"
-
-# Prompt for HF_TOKEN if not set
-HF_TOKEN_CURRENT="$(grep "^HF_TOKEN=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
-if [[ -z "$HF_TOKEN_CURRENT" ]]; then
-    echo ""
-    echo "Your Hugging Face token is needed to download gated models (Pyannote)."
-    echo "Get one at: https://huggingface.co/settings/tokens  (read access is sufficient)"
-    echo ""
-    read -r -s -p "HF_TOKEN: " HF_TOKEN_INPUT
-    echo ""
-    if [[ -z "$HF_TOKEN_INPUT" ]]; then
-        die "HF_TOKEN cannot be empty. Re-run the script and enter your token."
-    fi
-    # Write into .env
-    if grep -q "^HF_TOKEN=" "$ENV_FILE" 2>/dev/null; then
-        TMP_ENV="$(dirname "$ENV_FILE")/.env.tmp.$$"
-        sed "s@^HF_TOKEN=.*@HF_TOKEN=$HF_TOKEN_INPUT@" "$ENV_FILE" > "$TMP_ENV"
-        mv "$TMP_ENV" "$ENV_FILE"
-    else
-        printf '\nHF_TOKEN=%s\n' "$HF_TOKEN_INPUT" >> "$ENV_FILE"
-    fi
-    unset HF_TOKEN_INPUT
-    chmod 600 "$ENV_FILE"
-    echo "HF_TOKEN saved to $ENV_FILE"
-else
-    echo "HF_TOKEN already set in $ENV_FILE"
-fi
 
 # ── 6. Download model weights ─────────────────────────────────────────────────
 step "Downloading model weights..."

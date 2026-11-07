@@ -93,12 +93,12 @@ else
 fi
 echo ""
 
-# ── 5. Application Support data (DB, staging, meeting outputs) ───────────────
+# ── 5. Application Support data (DB, staging, file-job outputs) ───────────────
 echo "Step 5: Application data"
 APP_SUPPORT_DIR="$HOME/Library/Application Support/WisprAlt"
 if [[ -d "$APP_SUPPORT_DIR" ]]; then
     APP_SIZE="$(du -sh "$APP_SUPPORT_DIR" 2>/dev/null | cut -f1)"
-    echo "  This contains: jobs SQLite DB, staging WAVs, server-side meeting outputs."
+    echo "  This contains: jobs SQLite DB, staging WAVs, server-side file-job outputs."
     if confirm "  Remove $APP_SUPPORT_DIR ($APP_SIZE)?"; then
         rm -rf "$APP_SUPPORT_DIR"
         echo "  Removed $APP_SUPPORT_DIR"
@@ -115,7 +115,7 @@ echo "────────────────────────�
 echo -e "${GREEN}Server uninstall complete.${NC}"
 echo ""
 echo "The following were NOT removed (to avoid losing data):"
-echo "  server/.env            — contains HF_TOKEN and API key; delete manually if desired"
-echo "  ~/.cache/huggingface/  — HF model cache (~5.6 GB); remove with: rm -rf ~/.cache/huggingface/"
+echo "  server/.env            — contains the API key and server config; delete manually if desired"
+echo "  ~/.cache/huggingface/  — HF model cache (~2.7 GB); remove with: rm -rf ~/.cache/huggingface/"
 echo ""
 echo "To fully remove the repo:  rm -rf $REPO_ROOT"

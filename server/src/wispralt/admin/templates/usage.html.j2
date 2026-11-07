@@ -4,7 +4,7 @@
   <h2>Usage</h2>
 
   <form class="filters" method="get" action="/admin/usage">
-    <input type="text" name="kind" value="{{ filters.kind or '' }}" placeholder="kind (dictate / meeting)">
+    <input type="text" name="kind" value="{{ filters.kind or '' }}" placeholder="kind (dictate / file)">
     <input type="number" name="status" value="{{ filters.status if filters.status is not none else '' }}" placeholder="status">
     <input type="number" name="user_id" value="{{ filters.user_id if filters.user_id is not none else '' }}" placeholder="user_id">
     <input type="datetime-local" name="since" value="{{ filters.since or '' }}">

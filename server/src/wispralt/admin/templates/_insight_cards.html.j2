@@ -140,16 +140,16 @@
 
 {% macro card_dictation_vs_meeting_split(stats, empty_state="—") %}
 <section class="glass-card">
-  <h3>Dictation vs meeting split</h3>
+  <h3>Dictation vs file transcription split</h3>
   {% if stats and (stats.dictation_count or stats.meeting_count) %}
     {% set total = stats.dictation_count + stats.meeting_count %}
     {% set d_pct = (stats.dictation_count * 100 / total) | round(0) if total > 0 else 0 %}
     {% set m_pct = 100 - d_pct %}
     <div style="display: flex; gap: 4px; height: 24px; border-radius: 6px; overflow: hidden;">
       <div style="background: var(--accent); width: {{ d_pct }}%;" title="Dictations"></div>
-      <div style="background: var(--warn); width: {{ m_pct }}%;" title="Meetings"></div>
+      <div style="background: var(--warn); width: {{ m_pct }}%;" title="File transcriptions"></div>
     </div>
-    <p class="muted">{{ stats.dictation_count }} dictations ({{ d_pct }}%) / {{ stats.meeting_count }} meetings ({{ m_pct }}%)</p>
+    <p class="muted">{{ stats.dictation_count }} dictations ({{ d_pct }}%) / {{ stats.meeting_count }} file transcriptions ({{ m_pct }}%)</p>
   {% else %}<p class="muted">{{ empty_state }}</p>{% endif %}
 </section>
 {% endmacro %}

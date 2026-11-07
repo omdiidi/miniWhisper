@@ -62,7 +62,7 @@ unlinking.)
 No Xcode Command Line Tools, Homebrew, or other developer tooling is required —
 the installer uses only stock macOS utilities.
 
-## 3. The 4 macOS permissions WisprAlt needs
+## 3. The 3 macOS permissions WisprAlt needs
 
 Apple's TCC (Transparency, Consent, and Control) framework will not let any
 script auto-grant these — that's a security boundary, not a bug in the
@@ -74,8 +74,6 @@ launch.
 - **Input Monitoring** — required to detect FN-key holds (the global hotkey
   that triggers dictation).
 - **Microphone** — required to capture your voice.
-- **Screen Recording** — required for meeting-mode recording, which uses
-  ScreenCaptureKit to capture system audio alongside the mic.
 
 On macOS 14.4+, granting Input Monitoring requires a quit-and-reopen of the
 app before the OS will treat the grant as effective.
@@ -161,7 +159,7 @@ you don't have to coordinate the rotation tightly.
 ## 9. Uninstalling
 
 Copy-paste this block into Terminal. It quits the app, removes the bundle,
-clears all four TCC permissions, deletes UserDefaults, removes the Keychain
+clears all three TCC permissions, deletes UserDefaults, removes the Keychain
 entry, deletes logs and caches, and forces `cfprefsd` to forget the plist
 cache:
 

@@ -1,5 +1,5 @@
 ---
-description: Install and configure the WisprAlt macOS client app — download or build DMG, walk the user through 4 permissions, paste server config, test connection.
+description: Install and configure the WisprAlt macOS client app — download or build DMG, walk the user through 3 permissions, paste server config, test connection.
 ---
 
 # /setup-client
@@ -68,13 +68,12 @@ Required when re-installing over an existing app (rebuilds, version updates, fri
 ```bash
 tccutil reset Accessibility   co.wispralt.WisprAlt
 tccutil reset ListenEvent     co.wispralt.WisprAlt
-tccutil reset ScreenCapture   co.wispralt.WisprAlt
 tccutil reset Microphone      co.wispralt.WisprAlt
 ```
 
 Skip on a truly fresh install (no prior `/Applications/WisprAlt.app` ever existed). When in doubt, run them — `tccutil reset` is harmless on a non-existent entry.
 
-## Walk the 4-permission wizard
+## Walk the 3-permission wizard
 
 Open System Settings to each pane in order — instruct the user to grant permission, then continue:
 
@@ -82,7 +81,6 @@ Open System Settings to each pane in order — instruct the user to grant permis
 2. **Input Monitoring** — `open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"` — required for FN key detection.
    - **macOS 14.4+ note**: After granting, the app will require a Quit-and-Reopen. Tell the user to expect a sheet.
 3. **Microphone** — `open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"`.
-4. **Screen Recording** — `open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"` — required for `SCStream` system audio capture.
 
 ## Paste server config
 
@@ -122,7 +120,7 @@ Friends installing a shared DMG should run the quarantine removal immediately af
 xattr -dr com.apple.quarantine /Applications/WisprAlt.app
 ```
 
-Then open and grant the 4 permissions as above. The server URL and API key are shared by the user — friends do not run their own server.
+Then open and grant the 3 permissions as above. The server URL and API key are shared by the user — friends do not run their own server.
 
 ## Final smoke test
 
@@ -133,7 +131,7 @@ curl --max-time 5 -fsS -H "Authorization: Bearer $API_KEY" https://transcribe.in
 
 If `200` returned, dictation is ready. Tell the user:
 
-> Hold FN to dictate. Release to inject text at the cursor. Triple-tap FN within 400ms to start/stop a meeting recording.
+> Hold FN to dictate. Release to inject text at the cursor. Use "Transcribe file…" in the menubar to transcribe an audio or video file.
 
 ## Never
 

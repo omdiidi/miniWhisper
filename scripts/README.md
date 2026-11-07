@@ -13,7 +13,7 @@ git clone <repo> && cd wisprflowALT
 
 | Order | Script | Purpose |
 |-------|--------|---------|
-| 1 | `download-models.sh` | Download ~5.6 GB of model weights from Hugging Face |
+| 1 | `download-models.sh` | Download ~2.7 GB of model weights from Hugging Face (public, no token) |
 | 2 | `generate-api-key.sh` | Generate `openssl rand -hex 32` key; write to `server/.env` (mode 0600) |
 | 3 | `setup-cloudflared.sh` | Install cloudflared; configure HTTPS tunnel; persist `SERVER_URL` to `.env` |
 | 4 | `server-launchd.sh install` | Register FastAPI server as a macOS LaunchAgent |
@@ -27,10 +27,8 @@ sub-scripts in order. Prints `SERVER_URL` + `API_KEY` at the end for pasting int
 the client.
 
 ### `download-models.sh`
-- Pre-flight: requires ≥ 8 GB free on `$HOME`
-- Validates `HF_TOKEN` with 3-retry / 5s backoff (distinguishes HTTP 401 from 429)
-- Probes gated Pyannote repos for terms acceptance; prints exact accept URL on failure
-- Downloads: Parakeet (~1.2 GB), mlx-whisper large-v3-turbo (~1.6 GB), Pyannote 3.1 + segmentation-3.0 (~800 MB)
+- Pre-flight: requires ≥ 4 GB free on `$HOME`
+- Downloads (public repos, no token): Parakeet (~1.2 GB) for dictation and mlx-whisper large-v3-turbo (~1.6 GB) for file transcription; each download retries 3 times with a 5 s backoff
 - Reports total HF cache size after completion
 
 ### `generate-api-key.sh`
@@ -66,9 +64,10 @@ Health-check suite. Checks:
 4. `STAGING_DIR` and `MEETING_OUTPUT_DIR` on the same filesystem
 5. `/healthz` — polls up to 60 s
 6. `/readyz/dictation` — polls up to 60 s (Parakeet model load)
-7. `/readyz/meeting` — polls once; reports `models_warm` (cold is OK — first meeting will load lazily). Pass `--with-warmup` to chain smoke-meeting.sh for full E2E verification.
-8. Dictation round-trip: generates a silent WAV with Python + POSTs to `/transcribe/dictate`
-9. `/metrics` — pretty-prints JSON
+7. Dictation round-trip: generates a silent WAV with Python + POSTs to `/transcribe/dictate`
+8. `/metrics` — pretty-prints JSON
+
+The file-transcription model (MLX Whisper) loads lazily on the first file job and is evicted when idle, so doctor has no readiness check for it.
 
 ### `server-uninstall.sh`
 Prompts before each destructive action:

@@ -8,26 +8,21 @@
 #   4. STAGING_DIR and MEETING_OUTPUT_DIR on same filesystem
 #   5. Poll /healthz until 200 or 401 (max 60s)
 #   6. Poll /readyz/dictation until 200 (max 60s × 5s intervals)
-#   7. Poll /readyz/meeting once (200 expected immediately; reports models_warm
-#      from JSON body — cold is OK, models load lazily on first meeting)
-#   8. Generate test WAV via Python + POST to /transcribe/dictate
-#   9. GET /metrics and pretty-print JSON
+#   7. Generate test WAV via Python + POST to /transcribe/dictate
+#   8. GET /metrics and pretty-print JSON
+#
+# The file-transcription model (MLX Whisper) loads lazily on the first file
+# job, so there is no readiness probe for it here.
 #
 # Exit code: 0 if all checks pass, 1 if any required check fails.
 #
-# Usage: ./scripts/doctor.sh [--with-warmup]
-#   --with-warmup  After the standard checks, run scripts/smoke-meeting.sh to
-#                  trigger the lazy meeting-model load and verify end-to-end.
+# Usage: ./scripts/doctor.sh
 
 set -euo pipefail
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
-WITH_WARMUP=0
 for arg in "$@"; do
-    case "$arg" in
-        --with-warmup) WITH_WARMUP=1 ;;
-        *) echo "Unknown argument: $arg" >&2; exit 2 ;;
-    esac
+    echo "Unknown argument: $arg" >&2; exit 2
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -198,37 +193,11 @@ else
         info "The Parakeet model may still be loading, or the server is in an error state."
         info "Logs: tail -50 $HOME/Library/Logs/WisprAlt/server.err.log"
     fi
-
-    # ── 7. /readyz/meeting (single shot — lazy load) ──────────────────────────
-    echo ""
-    echo "Check 7: /readyz/meeting (single poll — meeting models lazy-load on first job)"
-    MEETING_BODY="/tmp/wispralt_readyz_meeting_$$.json"
-    HTTP_CODE="$(curl -fsS -o "$MEETING_BODY" -w "%{http_code}" \
-        --connect-timeout 5 --max-time 10 \
-        -H "Authorization: Bearer $WISPRALT_API_KEY" \
-        "$SERVER_URL/readyz/meeting" 2>/dev/null || echo "000")"
-    if [[ "$HTTP_CODE" != "200" ]]; then
-        fail "/readyz/meeting returned HTTP $HTTP_CODE — expected 200"
-        info "Body: $(cat "$MEETING_BODY" 2>/dev/null || echo '<empty>')"
-        info "Logs: tail -100 $HOME/Library/Logs/WisprAlt/server.err.log"
-    else
-        MODELS_WARM="$("$PYTHON_BIN" -c \
-            "import json,sys; d=json.load(open('$MEETING_BODY')); print('true' if d.get('models_warm') else 'false')" \
-            2>/dev/null || echo "unknown")"
-        if [[ "$MODELS_WARM" == "true" ]]; then
-            pass "/readyz/meeting returned 200 — models warm"
-        else
-            pass "/readyz/meeting returned 200 (models_warm=$MODELS_WARM)"
-            info "models cold — /readyz/meeting wired but lazy. First meeting will load (5–30s)."
-            info "For deploy verification, re-run with --with-warmup to chain scripts/smoke-meeting.sh."
-        fi
-    fi
-    rm -f "$MEETING_BODY"
 fi
 
-# ── 8. WAV round-trip test ────────────────────────────────────────────────────
+# ── 7. WAV round-trip test ────────────────────────────────────────────────────
 echo ""
-echo "Check 8: Dictation round-trip (generate WAV → POST /transcribe/dictate)"
+echo "Check 7: Dictation round-trip (generate WAV → POST /transcribe/dictate)"
 TEST_WAV="/tmp/wispralt_test_$$.wav"
 # P4#9 / validation-loop fallback: use Python+numpy+soundfile (works without ffmpeg)
 if "$PYTHON_BIN" -c \
@@ -256,9 +225,9 @@ else
     info "Install with: cd server && uv sync"
 fi
 
-# ── 9. /metrics ───────────────────────────────────────────────────────────────
+# ── 8. /metrics ───────────────────────────────────────────────────────────────
 echo ""
-echo "Check 9: /metrics"
+echo "Check 8: /metrics"
 if [[ -z "$SERVER_URL" || -z "$WISPRALT_API_KEY" ]]; then
     warn "SERVER_URL or API key not set — skipping /metrics"
 else
@@ -271,17 +240,6 @@ else
         echo "$METRICS_RESP" | "$PYTHON_BIN" -m json.tool 2>/dev/null || echo "$METRICS_RESP"
     else
         warn "/metrics returned empty response (server may not yet support this endpoint)"
-    fi
-fi
-
-# ── Optional warmup ───────────────────────────────────────────────────────────
-if [ "${WITH_WARMUP:-0}" = "1" ]; then
-    echo
-    echo "Running scripts/smoke-meeting.sh (--with-warmup) …"
-    if "$(dirname "$0")/smoke-meeting.sh"; then
-        pass "smoke-meeting.sh succeeded"
-    else
-        fail "smoke-meeting.sh failed (exit $?)"
     fi
 fi
 

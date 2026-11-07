@@ -6,7 +6,7 @@ title: Transcript Format
 
 ## Locked JSON schema
 
-The following schema is the canonical contract between server output and client storage. Every server transcript is a file job: one mono stream transcribed by mlx-whisper, labelled `"Speaker 1"`. The `speaker_raw` field in `speakers` is the stable raw label (always `"mic"` for file jobs); it is used as the lookup key and is never overwritten. The `display_name` field is the user-visible name and is the only field modified by client-side speaker rename.
+The following schema is the canonical contract between server output and client storage. Every server transcript is a file job: one mono stream transcribed by mlx-whisper, labelled `"Speaker 1"`. The `speaker_raw` field in `speakers` is the stable raw label (always `"mic"` for file jobs); it is used as the lookup key and is never overwritten. The `display_name` field is the user-visible name. (Client-side speaker rename was removed with the meeting recorder; the fields stay so old and new files share one schema.)
 
 ```jsonc
 {
@@ -23,7 +23,7 @@ The following schema is the canonical contract between server output and client 
       "start": 0.0,                  // seconds
       "end": 3.42,
       "channel": null,               // always null for file jobs (one mono stream)
-      "speaker": "Speaker 1",        // canonical label after any client renames
+      "speaker": "Speaker 1",        // display label
       "speaker_raw": "mic",          // raw label, never overwritten
       "text": "string",
       "words": [],                   // empty: file jobs run without word timestamps
@@ -41,64 +41,37 @@ The following schema is the canonical contract between server output and client 
 - `model` lists the ASR model only. Transcripts written before the meeting pipeline was removed also carried `diarization` and `denoise` keys, and `mode` values `remote` / `in_person`; readers must tolerate those on old files. File audio is no longer passed through the (pass-through) denoise stub.
 - Stereo uploads are averaged to one mono stream before transcription.
 - `warnings` (optional top-level array) may appear on transcripts written by older servers; current servers do not emit it.
-- `speaker_raw` is preserved even after rename so the client can map raw labels back to user names.
 - `speakers` is keyed by `speaker_raw` (not display name). This is a v3 change from the v1/v2 schema where `speakers` was keyed by display name.
-- `speaker` in each segment is the denormalized current display name; it is rewritten on every rename to keep the file self-contained for human readers.
-- Rename collision check: `renameSpeaker(raw:to:)` throws `.speakerNameConflict` if another speaker already has `display_name == newName`.
 
 ## Filename convention
 
-Files are saved under `~/Documents/WisprAlt/Meetings/` with the pattern:
+The client saves each file job into its own folder under the output folder chosen in Settings (default `~/Documents/WisprAlt/Meetings/`; the folder keeps its meeting-era name until a later rename):
 
 ```
-YYYY-MM-DD_HHMM<±HHMM>_<title>.{json,srt,vtt,txt}
+<output folder>/Custom Transcriptions/<source stem>__<yyyymmdd-HHmmss>/
+    <source file, copied as-is>
+    <source stem>.{json,srt,vtt,txt}
 ```
 
-The UTC offset is included to eliminate DST collision (e.g. `2026-04-24_1543-0700_meeting`).
+A second-resolution collision appends `-2`, `-3`, … to the folder name. Meeting transcripts saved by older versions stay in that folder untouched; the app no longer lists or edits them.
 
-## SRT format
+## SRT, VTT and TXT formats
 
-Speaker labels use the `Speaker: text` convention on a single line:
+Every current transcript is a single-speaker file job (`"mode": "single"`), so the text formats carry **no speaker prefix**:
 
 ```
 1
 00:00:00,000 --> 00:00:03,420
-You: Let me share my screen.
-
-2
-00:00:03,800 --> 00:00:06,100
-Other: Sure, go ahead.
+Let me share my screen.
 ```
-
-## VTT format
-
-Speaker labels use `<v Speaker>text</v>` WebVTT voice tags so playback tools render the speaker label natively:
 
 ```
 WEBVTT
 
 00:00:00.000 --> 00:00:03.420
-<v You>Let me share my screen.</v>
-
-00:00:03.800 --> 00:00:06.100
-<v Other>Sure, go ahead.</v>
+Let me share my screen.
 ```
 
-## TXT format
+TXT is one segment per line, plain text.
 
-Plain text with bracketed speaker prefix:
-
-```
-[You] Let me share my screen.
-[Other] Sure, go ahead.
-```
-
-## Client-side speaker rename contract
-
-Speaker rename happens entirely on the client. There is no server `PATCH` endpoint. The client:
-
-1. Loads the local `.json` file.
-2. Calls `renameSpeaker(raw:to:)` which updates `display_name` in `speakers` and rewrites `speaker` in every matching segment.
-3. Writes all four formats (`.json`, `.srt`, `.vtt`, `.txt`) atomically: each file is written to a `.{uuid}.tmp` file in the same directory first, then `replaceItemAt` replaces the original. A `.transcriptWriteInProgress` sentinel file is created before the first replace and deleted after the last; on app launch, orphan sentinels trigger a revert (delete partial outputs, keep originals).
-
-This is fully offline-capable and requires no network connectivity.
+Multi-speaker transcripts written by older servers used `Speaker: text` (SRT), `<v Speaker>text</v>` voice tags (VTT) and `[Speaker] text` (TXT). The server's writers still render those prefixes for any non-`single` transcript, but nothing produces one today.

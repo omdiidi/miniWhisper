@@ -36,7 +36,7 @@ Sync transcription. Returns text in one of: json (default), text, verbose_json, 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `file` | file | (required) | Audio bytes. See "File formats" below. ≤25 MB. |
-| `model` | string | `whisper-1` | One of 5 listed models. `gpt-4o-transcribe-diarize` returns 404 — use `/transcribe/meeting` for diarization. Unknown models still route to Parakeet but log a warning. |
+| `model` | string | `whisper-1` | One of 5 listed models. `gpt-4o-transcribe-diarize` returns 404 — WisprAlt has no diarization. Unknown models still route to Parakeet but log a warning. |
 | `response_format` | string | `json` | One of: `json`, `text`, `verbose_json`, `srt`, `vtt`. |
 | `language` | string | — | ISO-639-1 (e.g. `en`). Accepted, ignored (Parakeet is English-only). |
 | `prompt` | string | — | Accepted, ignored (no Parakeet equivalent). |
@@ -284,7 +284,7 @@ The following clients have been verified against WisprAlt's `/v1` (or are expect
 | 401 `invalid_api_key` | Token revoked or wrong. Mint a new one via `/admin/keys/new`. |
 | 401 with valid token | Sending cookie instead of `Authorization: Bearer ...` |
 | 400 `unsupported_file_type` | ffmpeg can't decode the file. Pre-convert to wav/mp3 locally. |
-| 400 `audio_too_long` | Audio > 15 min. Use `/transcribe/meeting` for longer clips. |
+| 400 `audio_too_long` | Audio > 15 min. Use the native async `/transcribe/file` for longer clips. |
 | 429 in rapid succession | Hit the 60/min/token cap. Honor `Retry-After`. |
 | Browser client fails silently with no error | CORS preflight failing. Check browser console for the actual error. |
 | 413 with HTML body (not JSON) | Cloudflare edge rejection on > 100 MB. Size-check locally. |
@@ -294,7 +294,7 @@ The following clients have been verified against WisprAlt's `/v1` (or are expect
 | Feature | Status |
 |---|---|
 | SSE streaming (`stream=true`) | Not supported on any model. Matches real OpenAI's whisper-1 behavior. |
-| Diarization (`response_format=diarized_json`, `model=gpt-4o-transcribe-diarize`) | Use `/transcribe/meeting` (async, native WisprAlt). |
+| Diarization (`response_format=diarized_json`, `model=gpt-4o-transcribe-diarize`) | Not supported. WisprAlt transcribes one mono stream; there are no speaker labels. |
 | Translation (`/v1/audio/translations`) | Parakeet is English-only. |
 | `include[]=logprobs` (returning logprobs) | Silently accepted; not surfaced (Parakeet doesn't produce logprobs). |
 | `language` parameter (forcing a non-English language) | Accepted, ignored. Output is always English-detected. |
