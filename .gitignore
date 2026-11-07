@@ -68,3 +68,6 @@ MISSION.*.md
 MISSION.*.log
 MISSION.*.banner
 .mission-backups/
+
+# mission test harness venv
+tmp/mission/part2/.venv-ci/
