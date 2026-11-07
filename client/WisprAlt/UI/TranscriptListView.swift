@@ -121,8 +121,11 @@ private struct TranscriptRowView: View {
 }
 
 // MARK: - Preview
-
-#Preview {
-    TranscriptListView()
-        .frame(width: 600, height: 500)
+#if DEBUG
+struct TranscriptListView_Previews: PreviewProvider {
+    static var previews: some View {
+        TranscriptListView()
+            .frame(width: 600, height: 500)
+    }
 }
+#endif

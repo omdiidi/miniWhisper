@@ -406,8 +406,11 @@ private struct RenameSpeakersSheet: View {
 }
 
 // MARK: - Preview
-
-#Preview {
-    TranscriptDetailView(jobID: "sample-job-id")
-        .frame(width: 700, height: 600)
+#if DEBUG
+struct TranscriptDetailView_Previews: PreviewProvider {
+    static var previews: some View {
+        TranscriptDetailView(jobID: "sample-job-id")
+            .frame(width: 700, height: 600)
+    }
 }
+#endif
