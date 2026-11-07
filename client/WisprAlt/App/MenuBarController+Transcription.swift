@@ -188,7 +188,9 @@ extension MenuBarController {
         // local state; cancel the job the server just created and end silently
         // instead of re-publishing it as active.
         if Task.isCancelled {
-            _ = try? await FileJobAPI.cancel(jobID)
+            // A new unstructured Task does not inherit this Task's cancelled
+            // state, so the cancel request is actually sent.
+            await Task { _ = try? await FileJobAPI.cancel(jobID) }.value
             throw CancellationError()
         }
         // Make the job id observable + persistent so a process restart can
@@ -260,9 +262,16 @@ extension MenuBarController {
         }
 
         // --- Cleanup ---
-        try await FileJobAPI.delete(jobID)
+        // Outputs are saved locally; the job is done from the user's point of
+        // view. Server cleanup is best-effort (a failed DELETE keeps the row
+        // for the retention sweep) and must not turn success into failure.
         recordingState.activeJobID = nil
         UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+        do {
+            try await FileJobAPI.delete(jobID)
+        } catch {
+            Log.warning("FileJobAPI.delete(\(jobID)) failed after download: \(error.localizedDescription)", category: "transcribe")
+        }
     }
 
     /// Poll the job with exponential backoff (1 s / 2 s / 4 s) on transient
@@ -348,6 +357,7 @@ extension MenuBarController {
     static func isCancellation(_ error: Error) -> Bool {
         if error is CancellationError { return true }
         if let urlErr = error as? URLError, urlErr.code == .cancelled { return true }
+        if case ServerError.transport(let underlying) = error { return isCancellation(underlying) }
         if let chunkErr = error as? ChunkedUploaderError {
             switch chunkErr {
             case .initFailed(let underlying), .chunkUploadFailed(let underlying),
@@ -390,10 +400,23 @@ extension MenuBarController {
         activeUploadSession = nil
         recordingState.lastUploadProgressAt = nil
 
-        // 4) Tell the server. 202 = cancel accepted (the server finishes the
+        // 4) Forget the job locally FIRST, so a cancel request that is still
+        //    in flight can never clear the state of a job started after it.
+        let cancelledRaw = recordingState.activeJobID
+        recordingState.activeJobID = nil
+        UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+        recordingState.phase = nil
+        recordingState.phaseLabel = nil
+        recordingState.chunkIndex = nil
+        recordingState.totalChunks = nil
+        recordingState.phaseElapsedS = nil
+        recordingState.uploadFraction = 0
+        recordingState.isFinalizing = false
+
+        // 5) Tell the server. 202 = cancel accepted (the server finishes the
         //    cancel itself); 204 = already finished or gone. Either way the
-        //    server owns the rest, so the client forgets the job right away.
-        if let raw = recordingState.activeJobID {
+        //    server owns the rest.
+        if let raw = cancelledRaw {
             let jobID = JobID(raw: raw)
             do {
                 let status = try await FileJobAPI.cancel(jobID)
@@ -412,17 +435,6 @@ extension MenuBarController {
                 )
             }
         }
-
-        // 5) Reset local UI state and forget the persisted id.
-        recordingState.activeJobID = nil
-        UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
-        recordingState.phase = nil
-        recordingState.phaseLabel = nil
-        recordingState.chunkIndex = nil
-        recordingState.totalChunks = nil
-        recordingState.phaseElapsedS = nil
-        recordingState.uploadFraction = 0
-        recordingState.isFinalizing = false
         self.mode = .idle
     }
 
@@ -514,11 +526,17 @@ extension MenuBarController {
                 "Resumed-job polling aborted: \(error.localizedDescription)",
                 category: "transcribe"
             )
+            if case ServerError.server(status: 404, _) = error {
+                // The server no longer knows the job: never resume it again.
+                UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+            }
         }
         // Timed out or polling failed: stop presenting the job as processing
-        // (that would keep `isBusy` true and block updates forever). The job id
-        // stays in UserDefaults, so the next launch resumes polling it.
+        // (that would keep `isBusy` true and block updates forever). Unless the
+        // server said 404, the job id stays in UserDefaults so the next launch
+        // resumes polling it.
         if mode == .processing { mode = .idle }
+        recordingState.activeJobID = nil
     }
 
     /// Map a thrown upload error to a user-readable banner string. Switches
@@ -590,6 +608,10 @@ extension MenuBarController {
         // and the shared job state, so Cancel could no longer reach the first.
         guard fileJobsInFlight == 0 else {
             Log.info("Transcribe file ignored: a file job is already running.", category: "transcribe")
+            AppNotifications.notify(
+                title: "Transcription Already Running",
+                body: "Wait for the current file to finish, or cancel it first."
+            )
             return
         }
         // Bring the app to front so the modal sheet appears reliably above

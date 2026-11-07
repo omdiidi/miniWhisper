@@ -57,7 +57,7 @@ Versioned deploy script for the mini. Contract:
 2. On the mini: creates `.wf-deploy-backup-<epoch>/` (using `mkdir -p` first — BSD `cp -r src1 src2 dst` requires `dst` to be an existing dir), then `cp -r server scripts "$BACKUP/"`, then overwrites with the new tree.
 3. Runs `uv sync` to install/upgrade pinned deps.
 4. Runs `server/scripts/prefetch-mlx-whisper.sh` (idempotent).
-5. `launchctl kickstart -k gui/$UID/co.wispralt.server`.
+5. `launchctl kickstart -k gui/$UID/co.wispralt.server` — or, when the installed plist still names an old module path (the pre-rename package), `scripts/server-launchd.sh install` to regenerate it.
 6. Polls `/healthz` for up to 60 s.
 
 **`set -e` polling bug fix.** Earlier iterations of the deploy script wrote `code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/healthz)` inside the poll loop with `set -e` at the top. The first poll iteration runs while the server is still binding the port — `curl` exits with code 7 (connect refused) — and `set -e` aborts the entire deploy script. The deploy actually succeeded (the server came up seconds later), but the script falsely reported FAILED. **Fix:** always pair the poll with `|| echo "000"`:

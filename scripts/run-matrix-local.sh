@@ -128,8 +128,8 @@ except: print('?')
     SEGS=0; SPEAKERS=0
     if [ "$STATUS" = "done" ]; then
         TXT=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/file/$JOB/download/txt" 2>/dev/null)
-        SEGS=$(echo "$TXT" | grep -c "^\[Speaker")
-        SPEAKERS=$(echo "$TXT" | grep -oE "\[Speaker [^]]+\]" | sort -u | wc -l | tr -d ' ')
+        SEGS=$(echo "$TXT" | grep -c .)
+        SPEAKERS=1  # file transcripts are single-speaker
     fi
     echo "  result: status=$STATUS wall=${WALL}s ratio=${RATIO}x segs=$SEGS speakers=$SPEAKERS"
 

@@ -360,9 +360,9 @@ FastAPI event loop (single thread)
     │
     └── POST /transcribe/file (+ chunked finalize)   (ffprobe + ffmpeg in worker)
             └── FileJobRunner.submit_source_or_429()
-                    ├── Check Semaphore locked → 429 code=file_job_busy (non-blocking)
+                    ├── Check a worker is queued/running (`_workers`) → 429 code=file_job_busy (non-blocking)
                     ├── Check available RAM < 2 GiB → 429 code=insufficient_memory
-                    └── asyncio.create_task(_run_source())
+                    └── _spawn(): create_task(_run_source()) tracked in `_workers`
                             └── async with asyncio.Semaphore(1)
                                     └── loop.run_in_executor(
                                             FileJobRunner._executor,  ← dedicated 1-worker pool

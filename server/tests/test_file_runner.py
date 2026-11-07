@@ -304,6 +304,7 @@ async def test_runner_raises_coded_errors(store: JobStore, monkeypatch: pytest.M
     # Back-to-back submits with no await between them: the first worker has
     # not acquired the semaphore yet, and the second submit must still 429.
     await runner.submit_source_or_429(Path("/tmp/a.m4a"))
+    assert runner.active  # queued worker already counts as active
     with pytest.raises(FileJobInProgressError) as busy:
         await runner.submit_source_or_429(Path("/tmp/b.m4a"))
     assert busy.value.code == "file_job_busy"

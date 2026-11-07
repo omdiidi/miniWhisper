@@ -129,7 +129,13 @@ case "$CMD" in
             echo "Agent already loaded — reloading with new plist..."
             launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
         fi
-        launchctl bootstrap "gui/$UID" "$PLIST_PATH"
+        # bootout returns before the old job is fully torn down, so an
+        # immediate bootstrap can fail with EIO; retry briefly.
+        for attempt in 1 2 3 4 5; do
+            launchctl bootstrap "gui/$UID" "$PLIST_PATH" && break
+            [[ $attempt -eq 5 ]] && { echo "ERROR: launchctl bootstrap failed" >&2; exit 1; }
+            sleep 1
+        done
         echo "LaunchAgent $LABEL loaded (will start immediately)."
         echo ""
         echo "Logs:"

@@ -786,7 +786,10 @@ def delete_file_job(request: Request, job_id: str) -> Response:
             logger.info("File job %s cancel requested.", job_id)
             return Response(status_code=202)
 
-    if job.output_dir is not None and not remove_job_outputs(Path(job.output_dir), job_id):
+    # A failed/cancelled job has no output_dir; its partial outputs (if any)
+    # live in the default output root, same fallback as the retention sweep.
+    out_root = Path(job.output_dir) if job.output_dir else Path(settings.meeting_output_dir)
+    if not remove_job_outputs(out_root, job_id):
         # Keep the row: it is what lets a retried DELETE or the retention
         # sweep find and remove the leftover transcript files.
         logger.warning("File job %s: some outputs could not be removed; row kept.", job_id)

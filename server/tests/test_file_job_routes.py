@@ -285,6 +285,16 @@ def test_delete_keeps_row_when_outputs_cannot_be_removed(
     assert store.get(jid) is not None  # kept so a retry / the sweep can clean up
 
 
+def test_delete_failed_job_removes_leftovers_from_default_root(make_app, store, out_dir) -> None:
+    jid = store.create("/tmp/src.m4a", api_key_id=OWNER.id)
+    store.set_failed(jid, "boom")  # failed jobs have no output_dir
+    (out_dir / f"{jid}.txt").write_text("partial")
+    resp = TestClient(make_app(OWNER)).delete(f"/transcribe/file/{jid}")
+    assert resp.status_code == 204
+    assert store.get(jid) is None
+    assert not (out_dir / f"{jid}.txt").exists()
+
+
 # ── real runner ───────────────────────────────────────────────────────────────
 
 

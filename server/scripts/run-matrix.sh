@@ -141,8 +141,8 @@ except: print(0)
     SEGS=0; SPEAKERS=0; ERR=""
     if [ "$STATUS" = "done" ]; then
         TXT=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/file/$JOB/download/txt" 2>/dev/null || echo "")
-        SEGS=$(echo "$TXT" | grep -c "^\[Speaker")
-        SPEAKERS=$(echo "$TXT" | grep -oE "\[Speaker [^]]+\]" | sort -u | wc -l | tr -d ' ')
+        SEGS=$(echo "$TXT" | grep -c .)
+        SPEAKERS=1  # file transcripts are single-speaker
     elif [ "$STATUS" = "failed" ]; then
         ERR=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','')[:60])")
     fi

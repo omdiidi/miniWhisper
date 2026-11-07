@@ -125,8 +125,8 @@ class FileJobRunner:
 
     @property
     def active(self) -> bool:
-        """True while a file job is currently running."""
-        return self._semaphore.locked()
+        """True while a file job is queued or running (same signal as admission)."""
+        return bool(self._workers)
 
     @property
     def active_job_id(self) -> str | None:
