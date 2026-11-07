@@ -61,3 +61,15 @@ def test_meeting_submit_route_absent(routes: list[tuple[str, frozenset[str]]]) -
 
 def test_meeting_readyz_absent(routes: list[tuple[str, frozenset[str]]]) -> None:
     assert [p for p, _ in routes if p.startswith(_MEETING_READYZ)] == []
+
+
+def test_file_job_routes_present(routes: list[tuple[str, frozenset[str]]]) -> None:
+    by_path: dict[str, set[str]] = {}
+    for path, methods in routes:
+        by_path.setdefault(path, set()).update(methods)
+    assert {"GET", "DELETE"} <= by_path["/transcribe/file/{job_id}"]
+    assert "GET" in by_path["/transcribe/file/{job_id}/download/{fmt}"]
+
+
+def test_no_meeting_routes_remain(routes: list[tuple[str, frozenset[str]]]) -> None:
+    assert [p for p, _ in routes if p.startswith(_MEETING_PREFIX)] == []

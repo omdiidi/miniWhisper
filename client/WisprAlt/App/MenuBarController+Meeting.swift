@@ -181,6 +181,7 @@ extension MenuBarController {
 
         } catch {
             mode = .idle
+            if Self.isCancellation(error) { return }  // user cancelled; silent end
 
             // Offline-signature check: when the mini is unreachable we queue
             // the recording locally for later retry rather than surfacing a

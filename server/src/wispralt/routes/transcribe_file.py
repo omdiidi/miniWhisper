@@ -14,6 +14,17 @@ chunked finalize ignores any ``mode`` key left in a pre-upgrade ``meta.json``.
 Busy 429 bodies are ``{"error", "retry_after_s": 60, "code"}`` where ``code``
 is ``file_job_busy`` or ``insufficient_memory`` (FileJobInProgressError.code).
 
+Job routes (declared after the chunked routes):
+
+GET    /transcribe/file/{job_id}                 Poll job status.
+GET    /transcribe/file/{job_id}/download/{fmt}  Stream a completed output.
+DELETE /transcribe/file/{job_id}                 Cancel (202) or remove (204).
+
+Ownership: the caller sees a job only if ``job.api_key_id == user.id`` or the
+caller is an admin. Legacy jobs with a NULL owner are admin-only. A job owned
+by someone else looks exactly like a missing one (404 on GET, 204 on DELETE),
+so existence never leaks.
+
 Auth: ``Bearer`` via ``Depends(require_api_key)``.
 Usage telemetry: route-key ``transcribe/file`` is registered in
 ``main.TRACKED_ROUTES`` + ``_KIND_MAP``; the middleware emits the usage_events
@@ -42,15 +53,18 @@ from fastapi import (
     Header,
     HTTPException,
     Request,
+    Response,
     UploadFile,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .._errors import FileJobInProgressError
 from ..auth import require_api_key
 from ..config import settings
-from ..jobs.runner import FileJobRunner
+from ..files.output import remove_job_outputs
+from ..jobs.runner import PHASE_LABELS, FileJobRunner
+from ..jobs.store import Job
 from ..ops import staging
 
 logger = logging.getLogger(__name__)
@@ -483,7 +497,7 @@ async def finalize_chunked(
     403  Ownership mismatch.
     404  upload_id not found.
     409  Missing chunks OR total-bytes mismatch.
-    429  Meeting/file job already in progress (assembled file is cleaned up).
+    429  A file job is already in progress (assembled file is cleaned up).
     503  RAM gate (<4 GiB available).
     507  Disk gate (free < total_bytes).
     """
@@ -607,3 +621,173 @@ async def finalize_chunked(
         upload_id, jid, total_bytes,
     )
     return JSONResponse({"job_id": jid, "status": "pending"}, status_code=202)
+
+
+# ── Job poll / download / delete ──────────────────────────────────────────────
+#
+# Declared after the chunked routes. The chunked routes are POST-only, so
+# there is no path overlap with these GET/DELETE ``/{job_id}`` routes.
+
+_JOB_ID_RE = re.compile(r"[0-9a-f-]{36}")
+_VALID_FORMATS = frozenset({"json", "srt", "vtt", "txt"})
+_MEDIA_TYPES: dict[str, str] = {
+    "json": "application/json",
+    "srt": "application/x-subrip",
+    "vtt": "text/vtt",
+    "txt": "text/plain",
+}
+_ACTIVE_STATUSES = frozenset({"pending", "running"})
+
+
+def _owned_job(request: Request, job_id: str) -> Job | None:
+    """Return the job if the caller owns it or is an admin, else None.
+
+    400 on a malformed job_id (server-issued UUIDs only; this also keeps
+    path-traversal shapes out of the output-path join). A missing job and a
+    job owned by someone else both return None so existence never leaks.
+    Legacy jobs with ``api_key_id IS NULL`` are visible to admins only.
+    """
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(400, "Invalid job_id format")
+    job = request.app.state.job_store.get(job_id)
+    user = getattr(request.state, "user", None)
+    if job is None or user is None:
+        return None
+    if getattr(user, "role", None) == "admin":
+        return job
+    if job.api_key_id is not None and int(job.api_key_id) == int(user.id):
+        return job
+    return None
+
+
+@router.get("/{job_id}", summary="Poll file job status")
+def poll_file_job(request: Request, job_id: str) -> JSONResponse:
+    """Return the current status of a file job.
+
+    Returns
+    -------
+    200 ``{"job_id", "status", ["mode"], ["request_mode"], ["error"],
+        ["progress"], ["serverFinishing"], ["formats", "outputs"]}``
+    400 Malformed job_id.
+    404 Job not found (or not visible to the caller).
+    """
+    job = _owned_job(request, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+
+    body: dict[str, object] = {"job_id": job.id, "status": job.status}
+    if job.mode is not None:
+        body["mode"] = job.mode
+    if job.request_mode is not None:
+        body["request_mode"] = job.request_mode
+    if job.error is not None:
+        body["error"] = job.error
+
+    if job.status == "running":
+        phase = job.phase
+        progress: dict[str, object] = {
+            "phase": phase,
+            "phase_label": PHASE_LABELS.get(phase) if phase else None,
+            "chunk_index": job.chunk_index,
+            "total_chunks": job.total_chunks,
+        }
+        if job.phase_started_at is not None:
+            progress["phase_elapsed_s"] = round(
+                time.time() - float(job.phase_started_at), 2
+            )
+        if job.audio_duration_s is not None:
+            progress["audio_duration_s"] = job.audio_duration_s
+        body["progress"] = progress
+        # serverFinishing: cancel was requested but the executor is still
+        # running (Whisper transcribes the whole file in one call, so the
+        # result is discarded only once that call returns).
+        if job.cancel_requested:
+            body["serverFinishing"] = True
+
+    if job.status == "done":
+        # `formats` kept for backward compat; `outputs` maps each format to
+        # its download URL so the client needs no URL-building knowledge.
+        body["formats"] = sorted(_VALID_FORMATS)
+        body["outputs"] = {
+            fmt: f"/transcribe/file/{job.id}/download/{fmt}"
+            for fmt in sorted(_VALID_FORMATS)
+        }
+
+    return JSONResponse(body)
+
+
+@router.get(
+    "/{job_id}/download/{fmt}",
+    summary="Stream a completed transcript output file",
+)
+def download_file_job(request: Request, job_id: str, fmt: str) -> StreamingResponse:
+    """Stream one of the four output formats (json, srt, vtt, txt).
+
+    Returns
+    -------
+    200  Streaming file response.
+    400  Unknown format or malformed job_id.
+    404  Job not found, not visible to the caller, or not yet done.
+    410  Output file missing from disk (e.g. swept by retention).
+    """
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(400, "Invalid job_id format")
+    if fmt not in _VALID_FORMATS:
+        raise HTTPException(400, f"Unknown format '{fmt}'; valid: {sorted(_VALID_FORMATS)}")
+
+    job = _owned_job(request, job_id)
+    if job is None or job.status != "done" or job.output_dir is None:
+        raise HTTPException(404, "Job not found or not yet complete")
+
+    output_path = Path(job.output_dir) / f"{job_id}.{fmt}"
+    if not output_path.exists():
+        raise HTTPException(410, "Output file missing; the job may have been cleaned up")
+
+    def _gen():
+        with open(output_path, "rb") as fh:
+            while chunk := fh.read(1 << 20):
+                yield chunk
+
+    return StreamingResponse(_gen(), media_type=_MEDIA_TYPES[fmt])
+
+
+@router.delete(
+    "/{job_id}",
+    status_code=204,
+    summary="Cancel a pending/running file job, or remove a finished one",
+)
+def delete_file_job(request: Request, job_id: str) -> Response:
+    """Cancel or remove a file job.
+
+    Returns
+    -------
+    202  The job was pending or running: cancel is requested and the runner
+         finishes it (``failed: cancelled by user``, outputs discarded).
+    204  Missing / not-visible job (idempotent, no leak), or a finished job
+         whose outputs and row are now removed. A job that finished between
+         the cancel request and the re-read is removed the same way.
+    400  Malformed job_id.
+    """
+    job = _owned_job(request, job_id)
+    if job is None:
+        return Response(status_code=204)
+
+    store = request.app.state.job_store
+    if job.status in _ACTIVE_STATUSES:
+        store.set_cancel_requested(job_id)
+        # Re-read: the runner may have finished between the GET above and
+        # the cancel flag landing. The runner's conditional set_running /
+        # set_done refuse a cancelled row, so a still-active job here is
+        # guaranteed to end failed.
+        job = store.get(job_id)
+        if job is None:
+            return Response(status_code=204)
+        if job.status in _ACTIVE_STATUSES:
+            logger.info("File job %s cancel requested.", job_id)
+            return Response(status_code=202)
+
+    if job.output_dir is not None and not remove_job_outputs(Path(job.output_dir), job_id):
+        logger.warning("File job %s: some outputs could not be removed.", job_id)
+    store.delete(job_id)
+    logger.info("File job %s deleted.", job_id)
+    return Response(status_code=204)

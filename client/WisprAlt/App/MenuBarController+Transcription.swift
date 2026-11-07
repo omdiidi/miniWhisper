@@ -176,13 +176,7 @@ extension MenuBarController {
             // Only set the user-facing banner when the watchdog didn't already
             // populate it (the watchdog sets a stall-specific message and
             // calls `cancelActiveTranscription`, which throws `.cancelled`).
-            let isCancellation: Bool
-            if let urlErr = error as? URLError, urlErr.code == .cancelled {
-                isCancellation = true
-            } else {
-                isCancellation = (error is CancellationError)
-            }
-            if !isCancellation && recordingState.uploadError == nil {
+            if !Self.isCancellation(error) && recordingState.uploadError == nil {
                 recordingState.uploadError = uploadErrorMessage(for: error)
             }
             throw error
@@ -219,6 +213,10 @@ extension MenuBarController {
                 outputFormats = Array(outputs.keys)
                 break pollLoop
             case .failed(let reason):
+                if reason == Self.cancelledByUserReason {
+                    // The user cancelled; the server confirmed it. Silent end.
+                    throw CancellationError()
+                }
                 throw MeetingProcessingError.serverFailed(reason)
             case .pending:
                 continue
@@ -337,11 +335,30 @@ extension MenuBarController {
 
     // MARK: - Cancel + resume
 
-    /// Cancel whatever transcription is currently running. Mid-upload cancel
-    /// is clean (URLSession is invalidated, no server-side state created).
-    /// Mid-transcribe cancel is *advisory* — the server-side executor thread
-    /// keeps running until it finishes naturally; `serverFinishingJobID` is
-    /// set on `recordingState` so the popover banner appears.
+    /// Server-side `failed` reason for a job the user cancelled
+    /// (`DELETE /transcribe/file/{id}` → 202, then the runner ends it).
+    static let cancelledByUserReason = "cancelled by user"
+
+    /// True for the errors a user-initiated cancel produces: Task
+    /// cancellation, a cancelled URLSession task, or the server confirming
+    /// the cancel. Callers treat these as a silent end (no error toast).
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let urlErr = error as? URLError, urlErr.code == .cancelled { return true }
+        return false
+    }
+
+    /// Cancel whatever transcription is currently running.
+    ///
+    /// Mid-upload cancel is clean (URLSession is invalidated, no server-side
+    /// state created). After upload, `DELETE /transcribe/file/{id}` returns
+    /// 202 (pending/running: the server ends the job as `failed: cancelled by
+    /// user` and discards its outputs) or 204 (already finished: removed). On
+    /// either, local job state (`activeJobID` and `serverFinishingJobID`) is
+    /// cleared at once and the polling Task is cancelled, so there is no
+    /// cancel-poll loop and "Transcribe file…" is never left disabled. If the
+    /// user resubmits while the server is still finishing a running Whisper
+    /// call, the server answers with a busy 429.
     @MainActor
     func cancelActiveTranscription() async {
         Log.info("Cancel requested — tearing down active transcription.", category: "transcribe")
@@ -361,22 +378,21 @@ extension MenuBarController {
         activeUploadSession = nil
         recordingState.lastUploadProgressAt = nil
 
-        // 3) Tell the server to stop. The DELETE is best-effort; on success
-        //    we set `serverFinishingJobID` so the UI knows the cancel was
-        //    acknowledged (and that in-pipeline work may continue).
+        // 4) Tell the server. 202 = cancel accepted (the server finishes the
+        //    cancel itself); 204 = already finished or gone. Either way the
+        //    server owns the rest, so the client forgets the job right away.
         if let raw = recordingState.activeJobID {
             let jobID = JobID(raw: raw)
             do {
-                try await MeetingAPI.cancel(jobID)
-                // Move the id from "active" to "server finishing" so the
-                // popover banner appears and new submissions are blocked.
-                // Mid-transcribe cancel is advisory — the server may still
-                // be running an in-pipeline phase that cannot be interrupted.
-                recordingState.serverFinishingJobID = raw
-                Log.warning(
-                    "Cancel is advisory for in-pipeline phases — server may keep running until natural completion.",
-                    category: "transcribe"
-                )
+                let status = try await MeetingAPI.cancel(jobID)
+                if status == 202 || status == 204 {
+                    recordingState.serverFinishingJobID = nil
+                } else {
+                    Log.warning(
+                        "MeetingAPI.cancel(\(raw)) returned unexpected HTTP \(status).",
+                        category: "transcribe"
+                    )
+                }
             } catch {
                 Log.warning(
                     "MeetingAPI.cancel(\(raw)) failed: \(error.localizedDescription)",
@@ -385,9 +401,7 @@ extension MenuBarController {
             }
         }
 
-        // 4) Reset local UI state and forget the persisted id. The
-        //    serverFinishingJobID (if set) is preserved on recordingState so
-        //    the banner stays visible.
+        // 5) Reset local UI state and forget the persisted id.
         recordingState.activeJobID = nil
         UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
         recordingState.phase = nil
@@ -451,12 +465,18 @@ extension MenuBarController {
                         body: "A job that was running when WisprAlt restarted has completed. Re-run the transcription to download outputs."
                     )
                     recordingState.activeJobID = nil
+                    recordingState.serverFinishingJobID = nil
                     UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
                     self.mode = .idle
                     return
                 case .failed(let reason):
-                    Log.warning("Resumed-job failed: \(reason)", category: "transcribe")
+                    // "cancelled by user" is a silent end; anything else is
+                    // logged (resume never toasts).
+                    if reason != Self.cancelledByUserReason {
+                        Log.warning("Resumed-job failed: \(reason)", category: "transcribe")
+                    }
                     recordingState.activeJobID = nil
+                    recordingState.serverFinishingJobID = nil
                     UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
                     self.mode = .idle
                     return
@@ -544,8 +564,10 @@ extension MenuBarController {
 
         guard panel.runModal() == .OK, let picked = panel.url else { return }
 
-        // Decouple the panel cleanup from the async pipeline.
-        Task { @MainActor [weak self] in
+        // Decouple the panel cleanup from the async pipeline. The Task is
+        // held in `activeJobTask` so `cancelActiveTranscription()` stops its
+        // upload/poll loop.
+        activeJobTask = Task { @MainActor [weak self] in
             await self?.handlePickedFile(picked)
         }
     }
@@ -623,6 +645,11 @@ extension MenuBarController {
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             mode = .idle
         } catch {
+            if Self.isCancellation(error) {
+                // User cancelled; cancelActiveTranscription() already reset state.
+                Log.info("Custom transcription cancelled — \(stem)", category: "transcribe")
+                return
+            }
             let message = formatTranscriptionError(error)
             Log.error("Custom transcription failed: \(message)", category: "transcribe")
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)

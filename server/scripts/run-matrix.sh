@@ -71,17 +71,9 @@ echo
 # Format: NAME|FILE|MODE|EXPECTED_DUR_S
 MATRIX=(
     "01-30s-file|gen-30s-mono.m4a|file|30"
-    "02-30s-meet-mono|gen-30s-mono.m4a|meeting|30"
-    "03-30s-meet-stereo|gen-30s-stereo.m4a|meeting|30"
     "04-5m-file|gen-5m-mono.m4a|file|330"
-    "05-5m-meet-mono|gen-5m-mono.m4a|meeting|330"
-    "06-5m-meet-stereo|gen-5m-stereo.m4a|meeting|330"
     "07-30m-file|sammamish-30m-mono.m4a|file|1800"
-    "08-30m-meet-mono|sammamish-30m-mono.m4a|meeting|1800"
-    "09-30m-meet-stereo|sammamish-30m-stereo.m4a|meeting|1800"
     "10-105m-file|sammamish-105m-mono.m4a|file|6341"
-    "11-105m-meet-mono|sammamish-105m-mono.m4a|meeting|6341"
-    "12-105m-meet-stereo|sammamish-source.wav|meeting|6341"
 )
 
 # ---------- Run loop ----------
@@ -107,7 +99,6 @@ for entry in "${MATRIX[@]}"; do
     T_SUBMIT=$(date +%s.%N)
     RESP=$(curl -sf -X POST "$SERVER/transcribe/file" \
         -H "Authorization: Bearer $API_KEY" \
-        -F "mode=$MODE" \
         -F "file=@$FILE")
     if [ -z "$RESP" ]; then
         echo "  FAIL: submit returned empty"
@@ -121,7 +112,7 @@ for entry in "${MATRIX[@]}"; do
     PEAK_RSS=0
     STATUS=""
     while true; do
-        STATUS_JSON=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/meeting/$JOB" 2>/dev/null || echo "{}")
+        STATUS_JSON=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/file/$JOB" 2>/dev/null || echo "{}")
         STATUS=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null)
         # Track RSS from admin/active
         ACTIVE=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER/admin/active" 2>/dev/null || echo "{}")
@@ -149,7 +140,7 @@ except: print(0)
     # Capture metrics
     SEGS=0; SPEAKERS=0; ERR=""
     if [ "$STATUS" = "done" ]; then
-        TXT=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/meeting/$JOB/txt" 2>/dev/null || echo "")
+        TXT=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/file/$JOB/download/txt" 2>/dev/null || echo "")
         SEGS=$(echo "$TXT" | grep -c "^\[Speaker")
         SPEAKERS=$(echo "$TXT" | grep -oE "\[Speaker [^]]+\]" | sort -u | wc -l | tr -d ' ')
     elif [ "$STATUS" = "failed" ]; then
@@ -162,7 +153,7 @@ except: print(0)
     echo "{\"name\":\"$NAME\",\"mode\":\"$MODE\",\"file\":\"$FILE\",\"expected_dur_s\":$EXP_DUR,\"wall_s\":$WALL,\"ratio\":$RATIO,\"segs\":$SEGS,\"speakers\":$SPEAKERS,\"peak_rss_mb\":$PEAK_RSS,\"status\":\"$STATUS\",\"error\":\"$ERR\"}" >> "$RAW_JSONL"
 
     # Clean up job on server to save disk
-    curl -sf -X DELETE -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/meeting/$JOB" >/dev/null 2>&1 || true
+    curl -sf -X DELETE -H "Authorization: Bearer $API_KEY" "$SERVER/transcribe/file/$JOB" >/dev/null 2>&1 || true
     sleep 3
 done
 

@@ -3,7 +3,7 @@ import CryptoKit
 
 // MARK: - Value types
 
-/// Opaque job identifier returned by `POST /transcribe/meeting`.
+/// Opaque job identifier returned by `POST /transcribe/file` (or chunked finalize).
 struct JobID: Hashable, CustomStringConvertible {
     let raw: String
     var description: String { raw }
@@ -34,7 +34,7 @@ struct ProgressInfo: Codable {
     }
 }
 
-/// The state of a server-side transcription job as reported by `GET /transcribe/meeting/{id}`.
+/// The state of a server-side transcription job as reported by `GET /transcribe/file/{id}`.
 enum JobStatus {
     /// Job created but processing hasn't started yet.
     case pending
@@ -416,14 +416,14 @@ enum MeetingAPI {
 
     // MARK: - Poll
 
-    /// Polls `GET /transcribe/meeting/{id}` for the current job status.
+    /// Polls `GET /transcribe/file/{id}` for the current job status.
     ///
     /// - Parameter id: Job identifier from `submit`.
     /// - Returns: A `JobStatus` value representing the current state.
     /// - Throws: `ServerError` on HTTP or transport failure.
     static func poll(_ id: JobID) async throws -> JobStatus {
         let request = try ServerClient.shared.buildRequest(
-            path: "/transcribe/meeting/\(id.raw)"
+            path: "/transcribe/file/\(id.raw)"
         )
         let (data, _) = try await ServerClient.shared.execute(request)
 
@@ -438,7 +438,7 @@ enum MeetingAPI {
     // MARK: - Download
 
     /// Downloads a completed transcript in the given format from
-    /// `GET /transcribe/meeting/{id}/download/{format}`.
+    /// `GET /transcribe/file/{id}/download/{format}`.
     ///
     /// - Parameters:
     ///   - id: Job identifier.
@@ -447,7 +447,7 @@ enum MeetingAPI {
     /// - Throws: `ServerError` on HTTP or transport failure.
     static func download(_ id: JobID, format: String) async throws -> Data {
         let request = try ServerClient.shared.buildRequest(
-            path: "/transcribe/meeting/\(id.raw)/download/\(format)"
+            path: "/transcribe/file/\(id.raw)/download/\(format)"
         )
         let (data, _) = try await ServerClient.shared.execute(request)
         return data
@@ -455,14 +455,14 @@ enum MeetingAPI {
 
     // MARK: - Delete
 
-    /// Calls `DELETE /transcribe/meeting/{id}` to clean up server-side staging files
+    /// Calls `DELETE /transcribe/file/{id}` to clean up server-side output files
     /// after the client has successfully saved the transcript locally.
     ///
     /// - Parameter id: Job identifier.
     /// - Throws: `ServerError` on HTTP or transport failure.
     static func delete(_ id: JobID) async throws {
         let request = try ServerClient.shared.buildRequest(
-            path: "/transcribe/meeting/\(id.raw)",
+            path: "/transcribe/file/\(id.raw)",
             method: "DELETE"
         )
         _ = try await ServerClient.shared.execute(request)
@@ -471,25 +471,28 @@ enum MeetingAPI {
 
     // MARK: - Cancel
 
-    /// Request server-side cancellation of an in-flight transcription via
-    /// `DELETE /transcribe/meeting/{id}`. The server sets `cancel_requested=1`
-    /// on the job row, which:
-    ///   - aborts cleanly if the job is still in `ffprobe` / `ffmpeg_decode`
-    ///     (those phases poll the cancel flag every 500 ms);
-    ///   - is advisory-only for in-pipeline phases (`transcribe`, `diarize`,
-    ///     `merge`) — the executor thread keeps running until it finishes,
-    ///     but the poll response will carry `serverFinishing: true` so the
-    ///     client can render the "Previous job finishing" banner.
+    /// Request server-side cancellation via `DELETE /transcribe/file/{id}`.
     ///
-    /// - Parameter id: Job identifier returned by `submit` / `submitFile`.
+    /// Server semantics:
+    ///   - `202` — the job was pending or running; `cancel_requested` is set
+    ///     and the server ends it as `failed: cancelled by user`, discarding
+    ///     any outputs. A pending job never starts; a running Whisper call
+    ///     keeps the job slot until it returns, then its result is dropped.
+    ///   - `204` — the job had already finished (outputs and row removed),
+    ///     or it does not exist / is not visible to this key.
+    ///
+    /// - Parameter id: Job identifier returned by `submitFile` / chunked finalize.
+    /// - Returns: The HTTP status code (`202` or `204` on success).
     /// - Throws: `ServerError` on HTTP or transport failure.
-    static func cancel(_ id: JobID) async throws {
+    @discardableResult
+    static func cancel(_ id: JobID) async throws -> Int {
         let request = try ServerClient.shared.buildRequest(
-            path: "/transcribe/meeting/\(id.raw)",
+            path: "/transcribe/file/\(id.raw)",
             method: "DELETE"
         )
-        _ = try await ServerClient.shared.execute(request)
-        Log.info("Cancel requested for job \(id.raw).", category: "meeting")
+        let (_, response) = try await ServerClient.shared.execute(request)
+        Log.info("Cancel requested for job \(id.raw) → HTTP \(response.statusCode).", category: "meeting")
+        return response.statusCode
     }
 
     // MARK: - Server log

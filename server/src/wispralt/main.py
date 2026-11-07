@@ -74,7 +74,6 @@ from wispralt.routes import (
 )
 from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
-from wispralt.routes import meeting as meeting_routes
 from wispralt.routes import telemetry as telemetry_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
 from wispralt.routes import v1_models, v1_transcriptions
@@ -780,10 +779,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_ui.authed_router)
     # /admin/data — Phase 2 admin Data tab (weekly insights + drill-down).
     app.include_router(admin_data.router)
-    # /transcribe/meeting/{id} — file-job poll/download/delete (legacy prefix;
-    # moves onto the /transcribe/file router next).
-    app.include_router(meeting_routes.router)
-    # /transcribe/file — container-agnostic submission (ffmpeg-transcoded).
+    # /transcribe/file — container-agnostic submission (ffmpeg-transcoded),
+    #     chunked upload, and per-job poll/download/delete.
     app.include_router(transcribe_file_routes.router)
     # /me — JSON identity self-management (any authenticated role).
     app.include_router(me_routes.router)
