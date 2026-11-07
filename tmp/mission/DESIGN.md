@@ -1,4 +1,4 @@
-# Target design v6 (Part 1, 2026-11-07, after review rounds 1-5)
+# Target design v7 (Part 1, 2026-11-07, after review rounds 1-6)
 
 Owner rule: clean, concise, future-proof, reusable; no abstraction for show.
 Review reports:
@@ -163,7 +163,7 @@ Context: single user, the old host was wiped, so there is no live install to sta
   - Backups live outside `data_dir` (default `~/WisprAlt-Backups/`). `restore` and `uninstall --purge-data` refuse a location inside `data_dir`.
   - A backup is a plain directory, so restore extracts nothing; restore still resolves every path, refuses symlinks, and verifies each stays inside the backup root (a backup may come from another machine).
   - Backups are **offline**: stop services → `VACUUM INTO` snapshot plus a copy of job outputs and staged inputs → manifest (counts, hashes, relative paths) → start services. Nothing can change mid-backup, and no maintenance flag is needed.
-  - `restore`: stop services → automatic pre-restore backup → validate the copy (`PRAGMA integrity_check` and the manifest) → swap `data_dir` atomically and remove stale `-wal`/`-shm` files → restart. Any failure rolls back.
+  - `restore`: stop services → move the current `data_dir` aside unchanged as `data_dir.pre-restore-<ts>` (with `-wal`/`-shm`; never `VACUUM INTO`, so a corrupt live DB never blocks restore) → validate the copy (`PRAGMA integrity_check` and the manifest) → swap `data_dir` atomically and remove stale `-wal`/`-shm` files → restart. Any failure swaps the moved-aside `data_dir` back.
   - `update` backs up before migrating. A `setup` rerun never rotates working keys.
 
 ### 2.2 Runtime
@@ -247,7 +247,7 @@ Context: single user, the old host was wiped, so there is no live install to sta
   - **No credentials are imported**. Users revoked in Supabase are imported as `disabled_at`, and devices rejoin by invite.
 - **Dedup:**
   - Re-imports are idempotent on a unique `(source, source_id)`.
-  - Transcript files dedup on a sha256 of the file content, scoped to the owner.
+  - Transcript files are grouped by stem (`{stem}.json/.txt/.srt/.vtt`) into ONE record; its `source_id` is the `job_id` in the JSON when present, else the sha256 of the primary file (JSON, else TXT), scoped to the owner. Sibling formats attach to that record and never create rows.
   - There is no cross-source text dedup, because Supabase holds no text.
 - **Dry run:** per-source counts (new, duplicate, malformed, unmatched owner). Nothing is written.
 - **Resume:** `import_runs` checkpoints. The report states counts, the earliest record, and that no dictation text survives the wipe. Nothing is fabricated.
