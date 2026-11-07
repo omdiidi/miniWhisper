@@ -3,16 +3,15 @@ import Foundation
 /// Namespace for the dictation transcription endpoint.
 ///
 /// Calls `POST /transcribe/dictate` on the configured server URL. If the
-/// origin is confirmed offline (per `ServerClient.isOfflineSignature`) and
-/// an OpenRouter API key is stored in the Keychain, the request retries
-/// directly against OpenRouter's `openai/whisper-large-v3-turbo` model as
-/// a one-percent fallback.
+/// first attempt fails with an offline signature (per
+/// `ServerClient.isOfflineSignature`), it waits `retrySpacingSec` and tries
+/// the origin once more. If the origin is still offline, the error is
+/// thrown and the caller surfaces the usual dictation error toast. There is
+/// no cloud audio fallback.
 ///
-/// The fallback is intentionally minimal: no Cloudflare Worker, no
-/// per-employee rate limiting, no central observability. Each install
-/// holds its own OpenRouter key in the Keychain
-/// (`co.wispralt.openrouter`); employees with no key set simply see the
-/// usual error toast when the mini is unreachable.
+/// When a `clientDedupId` is threaded through (streaming finalize failed),
+/// both origin requests carry `X-Client-Dedup-Id` so the server's dedup
+/// index collapses a duplicate row.
 enum DictationAPI {
     // MARK: - Response model
 
@@ -25,18 +24,6 @@ enum DictationAPI {
 
     /// Spacing between origin retry attempts before giving up on the mini.
     private static let retrySpacingSec: TimeInterval = 5
-
-    /// Timeout per OpenRouter request — keeps a hung provider from
-    /// dangling the dictation forever.
-    private static let openRouterTimeoutSec: TimeInterval = 60
-
-    /// Fallback model — OpenRouter's chat-completions audio path. We tried
-    /// `openai/whisper-large-v3-turbo` and `openai/whisper-1` first but both
-    /// return 500 Internal Server Error on OpenRouter (verified empirically
-    /// 2026-05-09). `gpt-4o-audio-preview` accepts the `input_audio` content
-    /// block, returns verbatim transcripts at OpenAI quality, and costs ≈
-    /// $0.000025 per typical dictation (negligible for 1% fallback usage).
-    private static let fallbackModel = "openai/gpt-4o-audio-preview"
 
     // MARK: - Public API
 
@@ -54,9 +41,9 @@ enum DictationAPI {
     ///
     /// If the streaming finalize fails for ANY reason (chunk POST error,
     /// finalize 5xx, timeout, decode error, abort) the session is aborted
-    /// and we fall through to the existing 3-attempt origin → OpenRouter
-    /// ladder, threading the streaming session's `clientDedupId` so the
-    /// fallback row collides with any already-persisted streaming row on
+    /// and we fall through to the origin retry path (origin, wait,
+    /// origin), threading the streaming session's `clientDedupId` so the
+    /// retry row collides with any already-persisted streaming row on
     /// the server-side partial unique index — exactly one `dictations` row
     /// per logical dictation regardless of which path won.
     ///
@@ -89,7 +76,7 @@ enum DictationAPI {
                     category: "fallback"
                 )
                 await session.abort()
-                // Thread the same dedup id through the fallback ladder so the
+                // Thread the same dedup id through the origin retry path so the
                 // ON CONFLICT(client_dedup_id) DO NOTHING index collapses a
                 // potential duplicate at server-side ingest.
                 return try await runExistingPath(wavData: wavData, clientDedupId: dedupId)
@@ -99,11 +86,9 @@ enum DictationAPI {
         return try await runExistingPath(wavData: wavData, clientDedupId: nil)
     }
 
-    /// VERBATIM port of the pre-Phase-2 transcribe(_:) body — the full
-    /// 3-attempt ladder (origin → retry → OpenRouter). The only additive
-    /// changes are: (a) thread `clientDedupId` into the `X-Client-Dedup-Id`
-    /// header when non-nil; (b) thread the same id into `callOpenRouter`
-    /// for the queue-side dedup.
+    /// Non-streaming path: origin attempt, wait, origin retry. Threads
+    /// `clientDedupId` into the `X-Client-Dedup-Id` header when non-nil
+    /// (server dedup contract).
     private static func runExistingPath(
         wavData: Data,
         clientDedupId: String?
@@ -141,23 +126,9 @@ enum DictationAPI {
             if !ServerClient.shared.isOfflineSignature(serverAttempt) {
                 throw err
             }
-            Log.warning("DictationAPI: origin attempt 2 → offline confirmed; trying OpenRouter fallback.", category: "fallback")
+            Log.warning("DictationAPI: origin attempt 2 → offline confirmed; giving up.", category: "fallback")
+            throw err
         }
-
-        // Attempt 3 — direct OpenRouter call.
-        guard let apiKey = try? KeychainHelper.getOpenRouterAPIKey(), !apiKey.isEmpty else {
-            Log.warning(
-                "DictationAPI: OpenRouter key not configured (set via Settings or `security add-generic-password -s co.wispralt.openrouter`). Cannot fall back.",
-                category: "fallback"
-            )
-            throw ServerError.server(status: 503, body: "Mac mini offline and no OpenRouter fallback key configured")
-        }
-
-        return try await callOpenRouter(
-            wavData: wavData,
-            apiKey: apiKey,
-            clientDedupId: clientDedupId
-        )
     }
 
     // MARK: - Origin attempt
@@ -196,113 +167,6 @@ enum DictationAPI {
             let attempt = makeAttempt(error: error, startedAt: startedAt, finishedAt: finishedAt)
             return AttemptResult(result: .failure(mapDecodeError(error), attempt))
         }
-    }
-
-    // MARK: - OpenRouter direct call
-
-    /// Calls OpenRouter's `/api/v1/chat/completions` with the audio inlined
-    /// as base64 in an `input_audio` content block. Reference:
-    /// https://openrouter.ai/docs/guides/overview/multimodal/audio
-    ///
-    /// Defensive parser: `choices[0].message.content` may come back as a
-    /// string OR as a multimodal array `[{type:"text", text:"..."}]`.
-    private static func callOpenRouter(
-        wavData: Data,
-        apiKey: String,
-        clientDedupId: String? = nil
-    ) async throws -> String {
-        let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
-        // gpt-4o-audio-preview returns clean verbatim text when prompted
-        // explicitly. Without the prompt it sometimes adds commentary like
-        // "Sure, here's what I heard:" — which would inject into the user's
-        // text field. Pin it.
-        let payload: [String: Any] = [
-            "model": fallbackModel,
-            "messages": [[
-                "role": "user",
-                "content": [
-                    [
-                        "type": "text",
-                        "text": "Transcribe this audio verbatim. Output only the words spoken, no commentary, no preamble, no quotes.",
-                    ],
-                    [
-                        "type": "input_audio",
-                        "input_audio": [
-                            "data": wavData.base64EncodedString(),
-                            "format": "wav",
-                        ],
-                    ],
-                ],
-            ]],
-        ]
-        let body = try JSONSerialization.data(withJSONObject: payload)
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = openRouterTimeoutSec
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://github.com/omdiidi/miniWhisper", forHTTPHeaderField: "HTTP-Referer")
-        request.setValue("WisprAlt", forHTTPHeaderField: "X-Title")
-        request.httpBody = body
-
-        let started = Date()
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch {
-            throw ServerError.transport(error)
-        }
-        let elapsedMs = Date().timeIntervalSince(started) * 1000
-        guard let http = response as? HTTPURLResponse else {
-            throw ServerError.transport(URLError(.badServerResponse))
-        }
-        guard http.statusCode == 200 else {
-            let bodyStr = String(data: data, encoding: .utf8) ?? ""
-            Log.error(
-                "OpenRouter fallback HTTP \(http.statusCode): \(bodyStr.prefix(200))",
-                category: "fallback"
-            )
-            throw ServerError.server(status: http.statusCode, body: bodyStr)
-        }
-
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        let text = parseOpenRouterContent(json)
-        Log.info(
-            "DictationAPI: source=fallback http=200 chars=\(text.count) ms=\(Int(elapsedMs))",
-            category: "fallback"
-        )
-
-        // Plan A §A8: persist this cloud-fallback dictation for later sync so it
-        // appears in /me/history + period insights. Non-throwing — a queue
-        // failure must NEVER break the user's primary "got text" flow.
-        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
-        DictationFallbackQueue.shared.enqueue(
-            text: text,
-            dictatedAt: Date(),
-            clientAppVersion: appVersion,
-            clientDedupId: clientDedupId
-        )
-
-        return text
-    }
-
-    /// Tolerates both string-shaped and multimodal-array-shaped `content`.
-    private static func parseOpenRouterContent(_ json: [String: Any]?) -> String {
-        guard let choices = json?["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any]
-        else { return "" }
-        if let s = message["content"] as? String { return s }
-        if let arr = message["content"] as? [[String: Any]] {
-            for block in arr {
-                if (block["type"] as? String) == "text",
-                   let t = block["text"] as? String
-                {
-                    return t
-                }
-            }
-        }
-        return ""
     }
 
     // MARK: - Classifier helpers

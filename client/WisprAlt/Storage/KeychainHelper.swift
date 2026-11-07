@@ -33,10 +33,9 @@ enum KeychainHelper {
     static let service = "co.wispralt"
     private static let account = "default"
 
-    /// Service identifier for the OpenRouter API key used by the cloud
-    /// fallback path (`DictationAPI` calls when the Mac mini origin is
-    /// unreachable). Stored in a separate Keychain item so rotating it
-    /// doesn't touch the WisprAlt bearer.
+    /// Service identifier for the OpenRouter API key, kept as the Mercury
+    /// smart formatting key (consumed in Part 3). Stored in a separate
+    /// Keychain item so rotating it doesn't touch the WisprAlt bearer.
     private static let openRouterService = "co.wispralt.openrouter"
 
     // MARK: - Public API
@@ -108,11 +107,10 @@ enum KeychainHelper {
         }
     }
 
-    // MARK: - OpenRouter API key (cloud fallback)
+    // MARK: - OpenRouter API key (Mercury smart formatting key)
 
-    /// Stores (or updates) the OpenRouter API key used by the cloud fallback
-    /// path. Optional — when absent, dictation simply errors out when the
-    /// mini is offline instead of falling back.
+    /// Stores (or updates) the OpenRouter API key used as the Mercury smart
+    /// formatting key. Optional.
     static func setOpenRouterAPIKey(_ key: String) throws {
         guard let data = key.data(using: .utf8) else { throw KeychainError.encodingFailed }
 
@@ -134,8 +132,8 @@ enum KeychainHelper {
         }
     }
 
-    /// Retrieves the OpenRouter API key. Returns nil when not set, which
-    /// disables the cloud fallback path.
+    /// Retrieves the OpenRouter API key (Mercury smart formatting key).
+    /// Returns nil when not set.
     static func getOpenRouterAPIKey() throws -> String? {
         var query = openRouterBaseQuery() as [CFString: Any]
         query[kSecReturnData] = kCFBooleanTrue

@@ -155,16 +155,6 @@ extension MenuBarController: FNKeyEventsDelegate {
                     )
                 )
 
-                // Plan A §A8: drain the cloud-fallback queue on online
-                // dictation success — a successful online dictation proves
-                // the origin is reachable, so this is the best moment to
-                // flush any queued OpenRouter-served dictations. Detached +
-                // utility priority so it doesn't contend with the next
-                // dictation if the user FN-holds again immediately.
-                Task.detached(priority: .utility) {
-                    await DictationFallbackQueue.shared.drain()
-                }
-
             } catch ServerError.unauthorized {
                 Log.error("Dictation failed — unauthorized. Re-paste API key in Settings.", category: "dictation")
                 AppNotifications.notify(
@@ -182,13 +172,6 @@ extension MenuBarController: FNKeyEventsDelegate {
                     body: "Could not write audio to disk: \(underlying.localizedDescription)"
                 )
             } catch {
-                // When the fallback path itself fails (mini AND Worker
-                // unreachable, or Worker rate-limited / budget-exhausted),
-                // surface a debounced "transcription temporarily unavailable"
-                // toast instead of a noisy localized-description.
-                if case ServerError.server = error {
-                    showFallbackUnavailableToast()
-                }
                 Log.error("Dictation failed: \(error.localizedDescription)", category: "dictation")
                 AppNotifications.notify(title: "Dictation Failed", body: error.localizedDescription)
             }

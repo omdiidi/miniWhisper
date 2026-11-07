@@ -2,8 +2,8 @@ import Foundation
 
 /// Failures surfaced by the streaming dictation path. The caller
 /// (`DictationAPI.transcribe`) treats any of these as a signal to fall back
-/// to the standard 3-attempt origin → OpenRouter ladder, threading the
-/// session's `clientDedupId` through so the fallback row collides with the
+/// to the non-streaming origin retry path (origin, wait, origin), threading
+/// the session's `clientDedupId` through so the retry row collides with the
 /// streaming row on the server-side partial unique index (no duplicate).
 enum StreamingFailure: Error {
     case aborted
@@ -42,9 +42,9 @@ actor DictationStreamSession {
     let sessionId: String = UUID().uuidString.lowercased()
 
     /// Client-supplied dedup id sent as a multipart form field on
-    /// `/finalize`. Also threaded into the existing `/transcribe/dictate`
-    /// ladder via `X-Client-Dedup-Id` when the streaming path fails so the
-    /// fallback row collides with the streaming row at server-side ingest.
+    /// `/finalize`. Also threaded into the `/transcribe/dictate` origin
+    /// retry path via `X-Client-Dedup-Id` when the streaming path fails so
+    /// the retry row collides with the streaming row at server-side ingest.
     let clientDedupId: String = UUID().uuidString.lowercased()
 
     /// Wall-clock timestamp the recorder began capturing audio. Sent on

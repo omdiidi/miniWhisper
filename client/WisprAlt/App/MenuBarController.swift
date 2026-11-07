@@ -97,18 +97,6 @@ final class MenuBarController: NSObject {
     /// observers with no cleanup path.
     var didResignActiveObserver: NSObjectProtocol?
 
-    // MARK: - Debounced toasts
-
-    /// Process-local last-shown timestamp for debounced toasts. 10-min window
-    /// per kind so flapping connectivity doesn't spam the user.
-    private enum ToastKind: String {
-        case fallbackUnavailable
-    }
-    private var lastToastShown: [ToastKind: Date] = [:]
-    private static let toastDebounceSec: TimeInterval = 600
-
-    /// Held to remove the foreground observer on deinit.
-    var didBecomeActiveObserver: NSObjectProtocol?
     /// Token for the `.dictationMaxDurationReached` observer; removed in deinit.
     var dictationMaxDurationObserver: NSObjectProtocol?
 
@@ -153,45 +141,6 @@ final class MenuBarController: NSObject {
         configureObservers()
         configureDictationCapObserver()
         configureFirstLaunchObserver()
-        configureFallbackQueueDrainTrigger()
-    }
-
-    /// App-foreground drain trigger for `DictationFallbackQueue`
-    /// (`NSApplication.didBecomeActiveNotification`), so any OpenRouter-served
-    /// dictations from offline mode sync to the origin as soon as the user
-    /// refocuses the app. The queue's drain coordinator coalesces concurrent
-    /// triggers.
-    func configureFallbackQueueDrainTrigger() {
-        didBecomeActiveObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task.detached(priority: .utility) {
-                await DictationFallbackQueue.shared.drain()
-            }
-        }
-    }
-
-    /// Fire the dictation-fallback-unavailable toast (Worker also down).
-    @MainActor
-    func showFallbackUnavailableToast() {
-        guard shouldShowToast(.fallbackUnavailable) else { return }
-        AppNotifications.notify(
-            title: "WisprAlt",
-            body: "Transcription temporarily unavailable."
-        )
-    }
-
-    private func shouldShowToast(_ kind: ToastKind) -> Bool {
-        let now = Date()
-        if let last = lastToastShown[kind],
-           now.timeIntervalSince(last) < Self.toastDebounceSec
-        {
-            return false
-        }
-        lastToastShown[kind] = now
-        return true
     }
 
     // MARK: - Observers
@@ -207,9 +156,6 @@ final class MenuBarController: NSObject {
 
     deinit {
         if let token = didResignActiveObserver {
-            NotificationCenter.default.removeObserver(token)
-        }
-        if let token = didBecomeActiveObserver {
             NotificationCenter.default.removeObserver(token)
         }
         if let token = dictationMaxDurationObserver {
