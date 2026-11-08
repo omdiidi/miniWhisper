@@ -36,14 +36,14 @@ final class Settings: ObservableObject {
 
     // MARK: - Published properties
 
-    /// The transcription server base URL. Must use https scheme.
+    /// The Local server base URL: https, or http only to this Mac (`LocalURLPolicy`).
     /// Set to nil to clear. Validated on assignment.
     @Published var serverURL: URL? {
         didSet {
             if let url = serverURL {
-                guard url.scheme == "https" else {
+                guard LocalURLPolicy.isAllowed(url) else {
                     Log.warning(
-                        "serverURL rejected — scheme must be https.",
+                        "serverURL rejected — https, or http only to this Mac.",
                         category: "settings"
                     )
                     // Revert to previous persisted value without triggering another didSet.
@@ -105,10 +105,10 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// Whether dictation requests should ask the server to apply smart formatting
-    /// (punctuation, casing, paragraph breaks) via the `X-Smart-Format` header.
-    /// Off by default. Adds ~250ms latency. Server silently ignores the flag if
-    /// `OPENROUTER_API_KEY` is not configured.
+    /// Smart formatting (punctuation, casing, paragraph breaks) by Mercury 2 on
+    /// OpenRouter, run by the client in both modes (`MercuryStep`) for
+    /// dictations of 20+ words. Off by default. Needs the OpenRouter key
+    /// (Keychain `co.wispralt.openrouter`); sends text only, never audio.
     @Published var smartFormatting: Bool {
         didSet {
             defaults.set(smartFormatting, forKey: Key.smartFormatting)
@@ -218,7 +218,7 @@ final class Settings: ObservableObject {
     private func loadServerURL(from store: UserDefaults) -> URL? {
         guard let raw = store.string(forKey: Key.serverURL),
               let url = URL(string: raw),
-              url.scheme == "https"
+              LocalURLPolicy.isAllowed(url)
         else { return nil }
         return url
     }

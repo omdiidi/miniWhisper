@@ -19,7 +19,7 @@ enum StreamingFailure: Error {
 /// `stop()` inside `LocalCapture`; spilled to the recorder's tap
 /// callback which calls `enqueueChunk(_:index:)` once per VAD-cut segment;
 /// finally drained by `DictationAPI.transcribe(capture:)` via
-/// `finalize(tail:smartFormat:)` which awaits all in-flight chunk POSTs and
+/// `finalize(tail:)` which awaits all in-flight chunk POSTs and
 /// then POSTs the trailing audio to the finalize endpoint.
 ///
 /// Concurrency notes
@@ -43,11 +43,15 @@ actor DictationStreamSession {
     /// grepping uniform with the rest of the codebase.
     let sessionId: String = UUID().uuidString.lowercased()
 
-    /// Client-supplied dedup id sent as a multipart form field on
-    /// `/finalize`. Also threaded into the `/transcribe/dictate` origin
-    /// retry path via `X-Client-Dedup-Id` when the streaming path fails so
-    /// the retry row collides with the streaming row at server-side ingest.
-    let clientDedupId: String = UUID().uuidString.lowercased()
+    /// The dictation id (captured at FN press), sent as `X-Client-Dedup-Id`
+    /// on every chunk and finalize and as the finalize `client_dedup_id`
+    /// field. The whole-file fallback reuses it, so the server keeps exactly
+    /// one row per dictation.
+    let clientDedupId: String
+
+    /// The Local server captured at FN press. A later Settings change never
+    /// moves an in-flight dictation to another host.
+    let endpoint: ServerEndpoint
 
     /// Wall-clock timestamp the recorder began capturing audio. Sent on
     /// `/finalize` as `speech_started_at` (Double seconds-since-epoch with
@@ -59,6 +63,9 @@ actor DictationStreamSession {
 
     private var inFlight: [Int: Task<Void, Error>] = [:]
     private var aborted: Bool = false
+    /// A chunk got a terminal 410/409 (`LocalDictationError`): finalize
+    /// rethrows it so the caller does not fall back to the whole file.
+    private var terminal: LocalDictationError?
 
     /// 8 s timeout per chunk POST — `STREAMING_CHUNK_POST_TIMEOUT_S` in the
     /// brief. If a chunk POST hangs longer than this the URLSession
@@ -66,7 +73,9 @@ actor DictationStreamSession {
     /// `StreamingFailure.transport(...)` and triggers fallback.
     private static let chunkPostTimeoutS: TimeInterval = 8.0
 
-    init(speechStartedAt: Date) {
+    init(endpoint: ServerEndpoint, dictationId: String, speechStartedAt: Date) {
+        self.endpoint = endpoint
+        self.clientDedupId = dictationId.lowercased()
         self.speechStartedAt = speechStartedAt
     }
 
@@ -88,7 +97,7 @@ actor DictationStreamSession {
                 // they latch `aborted`, which makes finalize() throw.
                 await self.chunkFinished(index)
             } catch {
-                await self.markAborted(cause: ErrorLog.describe(error))
+                await self.markAborted(cause: ErrorLog.describe(error), terminal: error as? LocalDictationError)
                 throw error
             }
         }
@@ -103,9 +112,11 @@ actor DictationStreamSession {
 
     /// Awaits every in-flight chunk POST, then POSTs the trailing tail audio
     /// to `/transcribe/dictate/stream/{sessionId}/finalize` and returns the
-    /// joined transcribed text. Any chunk failure cancels the remaining
-    /// in-flight tasks and rethrows so the caller can fall back.
-    func finalize(tail: Data, smartFormat: Bool) async throws -> String {
+    /// joined transcribed text (+ the Part 4 `saved` flag). Any chunk failure
+    /// cancels the remaining in-flight tasks and rethrows so the caller can
+    /// fall back; a terminal `LocalDictationError` is rethrown as is.
+    func finalize(tail: Data) async throws -> LocalRequests.Response {
+        if let terminal { throw terminal }
         guard !aborted else { throw StreamingFailure.aborted }
         // Release consumed tasks on every exit path; the session is one-shot.
         defer { inFlight.removeAll() }
@@ -120,7 +131,7 @@ actor DictationStreamSession {
                 self.markAborted(cause: "chunk_failed")
                 throw error
             }
-            return try await self.postFinalize(tail: tail, smartFormat: smartFormat)
+            return try await self.postFinalize(tail: tail)
         }
     }
 
@@ -135,7 +146,8 @@ actor DictationStreamSession {
     }
 
     /// `cause` is a fixed label or `ErrorLog.describe` output, never raw error text.
-    private func markAborted(cause: String) {
+    private func markAborted(cause: String, terminal: LocalDictationError? = nil) {
+        if let terminal, self.terminal == nil { self.terminal = terminal }
         if aborted { return }
         aborted = true
         for t in inFlight.values { t.cancel() }
@@ -149,80 +161,19 @@ actor DictationStreamSession {
 
     private func postChunk(_ wav: Data, index: Int) async throws {
         if aborted { throw StreamingFailure.aborted }
-        let boundary = UUID().uuidString
-        let body = Self.buildChunkMultipartBody(wavData: wav, boundary: boundary)
-
-        var request: URLRequest
-        do {
-            request = try ServerClient.shared.buildRequest(
-                path: "/transcribe/dictate/stream/\(sessionId)/chunk/\(index)",
-                method: "POST",
-                body: body,
-                contentType: "multipart/form-data; boundary=\(boundary)",
-                additionalHeaders: [:]
-            )
-        } catch {
-            throw StreamingFailure.transport(error)
-        }
+        var request = LocalRequests.chunk(endpoint: endpoint, sessionId: sessionId, index: index,
+                                          dedupId: clientDedupId, wav: wav, clientVersion: ServerClient.clientVersion)
         request.timeoutInterval = Self.chunkPostTimeoutS
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch {
-            throw StreamingFailure.transport(error)
-        }
-        _ = data
-        guard let http = response as? HTTPURLResponse else {
-            throw StreamingFailure.transport(URLError(.badServerResponse))
-        }
-        if !(200...299).contains(http.statusCode) {
-            Log.warning(
-                "stream chunk \(index) → HTTP \(http.statusCode) sessionId=\(sessionId)",
-                category: "dictation"
-            )
-            throw StreamingFailure.serverRejected(code: http.statusCode)
-        }
+        _ = try await send(request, label: "chunk \(index)")
         Log.info(
             "stream chunk \(index) → 202 sessionId=\(sessionId) bytes=\(wav.count)",
             category: "streaming"
         )
     }
 
-    // MARK: - Finalize POST
-
-    private struct FinalizeResponse: Decodable {
-        let text: String
-        let model_id: String
-        let duration_ms: Double
-        let smart_formatted: Bool?
-    }
-
-    private func postFinalize(tail: Data, smartFormat: Bool) async throws -> String {
-        if aborted { throw StreamingFailure.aborted }
-        let boundary = UUID().uuidString
-        let body = Self.buildFinalizeMultipartBody(
-            tailWav: tail,
-            smartFormat: smartFormat,
-            clientDedupId: clientDedupId,
-            speechStartedAt: speechStartedAt,
-            boundary: boundary
-        )
-
-        let request: URLRequest
-        do {
-            request = try ServerClient.shared.buildRequest(
-                path: "/transcribe/dictate/stream/\(sessionId)/finalize",
-                method: "POST",
-                body: body,
-                contentType: "multipart/form-data; boundary=\(boundary)",
-                additionalHeaders: [:]
-            )
-        } catch {
-            throw StreamingFailure.transport(error)
-        }
-
+    /// POSTs `request`; a non-2xx throws the terminal `LocalDictationError`
+    /// (410 `dictation_deleted` / 409 `dedup_conflict`) or `serverRejected`.
+    private func send(_ request: URLRequest, label: String) async throws -> Data {
         let data: Data
         let response: URLResponse
         do {
@@ -233,96 +184,36 @@ actor DictationStreamSession {
         guard let http = response as? HTTPURLResponse else {
             throw StreamingFailure.transport(URLError(.badServerResponse))
         }
-        if !(200...299).contains(http.statusCode) {
+        guard (200...299).contains(http.statusCode) else {
             Log.warning(
-                "stream finalize → HTTP \(http.statusCode) sessionId=\(sessionId)",
+                "stream \(label) → HTTP \(http.statusCode) sessionId=\(sessionId)",
                 category: "dictation"
             )
+            if let terminal = LocalRequests.terminalError(status: http.statusCode, body: data) { throw terminal }
             throw StreamingFailure.serverRejected(code: http.statusCode)
         }
-        let decoded: FinalizeResponse
+        return data
+    }
+
+    // MARK: - Finalize POST
+
+    private func postFinalize(tail: Data) async throws -> LocalRequests.Response {
+        if aborted { throw StreamingFailure.aborted }
+        let request = LocalRequests.finalize(
+            endpoint: endpoint, sessionId: sessionId, dedupId: clientDedupId, speechStartedAt: speechStartedAt,
+            tail: tail, clientVersion: ServerClient.clientVersion
+        )
+        let data = try await send(request, label: "finalize")
+        let decoded: LocalRequests.Response
         do {
-            decoded = try JSONDecoder().decode(FinalizeResponse.self, from: data)
+            decoded = try LocalRequests.decode(data)
         } catch {
             throw StreamingFailure.decode(error)
         }
         Log.info(
-            "stream finalize → 200 sessionId=\(sessionId) chars=\(decoded.text.count) " +
-                "duration_ms=\(decoded.duration_ms) sf=\(decoded.smart_formatted ?? false)",
+            "stream finalize → 200 sessionId=\(sessionId) chars=\(decoded.text.count) saved=\(decoded.saved)",
             category: "streaming"
         )
-        return decoded.text
-    }
-
-    // MARK: - Multipart body builders
-
-    /// Single `file` part — mirrors `DictationAPI.buildMultipartBody`.
-    private static func buildChunkMultipartBody(wavData: Data, boundary: String) -> Data {
-        var body = Data()
-        let crlf = "\r\n"
-        body.append("--\(boundary)\(crlf)".data(using: .utf8)!)
-        body.append(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"chunk.wav\"\(crlf)"
-                .data(using: .utf8)!
-        )
-        body.append("Content-Type: audio/wav\(crlf)".data(using: .utf8)!)
-        body.append(crlf.data(using: .utf8)!)
-        body.append(wavData)
-        body.append(crlf.data(using: .utf8)!)
-        body.append("--\(boundary)--\(crlf)".data(using: .utf8)!)
-        return body
-    }
-
-    /// `file` + `smart_format` + `client_dedup_id` + `speech_started_at` parts.
-    /// `speech_started_at` is the Double-precision seconds-since-epoch string;
-    /// the server consumes it as `Form(float)` so sub-second precision is
-    /// preserved end-to-end.
-    private static func buildFinalizeMultipartBody(
-        tailWav: Data,
-        smartFormat: Bool,
-        clientDedupId: String,
-        speechStartedAt: Date,
-        boundary: String
-    ) -> Data {
-        var body = Data()
-        let crlf = "\r\n"
-
-        // file
-        body.append("--\(boundary)\(crlf)".data(using: .utf8)!)
-        body.append(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"tail.wav\"\(crlf)"
-                .data(using: .utf8)!
-        )
-        body.append("Content-Type: audio/wav\(crlf)".data(using: .utf8)!)
-        body.append(crlf.data(using: .utf8)!)
-        body.append(tailWav)
-        body.append(crlf.data(using: .utf8)!)
-
-        // smart_format
-        body.append("--\(boundary)\(crlf)".data(using: .utf8)!)
-        body.append(
-            "Content-Disposition: form-data; name=\"smart_format\"\(crlf)\(crlf)"
-                .data(using: .utf8)!
-        )
-        body.append("\(smartFormat ? "true" : "false")\(crlf)".data(using: .utf8)!)
-
-        // client_dedup_id
-        body.append("--\(boundary)\(crlf)".data(using: .utf8)!)
-        body.append(
-            "Content-Disposition: form-data; name=\"client_dedup_id\"\(crlf)\(crlf)"
-                .data(using: .utf8)!
-        )
-        body.append("\(clientDedupId)\(crlf)".data(using: .utf8)!)
-
-        // speech_started_at — Double-precision seconds-since-epoch
-        body.append("--\(boundary)\(crlf)".data(using: .utf8)!)
-        body.append(
-            "Content-Disposition: form-data; name=\"speech_started_at\"\(crlf)\(crlf)"
-                .data(using: .utf8)!
-        )
-        body.append("\(speechStartedAt.timeIntervalSince1970)\(crlf)".data(using: .utf8)!)
-
-        body.append("--\(boundary)--\(crlf)".data(using: .utf8)!)
-        return body
+        return decoded
     }
 }

@@ -20,8 +20,8 @@ extension Notification.Name {
 
 // MARK: - DictationRecorder
 
-/// Records microphone audio via `AVAudioEngine` into a native-rate Float32
-/// WAV and hands it over from `stop()` as a `RecorderOutput`: the recording on
+/// Records microphone audio via `AVAudioEngine` into a native-rate Float32 CAF
+/// (`spool/<id>.caf`) and hands it over from `stop()` as a `RecorderOutput`: the recording on
 /// disk (the Online provider converts it to 16 kHz mono with `Mono16kWAV`)
 /// and, for a Local capture only, a `LocalCapture` holding the streaming
 /// session plus **16-bit PCM** WAVs at the native rate / channel count (the
@@ -330,7 +330,7 @@ final class DictationRecorder {
     /// Starts microphone capture.
     ///
     /// - Parameters:
-    ///   - dictationId: the dictation's id (names the temp recording).
+    ///   - dictationId: the dictation's id (names the spool file `spool/<id>.caf`).
     ///   - endpoint: the Local server, or nil. Local streaming is armed only
     ///     when this is non-nil, so an Online dictation never streams.
     ///   - maxSeconds: the dictation cap; audio past it is dropped and
@@ -439,7 +439,9 @@ final class DictationRecorder {
         // Local streaming is armed only for a Local endpoint. The session's
         // init does no I/O, so a throw below simply drops it. A previous
         // dictation's session is never touched here: `stop()` handed it off.
-        let session = endpoint.map { _ in DictationStreamSession(speechStartedAt: Date()) }
+        let session = endpoint.map {
+            DictationStreamSession(endpoint: $0, dictationId: dictationId, speechStartedAt: Date())
+        }
         isLocalCapture = endpoint != nil
 
         // Write directly in the input format. The server (soundfile + librosa)
@@ -453,11 +455,13 @@ final class DictationRecorder {
         // average. AVAudioConverter's default channel-mix on macOS sums
         // channels without averaging — that bug is exactly what produced the
         // peak=3.974 floats we just removed.
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("wispralt_dictation_\(dictationId).wav")
+        // The spool file (`spool/<id>.caf`; its sidecar was written by
+        // `dictationStart` before this call). After FN-up the dictation's
+        // disposition (`SpoolStore`) owns it, never this recorder.
+        let tempURL = SpoolFiles.audioURL(dictationId)
         audioFileURL = tempURL
 
-        // Write a Float32 WAV that EXACTLY matches the tap's native format
+        // Write Float32 PCM (CAF) that EXACTLY matches the tap's native format
         // (sampleRate, channelCount, Float32, deinterleaved). Matching the
         // buffer format means AVAudioFile.write performs zero conversion —
         // it just streams the float bytes to disk. Empirically, asking
@@ -704,7 +708,7 @@ final class DictationRecorder {
         do {
             try engine.start()
         } catch {
-            // Full cleanup on engine failure: tap, observer, file, temp WAV.
+            // Full cleanup on engine failure: tap, observer, file, spool audio.
             inputNode.removeTap(onBus: 0)
             if let token = configChangeObserver {
                 NotificationCenter.default.removeObserver(token)
@@ -744,12 +748,14 @@ final class DictationRecorder {
     ///    From here on `start()` may run for the next dictation, so only the
     ///    locals are used below.
     ///
-    /// - Returns: the native-rate Float32 recording on disk (the caller deletes
-    ///   it) and, for a Local capture, the `LocalCapture` (Int16 WAVs, session).
-    /// - Throws: `notRecording`; `writeFailed(_)` for a tap write error or a
-    ///   device change; `emptyRecording` under ~50 ms; `encodeFailed` when the
-    ///   Local re-encode fails. On any throw the taken session is aborted and
-    ///   the temp file deleted.
+    /// - Returns: the native-rate Float32 spool recording (the dictation's
+    ///   disposition owns the file) and, for a Local capture, the
+    ///   `LocalCapture` (Int16 WAVs, session). A mid-recording device change
+    ///   returns what was recorded with `interruptedByDeviceChange`.
+    /// - Throws: `notRecording`; `writeFailed(_)` for a tap write error;
+    ///   `emptyRecording` under ~50 ms; `encodeFailed` when the Local
+    ///   re-encode fails. On any throw the taken session is aborted; the spool
+    ///   file stays for the disposition.
     func stop() async throws -> RecorderOutput {
         guard slot.isActive else { throw DictationError.notRecording }
 
@@ -790,7 +796,7 @@ final class DictationRecorder {
 
         let interrupted = DictationError.isDeviceChange(failure)
         do {
-            if let failure { throw DictationError.writeFailed(failure) }
+            if let failure, !interrupted { throw DictationError.writeFailed(failure) }
             // ≈ 50 ms at the native rate: an FN tap without speech, or no mic.
             guard let url, frames >= AVAudioFrameCount(max(rate * 0.05, 1)) else {
                 throw DictationError.emptyRecording
@@ -807,7 +813,6 @@ final class DictationRecorder {
             )
         } catch {
             abortTakenSession(session)
-            if let url { try? FileManager.default.removeItem(at: url) }
             throw error
         }
     }
@@ -933,9 +938,7 @@ final class DictationRecorder {
         if let token = configChangeObserver {
             NotificationCenter.default.removeObserver(token)
         }
-        if let url = audioFileURL {
-            try? FileManager.default.removeItem(at: url)
-        }
+        // A spool file left here is recovered into Retry at the next launch.
     }
 
 }

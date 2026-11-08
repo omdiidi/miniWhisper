@@ -72,6 +72,9 @@ let package = Package(
             name: "WisprAltCoreTests",
             dependencies: ["WisprAltCore"],
             path: "Tests/WisprAltCoreTests",
+            resources: [
+                .copy("Fixtures")
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]

@@ -78,6 +78,9 @@ struct SettingsView: View {
     @State private var hasOpenAIKey: Bool = false
     @State private var openAIKeyError: String?
     @FocusState private var openAIKeyFocused: Bool
+    // OpenRouter key entry (Smart formatting). Read only while the toggle is on.
+    @State private var openRouterKeyText: String = ""
+    @State private var hasOpenRouterKey: Bool = false
     /// Last Local `/healthz` result for the status line (nil = not checked yet).
     /// Checked only on popover open in Local or on a switch to Local.
     @State private var localHealthy: Bool? = nil
@@ -460,19 +463,55 @@ struct SettingsView: View {
         )
     }
 
-    /// Smart-formatting toggle. Off by default. Adds light cleanup to longer
-    /// dictations (punctuation, capitalization, paragraph breaks) without
-    /// changing the words you said. Adds a small amount of latency.
+    /// Smart-formatting toggle (Mercury 2 on OpenRouter, run by this app in
+    /// both modes). Off by default. Sends the dictated text, never audio.
     private var smartFormattingSection: some View {
         Section {
             Toggle("Smart formatting", isOn: Binding(
                 get: { settings.smartFormatting },
-                set: { settings.smartFormatting = $0 }
+                set: { settings.smartFormatting = $0; if $0 { hasOpenRouterKey = OpenRouterKey.current() != nil } }
             ))
-            Text("Adds light cleanup — punctuation, capitalization, paragraph breaks — to longer dictations. Your wording is preserved. Off by default.")
+            Text("Adds light cleanup — punctuation, capitalization, paragraph breaks — to dictations of \(MercuryPolicy.minWords)+ words. Your wording is preserved. Off by default.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if settings.smartFormatting {
+                Text("Privacy: the dictated text (never audio) is sent to OpenRouter (Mercury 2) for cleanup.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    SecureField(hasOpenRouterKey ? "Key saved — paste to replace" : "Paste OpenRouter API key…",
+                                text: $openRouterKeyText)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(saveOpenRouterKey)
+                    Button("Save", action: saveOpenRouterKey)
+                        .disabled(openRouterKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Remove", role: .destructive) {
+                        do { try OpenRouterKey.remove(); hasOpenRouterKey = false } catch {
+                            Log.error("OpenRouter key remove failed: \(ErrorLog.describe(error))", category: "settings")
+                        }
+                    }
+                    .disabled(!hasOpenRouterKey)
+                }
+                Text(hasOpenRouterKey ? "OpenRouter key saved" : "OpenRouter key missing")
+                    .font(.caption)
+                    .foregroundStyle(hasOpenRouterKey ? .green : .orange)
+                if let status = LastTranscriptCaption.formattingStatus(recordingState.lastFormatting) {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
+            }
         } header: { Text("Quality") }
+    }
+
+    private func saveOpenRouterKey() {
+        let trimmed = openRouterKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try OpenRouterKey.save(trimmed)
+            openRouterKeyText = ""
+            hasOpenRouterKey = true
+        } catch {
+            Log.error("OpenRouter key save failed: \(ErrorLog.describe(error))", category: "settings")
+        }
     }
 
     /// Input mic picker — applies ONLY to WisprAlt's own dictation. The picker
@@ -548,6 +587,7 @@ struct SettingsView: View {
 
     private func loadCurrentValues() {
         hasOpenAIKey = OpenAIKey.current() != nil
+        if settings.smartFormatting { hasOpenRouterKey = OpenRouterKey.current() != nil }
         serverURLText = settings.serverURL?.absoluteString ?? ""
         // The Local key is read only in Local mode (its rows are hidden in Online).
         guard isLocal else { return }
@@ -612,8 +652,8 @@ struct SettingsView: View {
             settings.serverURL = nil
             return
         }
-        guard let url = URL(string: trimmed), url.scheme == "https" else {
-            serverURLError = "URL must begin with https://"
+        guard let url = URL(string: trimmed), LocalURLPolicy.isAllowed(url) else {
+            serverURLError = LocalURLPolicy.hint
             return
         }
         settings.serverURL = url
@@ -807,17 +847,13 @@ private struct QuickActionsSection: View {
 
     var body: some View {
         Section {
-            // v0.5.0: surface most-recent server-persisted dictation so the
-            // user can re-paste it without rummaging through the portal.
-            // Reads the Local server, so it is disabled in Online.
+            // The last dictation's text, saved on this Mac before any paste
+            // (both modes; 7 days).
             Button("Copy last dictation", systemImage: "doc.on.clipboard") {
                 performLastDictationCopy()
             }
             .buttonStyle(.bordered)
-            .disabled(!isLocal)
-            .help(isLocal
-                  ? "Copies the text of your most recent persisted dictation. May lag your current dictation by a second or two while it finalizes server-side."
-                  : "Available in Local mode only for now.")
+            .help("Copies the text of your most recent dictation (kept on this Mac for 7 days).")
 
             if let toast = copyToast, toast.button == "last-dictation" {
                 Text(toast.message)
@@ -833,6 +869,13 @@ private struct QuickActionsSection: View {
             if hasInFlightJob {
                 inFlightSection
             }
+
+            if !recordingState.retryItems.isEmpty {
+                retrySection
+            }
+            Text("Saved text and failed recordings stay on this Mac for 7 days, protected by FileVault.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Button("Transcribe file…", systemImage: "waveform.badge.plus") {
                 MenuBarController.shared?.transcribePickedFile()
@@ -901,6 +944,7 @@ private struct QuickActionsSection: View {
         }
         .onAppear {
             customViewModel.start()
+            Task { await MenuBarController.shared?.refreshRetryList() }
         }
         .onDisappear {
             customViewModel.stop()
@@ -908,6 +952,43 @@ private struct QuickActionsSection: View {
         .sheet(isPresented: $showingServerLogSheet) {
             ServerLogSheet(jobIDProvider: { serverLogJobID })
         }
+    }
+
+    /// "Retry N": saved recordings (newest 2, 7 days). Actions per entry come
+    /// from `RetryEntries.actions` for the current mode.
+    private var retrySection: some View {
+        DisclosureGroup("Retry \(recordingState.retryItems.count)") {
+            ForEach(recordingState.retryItems) { item in
+                let plan = RetryEntries.actions(sidecar: item.sidecar, currentMode: settings.mode)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(Self.retryCaption(item))
+                        .font(.caption)
+                    HStack {
+                        if plan.actions.contains(.retry) {
+                            Button("Retry") { MenuBarController.shared?.retrySaved(item.id) }
+                        }
+                        Button("Export…") { MenuBarController.shared?.exportSaved(item) }
+                        Button("Discard") { MenuBarController.shared?.discardSaved(item.id) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    if let hint = plan.hint {
+                        Text(hint).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let status = recordingState.retryStatus {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// "5 min ago · 0:42 · Online".
+    private static func retryCaption(_ item: RetryItem) -> String {
+        let age = RelativeDateTimeFormatter().localizedString(for: item.createdAt, relativeTo: Date())
+        let secs = Int(item.durationSeconds.rounded())
+        let mode = SpoolSidecar.decode(item.sidecar).map { $0.mode == .online ? "Online" : "Local" } ?? "unknown mode"
+        return "\(age) · \(secs / 60):\(String(format: "%02d", secs % 60)) · \(mode)"
     }
 
     /// Open Portal + Open My Dictations (Local only).
@@ -1137,23 +1218,13 @@ private struct QuickActionsSection: View {
     }
 
     private func performLastDictationCopy() {
+        if let last = LastTextStore.load() {
+            ClipboardInjector.copyOnly(last.text)
+            copyToast = ("last-dictation", "Copied — \(last.text.count.formatted(.number)) chars")
+        } else {
+            copyToast = ("last-dictation", "No dictation in the last 7 days.")
+        }
         Task { @MainActor in
-            do {
-                let last = try await LastDictationAPI.fetch()
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.setString(last.text, forType: .string)
-                copyToast = ("last-dictation", "Copied — \(last.text.count.formatted(.number)) chars")
-            } catch ServerError.server(status: 404, _) {
-                copyToast = ("last-dictation", "No dictations yet — say something first.")
-            } catch ServerError.server(status: 403, _) {
-                copyToast = ("last-dictation", "Break-glass admin has no personal dictations.")
-            } catch ServerError.unauthorized {
-                copyToast = ("last-dictation", "API key rejected.")
-            } catch {
-                Log.warning("Copy-last-dictation failed: \(ErrorLog.describe(error))", category: "settings")
-                copyToast = ("last-dictation", "Couldn't fetch — try again.")
-            }
             try? await Task.sleep(nanoseconds: 1_800_000_000)
             if copyToast?.button == "last-dictation" { copyToast = nil }
         }

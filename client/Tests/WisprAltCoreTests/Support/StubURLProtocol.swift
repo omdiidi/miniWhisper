@@ -1,9 +1,15 @@
 import Foundation
+import Testing
+
+/// Parent of every suite that uses `StubURLProtocol`. Its `.serialized`
+/// trait applies to the nested suites, so they never run concurrently with
+/// each other and clobber the static stub state.
+@Suite(.serialized) enum StubURLSuites {}
 
 /// URLProtocol stub for provider tests. `responses` is consumed in order, one
 /// per request; `.hang` never answers (the request only ends when cancelled).
-/// State is static, so every suite that uses it must be `.serialized` and call
-/// `reset()` first.
+/// State is static, so every suite that uses it is nested in `StubURLSuites`
+/// and calls `reset()` first.
 final class StubURLProtocol: URLProtocol {
     enum Reply {
         case http(Int, Data)

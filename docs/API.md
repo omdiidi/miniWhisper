@@ -140,6 +140,10 @@ Transcribe a short audio clip using the warm Parakeet model.
 | `X-Smart-Format` | — | — | **Removed (Part 4).** Server smart formatting (OpenRouter Mercury) is gone; the header is ignored and the raw transcript is always returned. Any formatting now happens in the client. |
 | `X-Client-Dedup-Id` | UUID v4 string | absent ⇒ off | **Optional, additive (Phase 5b streaming-dictation).** When present, must be a syntactically valid UUID v4. Forwarded to `JobStore.insert_dictation(..., client_dedup_id=...)`; the row participates in the `idx_dictations_client_dedup` partial-unique index, so a subsequent retry that sends the same UUID is silently de-duped (`ON CONFLICT(client_dedup_id) DO NOTHING`). Used by the safety-buffer fallback in `DictationStreamSession` to guarantee at most one persisted row per utterance when a streaming finalize loses to its local fallback. When the header is **absent**, behavior is bit-identical to the pre-streaming contract: the column is left NULL and the partial-unique index never applies. Malformed UUIDs are rejected at the validation boundary (422). |
 
+#### Client dedup contract
+
+The macOS client (Core `LocalRequests`) sends `X-Client-Dedup-Id: <dictation id>` (lowercase UUID v4) on every Local dictation request: whole-file, every stream chunk, and finalize (which also carries the `client_dedup_id` field with the same value). It reads `"saved": true|false` from a 200 (absent ⇒ true): on `false` the text is delivered and the audio is kept. It treats 410 `{"error":"dictation_deleted"}` and 409 `{"error":"dedup_conflict"}` as terminal for that dictation (no fallback, no retry); a 409/410 without an `error` key is handled as today. The server side of `saved`, 409 and 410 lands in Part 4.
+
 **Audio format flexibility (server-side resampling):**
 
 - Sample rate: any rate libsndfile / librosa accepts (8 kHz, 16 kHz, 44.1 kHz, 48 kHz, etc.). Server resamples to 16 kHz internally before Parakeet inference.
@@ -371,7 +375,7 @@ Source: `server/src/wispralt/routes/me.py`.
 **Auth:** Bearer required (employee or admin token via `Authorization: Bearer <token>`).
 
 Returns the caller's most recent dictation as JSON. Powers the menubar
-"Copy last dictation" button (v0.5.0). The row is filtered by
+"Copy last dictation" button (v0.5.0). Since Part 3 the macOS client no longer calls it (the button reads the client's own `last.json`); the route stays for other clients. The row is filtered by
 `deleted_at IS NULL` so a soft-deleted dictation is not returned; tie-break
 on identical `created_at` is `id DESC`.
 

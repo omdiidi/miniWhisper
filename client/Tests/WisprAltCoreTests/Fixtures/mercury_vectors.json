@@ -1,0 +1,304 @@
+{
+ "source": "server/tests/test_mercury_safety.py (all 34 cases); expectations computed from server/src/wispralt/smart_format/mercury_client.py",
+ "vectors": [
+  {
+   "name": "empty_string",
+   "kind": "wordCount",
+   "input": "",
+   "expect": 0
+  },
+  {
+   "name": "whitespace_only",
+   "kind": "wordCount",
+   "input": "   \n\t  ",
+   "expect": 0
+  },
+  {
+   "name": "single_word",
+   "kind": "wordCount",
+   "input": "hello",
+   "expect": 1
+  },
+  {
+   "name": "paragraph",
+   "kind": "wordCount",
+   "input": "Okay so today I am going to be talking about a few things",
+   "expect": 13
+  },
+  {
+   "name": "punctuation_tokens_count",
+   "kind": "wordCount",
+   "input": "Hello, world!",
+   "expect": 2
+  },
+  {
+   "name": "bullet_glyphs_count",
+   "kind": "wordCount",
+   "input": "• item one\n• item two",
+   "expect": 6
+  },
+  {
+   "name": "exact_match",
+   "kind": "window",
+   "raw": "a b c d e",
+   "cleaned": "a, b, c, d, e.",
+   "expect": true
+  },
+  {
+   "name": "minor_punctuation_growth",
+   "kind": "window",
+   "raw": "the cat sat on the mat",
+   "cleaned": "The cat sat on the mat.",
+   "expect": true
+  },
+  {
+   "name": "filler_removal_accepted",
+   "kind": "window",
+   "raw": "so I uh think we should you know go to the store and uh buy some milk",
+   "cleaned": "I think we should go to the store and buy some milk.",
+   "expect": true
+  },
+  {
+   "name": "repeat_collapse_accepted",
+   "kind": "window",
+   "raw": "I I went to to the the store yesterday morning",
+   "cleaned": "I went to the store yesterday morning.",
+   "expect": true
+  },
+  {
+   "name": "summarization_rejected",
+   "kind": "window",
+   "raw": "the weather today is really nice and I think we should go for a long walk outside in the park",
+   "cleaned": "Nice weather; let's walk.",
+   "expect": false
+  },
+  {
+   "name": "hallucination_rejected",
+   "kind": "window",
+   "raw": "the meeting starts at three pm in the main room",
+   "cleaned": "The important quarterly planning meeting starts promptly at three pm in the main conference room near the lobby.",
+   "expect": false
+  },
+  {
+   "name": "bullet_formatting_accepted",
+   "kind": "window",
+   "raw": "first thing we should do is buy milk second thing we need to do is pick up the mail third thing we should remember is to feed the cat please",
+   "cleaned": "First thing we should do is buy milk.\n• Second thing we need to do is pick up the mail.\n• Third thing we should remember is to feed the cat please.",
+   "expect": true
+  },
+  {
+   "name": "empty_raw_rejected",
+   "kind": "window",
+   "raw": "",
+   "cleaned": "anything at all here",
+   "expect": false
+  },
+  {
+   "name": "empty_cleaned_rejected",
+   "kind": "window",
+   "raw": "hello world how are you",
+   "cleaned": "",
+   "expect": false
+  },
+  {
+   "name": "just_inside_ceiling",
+   "kind": "window",
+   "raw": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+   "cleaned": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+   "expect": true
+  },
+  {
+   "name": "just_outside_ceiling",
+   "kind": "window",
+   "raw": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+   "cleaned": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+   "expect": false
+  },
+  {
+   "name": "plain_string",
+   "kind": "extract",
+   "input": "hello world",
+   "expect": "hello world"
+  },
+  {
+   "name": "empty_string",
+   "kind": "extract",
+   "input": "",
+   "expect": ""
+  },
+  {
+   "name": "none",
+   "kind": "extract",
+   "input": null,
+   "expect": ""
+  },
+  {
+   "name": "list_of_text_parts",
+   "kind": "extract",
+   "input": [
+    {
+     "type": "text",
+     "text": "hello "
+    },
+    {
+     "type": "text",
+     "text": "world"
+    }
+   ],
+   "expect": "hello world"
+  },
+  {
+   "name": "list_skips_image_parts",
+   "kind": "extract",
+   "input": [
+    {
+     "type": "image",
+     "url": "https://example.com/x.png"
+    },
+    {
+     "type": "text",
+     "text": "only this"
+    }
+   ],
+   "expect": "only this"
+  },
+  {
+   "name": "list_with_bare_string_element",
+   "kind": "extract",
+   "input": [
+    "plain"
+   ],
+   "expect": "plain"
+  },
+  {
+   "name": "list_empty",
+   "kind": "extract",
+   "input": [],
+   "expect": ""
+  },
+  {
+   "name": "dict_text_field",
+   "kind": "extract",
+   "input": {
+    "text": "hi"
+   },
+   "expect": "hi"
+  },
+  {
+   "name": "dict_content_field",
+   "kind": "extract",
+   "input": {
+    "content": "yo"
+   },
+   "expect": "yo"
+  },
+  {
+   "name": "dict_unknown_keys",
+   "kind": "extract",
+   "input": {
+    "foo": "bar"
+   },
+   "expect": ""
+  },
+  {
+   "name": "nested_dict_content_holds_string",
+   "kind": "extract",
+   "input": {
+    "content": {
+     "text": "deep"
+    }
+   },
+   "expect": "deep"
+  },
+  {
+   "name": "nested_dict_content_holds_parts",
+   "kind": "extract",
+   "input": {
+    "content": [
+     {
+      "type": "text",
+      "text": "hi"
+     }
+    ]
+   },
+   "expect": "hi"
+  },
+  {
+   "name": "list_element_with_nested_content",
+   "kind": "extract",
+   "input": [
+    {
+     "content": [
+      {
+       "text": "hi"
+      }
+     ]
+    }
+   ],
+   "expect": "hi"
+  },
+  {
+   "name": "list_element_with_doubly_nested_content",
+   "kind": "extract",
+   "input": [
+    {
+     "content": [
+      {
+       "content": [
+        {
+         "text": "deep"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "expect": "deep"
+  },
+  {
+   "name": "list_mixed_text_and_content_elements",
+   "kind": "extract",
+   "input": [
+    {
+     "text": "hello "
+    },
+    {
+     "content": [
+      {
+       "text": "world"
+      }
+     ]
+    }
+   ],
+   "expect": "hello world"
+  },
+  {
+   "name": "depth_limit_prevents_stack_blow",
+   "kind": "extract",
+   "input": {
+    "text": {
+     "text": {
+      "text": {
+       "text": {
+        "text": {
+         "text": "too deep"
+        }
+       }
+      }
+     }
+    }
+   },
+   "expect": ""
+  },
+  {
+   "name": "unrecognized_top_level",
+   "kind": "extractEach",
+   "inputs": [
+    42,
+    3.14,
+    true
+   ],
+   "expect": ""
+  }
+ ]
+}

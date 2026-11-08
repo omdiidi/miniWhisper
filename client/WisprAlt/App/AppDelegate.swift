@@ -73,6 +73,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Instantiate the menubar controller first so the status item is visible immediately.
         menuBarController = MenuBarController()
 
+        // Saved audio from the last session (crash / quit mid-dictation) goes
+        // to Retry. The spool ids are snapshotted now, before the FN monitor
+        // exists, so no new dictation is ever touched. Nothing is sent.
+        menuBarController.recoverSpoolAtLaunch()
+
         // Warm the OpenAI key cache (at most one Keychain prompt per signed build).
         _ = OpenAIKey.current()
 

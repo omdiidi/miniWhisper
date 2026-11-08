@@ -58,6 +58,6 @@ If you just need to read state and the user is sitting at the mini, the fastest 
   committed, never logged. The legacy `sudo cloudflared service install` flow is
   abandoned because its plist is broken on macOS 14/15. Rotation: see
   docs/DEPLOYMENT-NOTES.md.
-- Secrets: the optional `OPENROUTER_API_KEY` (weekly insights) in `server/.env` (mode 0600). API keys live hashed in `DATA_DIR/wispralt.db`; the first admin token is printed once by `python -m wispralt.bootstrap` (terminal only). Client API key in Keychain (`co.wispralt`). Never commit either.
+- Secrets: the optional `OPENROUTER_API_KEY` (weekly insights) in `server/.env` (mode 0600). Server API keys live hashed in `DATA_DIR/wispralt.db`; the first admin token is printed once by `python -m wispralt.bootstrap` (terminal only). Client keys in the Keychain only: Local `co.wispralt`, OpenAI `co.wispralt.openai`, OpenRouter `co.wispralt.openrouter` (client-side Mercury smart formatting). Never commit any of them.
 
 @CLAUDE.local.md

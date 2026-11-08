@@ -6,6 +6,9 @@ public enum ErrorOutcome: Equatable, Sendable { case empty, cancelled, failed(Fa
 public enum FailureKind: Equatable, Sendable {
     case keyMissing, auth, quota, modelNotFound, network, server,
          deadline, deviceChanged, writeFailed, encodeFailed, other
+    /// Terminal: the Local server refused this dictation id (410
+    /// `dictation_deleted` / 409 `dedup_conflict`). Never retried.
+    case rejected
 }
 
 /// An error that knows how to describe itself to a log without transcript
