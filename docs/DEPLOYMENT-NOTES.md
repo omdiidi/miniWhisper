@@ -1,8 +1,8 @@
 # Deployment Notes — Lessons from a Real First Install
 
-This document captures the issues actually encountered the first time someone bootstrapped WisprAlt on a Mac mini, and the fixes applied. Use this as a supplement to `SETUP-SERVER.md` — every entry below maps to a real failure mode.
+This document captures the issues actually encountered the first time someone bootstrapped WisprAlt on a Mac mini, and the fixes applied. Use this as a supplement to `SETUP-SERVER.md` — every entry below maps to a real failure mode. Today a host is installed and updated with the `wispralt` CLI ([INSTALL.md](INSTALL.md)); the mini-era bash scripts and the gist-based deploy were retired in Part 5.
 
-## Server bootstrap (`scripts/setup-server.sh`)
+## Server bootstrap (historical dependency fixes)
 
 > **Historical context (resolved by Phase 10, 2026-05-10, and Part 2, 2026-11-07).** The dependency failures below were hit during the WhisperX-era install and have been resolved by the WhisperX → mlx-whisper swap. Both `whisperx` and `ctranslate2` were removed from `pyproject.toml` in Phase 10; the meeting pipeline (diarization and the DeepFilterNet denoise stub) was removed in Part 2. These notes are retained as institutional memory for future toolchain bumps. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md).
 
@@ -30,9 +30,9 @@ Two more entries used to live here: a `torch.load(weights_only=False)` patch for
 
 ### `huggingface-cli` renamed to `hf` in 1.x
 
-**Symptom:** `scripts/download-models.sh` errors with `huggingface-cli: command not found` after a fresh `uv sync`.
+**Symptom:** the old model-download script failed with `huggingface-cli: command not found` after a fresh `uv sync`.
 
-**Fix applied:** the script now invokes `huggingface-cli download` only when that binary is on PATH; otherwise falls back to the new `hf download` CLI. Both are documented at <https://huggingface.co/docs/huggingface_hub>.
+**Fix applied:** moot since Part 5: `wispralt setup` calls the `huggingface_hub` Python API (`model_info`, `snapshot_download`) directly, so no Hub CLI is involved.
 
 ## MLX Whisper dependency + model cache
 
@@ -45,51 +45,33 @@ The file transcription path uses [`mlx-community/whisper-large-v3-turbo`](https:
 | `mlx-whisper` | `==0.4.2` | Hard pin — the tqdm-monkeypatch shape in `mlx_whisper_loader.py` is verified against this exact source. A minor bump can move `tqdm.auto.tqdm.update` and silently break the chunk-progress callback (UI shows no progress; transcription still works). |
 | `huggingface-hub` | `>=1.12.0,<1.13` | Kept on the known-good 1.12.x line for the mlx-whisper / Parakeet model fetch. The original reason (a diarization library still calling the removed `use_auth_token=` kwarg) left with the meeting pipeline, so the bound can be relaxed, but deliberately and with a model-fetch smoke test, not as a side effect. |
 
-**Model cache:** Hugging Face stores snapshots under `~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo/`. Disk footprint is **~1.6 GB** (the `model.safetensors` weight file alone is ~1.5 GB; tokenizer + config + generation config make up the rest). The prefetch script asserts `model.safetensors > 800 MB` as a sanity check — see the recovery section below.
+**Model cache:** the host's `HF_HOME` is `~/Library/Application Support/WisprAlt/models`, so snapshots live under `…/models/hub/models--mlx-community--whisper-large-v3-turbo/`. Disk footprint is **~1.6 GB** (the `weights.safetensors` file alone is ~1.6 GB).
 
-**Prefetch step:** run `server/scripts/prefetch-mlx-whisper.sh` once at deploy time. It calls `huggingface_hub.snapshot_download(repo_id=..., revision=..., resume_download=True)` then asserts the size of `model.safetensors`. Idempotent — re-running on a healthy cache is a no-op.
+**Download and verification:** `wispralt setup` (and `wispralt update`) resolves each model's current commit, downloads that snapshot if it is not cached, and checks every LFS file's sha256 against the Hub's metadata (other files by size). The verified commit is recorded in `install-state.json`. Re-running on a verified cache downloads nothing.
 
-## `scripts/deploy-server.sh`
+## Updating a host
 
-Versioned deploy script for the mini. Contract:
+`wispralt update` replaced the gist-based mini deploy. It refuses a clone with local changes, runs `git pull --ff-only`, stops the service (proven by the server's data lock), takes a backup, reinstalls the CLI with `uv tool install --force --reinstall`, and then restarts itself in the new code to re-verify the models, reload the LaunchAgent and wait for `/healthz` + `/readyz/db`. If the new version is unhealthy it exits 1 and prints the `wispralt restore` command for the backup it just took.
 
-1. Reads server code from the dev box, tarballs it (excludes `__pycache__`, `.venv`, `*.log`), transfers to the mini via the `/macmini paste` skill's gist-transport mechanism.
-2. On the mini: creates `.wf-deploy-backup-<epoch>/` (using `mkdir -p` first — BSD `cp -r src1 src2 dst` requires `dst` to be an existing dir), then `cp -r server scripts "$BACKUP/"`, then overwrites with the new tree.
-3. Runs `pip install -e '.[host]'` to install/upgrade pinned deps (the MLX stack is the `[host]` extra).
-4. Runs `server/scripts/prefetch-mlx-whisper.sh` (idempotent).
-5. `launchctl kickstart -k gui/$UID/co.wispralt.server` — or, when the installed plist still names an old module path (the pre-rename package), `scripts/server-launchd.sh install` to regenerate it.
-6. Polls `/healthz` for up to 60 s.
-
-**`set -e` polling bug fix.** Earlier iterations of the deploy script wrote `code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/healthz)` inside the poll loop with `set -e` at the top. The first poll iteration runs while the server is still binding the port — `curl` exits with code 7 (connect refused) — and `set -e` aborts the entire deploy script. The deploy actually succeeded (the server came up seconds later), but the script falsely reported FAILED. **Fix:** always pair the poll with `|| echo "000"`:
-
-```bash
-code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/healthz || echo "000")
-```
-
-Idempotency: the script is safe to re-run. The backup directory is timestamped per invocation; old backups accumulate and should be hand-pruned every few months.
-
-## Recovery from corrupt mlx-whisper prefetch
+## Recovery from a corrupt model download
 
 **Signs of a torn snapshot:**
 
-- `model.safetensors` smaller than ~800 MB (full file is ~1.5 GB).
+- `wispralt setup` reports a file that "failed verification" (wrong size or sha256).
 - `mlx_whisper.transcribe` raises a safetensors deserialization error on the first call.
 - `mlx_whisper_loader.load()` hangs or crashes during the silence-warmup pass.
 
 **Manual recovery:**
 
+Setup already re-downloads a snapshot that fails verification once (forced) before it gives up. If it still fails:
+
 ```bash
 # 1. Remove the bad snapshot
-rm -rf ~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo
+rm -rf ~/Library/Application\ Support/WisprAlt/models/hub/models--mlx-community--whisper-large-v3-turbo
 
-# 2. Re-run the prefetch (asserts > 800 MB on completion)
-bash server/scripts/prefetch-mlx-whisper.sh
-
-# 3. Kickstart the server to force the loader to re-load on first job
-launchctl kickstart -k gui/$UID/co.wispralt.server
+# 2. Download and verify again, then restart the service
+wispralt setup --role host
 ```
-
-The prefetch script uses `resume_download=True`, so a network blip mid-download recovers on re-run without redownloading completed shards. If `resume_download` itself is broken (it has been flaky in past `huggingface_hub` releases), nuke the directory and start clean as above.
 
 ## Cloudflare Tunnel
 
@@ -98,7 +80,7 @@ This was the most painful part of the install. The flow that **actually works** 
 1. **Create the tunnel** via the Zero Trust dashboard → Networks → Connectors → Cloudflared. The dashboard generates a long base64 token (`eyJhIjoi...`).
 2. **Add a Published Application Route** mapping your hostname (e.g. `transcribe.example.com`) to `http://localhost:8080`.  
    ⚠️ `8080` is the default FastAPI port we ship with — match it to whatever the LaunchAgent actually binds.
-3. **Run cloudflared** on the mini in a way that survives reboots. Use a **user-level LaunchAgent**, not the system LaunchDaemon installed by `cloudflared service install`.
+3. **Run cloudflared** on the host in a way that survives reboots. Use a **user-level LaunchAgent**, not the system LaunchDaemon installed by `cloudflared service install`.
 
 ### Why not `cloudflared service install <TOKEN>`?
 
@@ -131,7 +113,7 @@ cloudflared --version    # should show 2024.10.x or newer
 
 If `https://your-host/healthz` returns HTTP 530 with `error code: 1033`, walk the chain in this order:
 
-1. **Local FastAPI:** `curl http://127.0.0.1:8080/healthz` on the mini. Expect `{"status":"ok"}`. If 200 → FastAPI is fine, problem is in cloudflared.
+1. **Local FastAPI:** `curl http://127.0.0.1:8000/healthz` on the host. Expect `{"status":"ok"}`. If 200 → FastAPI is fine, problem is in cloudflared.
 2. **Cloudflared process:** `pgrep -lf cloudflared`. If empty → cloudflared isn't running. If a PID exists, check `lsof -nP -p <PID> | grep ESTABLISHED` — there should be outbound connections to Cloudflare's edge (port 7844 or 443).
 3. **Tunnel registration:** Cloudflare dashboard → your tunnel → Overview tab. Status must be HEALTHY with at least one connector listed. If INACTIVE, the running cloudflared isn't successfully registering — check `~/Library/Logs/WisprAlt/cloudflared.log` for errors like `Couldn't fetch tunnel`, `Login required`, or `Tunnel ID invalid`.
 4. **Route mapping:** Published Application Routes tab. The route must point to the EXACT host:port that FastAPI binds to. `http://localhost:8080` matches a server bound to `127.0.0.1:8080`; `http://localhost:8765` would not.
@@ -144,19 +126,19 @@ The setup writes three files containing secrets. None are committed:
 
 | File | Mode | Contains |
 |---|---:|---|
-| `~/wispralt/server/.env` | 0600 | `DATA_DIR`, `SERVER_URL`, optional `OPENROUTER_API_KEY` (weekly insights). No API key: keys live hashed in `DATA_DIR/wispralt.db` |
+| `~/.config/wispralt/.env` | 0600 | `DATA_DIR`, `SERVER_URL`, `SERVER_LOG_PATH`, optional `OPENROUTER_API_KEY` (weekly insights). No API key: keys live hashed in `DATA_DIR/wispralt.db` |
 | `~/.config/wispralt/cloudflare-token` | 0600 | Cloudflare tunnel token only |
 | `~/.config/wispralt/client-config.txt` | 0600 | Legacy (pre-Part 4) copy of `SERVER_URL` + the old env key; the bootstrap step now prints the token to the terminal only, so delete this file on an upgraded host |
 
-`.gitignore` covers all three. Cloudflare tunnel token is **never** stored in `server/.env` — it lives in `~/.config/wispralt/cloudflare-token` and is read by the cloudflared LaunchAgent via `--token-file` at start time.
+All three live outside the repo. Cloudflare tunnel token is **never** stored in the host `.env` — it lives in `~/.config/wispralt/cloudflare-token` and is read by the cloudflared LaunchAgent via `--token-file` at start time.
 
 ### Rotating tokens
 
 After any setup involving copy/paste into shared tools (chat, screen recordings, etc.), rotate:
 
-- **`OPENROUTER_API_KEY`** (if set, for weekly insights): rotate at <https://openrouter.ai/keys>, update `server/.env`, restart the FastAPI LaunchAgent.
+- **`OPENROUTER_API_KEY`** (if set, for weekly insights): rotate at <https://openrouter.ai/keys>, update `~/.config/wispralt/.env`, then `wispralt restart`.
 - **Cloudflare tunnel token:** in the Zero Trust dashboard → tunnel → Configure → Rotate token. See "Cloudflared LaunchAgent (user-level)" below for the rotation procedure — the steps differ depending on whether your cloudflared version supports `--token-file`.
-- **Admin token:** on the server, `cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin` revokes the old key and prints a new one (terminal only); enter it in the client. Employee / integration keys rotate from the admin UI.
+- **Admin token:** on the host, `wispralt keys rotate-admin` revokes the old key and prints a new one (terminal only, or `--token-file`); enter it in the client. Employee / integration keys rotate from the admin UI or `wispralt keys rotate USER_ID`.
 
 ## Client (`client/`) — Swift package gotchas
 

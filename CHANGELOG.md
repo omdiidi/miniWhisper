@@ -2,6 +2,57 @@
 
 All notable changes to WisprAlt are documented here.
 
+## [Unreleased] - 2026-11-07 — Part 5: the `wispralt` CLI and install
+
+One command now installs, runs and maintains a host and/or client on any
+Apple Silicon Mac: clone, then `./install.sh`.
+
+### Added
+
+- **`wispralt` CLI** (console script in the server package, installed with
+  `uv tool install`): `setup --role host|client|both`, `status`, `doctor`,
+  `start|stop|restart`, `users`, `keys` (incl. `rotate-admin`), `retention`,
+  `backup`, `restore`, `update`, `uninstall`. Non-interactive flags for
+  scripted/agent installs; exit codes 0/1/2/3; `--json` output.
+- **Idempotent setup.** Reruns add only missing `.env` keys, download nothing
+  when the models verify (sha256 against Hugging Face metadata), never create a
+  second admin or rotate a key, and ask the retention question once.
+- **Safe key handoff.** A new key goes only to a terminal or a new 0600
+  `--token-file`; with `--role both` it reaches the app's Keychain through
+  `security -i` on stdin, never a command line.
+- **Offline backup/restore/update** wrapped around the server lock: the service
+  is stopped, proven stopped, and restarted afterwards.
+
+### Changed
+
+- **`install.sh`** is now a thin bootstrap run from a clone (Homebrew, `ffmpeg`,
+  `uv`, then `wispralt setup`). The `curl | bash` release installer and its
+  Keychain seeding are gone; a DMG is installed with `setup --dmg`, verified
+  with `codesign` + `spctl`, and quarantine is never stripped.
+- **Host layout.** Config in `~/.config/wispralt/` (`.env`, `install-state.json`),
+  data in `~/Library/Application Support/WisprAlt/host`, models in
+  `…/WisprAlt/models` (`HF_HOME`), backups in `~/WisprAlt-Backups/`; all
+  re-rooted by `WISPRALT_ROOT`. The LaunchAgent is `co.wispralt.host`; a
+  mini-era `co.wispralt.server` is booted out and its plist moved aside.
+- `python -m wispralt.bootstrap` is a thin shim over the CLI's admin functions.
+- `scripts/setup-cloudflared.sh` (optional tunnel) writes the host config
+  `.env`; `scripts/verify-openai-compat.sh` defaults to the local host.
+
+### Removed
+
+- `scripts/setup-server.sh`, `download-models.sh`, `server-launchd.sh`,
+  `doctor.sh`, `server-uninstall.sh`, `uninstall-client.sh` (folded into the
+  CLI), `deploy-server.sh`, `run-matrix-local.sh`, `setup-local-codesign.sh`,
+  `server/scripts/prefetch-mlx-whisper.sh` and `server/scripts/run-matrix.sh`.
+- The `/setup-server`, `/setup-client`, `/update-models`, `/test-connection`
+  and `/verify-autostart` Claude commands (`wispralt setup|doctor|update`).
+
+### Known gaps
+
+- The app's in-app update button still shells the retired curl installer, and
+  the portal's **Add employee** page still shows a curl install command; both
+  are retargeted in later parts.
+
 ## [Unreleased] - 2026-11-07 — Part 2: removals (meetings, cloud fallback, Hugging Face token)
 
 WisprAlt is now dictation plus file transcription. Everything below is a

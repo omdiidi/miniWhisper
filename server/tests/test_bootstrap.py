@@ -23,7 +23,6 @@ from wispralt.accounts.store import AccountStore
 from wispralt.database import Database
 
 _TOKEN = re.compile(r"\b[0-9a-f]{64}\b")
-_REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -120,10 +119,3 @@ def test_bad_data_dir_creates_nothing(env: dict[str, str], cwd: Path, value: str
     code, out, err = _run_tty(["--label", "owner"], {**env, "DATA_DIR": value}, cwd)
     assert code != 0 and "DATA_DIR" in err and not _TOKEN.search(out)
     assert list(cwd.iterdir()) == []
-
-
-def test_setup_writes_data_dir_before_bootstrap() -> None:
-    lines = (_REPO / "scripts" / "setup-server.sh").read_text().splitlines()
-    write = next(i for i, ln in enumerate(lines) if "DATA_DIR=" in ln and "printf" in ln)
-    boot = next(i for i, ln in enumerate(lines) if "-m wispralt.bootstrap --label" in ln)
-    assert write < boot

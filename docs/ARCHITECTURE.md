@@ -71,7 +71,7 @@ The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port
 | **MicEnumerator** | `client/WisprAlt/Audio/MicEnumerator.swift` | Stateless static helper bridging AVFoundation device discovery to CoreAudio HAL property reads. `availableInputs()` uses `[.external, .microphone]` (macOS 15+ — `.builtInMicrophone` is deprecated, subsumed by `.microphone`); dedup by uniqueID. `audioDeviceID(forUID:)` translates an AV `uniqueID` to an `AudioDeviceID` via `kAudioHardwarePropertyTranslateUIDToDevice` (using `withUnsafePointer(to: &cfUID)` and `qualifierSize = MemoryLayout<CFString?>.size`). `systemDefaultInputName()` exposes the current default's localized name for the picker label. Powers the SwiftUI Input Mic picker in `SettingsView`. |
 | **AppDelegate** | `client/WisprAlt/App/AppDelegate.swift` | App lifecycle. Exposes `static weak var shared: AppDelegate?` for cross-controller access. Recovers last session's spool into Retry (`recoverSpoolAtLaunch`; nothing is sent), warms the OpenAI key cache, then runs `menuBarController.applyModeEvent(.launch)`: in Local mode with a server URL + key it resumes a saved Local file job and fetches `/me` once; in Online it contacts neither. |
 | **PermissionGate** | `client/WisprAlt/App/PermissionGate.swift` | Sequential 3-permission wizard: Accessibility → Input Monitoring → Microphone. On macOS 14.4+, posts a blocking "Quit and Reopen Required" sheet after Input Monitoring is granted (`CGRequestListenEventAccess` returns `true` but real grant requires process restart). |
-| **SparkleController** | `client/WisprAlt/Update/SparkleController.swift` | Sparkle 2 wrapper. Defers the update sheet while `MenuBarController.isBusy`. Auto-updates intentionally **disabled** in be720a1 — `startingUpdater: false` + `SUEnableAutomaticChecks=false` in Info.plist. Tier 1.5 distribution rides on `install.sh` (curl one-liner; see docs/INSTALL.md) for fresh installs and `/wispralt-update` (Claude Code) for in-place updates. |
+| **SparkleController** | `client/WisprAlt/Update/SparkleController.swift` | Sparkle 2 wrapper. Defers the update sheet while `MenuBarController.isBusy`. Auto-updates intentionally **disabled** in be720a1 — `startingUpdater: false` + `SUEnableAutomaticChecks=false` in Info.plist. Fresh installs: clone + `./install.sh`; updates: `wispralt update --client` (see docs/INSTALL.md). |
 
 ### Online mode (OpenAI direct)
 
@@ -1177,8 +1177,10 @@ labels them so users can tell which dictations went through the old path.
 A lightweight in-app update checker runs alongside the still-disabled Sparkle
 wrapper. The new module lives at
 `client/WisprAlt/Update/UpdateChecker.swift` and is **deliberately not Sparkle**
-— it reuses `install.sh` (the curl one-liner) as the canonical install path so
-there is exactly one update mechanism to reason about.
+— it shells the old `install.sh` curl one-liner. Part 5 replaced that
+installer (it now needs a clone and prints "clone first" when piped), so until
+the checker is retargeted at `wispralt update --client` the in-app update does
+not install anything.
 
 - **Polling.** The checker fires 60 s after launch and then every 6 h,
   debounced via `Settings.shared.lastUpdateCheck` so a wake-from-sleep doesn't

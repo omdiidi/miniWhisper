@@ -4,24 +4,19 @@ FastAPI-based transcription server for WisprAlt.
 
 ## Quick Start
 
-Run the one-step setup script from the repo root:
+From the repo root run `./install.sh --role host`. It installs this package as
+the `wispralt` CLI (`uv tool install`, console script `wispralt.cli.main:main`)
+and runs `wispralt setup`, which:
 
-```bash
-./scripts/setup-server.sh
-```
+1. Checks the Mac and installs the Apple Silicon `[host]` extra
+2. Writes `~/.config/wispralt/.env` (0600; only missing keys)
+3. Downloads and sha256-verifies the models (Parakeet for dictation, MLX
+   Whisper for file transcription; both public, no Hugging Face token needed)
+4. Creates the database and the first admin (key shown once)
+5. Registers the `co.wispralt.host` LaunchAgent and checks `/healthz`
 
-The script handles:
-
-1. Python 3.11 and `uv` availability checks
-2. Virtual-environment creation and dependency installation
-3. Model weight download (~2.7 GB total: Parakeet for dictation, MLX Whisper
-   for file transcription; both public, no Hugging Face token needed)
-4. API-key generation and `.env` permissions hardening
-5. Cloudflare Tunnel installation
-6. LaunchAgent registration (auto-starts on login)
-7. End-to-end health check via `doctor.sh`
-
-For a detailed walkthrough see `../docs/SETUP-SERVER.md`.
+The CLI code lives in `src/wispralt/cli/`. See `../docs/INSTALL.md` (command
+reference) and `../docs/SETUP-SERVER.md` (host details).
 
 **Note on `uv.lock`**: not committed yet. After installing `uv` (`brew install uv`), run `cd server && uv lock` to generate it. Commit the lockfile to ensure reproducible installs in CI.
 

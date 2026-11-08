@@ -8,18 +8,48 @@ Each entry follows the format: **Symptom → Diagnosis → Fix**.
 
 ---
 
+## `wispralt doctor`
+
+`wispralt doctor` (add `--client` on a client, `--json` for scripts) runs
+read-only checks and exits 3 if any fails. Each failing line ends with
+`-> <fix>`; the table explains them.
+
+| Check | Fails when | Fix |
+|---|---|---|
+| `apple-silicon` | the Mac is not arm64 (a warning on a client-only Mac) | the host needs MLX on Apple Silicon; use this Mac as a client |
+| `macos` | older than macOS 14 | update macOS |
+| `disk` | under 6 GB free where the models live | free space, then `wispralt setup --role host` |
+| `ffmpeg` / `uv` | not on `PATH` | `brew install ffmpeg` / `brew install uv` (or rerun `./install.sh`) |
+| `env-file` | `~/.config/wispralt/.env` missing, not 0600 or not yours | `chmod 600 ~/.config/wispralt/.env`; if missing, `wispralt setup --role host` |
+| `env-data-dir` | the `.env`'s `DATA_DIR` differs from the data dir in `install-state.json` | make them agree (edit `DATA_DIR`, or rerun setup with the matching `--data-dir`) |
+| `data-dir` | the data dir is missing or not 0700 | `chmod 700` it, or `wispralt setup --role host` |
+| `db-integrity` | `PRAGMA integrity_check` (read-only) is not `ok` | `wispralt restore <newest backup> --yes` |
+| `service` | the LaunchAgent is not loaded or its plist lacks `RunAtLoad` | `wispralt restart` |
+| `/healthz`, `/readyz/dictation`, `/readyz/db` | a probe is not HTTP 200 | read `~/Library/Logs/WisprAlt/server.err.log` and `wispralt.log`, then `wispralt restart`. `/readyz/dictation` stays 503 while the model loads (up to a minute after start) |
+| `legacy-agent` | the mini-era `co.wispralt.server` is loaded (fail: it competes for the port) or its plist is still in LaunchAgents (warning) | `wispralt setup --role host` boots it out and moves its plist to `~/.config/wispralt/legacy/` |
+| `cloudflared` (warning) | the tunnel agent is loaded but its token file is missing | rerun `scripts/setup-cloudflared.sh`, or `launchctl bootout gui/$UID/co.wispralt.cloudflared` |
+| `warmup` (`--warmup` only) | the dictation model cannot load or transcribe a test tone | `wispralt setup --role host` (re-verifies and repairs the models) |
+| `xcode`, `signing-identity` (client, warnings) | only Command Line Tools, or no Apple Development identity | needed only to build the app: install Xcode, then Xcode > Settings > Accounts. A DMG install needs neither |
+| `app` (client) | `/Applications/WisprAlt.app` is missing | `wispralt setup --role client` |
+| `app-running`, `keychain` (client, warnings) | the app is not running / no key is stored | open the app; add a key in its Settings |
+
+Two lines are information only: the FileVault status, and a reminder that the
+host is a per-user agent, so it runs only while you are logged in.
+
+---
+
 ## Server Issues
 
 ### Model download fails
 
-**Symptom:** `download-models.sh` exits with "Could not download <repo> after 3 attempts".
+**Symptom:** `wispralt setup` stops with "cannot fetch <repo>" or "download of <repo> failed".
 
 **Diagnosis:** Both models (`mlx-community/parakeet-tdt-0.6b-v2`, `mlx-community/whisper-large-v3-turbo`) are public, so no token or license acceptance is involved. The failure is network access to huggingface.co, a rate limit (HTTP 429), or a full disk.
 
 **Fix:**
 1. Check connectivity: `curl -fsSI https://huggingface.co` should return 200.
-2. On HTTP 429, wait a few minutes and re-run `bash scripts/download-models.sh` (downloads resume).
-3. Confirm ≥ 4 GB free on `$HOME` (`df -h ~`).
+2. On HTTP 429, wait a few minutes and re-run `wispralt setup --role host` (downloads resume; a verified model is not fetched again).
+3. Confirm ≥ 6 GB free on `$HOME` (`df -h ~`).
 
 ---
 
@@ -69,15 +99,15 @@ xcode-select --install
 
 ### `.env` permissions warning at startup
 
-**Symptom:** Server log shows `SECURITY WARNING: server/.env has mode 6XX, expected 0600`.
+**Symptom:** Server log shows `SECURITY WARNING: .env has mode 6XX, expected 0600` (or `wispralt doctor` fails `env-file`).
 
 **Diagnosis:** The `.env` file was created with overly permissive mode (e.g. 0644 set by a text editor).
 
 **Fix:**
 ```bash
-chmod 600 server/.env
+chmod 600 ~/.config/wispralt/.env
 ```
-Verify: `ls -la server/.env` should show `-rw-------`.
+Verify: `ls -la ~/.config/wispralt/.env` should show `-rw-------`.
 
 ---
 
@@ -157,9 +187,8 @@ the server on failure.
   editing one.
 - **Exit 2 refused** — no terminal and no `--yes`; the owner mapping is ambiguous
   (more than one enabled admin on either side: use `--owner-map PG_ID=LOCAL_ID`); no
-  local admin yet (run `python -m wispralt.bootstrap`); or the server holds
-  `<DATA_DIR>.lock` (stop it first; until Part 4's lock lands the server does not
-  take it, so stop the service yourself).
+  local admin yet (run `wispralt setup --role host`); or the server holds
+  `<DATA_DIR>.lock` (stop it first with `wispralt stop`).
 - **`unmatched` rows** — usage rows whose Supabase user is not in the snapshot (or was
   malformed). They stay in the snapshot and are listed in the report.
 - **A crash mid-import** — just run the same command again: it resumes after the last
@@ -306,7 +335,7 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 **Fix:**
 1. Open Activity Monitor → Network tab; check upload bytes/sec for WisprAlt.
 2. If upload speed is near zero, the connection may have been dropped by Cloudflare. Cancel and retry.
-3. Check `MEETING_OUTPUT_DIR` free space with `doctor.sh`.
+3. Check free space with `wispralt status` (sizes) and `wispralt doctor` (`disk`).
 
 ---
 
@@ -328,7 +357,7 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 **Fix:**
 1. Check `GET /metrics` for `meeting.active` and `meeting.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/wispralt.log` for Python tracebacks.
-2. Restart the server (`scripts/server-launchd.sh restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staged source.
+2. Restart the server (`wispralt restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staged source.
 3. If the server is healthy but the job consistently times out for long files, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
 
 ---
@@ -496,7 +525,7 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 **Fix:**
 
 - For 401 from a browser: visit `/admin/login`, paste the admin token, submit. The cookie is set with `max_age=8h`.
-- For 403: use the admin token, not an employee token. There is no env-var admin key and no break-glass admin. If the admin token is lost, mint a new one on the server's terminal: `cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin` (prints the new token once; add `--user-id N` when there are several admins).
+- For 403: use the admin token, not an employee token. There is no env-var admin key and no break-glass admin. If the admin token is lost, mint a new one on the host's terminal: `wispralt keys rotate-admin` (prints the new token once, or writes it to a new `--token-file`; add `--user-id N` when there are several admins).
 - **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Revoke, Mint, Rotate) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (the `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
 - **503** instead of 401/403: the account lookup hit a `sqlite3.Error`. Check `/readyz/db` and the "Local database" section; there is no fallback admin.
 
