@@ -190,6 +190,13 @@ async def _finalize(
     session = await store.get_for_owner(session_id, int(user.id))
     if session.dedup_id != did:
         raise HTTPException(409, "Dedup id does not match session")
+    async with session.lock:
+        blank_replay = session.blank_text if session.status == "finalized" else None
+    if blank_replay is not None:
+        # A retry of a finalize whose text was blank (never stored, so the
+        # replay above found nothing): replay it like a stored dictation.
+        request.state.dedup_replay = True
+        return _final_response(blank_replay, 0.0, replayed=True, saved=True)
 
     # v5.2: try/finally wraps from the FIRST status mutation onward so any
     # exception (CorruptAudioError from wav_header_duration_ms, HTTPException
@@ -264,7 +271,8 @@ async def _finalize(
             raise HTTPException(409, "Partial transcripts have gaps") from exc
 
         # Blank text is not stored (same rule as /transcribe/dictate): there is
-        # nothing to keep, so it reports saved=true.
+        # nothing to keep, so it reports saved=true. The session remembers it
+        # (blank_text, set below) so a retried finalize replays it.
         if not joined.strip():
             text, ok = joined, True
         else:
@@ -284,6 +292,8 @@ async def _finalize(
 
         async with session.lock:
             session.status = "finalized"
+            if not joined.strip():
+                session.blank_text = joined
 
         observability.streaming_sessions_finalized_total.increment()
 

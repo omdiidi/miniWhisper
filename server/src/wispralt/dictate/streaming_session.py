@@ -78,6 +78,10 @@ class StreamingSession:
     cumulative_inference_ms: float = 0.0
     status: Literal["active", "finalizing", "finalized", "aborted"] = "active"
     last_error: str | None = None
+    # Set when the session finalized with blank text: blank text is never
+    # stored (so the dedup row replay cannot find it), and a retried finalize
+    # replays this instead of getting "Session is finalized".
+    blank_text: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
