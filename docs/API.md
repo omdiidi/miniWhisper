@@ -846,7 +846,7 @@ Upload a single chunk's raw bytes.
 
 **Auth:** Bearer required. **Owner must match the user that ran `/init`.**
 
-Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; on a busy 429 (`FileJobInProgressError`) it also cleans up the assembled file so a retry starts fresh. A `mode` key left in a pre-upgrade `meta.json` is ignored, so such uploads finish as ordinary file jobs.
+Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; a 500 (`Concat failed` / `Assembled size mismatch`) removes only the partial output and keeps the chunks, so finalize can be retried; on a busy 429 (`FileJobInProgressError`) it also cleans up the assembled file so a retry starts fresh. A `mode` key left in a pre-upgrade `meta.json` is ignored, so such uploads finish as ordinary file jobs.
 
 **Request:** Empty body (`{}`).
 
