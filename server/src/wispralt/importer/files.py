@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from wispralt._errors import ImportIntegrityError, OwnerMappingRequired
-from wispralt.ops.backup import server_lock
+from wispralt.importer.lock import offline
 from wispralt.importer.report import Report
 from wispralt.importer.runs import ImportRuns
 from wispralt.imports import insert_rows
@@ -245,7 +245,7 @@ def _apply(
 ) -> dict[str, int]:
     outputs.mkdir(parents=True, exist_ok=True)
     runs = ImportRuns(db)
-    with server_lock(db.path.parent):
+    with offline(db.path.parent):
         run = runs.begin(SOURCE, origin)
         total = len(planned)
         sids = [row["source_id"] for row, _ in planned]

@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from wispralt._errors import ExportBlocked, ImportIntegrityError, OwnerMappingRequired
-from wispralt.ops.backup import server_lock
+from wispralt.importer.lock import offline
 from wispralt.importer.report import Report
 from wispralt.importer.runs import ImportRuns
 from wispralt.importer.supabase_export import TABLES
@@ -143,7 +143,7 @@ def resolve_owner(
     if dry_run or (not local_admins and not has_pg_admin):
         return {}
     if not local_admins:
-        raise OwnerMappingRequired("no local admin yet: run `python -m wispralt.bootstrap` first")
+        raise OwnerMappingRequired("no local admin yet: run `wispralt setup --role host` first")
     hint = f"proposed {proposal[0]}={proposal[1]}" if proposal else "no unambiguous proposal"
     raise OwnerMappingRequired(f"confirm the owner mapping ({hint}): --yes or --owner-map PG=LOCAL")
 
@@ -305,7 +305,7 @@ def import_snapshot(
     applied: dict[str, dict[str, int]] = {}
     if not dry_run:
         runs = ImportRuns(db)
-        with server_lock(db.path.parent):
+        with offline(db.path.parent):
             with db.write() as con:
                 for pg_id, local_id in owners.items():
                     link_existing(con, "users", local_id, SOURCE["users"], str(pg_id))

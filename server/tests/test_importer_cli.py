@@ -121,3 +121,33 @@ def test_files_command(
     assert cli.main(["files", str(d), "--owner", str(admin), "--yes"]) == cli.OK
     assert _count(db, "SELECT count(*) FROM jobs WHERE source = 'files'") == 1
     assert cli.main(["files", str(d), "--owner", "999", "--yes"]) == cli.REFUSED
+
+
+def test_real_run_takes_the_lock_before_migrating_and_dry_run_never_migrates(
+    db: Database, tmp_path: Path, admin: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review fix: a live server's DB is never migrated; a dry run never migrates at all."""
+    from wispralt.database import Database as Db
+    from wispralt.ops.backup import server_lock
+
+    d = tmp_path / "meetings"
+    d.mkdir()
+    (d / "m.json").write_text(json.dumps({"job_id": "j1", "segments": [{"text": "hi"}]}))
+    migrated: list[int] = []
+    real = Db.migrate
+    monkeypatch.setattr(Db, "migrate", lambda self: migrated.append(1) or real(self))
+    assert cli.main(["files", str(d), "--owner", str(admin), "--dry-run"]) == cli.OK
+    assert migrated == []
+    with server_lock(db.path.parent):  # a running server holds it
+        assert cli.main(["files", str(d), "--owner", str(admin), "--yes"]) == cli.REFUSED
+    assert migrated == [] and _count(db, "SELECT count(*) FROM jobs") == 0
+    assert cli.main(["files", str(d), "--owner", str(admin), "--yes"]) == cli.OK  # lock nests
+    assert migrated == [1] and _count(db, "SELECT count(*) FROM jobs") == 1
+
+
+def test_missing_db_points_at_the_wispralt_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["files", str(tmp_path), "--owner", "1", "--dry-run"]) == cli.ERROR
+    err = capsys.readouterr().err
+    assert "wispralt setup --role host" in err and "wispralt.bootstrap" not in err
