@@ -69,7 +69,7 @@ from wispralt.jobs.runner import FileJobRunner
 from wispralt.jobs.store import JobStore
 from wispralt.middleware import openai_errors
 from wispralt.middleware.rate_limit import RateLimitMiddleware
-from wispralt.ops import background, staging
+from wispralt.ops import background, monitoring, staging
 from wispralt.ops.backup import server_lock
 from wispralt.ops.env_writer import find_env_path
 from wispralt.ops.logging_setup import configure_file_logging
@@ -77,6 +77,7 @@ from wispralt.routes import (
     admin,
     admin_data,
     admin_invites,
+    admin_system,
     admin_ui,
     dictate,
     health,
@@ -86,6 +87,7 @@ from wispralt.routes import (
 from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
+from wispralt.settings_store import SettingsStore
 from wispralt.usage.events import UsageEvent
 from wispralt.usage.store import UsageStore
 
@@ -138,6 +140,8 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
     app.state.db = database
     app.state.accounts = AccountStore(database)
     app.state.usage = UsageStore(database)
+    app.state.settings_store = SettingsStore(database)
+    monitoring.on_startup(app, app.state.settings_store)  # server_starts, started_at, cpu prime
     # Portal first-admin setup: a one-time code file while no enabled admin exists.
     setup_code.prepare(app.state.accounts, settings.data_dir)
 
@@ -458,6 +462,7 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
             logger.warning("insights_client.aclose failed: %s", exc)
 
     app.state.job_store = app.state.accounts = app.state.usage = app.state.db = None
+    app.state.settings_store = None
     logger.info("Shutdown: database released.")
     logger.info("WisprAlt server clean shutdown.")
 
@@ -649,6 +654,8 @@ def create_app() -> FastAPI:
     # /admin/invites (admin) + the public POST /invites/redeem (Part 6).
     app.include_router(admin_invites.router)
     app.include_router(admin_invites.public_router)
+    # /admin/system — host / queue / DB / clients monitoring (Part 6).
+    app.include_router(admin_system.router)
     # /admin/data — Phase 2 admin Data tab (weekly insights + drill-down).
     app.include_router(admin_data.router)
     # /transcribe/file — container-agnostic submission (ffmpeg-transcoded),

@@ -126,8 +126,8 @@ class LatencyHistogram:
 
         return {
             "p50": statistics.median(values),
-            "p95": _percentile(values, 0.95),
-            "p99": _percentile(values, 0.99),
+            "p95": percentile(values, 0.95),
+            "p99": percentile(values, 0.99),
         }
 
     def all_routes(self) -> set[str]:
@@ -135,7 +135,7 @@ class LatencyHistogram:
             return {r for r, dq in self._by_route.items() if dq}
 
 
-def _percentile(sorted_values: list[float], q: float) -> float:
+def percentile(sorted_values: list[float], q: float) -> float:
     """Return the *q*-th quantile of a pre-sorted list (linear interpolation)."""
     n = len(sorted_values)
     idx = q * (n - 1)

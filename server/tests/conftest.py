@@ -18,6 +18,7 @@ from wispralt.accounts.store import AccountStore  # noqa: E402
 from wispralt.config import settings  # noqa: E402
 from wispralt.database import Database  # noqa: E402
 from wispralt.jobs.store import JobStore  # noqa: E402
+from wispralt.settings_store import SettingsStore  # noqa: E402
 from wispralt.usage.store import UsageStore  # noqa: E402
 
 if TYPE_CHECKING:
@@ -85,6 +86,7 @@ def wire(db: Database, accounts: AccountStore, usage: UsageStore) -> Wire:
         app.state.job_store = JobStore(db, settings.data_dir)
         app.state.accounts = accounts
         app.state.usage = usage
+        app.state.settings_store = SettingsStore(db)
         return app
 
     return _wire

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from wispralt.observability import percentile
+
 if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Iterator
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
     from wispralt.usage.events import UsageEvent
 
 _DAY = 86_400.0
+ACTIVE_WINDOW_S = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,3 +191,70 @@ class UsageStore:
                 (*params, limit),
             ):
                 yield _event(r)
+
+    def clients_last_seen(
+        self, now: float, *, recent_s: float = 7 * _DAY, active_s: float = ACTIVE_WINDOW_S
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Per key (device) seen within ``recent_s``: ``active`` = seen within ``active_s``
+        (2 min), ``recent`` = the rest. Each row: key_id, key_label, user_id, user_label,
+        kind, last_seen (unix s). Rows without a ``key_id`` (pre-0002, imported) are skipped.
+        """
+        with self.db.read() as con:
+            rows = [
+                dict(r)
+                for r in con.execute(
+                    "SELECT e.key_id, k.label AS key_label, u.id AS user_id,"
+                    " COALESCE(u.display_name, u.label) AS user_label, u.kind,"
+                    " MAX(e.ts) AS last_seen"
+                    " FROM usage_events e JOIN api_keys k ON k.id = e.key_id"
+                    " JOIN users u ON u.id = k.user_id"
+                    " WHERE e.key_id IS NOT NULL AND e.ts >= ?"
+                    " GROUP BY e.key_id ORDER BY last_seen DESC",
+                    (now - recent_s,),
+                )
+            ]
+        return {
+            "active": [r for r in rows if r["last_seen"] >= now - active_s],
+            "recent": [r for r in rows if r["last_seen"] < now - active_s],
+        }
+
+    def latency_error_summary(
+        self, since: float, until: float | None = None, *, user_id: int | None = None
+    ) -> dict[str, Any]:
+        """Over ``[since, until)``: per-kind ``{count, p50_ms, p95_ms}``, total requests, 5xx
+        count and rate, 4xx+5xx error rate. Usage rows are request telemetry (a streamed
+        dictation is several rows), so this feeds latency and error rates only."""
+        clauses, params = ["ts >= ?"], [since]
+        if until is not None:
+            clauses.append("ts < ?")
+            params.append(until)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        by_kind: dict[str, list[float]] = {}
+        total = errors = server_errors = 0
+        with self.db.read() as con:
+            for r in con.execute(
+                f"SELECT kind, status, duration_ms FROM usage_events WHERE {' AND '.join(clauses)}",
+                params,
+            ):
+                total += 1
+                errors += r["status"] >= 400
+                server_errors += r["status"] >= 500
+                if r["duration_ms"] is not None:
+                    by_kind.setdefault(r["kind"], []).append(float(r["duration_ms"]))
+        return {
+            "total": total,
+            "errors": errors,
+            "server_errors": server_errors,
+            "error_rate": (errors / total) if total else None,
+            "rate_5xx": (server_errors / total) if total else None,
+            "by_kind": {
+                kind: {
+                    "count": len(v),
+                    "p50_ms": percentile(sorted(v), 0.5),
+                    "p95_ms": percentile(sorted(v), 0.95),
+                }
+                for kind, v in sorted(by_kind.items())
+            },
+        }

@@ -32,6 +32,7 @@ ADMIN_PAGES = [
     "/admin/invites",
     "/admin/usage",
     "/admin/data",
+    "/admin/system",
 ]
 SELF_PAGES = ["/me/history", "/me/insights"]
 ADMIN_NAV_LINKS = (
@@ -40,7 +41,18 @@ ADMIN_NAV_LINKS = (
     'href="/admin/invites"',
     'href="/admin/data"',
     'href="/admin/usage"',
+    'href="/admin/system"',
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wispralt.ops import monitoring
+
+    async def fake_probe(url: str) -> bool:
+        return False
+
+    monkeypatch.setattr(monitoring, "probe_reachable", fake_probe)
 
 
 @pytest.fixture

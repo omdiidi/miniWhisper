@@ -323,6 +323,25 @@ class JobStore:
                 (status, time.time() - _DAY),
             ).fetchone()[0]
 
+    def queue_counts(self, now: float) -> dict[str, float | int | None]:
+        """System page: pending / running now, failed in the last 24 h, oldest pending age."""
+        with self.db.read() as con:
+            r = con.execute(
+                "SELECT COALESCE(SUM(status = 'pending'), 0) AS pending,"
+                " COALESCE(SUM(status = 'running'), 0) AS running,"
+                " COALESCE(SUM(status = 'failed' AND finished_at > ?), 0) AS failed_24h,"
+                " MIN(CASE WHEN status = 'pending' THEN created_at END) AS oldest_pending"
+                " FROM jobs",
+                (now - _DAY,),
+            ).fetchone()
+        oldest = r["oldest_pending"]
+        return {
+            "pending": int(r["pending"]),
+            "running": int(r["running"]),
+            "failed_24h": int(r["failed_24h"]),
+            "oldest_pending_age_s": None if oldest is None else max(0.0, now - oldest),
+        }
+
     def list_active_jobs(self) -> list[Job]:
         with self.db.read() as con:
             rows = con.execute("SELECT * FROM jobs WHERE status IN ('pending','running')")
