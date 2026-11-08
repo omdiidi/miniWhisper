@@ -12,6 +12,10 @@ class MigrationError(Exception):
     """The DB's applied migrations do not match this code's migration files."""
 
 
+class AlreadyBootstrapped(Exception):
+    """First-admin bootstrap refused: an enabled admin already exists."""
+
+
 class DiskFullError(Exception):
     """Raised when a write fails because the filesystem has no free space (ENOSPC)."""
 

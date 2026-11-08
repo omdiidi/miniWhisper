@@ -653,6 +653,22 @@ Part 4 moves the Local-mode host onto **one SQLite file**, `data_dir/wispralt.db
 dictations, jobs, weekly_insights, settings). Callers move onto it task by task
 during Part 4; until then the sections below describe the current stores.
 
+**Repositories** are classes over `Database`, one transaction per method:
+
+- `accounts.store.AccountStore` splits identity from credentials: `users`
+  (`role`, `kind`, `disabled_at`) and `api_keys` (`token_hash`, `revoked_at`).
+  A key authenticates only while it is not revoked and its user is not disabled
+  (`lookup_key`, one indexed join). `rotate_user_key` revokes the user's active
+  keys, inserts one new key and clears `disabled_at` in a single transaction, so a
+  failure leaves the old key valid. `create_first_admin` refuses
+  (`AlreadyBootstrapped`) while an enabled admin exists.
+- `accounts.service` is the only code that sees plaintext tokens: it generates a
+  64-hex token, stores its sha256 and returns the plaintext once; it logs ids only.
+- `usage.store.UsageStore` writes one `usage_events` row per `record` and serves
+  the portal reads (overview tiles, top users, 14 UTC-day buckets, user totals,
+  drilldown and CSV). The p50 is the median of the window's `duration_ms` values,
+  computed in Python.
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output

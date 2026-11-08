@@ -82,7 +82,9 @@ This section describes the rollback strategy that was in place during Phases 1�
 | `server/tests/test_token_cache.py` | LRU + 60 s TTL on `TokenCache` |
 | `server/tests/test_usage_writer.py` | UsageEventQueue overflow + drainer batch + FK-violation retry |
 | `server/tests/test_admin_routes_auth.py` | `/admin/*` 403 employee / 200 admin |
-| `server/tests/conftest.py` | shared harness: `DATA_DIR` set before import, per-test `settings.data_dir = tmp_path`, migrated `db` fixture |
+| `server/tests/conftest.py` | shared harness: `DATA_DIR` set before import, per-test `settings.data_dir = tmp_path`, migrated `db` fixture, `accounts` / `usage` stores, `make_user` |
+| `server/tests/test_accounts.py` | `AccountStore` lookup / rotate / revoke / disable, first-admin bootstrap, no token in logs |
+| `server/tests/test_usage_store.py` | `UsageStore` record, overview, user totals, p50, drilldown filters, CSV rows |
 | `server/tests/test_database.py` | `Database` migrations (fresh, idempotent, failed, edited, missing, newer), pragmas, rollback, concurrent writers, `check()`, `DATA_DIR` validation |
 | `server/tests/test_db_health.py` | `db.health_check` + `db.recreate_pool` |
 | `server/tests/test_auth_break_glass.py` | Postgres-unreachable → env-var bearer → admin path |
