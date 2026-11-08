@@ -593,9 +593,10 @@ malformed`) means the index drifted: rebuild it with
 
   | Status / error | Meaning | What to do |
   |---|---|---|
-  | `aborted` · `budget` | The 30-day spending cap was reached (checked before every call). | Wait for older spend to age out, or raise the cap in Settings. |
+  | `aborted` · `budget` | The next call's worst-case cost (prompt + a full reply at the rate card) would cross the 30-day cap (checked before every call). | Wait for older spend to age out, or raise the cap in Settings. |
   | `aborted` · `rate_limit` | OpenRouter returned 429. | The scheduler retries after 6 hours; or start the week again later. |
   | `failed` · `all_people_failed` | Every person's reply was unusable or errored. | See the failures column (`openrouter_error`, `json_decode`, `schema`); check the model id in Settings. |
+  | `failed` · `team_openrouter_error` / `team_unusable` | People were analysed but the team summary call errored, or its reply was unusable twice. | The scheduler retries after 6 hours (or start the week again); saved people are not paid for twice. |
   | `failed` · `<ExceptionName>` | The run crashed. | Check `wispralt.log` around the start time (logs hold ids and classes, never text). |
   | `skipped` · `ai_disabled` / `no_client` | AI is off, or no key. | See above. |
 

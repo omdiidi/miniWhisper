@@ -911,7 +911,8 @@ insights timezone (DB setting, else `INSIGHTS_TIMEZONE`, else the host zone from
    remain, so an invented ref, or another person's record (it was never in this
    person's prompt), can never survive. `quotable_line` is kept only when its text is an
    exact substring of the record it cites. The team pass receives the validated person
-   insights and its items may cite only refs those insights cite.
+   insights of the week (saved earlier or new in this run) and its items may cite only
+   refs those insights cite.
 4. **Render.** `sources.build_view` re-checks refs at view time
    (`JobStore.refs_exist(refs, viewer, is_admin)`): refs to deleted records, or to
    records the viewer may not open, are hidden, and an item left with none is hidden.
@@ -957,15 +958,23 @@ CREATE TABLE insight_runs(
 ```
 
 Progress is updated after every person; the portal polls it every 2 s. A run ends
-`done`; `failed` (`all_people_failed`, or a crash with its exception class); `aborted`
-(`budget` or `rate_limit`); or `skipped` (`ai_disabled`, `no_client`). Without `force`
-a week is restart-safe (people who already have a row are skipped, so nobody is paid
-for twice); `force` regenerates them.
+`done`; `failed` (`all_people_failed`, `team_openrouter_error` / `team_unusable` when
+the team call errors or is unusable twice, or a crash with its exception class);
+`aborted` (`budget` or `rate_limit`); or `skipped` (`ai_disabled`, `no_client`). A
+failed or aborted scheduled run is not `done`, so the scheduler retries it. Without
+`force` a week is restart-safe (people who already have a row are skipped, so nobody is
+paid for twice) but their saved insights still go into the team prompt; the team pass
+runs when the week has no team row, anyone new was analysed, or with `force`. `force`
+regenerates everyone.
 
 ### Cost control
 
 - The **30-day cap** is checked before **every** OpenRouter call (person and team),
-  against the 30-day spend at the start of the run plus this run's spend.
+  against the 30-day spend at the start of the run plus this run's spend **plus that
+  call's reserved worst case** (`cron.call_reserve_usd`: prompt tokens counted
+  generously, the larger of 1.35/word and 1 per 3 chars, plus a full `max_tokens`
+  reply, at the rate card via `client.worst_case_cost_usd`). A call that could cross
+  the cap is never made.
   `rolling_insights_cost_usd` takes the larger of the stored insights' cost and the
   runs' recorded spend (a forced rerun overwrites a row's cost; runs also count replies
   that were billed but unusable).

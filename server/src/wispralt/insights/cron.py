@@ -12,7 +12,15 @@ enabled it after the disclosure, and an InsightsClient exists (``OPENROUTER_API_
   (progress per person; ``failures`` = ``{user_id, error_class}``, never text) and ends
   ``done``, ``failed`` (every person failed, or a crash), ``aborted`` (``budget`` or
   ``rate_limit``) or ``skipped`` (AI off, no client).
-* The 30-day cost cap is checked before EVERY OpenRouter call, not once per run.
+* The 30-day cost cap is checked before EVERY OpenRouter call, not once per run, and the
+  check reserves that call's worst case (``call_reserve_usd``: the prompt's tokens plus a
+  full ``max_tokens`` reply at the rate card), so a call that could cross the cap is never
+  made.
+* A rerun without ``force`` skips people who already have a row, but the team pass still
+  reads every person insight of the week (saved or new). The team pass runs when there is
+  no team row yet, when anyone new was analysed, or with ``force``. A team call that fails
+  (OpenRouter error, or unusable twice) ends the run ``failed`` (``team_openrouter_error`` /
+  ``team_unusable``), so the scheduler retries it.
 * Each person's records go into the prompt behind their refs (``sources.assemble``); the
   reply is parsed and cleaned by ``sources.validate_person``; the team pass may cite only
   refs those person insights cite. Logs carry ids, classes and lengths, never text.
@@ -39,6 +47,7 @@ from wispralt.insights.client import (
     InsightsError,
     RateLimitedError,
     input_rate_per_1k,
+    worst_case_cost_usd,
 )
 from wispralt.insights.prompts import (
     PERSON_SYSTEM_PROMPT,
@@ -55,6 +64,9 @@ SCHEDULER_FIRST_CHECK_S = 60.0
 RETRY_AFTER_S = 6 * 3600.0
 TOKENS_PER_WORD = 1.35
 MAX_BACKFILL_WEEKS = 12
+PERSON_MAX_TOKENS = 2000
+TEAM_MAX_TOKENS = 2500
+CHARS_PER_TOKEN_FLOOR = 3.0  # generous: real prompts average ~4 chars per token
 
 Week = tuple[int, int]
 
@@ -68,6 +80,7 @@ class RunOutcome:
     failures: list[dict[str, Any]] = field(default_factory=list)
     cost_usd: float = 0.0
     aborted: str | None = None  # 'rate_limit' | 'budget'
+    team_error: str | None = None  # 'team_openrouter_error' | 'team_unusable'
 
 
 def _qualifies(dictations: int, files: int) -> bool:
@@ -76,6 +89,15 @@ def _qualifies(dictations: int, files: int) -> bool:
 
 
 # ── estimate ─────────────────────────────────────────────────────────────────
+
+
+def call_reserve_usd(model: str, system_prompt: str, user_prompt: str, max_tokens: int) -> float:
+    """Worst-case cost of one call, reserved against the cap before it is made: input
+    tokens counted generously (the larger of 1.35/word and 1 per 3 chars) plus a full
+    ``max_tokens`` reply, at the model's rate card."""
+    text = system_prompt + "\n" + user_prompt
+    input_tokens = max(len(text.split()) * TOKENS_PER_WORD, len(text) / CHARS_PER_TOKEN_FLOOR)
+    return worst_case_cost_usd(model, int(input_tokens) + 1, max_tokens)
 
 
 def estimate_cost(job_store, accounts, weeks: list[Week], *, model: str, tz_name: str) -> dict[str, float]:  # noqa: ANN001
@@ -202,6 +224,8 @@ async def _run_one(app, week: Week, cfg, *, trigger: str, force: bool) -> RunOut
         await finish("aborted", outcome.aborted)
     elif outcome.people_total and not outcome.people_done:
         await finish("failed", "all_people_failed")
+    elif outcome.team_error:
+        await finish("failed", outcome.team_error)  # not done: the scheduler retries it
     else:
         await finish("done", None)
     return outcome
@@ -220,19 +244,27 @@ async def _run_weekly_insights_inner(
     word_cap = int(settings.insights_input_word_cap)
     baseline = await asyncio.to_thread(job_store.rolling_insights_cost_usd, 30)
 
-    def over_cap() -> bool:
-        return baseline + outcome.cost_usd >= cfg.cap_30d_usd
+    def over_cap(reserve_usd: float) -> bool:
+        """True when spend so far plus this call's worst case would cross the cap."""
+        return baseline + outcome.cost_usd + reserve_usd > cfg.cap_30d_usd
 
     async def report() -> None:
         if progress is not None:
             await progress(outcome)
 
     users = await asyncio.to_thread(accounts.list_people, active=True)
-    person_insights: list[tuple[str, dict]] = []  # (name, validated insight)
+    person_insights: list[tuple[str, dict]] = []  # (name, validated insight), saved or new
 
     for user in users:
-        if not force and job_store.get_weekly_insight_person(user.id, iso_year, iso_week):
-            continue  # restart-safe: never pay twice for the same person and week
+        name = user.display_name or user.label
+        if not force:
+            saved = await asyncio.to_thread(
+                job_store.get_weekly_insight_person, user.id, iso_year, iso_week
+            )
+            if saved is not None:
+                # restart-safe: never pay twice for a person, but the team pass needs it
+                person_insights.append((name, saved))
+                continue
         transcripts = await asyncio.to_thread(
             job_store.transcripts_in_range, user.id, since_epoch=week_start, until_epoch=week_end
         )
@@ -240,16 +272,9 @@ async def _run_weekly_insights_inner(
         files = sum(t["kind"] == "file" for t in transcripts)
         if not _qualifies(dictations, files):
             continue
-        if over_cap():
-            logger.warning("Insights 30-day cap reached before user_id=%s; aborting", user.id)
-            outcome.aborted = "budget"
-            break
-        outcome.people_total += 1
-        await report()
-
         assembled = sources.assemble(transcripts, cap=word_cap)
         user_prompt = PERSON_USER_PROMPT_TEMPLATE.format(
-            display_name=user.display_name or user.label,
+            display_name=name,
             iso_year=iso_year,
             iso_week=iso_week,
             total_words=assembled.total_words,
@@ -258,10 +283,17 @@ async def _run_weekly_insights_inner(
             input_word_cap=word_cap,
             transcript_blob=assembled.blob,
         )
+        if over_cap(call_reserve_usd(cfg.model, PERSON_SYSTEM_PROMPT, user_prompt, PERSON_MAX_TOKENS)):
+            logger.warning("Insights 30-day cap would be crossed by user_id=%s; aborting", user.id)
+            outcome.aborted = "budget"
+            break
+        outcome.people_total += 1
+        await report()
+
         try:
             resp = await client.analyze(
                 system_prompt=PERSON_SYSTEM_PROMPT, user_prompt=user_prompt,
-                max_tokens=2000, model=cfg.model,
+                max_tokens=PERSON_MAX_TOKENS, model=cfg.model,
             )
         except RateLimitedError:
             # 429: stop the whole run; every later person would hit the same limit.
@@ -300,11 +332,13 @@ async def _run_weekly_insights_inner(
             )
         )
         outcome.people_done += 1
-        person_insights.append((user.display_name or user.label, insight))
+        person_insights.append((name, insight))
         await report()
 
     if person_insights and outcome.aborted is None:
-        await _team_pass(app, week, cfg, person_insights, outcome, over_cap)
+        team_saved = await asyncio.to_thread(job_store.get_weekly_insight_team, iso_year, iso_week)
+        if force or team_saved is None or outcome.people_done:
+            await _team_pass(app, week, cfg, person_insights, outcome, over_cap)
 
     logger.info(
         "Weekly insights W%02d — %d/%d people, cost $%.4f, failures=%s, aborted=%s",
@@ -315,7 +349,8 @@ async def _run_weekly_insights_inner(
 
 
 async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome, over_cap) -> None:  # noqa: ANN001
-    """Team insight over this run's person insights; it may cite only their refs."""
+    """Team insight over every person insight of the week; it may cite only their refs.
+    Sets ``outcome.team_error`` when no usable team insight was saved (budget aside)."""
     client: InsightsClient = app.state.insights_client
     allowed = set().union(*(sources.refs_in(i) for _, i in person_insights))
     digests_jsonl = "\n".join(
@@ -324,17 +359,23 @@ async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome,
     user_prompt = TEAM_USER_PROMPT_TEMPLATE.format(
         iso_year=week[0], iso_week=week[1], digests_jsonl=digests_jsonl
     )
+    reserve = call_reserve_usd(cfg.model, TEAM_SYSTEM_PROMPT, user_prompt, TEAM_MAX_TOKENS)
     for temperature in (0.2, 0.0):  # one retry at 0.0 when the reply is unusable
-        if over_cap():
+        if over_cap(reserve):
             outcome.aborted = "budget"
             return
         try:
             resp = await client.analyze(
-                system_prompt=TEAM_SYSTEM_PROMPT, user_prompt=user_prompt, max_tokens=2500,
-                temperature=temperature, model=cfg.model,
+                system_prompt=TEAM_SYSTEM_PROMPT, user_prompt=user_prompt,
+                max_tokens=TEAM_MAX_TOKENS, temperature=temperature, model=cfg.model,
             )
+        except RateLimitedError:
+            outcome.aborted = "rate_limit"
+            logger.warning("OpenRouter 429 on the team pass: aborting the insights run")
+            return
         except InsightsError as exc:
             logger.warning("Team insights failed: %s status=%s", type(exc).__name__, exc.status_code)
+            outcome.team_error = "team_openrouter_error"
             return
         outcome.cost_usd += resp.cost_usd
         try:
@@ -353,6 +394,7 @@ async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome,
             )
         )
         return
+    outcome.team_error = "team_unusable"
 
 
 if __name__ == "__main__":

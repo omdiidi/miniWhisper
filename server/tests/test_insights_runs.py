@@ -47,12 +47,14 @@ class Stub:
     def __init__(self, cost: float = 0.01, fail_with: tuple[int, Exception] | None = None,
                  on_call=None) -> None:  # noqa: ANN001
         self.calls = 0
+        self.prompts: list[str] = []
         self.cost = cost
         self.fail_with = fail_with
         self.on_call = on_call
 
     async def analyze(self, *, system_prompt: str, user_prompt: str, **_: Any) -> InsightsResponse:
         self.calls += 1
+        self.prompts.append(user_prompt)
         if self.on_call is not None:
             self.on_call(self.calls)
         if self.fail_with and self.fail_with[0] == self.calls:
@@ -182,6 +184,73 @@ async def test_hitting_the_cap_mid_run_aborts_with_budget(
     [run] = job_store.recent_insight_runs()
     assert (run["status"], run["error_class"], run["people_done"]) == ("aborted", "budget", 2)
     assert run["cost_usd"] == 10.0 and job_store.get_weekly_insight_team(*week) is None
+
+
+async def test_a_call_whose_worst_case_would_cross_the_cap_is_never_made(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    # Nothing spent yet, but one stub/model call can cost up to a full 2000-token reply at
+    # the fail-closed ``_default`` rate (0.8 USD), which is over a 0.5 cap.
+    _ai_on(settings_store, cap=0.5)
+    reserve = cron.call_reserve_usd("stub/model", "sys", "user", cron.PERSON_MAX_TOKENS)
+    assert reserve >= 2000 / 1000 * INSIGHTS_PRICING_PER_1K["_default"]["output"]
+    stub = Stub(cost=0.01)
+    outcome = await cron.run_weekly_insights(_app(job_store, accounts, settings_store, stub), week,
+                                             trigger="manual")
+    assert stub.calls == 0 and outcome.aborted == "budget"
+    [run] = job_store.recent_insight_runs()
+    assert (run["status"], run["error_class"]) == ("aborted", "budget")
+
+
+async def test_a_failed_team_call_fails_the_run_and_the_retry_uses_every_saved_person(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    from wispralt.insights.client import InsightsError
+
+    _ai_on(settings_store)
+    first = Stub(fail_with=(4, InsightsError("OpenRouter HTTP 500", status_code=500)))
+    await cron.run_weekly_insights(_app(job_store, accounts, settings_store, first), week,
+                                   trigger="scheduled")
+    [run] = job_store.recent_insight_runs()
+    assert (run["status"], run["error_class"], run["people_done"]) == (
+        "failed", "team_openrouter_error", 3)
+    assert job_store.scheduled_run_state(*week)["done"] is False  # the scheduler will retry
+    assert job_store.get_weekly_insight_team(*week) is None
+
+    retry = Stub()
+    await cron.run_weekly_insights(_app(job_store, accounts, settings_store, retry), week,
+                                   trigger="scheduled")
+    assert retry.calls == 1  # the team pass only: saved people are not paid for twice
+    team_prompt = retry.prompts[0]
+    for p in busy_people:
+        assert f'"person": "{p.label}"' in team_prompt
+    assert job_store.get_weekly_insight_team(*week) is not None
+    assert job_store.recent_insight_runs()[0]["status"] == "done"
+
+    again = Stub()  # everything saved: a third run pays for nothing
+    await cron.run_weekly_insights(_app(job_store, accounts, settings_store, again), week,
+                                   trigger="manual")
+    assert again.calls == 0
+
+
+async def test_an_unusable_team_reply_fails_the_run(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    _ai_on(settings_store)
+
+    class BadTeam(Stub):
+        async def analyze(self, *, system_prompt: str, user_prompt: str, **kw: Any) -> InsightsResponse:
+            resp = await super().analyze(system_prompt=system_prompt, user_prompt=user_prompt, **kw)
+            if self.calls > 3:
+                return resp.model_copy(update={"content": "not json"})
+            return resp
+
+    stub = BadTeam()
+    await cron.run_weekly_insights(_app(job_store, accounts, settings_store, stub), week,
+                                   trigger="manual")
+    assert stub.calls == 5  # three people, then the team call and its one retry
+    [run] = job_store.recent_insight_runs()
+    assert (run["status"], run["error_class"]) == ("failed", "team_unusable")
 
 
 async def test_rate_limit_aborts_the_run(
