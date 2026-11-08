@@ -45,9 +45,15 @@ import WisprAltCore
     }
 
     @Test func dropAfterRetry_onlyWhenSavedWithWords() {
-        #expect(RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m")))
-        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: " \n", modelUsed: "m")))
-        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m", serverSaved: false)))
+        #expect(RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m"), textSaved: true))
+        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: " \n", modelUsed: "m"), textSaved: true))
+        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m", serverSaved: false),
+                                             textSaved: true))
+    }
+
+    /// A Retry whose text could not be written to `last.json` keeps the recording.
+    @Test func dropAfterRetry_keepsWhenTheTextSaveFailed() {
+        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m"), textSaved: false))
     }
 
     @Test func sidecar_roundTrip() throws {
