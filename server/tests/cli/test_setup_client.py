@@ -170,3 +170,24 @@ def test_security_word_quoting() -> None:
     )
     with pytest.raises(CliError):
         client._arg('/x"y')
+
+
+def test_same_version_from_another_commit_rebuilds(
+    cli: CliFn, runner: FakeRunner, clone: Path
+) -> None:
+    """An old build with the same version (no or another stamped commit) is replaced."""
+    import plistlib
+
+    runner.on("git", "-C", str(clone), "rev-parse", "HEAD", out="abc123\n")
+    _building(runner, clone)
+    old = Paths.resolve().app
+    make_app(old, "0.5.0")  # same version, no WisprAltSourceCommit: an older build
+    code, out, _ = _client(cli, "--source", str(clone))
+    assert code == 0 and "already installed" not in out
+    assert any(c[0] == "bash" for c in runner.calls)
+    info = old / "Contents" / "Info.plist"
+    data = plistlib.loads(info.read_bytes())
+    info.write_bytes(plistlib.dumps({**data, "WisprAltSourceCommit": "abc123"}))
+    runner.calls.clear()
+    code, out, _ = _client(cli, "--source", str(clone))
+    assert code == 0 and "already installed" in out

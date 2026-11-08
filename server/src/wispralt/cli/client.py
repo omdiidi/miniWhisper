@@ -109,11 +109,29 @@ def install_dmg(ctx: Ctx, dmg: Path) -> None:
         shutil.rmtree(mount, ignore_errors=True)
 
 
+def app_commit(app: Path) -> str | None:
+    """The clone commit ``build-client-local.sh`` stamped as ``WisprAltSourceCommit``."""
+    try:
+        with (app / "Contents" / "Info.plist").open("rb") as f:
+            return str(plistlib.load(f).get("WisprAltSourceCommit") or "") or None
+    except (OSError, plistlib.InvalidFileException):
+        return None
+
+
 def build_and_install(ctx: Ctx, source: Path, *, rebuild: bool) -> None:
+    """Build and install unless the installed app is this version built from this commit.
+
+    The version alone is not enough: it rarely changes between builds, so an old
+    app with the same version would be kept. A clone that is not a git checkout
+    falls back to the version check.
+    """
     recover_interrupted_install(ctx.paths.app)
     current = app_version(ctx.paths.app)
     wanted = plist_version(source / "client" / "WisprAlt" / "Info.plist")
-    if not rebuild and current and current == wanted:
+    head = ctx.runner.run(["git", "-C", str(source), "rev-parse", "HEAD"], check=False)
+    commit = head.stdout.strip() if head.returncode == 0 else ""
+    same_build = not commit or app_commit(ctx.paths.app) == commit
+    if not rebuild and current and current == wanted and same_build:
         print(f"client {current} already installed (pass --rebuild to rebuild)")
         return
     print("building the client (needs the Command Line Tools and an Apple Development identity) …")

@@ -81,6 +81,13 @@ if [[ -n "$RELEASE_REPO" ]]; then
     /usr/libexec/PlistBuddy -c "Add :WisprAltReleaseRepo string $RELEASE_REPO" \
         "$APP_PATH/Contents/Info.plist"
 fi
+# The clone commit, so `wispralt setup|update --client` can tell an old build of the
+# same version from this one.
+SOURCE_COMMIT="$(git -C "$CLIENT_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [[ -n "$SOURCE_COMMIT" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :WisprAltSourceCommit string $SOURCE_COMMIT" \
+        "$APP_PATH/Contents/Info.plist"
+fi
 
 # Compile the asset catalog with actool. SPM does NOT auto-run actool on .xcassets
 # resources — it just copies the directory raw. We compile manually so the bundle
