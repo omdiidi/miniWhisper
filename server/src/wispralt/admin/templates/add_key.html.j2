@@ -1,17 +1,23 @@
 {% extends "base.html.j2" %}
-{% block title %}Add API Key · WisprAlt Admin{% endblock %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Add API key · WisprAlt{% endblock %}
 {% block content %}
-<h1>Add API key for a third-party program</h1>
-<p>This key will work against <code>/v1/audio/transcriptions</code> and <code>/v1/models</code> only — it cannot access <code>/me</code>.</p>
-
-{% if error %}<p class="error">{{ error }}</p>{% endif %}
-
-<form method="POST" action="/admin/keys/new">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <label for="program_name">Program name <small>(displayed in admin UI; e.g. "Buzz on Bob's MacBook", "Open WebUI prod")</small></label>
-  <input type="text" name="program_name" id="program_name" required maxlength="40" autofocus value="{{ form_program_name or '' }}" />
-
-  <button type="submit" class="btn btn-primary">Mint key</button>
-  <a href="/admin/keys">Cancel</a>
-</form>
+  <div class="page-head">
+    <div>
+      <h1>Add API key for a third-party program</h1>
+      <p class="muted">Works against <code>/v1/audio/transcriptions</code> and <code>/v1/models</code> only.</p>
+    </div>
+  </div>
+  {% if error %}<p class="notice bad" role="alert">{{ error }}</p>{% endif %}
+  <form class="form card" method="post" action="/admin/keys/new">
+    {{ ui.csrf(csrf_token) }}
+    <label for="program_name">Program name</label>
+    <input type="text" name="program_name" id="program_name" required maxlength="40" autofocus
+           value="{{ form_program_name or '' }}" aria-describedby="pn-hint">
+    <p class="hint" id="pn-hint">Shown in the portal, e.g. "Buzz on Bob's MacBook" or "Open WebUI prod".</p>
+    <div class="actions">
+      <button type="submit" class="primary">Create key</button>
+      <a href="/admin/keys">Cancel</a>
+    </div>
+  </form>
 {% endblock %}

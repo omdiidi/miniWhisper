@@ -5,7 +5,7 @@
 {% include "_stats_grid_partial.html.j2" %}
 
 {% if insight %}
-  <p class="ai-disclaimer">AI-generated insights — may be inaccurate.</p>
+  <p class="muted small">AI-generated insights — may be inaccurate.</p>
   {{ card_weekly_digest(insight.get('digest', [])) }}
   {{ card_action_items(insight.get('action_items', [])) }}
   {{ card_project_pie(insight.get('projects', [])) }}
@@ -13,7 +13,7 @@
   {{ card_blockers(insight.get('blockers', [])) }}
   {{ card_quotable_line(insight.get('quotable_line', '')) }}
 {% else %}
-  <section class="glass-card">
+  <section class="card">
     <h3>No insights yet</h3>
     <p class="muted">No insights for this week yet — check back Monday morning.</p>
   </section>

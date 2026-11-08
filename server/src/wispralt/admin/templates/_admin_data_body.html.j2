@@ -5,7 +5,7 @@
 {% include "_stats_grid_partial.html.j2" %}
 
 {% if user_id and person_insight %}
-  <p class="ai-disclaimer">AI-generated insights — may be inaccurate.</p>
+  <p class="muted small">AI-generated insights — may be inaccurate.</p>
   {{ card_weekly_digest(person_insight.get('digest', [])) }}
   {{ card_action_items(person_insight.get('action_items', [])) }}
   {{ card_project_pie(person_insight.get('projects', [])) }}
@@ -15,12 +15,12 @@
   <p><a href="/admin/data?range={{ range }}">← Back to team</a></p>
 {% elif not user_id %}
   {% if team_insight %}
-    <p class="ai-disclaimer">AI-generated team insights — may be inaccurate.</p>
+    <p class="muted small">AI-generated team insights — may be inaccurate.</p>
     {{ card_team_themes(team_insight.get('themes', [])) }}
     {{ card_knowledge_gaps(team_insight.get('knowledge_gaps', [])) }}
     {{ card_tool_mentions(team_insight.get('tool_mentions', {})) }}
   {% else %}
-    <section class="glass-card">
+    <section class="card">
       <h3>Team insights pending</h3>
       <p class="muted">Will populate after Sunday's cron run.</p>
     </section>
@@ -28,9 +28,9 @@
 
   {{ card_filler_leaderboard(per_user_fillers) }}
 
-  <section class="glass-card">
+  <section class="card">
     <h3>Per-employee stats ({{ range }})</h3>
-    <table>
+    <div class="table-wrap"><table>
       <thead>
         <tr>
           <th>Employee</th>
@@ -54,6 +54,6 @@
           </tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   </section>
 {% endif %}

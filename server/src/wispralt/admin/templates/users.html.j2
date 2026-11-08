@@ -1,52 +1,46 @@
 {% extends "base.html.j2" %}
-{% block title %}Users — Wispralt Admin{% endblock %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}People · WisprAlt{% endblock %}
 {% block content %}
-  <div style="display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px;">
-    <h2 style="margin: 0;">Users</h2>
-    <a href="/admin/users/new" style="background: var(--accent); color: #fff; padding: 6px 12px; border-radius: 4px; font-size: 13px;">+ Add employee</a>
+  <div class="page-head">
+    <h1>People</h1>
+    <a class="btn primary" href="/admin/users/new">Add employee</a>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th>ID</th>
-        <th>Label</th>
-        <th>Role</th>
-        <th>Created</th>
-        <th>Last seen</th>
-        <th>Status</th>
-        <th>Actions</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for u in users %}
-        <tr>
-          <td>{{ u.id }}</td>
-          <td>
-            <a href="/admin/users/{{ u.id }}">
-              {% if u.display_name %}{{ u.display_name }} <span class="muted">({{ u.label }})</span>
-              {% else %}{{ u.label }}{% endif %}
-            </a>
-          </td>
-          <td>{{ u.role }}</td>
-          <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
-          <td>{{ u.last_seen_at.strftime('%Y-%m-%d %H:%M') if u.last_seen_at else '—' }}</td>
-          <td>{% if u.disabled_at %}<span class="warn">revoked</span>{% else %}active{% endif %}</td>
-          <td>
-            {% if not u.disabled_at %}
-              <form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke" onsubmit="return confirm('Revoke user {{ u.label }}? This invalidates the token immediately.');">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button type="submit" class="danger">Revoke</button>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Role</th><th>Created</th><th>Last seen</th><th>Status</th><th>Actions</th></tr>
+      </thead>
+      <tbody>
+        {% for u in users %}
+          <tr>
+            <td>
+              <a href="/admin/users/{{ u.id }}">{{ u.display_name or u.label }}</a>
+              {% if u.display_name %}<span class="muted small">{{ u.label }}</span>{% endif %}
+            </td>
+            <td>{{ u.role }}</td>
+            <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
+            <td>{{ u.last_seen_at.strftime('%Y-%m-%d %H:%M') if u.last_seen_at else '—' }}</td>
+            <td>{% if u.disabled_at %}{{ ui.badge("revoked", "warn") }}{% else %}{{ ui.badge("active", "ok") }}{% endif %}</td>
+            <td class="row">
+              {% if not u.disabled_at %}
+                <form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke"
+                      onsubmit="return confirm('Revoke {{ u.label }}? Their keys stop working immediately.');">
+                  {{ ui.csrf(csrf_token) }}
+                  <button type="submit" class="danger">Revoke</button>
+                </form>
+              {% endif %}
+              <form class="inline" method="post" action="/admin/users/{{ u.id }}/mint"
+                    onsubmit="return confirm('Mint a new token for {{ u.label }}? The old token stops working immediately.');">
+                {{ ui.csrf(csrf_token) }}
+                <button type="submit">Mint new token</button>
               </form>
-            {% endif %}
-            <form class="inline" method="post" action="/admin/users/{{ u.id }}/mint" onsubmit="return confirm('Mint a new token for {{ u.label }}? The old token will stop working immediately.');">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <button type="submit">Mint new token</button>
-            </form>
-          </td>
-        </tr>
-      {% else %}
-        <tr><td colspan="7">No users yet.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6">{{ ui.empty_state("No people yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endblock %}

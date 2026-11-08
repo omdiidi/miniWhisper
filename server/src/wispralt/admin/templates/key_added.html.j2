@@ -1,23 +1,22 @@
 {% extends "base.html.j2" %}
-{% block title %}API Key {{ "Created" if mode == "mint" else "Rotated" }} · WisprAlt Admin{% endblock %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}API key {{ "created" if mode == "mint" else "rotated" }} · WisprAlt{% endblock %}
 {% block content %}
-{% if mode == "mint" %}
-  <h1>API key created for "{{ program_name }}"</h1>
-  <p><strong>Copy the token now — it won't be shown again.</strong></p>
-{% else %}
-  <h1>API key rotated for "{{ program_name or label }}"</h1>
-  <p><strong>The old token is invalid. Paste the new one into the program now.</strong></p>
-{% endif %}
-
-<h2>Token</h2>
-<pre><code>{{ plaintext }}</code></pre>
-
-<h2>How to use it (OpenAI-compatible)</h2>
-<p>In any program that speaks the OpenAI Whisper API, set these two environment variables:</p>
-<pre><code>export OPENAI_BASE_URL={{ server_url }}/v1
-export OPENAI_API_KEY={{ plaintext }}</code></pre>
-
-<p>Then any OpenAI Whisper client (Python <code>openai</code> SDK, Node <code>openai</code> SDK, Buzz, MacWhisper, Open WebUI voice mode, etc.) will route to WisprAlt instead of OpenAI's servers.</p>
-
-<p>See <a href="/admin/keys">Integration Keys</a> · <a href="/admin/">Dashboard</a></p>
+  <div class="page-head">
+    {% if mode == "mint" %}
+      <h1>API key created for "{{ program_name }}"</h1>
+    {% else %}
+      <h1>API key rotated for "{{ program_name or label }}"</h1>
+    {% endif %}
+  </div>
+  <p class="notice warn">
+    {% if mode == "mint" %}<strong>Copy the key now.</strong> It is shown only once.
+    {% else %}<strong>The old key no longer works.</strong> Paste the new one into the program now.{% endif %}
+  </p>
+  {% call ui.card("Key") %}{{ ui.secret_once(plaintext, "token") }}{% endcall %}
+  {% call ui.card("Use it (OpenAI-compatible)") %}
+    <p>Any program that speaks the OpenAI Whisper API routes to WisprAlt with these two variables:</p>
+    {{ ui.secret_once("export OPENAI_BASE_URL=" ~ server_url ~ "/v1\nexport OPENAI_API_KEY=" ~ plaintext, "env") }}
+  {% endcall %}
+  <p><a href="/admin/keys">Back to integrations</a></p>
 {% endblock %}

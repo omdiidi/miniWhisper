@@ -1,50 +1,28 @@
 {% extends "base.html.j2" %}
-{% block title %}Employee added — Wispralt Admin{% endblock %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Employee added · WisprAlt{% endblock %}
 {% block content %}
-  <h2>Employee added: {{ label }} <span class="muted" style="color: var(--muted); font-weight: 400;">(#{{ user_id }}, {{ role }})</span></h2>
-  {% if display_name %}
-    <p class="muted" style="color: var(--muted); margin-top: -4px; font-size: 13px;">
-      Display name: <strong>{{ display_name }}</strong>
-      &nbsp;·&nbsp;
-      <span>Employee will skip the name-prompt on first launch.</span>
-    </p>
-  {% endif %}
-  <p class="warn">
-    <strong>Copy the install command now.</strong> The plaintext token is shown only once;
-    the server stores only its sha256 hash. If you close this page without copying, the
-    token is unrecoverable — you'll need to mint a new one from the user list.
-  </p>
+  <div class="page-head">
+    <div>
+      <h1>Employee added: {{ label }} <span class="muted">#{{ user_id }} · {{ role }}</span></h1>
+      {% if display_name %}<p class="muted">Display name: <strong>{{ display_name }}</strong> (the app skips its name prompt).</p>{% endif %}
+    </div>
+  </div>
+  <p class="notice warn"><strong>Copy this now.</strong> The key is shown only once; the server keeps only its hash.</p>
 
-  <h3 style="margin-top: 24px; font-size: 14px;">1. Install command (text this to {{ label }})</h3>
-  <pre id="install-cmd" style="background: #1a1a1a; color: #f5f5f5; padding: 16px; border-radius: 6px; overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;">{{ install_command }}</pre>
-  <button type="button" onclick="copyInstallCmd()" style="margin-top: 8px;">Copy install command</button>
-  <span id="copy-status" class="muted" style="margin-left: 12px; color: var(--muted); font-size: 13px;"></span>
-
-  <h3 style="margin-top: 28px; font-size: 14px;">2. Just the token (if they prefer pasting it into Settings)</h3>
-  <code class="token">{{ plaintext }}</code>
-
-  <h3 style="margin-top: 28px; font-size: 14px;">What the employee does</h3>
-  <ol style="font-size: 13px; line-height: 1.7;">
-    <li>Opens Terminal on the Mac they want to dictate from.</li>
-    <li>Pastes the install command above and presses Enter.</li>
-    <li>The script downloads, signs in, and launches WisprAlt automatically.</li>
-    <li>Walks the 3 macOS permission prompts (Accessibility, Input Monitoring, Microphone).</li>
-  </ol>
-
-  <p style="margin-top: 24px;">
-    <a href="/admin/users">&larr; Back to users</a>
-    &nbsp;·&nbsp;
-    <a href="/admin/users/new">+ Add another employee</a>
-  </p>
-
-  <script>
-    function copyInstallCmd() {
-      const text = document.getElementById('install-cmd').innerText;
-      const status = document.getElementById('copy-status');
-      navigator.clipboard.writeText(text).then(
-        () => { status.textContent = 'Copied.'; setTimeout(() => status.textContent = '', 2500); },
-        () => { status.textContent = 'Copy failed — select the text manually.'; }
-      );
-    }
-  </script>
+  {% call ui.card("1. Install command (send this to " ~ label ~ ")") %}
+    {{ ui.secret_once(install_command, "install-cmd") }}
+  {% endcall %}
+  {% call ui.card("2. Just the key (to paste into Settings)") %}
+    {{ ui.secret_once(plaintext, "token") }}
+  {% endcall %}
+  {% call ui.card("What the employee does") %}
+    <ol>
+      <li>Opens Terminal on the Mac they dictate from.</li>
+      <li>Pastes the install command and presses Enter.</li>
+      <li>The script downloads, signs in and launches WisprAlt.</li>
+      <li>Grants the three macOS permissions (Accessibility, Input Monitoring, Microphone).</li>
+    </ol>
+  {% endcall %}
+  <p><a href="/admin/users">Back to people</a> · <a href="/admin/users/new">Add another</a></p>
 {% endblock %}

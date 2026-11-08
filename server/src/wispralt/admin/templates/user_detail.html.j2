@@ -1,61 +1,42 @@
 {% extends "base.html.j2" %}
-{% block title %}{{ user.label }} — Wispralt Admin{% endblock %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}{{ user.display_name or user.label }} · WisprAlt{% endblock %}
 {% block content %}
-  <h2>
-    {% if user.display_name %}{{ user.display_name }} <small class="muted">({{ user.label }})</small>
-    {% else %}{{ user.label }}{% endif %}
-    <span class="warn" style="font-size: 14px;">({{ user.role }})</span>
-  </h2>
-  <p><a href="/admin/users">&larr; Back to users</a></p>
-
-  <div class="tiles">
-    <div class="tile">
-      <div class="label">Dictations 24h</div>
-      <div class="value">{{ totals.dictations_24h or 0 }}</div>
-    </div>
-    <div class="tile">
-      <div class="label">Dictations 7d</div>
-      <div class="value">{{ totals.dictations_7d or 0 }}</div>
-    </div>
-    <div class="tile">
-      <div class="label">Dictations 30d</div>
-      <div class="value">{{ totals.dictations_30d or 0 }}</div>
-    </div>
-    <div class="tile">
-      <div class="label">Errors 24h</div>
-      <div class="value">{{ totals.errors_24h or 0 }}</div>
-    </div>
-    <div class="tile">
-      <div class="label">p50 latency 24h</div>
-      <div class="value">{% if totals.p50_24h %}{{ "%.0f"|format(totals.p50_24h) }} ms{% else %}—{% endif %}</div>
+  <div class="page-head">
+    <div>
+      <h1>{{ user.display_name or user.label }} {{ ui.badge(user.role) }}</h1>
+      {% if user.display_name %}<p class="muted">{{ user.label }}</p>{% endif %}
     </div>
   </div>
 
-  <h2>Last 50 events</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>When</th>
-        <th>Kind</th>
-        <th>Status</th>
-        <th>Duration (ms)</th>
-        <th>Bytes in</th>
-        <th>Request ID</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for e in events %}
-        <tr>
-          <td>{{ e.ts.strftime('%Y-%m-%d %H:%M:%S') if e.ts else '—' }}</td>
-          <td>{{ e.kind }}</td>
-          <td>{{ e.status }}</td>
-          <td>{% if e.duration_ms is not none %}{{ "%.0f"|format(e.duration_ms) }}{% else %}—{% endif %}</td>
-          <td>{{ e.bytes_in if e.bytes_in is not none else '—' }}</td>
-          <td>{{ e.request_id or '—' }}</td>
-        </tr>
-      {% else %}
-        <tr><td colspan="6">No events for this user yet.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="tiles">
+    {{ ui.tile("Requests 24h", totals.dictations_24h or 0) }}
+    {{ ui.tile("Requests 7d", totals.dictations_7d or 0) }}
+    {{ ui.tile("Requests 30d", totals.dictations_30d or 0) }}
+    {{ ui.tile("Errors 24h", totals.errors_24h or 0) }}
+    {{ ui.tile("p50 latency 24h", ("%.0f ms" | format(totals.p50_24h)) if totals.p50_24h else "—") }}
+  </div>
+
+  <h2>Last 50 requests</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>When</th><th>Kind</th><th>Status</th><th class="num">Duration (ms)</th><th class="num">Bytes in</th><th>Request ID</th></tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+          <tr>
+            <td>{{ e.ts.strftime('%Y-%m-%d %H:%M:%S') if e.ts else '—' }}</td>
+            <td>{{ e.kind }}</td>
+            <td>{{ e.status }}</td>
+            <td class="num">{% if e.duration_ms is not none %}{{ "%.0f" | format(e.duration_ms) }}{% else %}—{% endif %}</td>
+            <td class="num">{{ e.bytes_in if e.bytes_in is not none else '—' }}</td>
+            <td><code>{{ e.request_id or '—' }}</code></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6">{{ ui.empty_state("No requests for this user yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endblock %}

@@ -1,0 +1,44 @@
+{# Portal UI macros. Import with: {% import "_ui.html.j2" as ui %} #}
+
+{# A stat tile. Keeps the label/value markup the tests read. #}
+{% macro tile(label, value, href=None, hint=None) -%}
+<div class="tile">
+  <div class="label">{% if href %}<a href="{{ href }}">{{ label }}</a>{% else %}{{ label }}{% endif %}</div>
+  <div class="value">{{ value }}</div>
+  {%- if hint %}<div class="hint">{{ hint }}</div>{% endif %}
+</div>
+{%- endmacro %}
+
+{# A titled card: {% call ui.card("Title") %}…{% endcall %} #}
+{% macro card(title=None, id=None) -%}
+<section class="card"{% if id %} id="{{ id }}"{% endif %}>
+  {% if title %}<h3>{{ title }}</h3>{% endif %}
+  {{ caller() }}
+</section>
+{%- endmacro %}
+
+{% macro badge(text, tone="") -%}
+<span class="badge {{ tone }}">{{ text }}</span>
+{%- endmacro %}
+
+{% macro empty_state(text) -%}
+<p class="empty">{{ text }}</p>
+{%- endmacro %}
+
+{# A secret shown exactly once, with a copy button (Alpine). The page that
+   renders this must send Cache-Control: no-store. #}
+{% macro secret_once(value, id) -%}
+<div class="secret" x-data="{ copied: false }">
+  <pre id="{{ id }}" x-ref="secret">{{ value }}</pre>
+  <button type="button"
+          @click="navigator.clipboard.writeText($refs.secret.innerText).then(() => { copied = true; setTimeout(() => copied = false, 2000) })">
+    Copy
+  </button>
+  <span class="muted small" role="status" x-show="copied" x-cloak>Copied.</span>
+</div>
+{%- endmacro %}
+
+{# Hidden CSRF field for a mutating form. #}
+{% macro csrf(token) -%}
+<input type="hidden" name="csrf_token" value="{{ token }}">
+{%- endmacro %}
