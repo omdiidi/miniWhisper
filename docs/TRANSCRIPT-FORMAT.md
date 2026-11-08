@@ -43,14 +43,35 @@ The following schema is the canonical contract between server output and client 
 - `warnings` (optional top-level array) may appear on transcripts written by older servers; current servers do not emit it.
 - `speakers` is keyed by `speaker_raw` (not display name). This is a v3 change from the v1/v2 schema where `speakers` was keyed by display name.
 
+## Online JSON
+
+An Online file job (OpenAI) writes `<stem>.txt` and `<stem>.json` only (no SRT/VTT: OpenAI returns no timestamps). The JSON is a separate, smaller shape (`OnlineTranscript` in `client/WisprAltCore/FileJobContract.swift`):
+
+```jsonc
+{
+  "version": 1,
+  "mode": "online",
+  "model": "gpt-transcribe",            // the OpenAI file model used
+  "source": "talk.m4a",                 // picked file name (the file itself is not copied)
+  "created_at": "ISO 8601 string",
+  "duration_s": 1200.0,                 // null if unknown
+  "text": "string",                     // chunk texts joined by one space; the .txt holds the same text
+  "chunks": [                           // one entry for a direct upload
+    { "index": 0, "start_s": 0.0, "end_s": 598.4, "text": "string" }
+  ]
+}
+```
+
+Readers tell the two shapes apart by `mode`: `"online"` here, `"single"` (and legacy values) for server transcripts.
+
 ## Filename convention
 
 The client saves each file job into its own folder under the output folder chosen in Settings (default `~/Documents/WisprAlt/Transcripts/`; a Mac that already has `~/Documents/WisprAlt/Meetings/` keeps using it):
 
 ```
 <output folder>/Custom Transcriptions/<source stem>__<yyyymmdd-HHmmss>/
-    <source file, copied as-is>
-    <source stem>.{json,srt,vtt,txt}
+    <source file, copied as-is>          (Local only)
+    <source stem>.{json,srt,vtt,txt}     (Online: .json and .txt only)
 ```
 
 A second-resolution collision appends `-2`, `-3`, … to the folder name. Meeting transcripts saved by older versions stay in that folder untouched; the app no longer lists or edits them.

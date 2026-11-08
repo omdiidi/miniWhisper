@@ -14,8 +14,8 @@ import WisprAltCore
 
     // MARK: Route
 
-    @Test func defaultMode_isLocalUntilOnlineFileJobsLand() {
-        #expect(TranscriptionMode.default == .local)
+    @Test func defaultMode_isOnline() {
+        #expect(TranscriptionMode.default == .online)
     }
 
     @Test func onlineWithKey_routesOpenAIFile_noStreamEndpoint() {
@@ -85,6 +85,30 @@ import WisprAltCore
         // No field of LaunchActions can reach an Online job; only the Local poll.
         let a = LaunchActions.decide(.switched(to: .online), state(mode: .online, online: true))
         #expect(a == LaunchActions())
+    }
+
+    // MARK: Online file job end (Task 9)
+
+    @Test func onlineJobFinished_thenSwitchToLocal_resumes() {
+        #expect(LaunchActions.decide(.switched(to: .local), state(online: false)).resumeLocalJob)
+    }
+
+    @Test func switchToLocalDuringOnlineJob_thenJobEnds_resumesWithoutMe() {
+        // The switch itself does nothing while the Online job runs …
+        #expect(!LaunchActions.decide(.switched(to: .local), state(online: true)).resumeLocalJob)
+        // … and its end (task handle already cleared) resumes the saved Local job.
+        let a = LaunchActions.decide(.onlineJobEnded, state(online: false))
+        #expect(a.resumeLocalJob)
+        #expect(!a.fetchMe)
+        #expect(!a.cancelLocalPoll)
+    }
+
+    @Test func onlineJobEnded_inOnline_doesNothing() {
+        #expect(LaunchActions.decide(.onlineJobEnded, state(mode: .online)) == LaunchActions())
+    }
+
+    @Test func onlineJobEnded_pollerAlreadyRunning_noResume() {
+        #expect(!LaunchActions.decide(.onlineJobEnded, state(poller: true)).resumeLocalJob)
     }
 
     @Test func meAlreadyFetched_noFetchMe() {

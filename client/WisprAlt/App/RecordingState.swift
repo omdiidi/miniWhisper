@@ -40,6 +40,9 @@ final class RecordingState: ObservableObject {
     /// Currently-active server job id. Persisted to UserDefaults so a process
     /// restart can resume polling. Nil when no job is in flight.
     @Published var activeJobID: String? = nil
+    /// The running Online file job (never persisted: a quit loses it). Shows
+    /// the in-flight card with Cancel; never touches the Local job fields.
+    @Published var onlineJobID: String? = nil
     /// Set when the user cancelled but the server-side executor is still
     /// running an in-pipeline phase. The popover shows a "Previous job
     /// finishing" banner and blocks new submissions while this is non-nil.

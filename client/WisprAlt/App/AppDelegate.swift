@@ -70,6 +70,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // An Online file job interrupted by quit is lost (never resumed); its
+        // temp dir is swept here, before any job can start.
+        OnlineFileJob.sweepLeftovers()
+
         // Instantiate the menubar controller first so the status item is visible immediately.
         menuBarController = MenuBarController()
 

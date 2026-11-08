@@ -5,13 +5,12 @@ import WisprAltCore
 /// Pre-upload helper that extracts the audio track from a video container into
 /// a temp `.m4a` (or `.mp4` fallback). The original video is left untouched.
 ///
-/// Callers should:
-/// 1. Pass the user-picked URL to ``extractAudioIfVideo(_:)``.
-/// 2. Upload the returned URL (which may equal the input if no extraction was
-///    needed or if extraction failed — degrade gracefully).
-/// 3. Delete the parent temp directory after the upload completes if the
-///    returned URL is different from the input (the parent dir is unique per
-///    call so a single `removeItem` cleans up everything).
+/// Callers:
+/// - Local: ``extractAudioIfVideo(_:)`` (non-strict, never throws). Upload the
+///   returned URL; if it differs from the input, delete its parent temp dir
+///   afterwards (unique per call, so one `removeItem` cleans up).
+/// - Online: ``extract(_:strict:tempDir:)`` with `strict: true` and the job's
+///   own temp dir (the job removes that dir). Throws `ExtractError`.
 ///
 /// Design notes:
 /// - Uses `AVAssetExportPresetPassthrough` to copy the audio track without
@@ -24,17 +23,36 @@ import WisprAltCore
 ///   `outputFileType = .m4a`; falls back to `.mp4` if the source's audio
 ///   codec isn't AAC-compatible.
 enum AudioExtractor {
-    /// If *url* points at a container with BOTH a video and an audio track,
-    /// extract just the audio to a temp file and return that path. Otherwise
-    /// return *url* unchanged.
-    ///
-    /// Never throws — every failure mode degrades to "return original URL"
-    /// so the caller can still attempt the upload and surface a meaningful
-    /// server-side error if it really is unprocessable.
+    /// Local path: never throws — every failure degrades to "return original
+    /// URL" so the server can still try the file and report a real error.
     static func extractAudioIfVideo(_ url: URL) async -> URL {
-        let asset = AVURLAsset(url: url)
+        (try? await extract(url, strict: false, tempDir: nil)) ?? url
+    }
 
-        // Probe tracks. If either probe throws, treat as "no extraction".
+    /// If *url* has BOTH a video and an audio track, extract just the audio
+    /// and return its path; otherwise return *url* (decisions:
+    /// `AudioExtractPolicy`). `strict` (Online) throws `ExtractError` instead of
+    /// falling back, and keeps an extraction even when it is not smaller.
+    /// With a `tempDir` (the Online job's own dir) the output goes there and
+    /// the extractor never deletes it; without one it makes its own
+    /// `wispralt-extract-<uuid>` dir, removed unless the extraction is used.
+    static func extract(_ url: URL, strict: Bool, tempDir givenDir: URL?) async throws -> URL {
+        let asset = AVURLAsset(url: url)
+        let inSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        /// True → use the extraction; false → the original; throws in strict mode.
+        /// Defaults describe "so far so good" (an extraction smaller than the source).
+        func decide(video: Bool = true, audio: Bool = true, ok: Bool = true,
+                    out: Int = 1, in inBytes: Int = 2) throws -> Bool {
+            switch AudioExtractPolicy.decide(strict: strict, hasVideo: video, hasAudio: audio, exportOK: ok,
+                                             outBytes: out, inBytes: inBytes) {
+            case .useOriginal: return false
+            case .useExtracted: return true
+            case .fail(let e): throw e
+            }
+        }
+
+        // Probe tracks. A probe failure returns the original in both modes;
+        // the Online decode step then reports it.
         let videoTracks: [AVAssetTrack]
         let audioTracks: [AVAssetTrack]
         do {
@@ -47,68 +65,37 @@ enum AudioExtractor {
             )
             return url
         }
-
-        guard !videoTracks.isEmpty else {
-            // Audio-only file (or unreadable) — no extraction needed.
-            return url
-        }
-        guard !audioTracks.isEmpty else {
-            // Video without audio — Whisper will surface the no-audio error.
-            Log.info("AudioExtractor: video has no audio track, using original.", category: "transcribe")
+        guard try decide(video: !videoTracks.isEmpty, audio: !audioTracks.isEmpty) else {
+            Log.info("AudioExtractor: no extraction (audio-only, or video without audio).", category: "transcribe")
             return url
         }
 
-        // Unique temp directory so cleanup is a single `removeItem` on the
-        // parent. Created up front, deleted on any failure path via `defer`.
-        let tempDir = FileManager.default.temporaryDirectory
+        // Own temp dir unless the caller gave one; deleted on every path that
+        // does not use the extraction (never the caller's dir).
+        let tempDir = givenDir ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("wispralt-extract-\(UUID().uuidString)", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        } catch {
-            Log.warning(
-                "AudioExtractor: failed to create temp dir (\(ErrorLog.describe(error))) — using original.",
-                category: "transcribe"
-            )
-            return url
-        }
-
-        // R-L: only retain tempDir on success. If we fall through to "return url"
-        // anywhere below, the deferred block nukes it.
-        var keepTempDir = false
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        var keepTempDir = givenDir != nil
         defer {
             if !keepTempDir {
                 try? FileManager.default.removeItem(at: tempDir)
             }
         }
 
-        guard let export = AVAssetExportSession(
-            asset: asset,
-            presetName: AVAssetExportPresetPassthrough
-        ) else {
-            Log.warning("AudioExtractor: AVAssetExportSession init failed — using original.", category: "transcribe")
-            return url
-        }
-
         // R-E: `.m4a` is only valid for AAC-compatible audio. Probe support and
         // fall back to `.mp4` otherwise. Output extension matches.
-        let outputType: AVFileType
-        let outputExt: String
-        if export.supportedFileTypes.contains(.m4a) {
-            outputType = .m4a
-            outputExt = "m4a"
-        } else if export.supportedFileTypes.contains(.mp4) {
-            outputType = .mp4
-            outputExt = "mp4"
-        } else {
-            Log.warning(
-                "AudioExtractor: neither .m4a nor .mp4 supported by passthrough export — using original.",
-                category: "transcribe"
-            )
+        let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough)
+        let types = export?.supportedFileTypes ?? []
+        let output: (type: AVFileType, ext: String)? =
+            types.contains(.m4a) ? (.m4a, "m4a") : types.contains(.mp4) ? (.mp4, "mp4") : nil
+        guard let export, let output else {
+            Log.warning("AudioExtractor: passthrough export unavailable.", category: "transcribe")
+            _ = try decide(ok: false)
             return url
         }
 
-        let outURL = tempDir.appendingPathComponent("audio.\(outputExt)")
-        export.outputFileType = outputType
+        let outURL = tempDir.appendingPathComponent("audio.\(output.ext)")
+        export.outputFileType = output.type
         export.outputURL = outURL
 
         // R-D: completion-handler form wrapped in a checked continuation.
@@ -121,19 +108,18 @@ enum AudioExtractor {
         guard export.status == .completed else {
             let cause = export.error.map { ErrorLog.describe($0) } ?? "none"
             Log.warning(
-                "AudioExtractor: export failed (status=\(export.status.rawValue), \(cause)) — using original.",
+                "AudioExtractor: export failed (status=\(export.status.rawValue), \(cause)).",
                 category: "transcribe"
             )
+            _ = try decide(ok: false)
             return url
         }
 
-        // Sanity: output must be smaller than input to be worth keeping.
-        // If the "audio-only" file ended up larger than the source, something
-        // weird happened (e.g. all-video container with tiny audio re-muxed
-        // into a larger m4a wrapper) — fall back to the original.
-        let inSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        // Not smaller than the source (e.g. a tiny audio track re-muxed into a
+        // larger wrapper): Local keeps the original; Online keeps the
+        // extraction, since the original video may not decode.
         let outSize = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int) ?? 0
-        guard outSize > 0, outSize < inSize else {
+        guard try decide(out: outSize, in: inSize) else {
             Log.warning(
                 "AudioExtractor: output (\(outSize)B) not smaller than input (\(inSize)B) — using original.",
                 category: "transcribe"
@@ -141,14 +127,13 @@ enum AudioExtractor {
             return url
         }
 
-        let inMB = Double(inSize) / 1_048_576.0
-        let outMB = Double(outSize) / 1_048_576.0
-        Log.info(
-            String(format: "AudioExtractor: extracted audio %.1fMB → %.1fMB (%.0f%% reduction)",
-                   inMB, outMB, (1.0 - outMB / inMB) * 100.0),
-            category: "transcribe"
-        )
-
+        if inSize > 0 {
+            Log.info(
+                String(format: "AudioExtractor: extracted audio (%.0f%% of the source size)",
+                       Double(outSize) / Double(inSize) * 100.0),
+                category: "transcribe"
+            )
+        }
         keepTempDir = true
         return outURL
     }

@@ -28,11 +28,27 @@ public final class OpenAIFileProvider: DictationProvider, @unchecked Sendable {
     public func finish(_ recording: Recording) async throws -> DictationResult {
         guard let key = keyProvider(), !key.isEmpty else { throw ProviderError.keyMissing }
         let audio = try Mono16kWAV.make(from: recording.fileURL)
-        let request = OpenAIRequests.transcription(model: model, audio: audio, filename: "audio.wav",
-                                                   contentType: "audio/wav", prompt: nil,
+        return try await send(audio: audio, filename: "audio.wav", contentType: "audio/wav", prompt: nil,
+                              durationSeconds: recording.durationSeconds, key: key)
+    }
+
+    /// One upload of ready-made audio (an Online file job's direct file or one
+    /// chunk). Same retry and deadline as dictation; `prompt` only when the
+    /// model supports it.
+    public func transcribe(audio: Data, filename: String, contentType: String, prompt: String?,
+                           durationSeconds: Double) async throws -> DictationResult {
+        guard let key = keyProvider(), !key.isEmpty else { throw ProviderError.keyMissing }
+        return try await send(audio: audio, filename: filename, contentType: contentType, prompt: prompt,
+                              durationSeconds: durationSeconds, key: key)
+    }
+
+    private func send(audio: Data, filename: String, contentType: String, prompt: String?,
+                      durationSeconds: Double, key: String) async throws -> DictationResult {
+        let request = OpenAIRequests.transcription(model: model, audio: audio, filename: filename,
+                                                   contentType: contentType, prompt: prompt,
                                                    responseFormat: "json", key: key)
         let holder = inFlight, session = session, modelID = model.id, delay = retryDelay
-        return try await withDeadline(seconds: deadline(recording.durationSeconds), onTimeout: { holder.cancel() }) {
+        return try await withDeadline(seconds: deadline(durationSeconds), onTimeout: { holder.cancel() }) {
             do {
                 return try await Self.send(request, session: session, holder: holder, modelID: modelID)
             } catch let error where OpenAIErrors.isTransient(error) {

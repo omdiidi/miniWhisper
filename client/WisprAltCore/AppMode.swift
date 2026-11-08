@@ -4,8 +4,8 @@ import Foundation
 public enum TranscriptionMode: String, Codable, Sendable, CaseIterable {
     case online, local
 
-    /// Mode used when nothing is stored. Local until Online file jobs exist.
-    public static let `default`: TranscriptionMode = .local
+    /// Mode used when nothing is stored (fresh install and upgrade alike).
+    public static let `default`: TranscriptionMode = .online
 }
 
 /// The Local server a dictation was captured against.

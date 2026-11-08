@@ -404,6 +404,14 @@ extension MenuBarController {
     func cancelActiveTranscription() async {
         Log.info("Cancel requested — tearing down active transcription.", category: "transcribe")
 
+        // Online file job: cancel its task and stop. Its `defer`
+        // (`onlineJobDidEnd`) cleans up; nothing here touches the Local job
+        // (no fence bump, no `activeJobID`, no server DELETE).
+        if let online = onlineJobTask {
+            online.cancel()
+            return
+        }
+
         // 1) Fence first: the cancelled task's generation goes stale, so none
         //    of its later writes land. Then cancel it — stops the poll loop on
         //    the next cooperative yield point.
@@ -642,9 +650,6 @@ extension MenuBarController {
     /// hands off to the async pipeline.
     @MainActor
     func transcribePickedFile() {
-        // Online file transcription is not wired yet, and Online never
-        // contacts the Local host (the popover disables the button too).
-        guard Settings.shared.mode == .local else { return }
         // One file job at a time: a second Task would overwrite `activeJobTask`
         // and the shared job state, so Cancel could no longer reach the first.
         guard fileJobsInFlight == 0 else {
@@ -671,6 +676,13 @@ extension MenuBarController {
 
         guard panel.runModal() == .OK, let picked = panel.url else { return }
 
+        // The mode at pick time decides, before any task starts (so before
+        // the Local path makes a job folder and copies the source).
+        if Settings.shared.mode == .online {
+            startOnlineFileJob(picked)
+            return
+        }
+
         // Decouple the panel cleanup from the async pipeline. The Task is
         // held in `activeJobTask` so `cancelActiveTranscription()` stops its
         // upload/poll loop.
@@ -686,6 +698,57 @@ extension MenuBarController {
             }
             await self?.handlePickedFile(picked, gen: gen)
         }
+    }
+
+    /// Online file job in its own `onlineJobTask`: no mode switch cancels it,
+    /// it never touches `localUploadPhase`, and it is counted in
+    /// `fileJobsInFlight` (busy signal + one-job guard).
+    @MainActor
+    func startOnlineFileJob(_ picked: URL) {
+        let model = OpenAIModels.fileModel(for: Settings.shared.openAIModel)
+        let job = OnlineFileJob(source: picked, model: model) { [weak self] index, total in
+            self?.recordingState.chunkIndex = index
+            self?.recordingState.totalChunks = total
+        }
+        Log.info("Online file job started (model=\(model.id)).", category: "transcribe")
+        fileJobsInFlight += 1
+        recordingState.onlineJobID = job.id
+        recordingState.phase = "transcribe"
+        onlineJobTask = Task { @MainActor [weak self] in
+            defer { self?.onlineJobDidEnd() }
+            do {
+                _ = try await job.run()
+                Log.info("Online file job complete.", category: "transcribe")
+                NotificationCenter.default.post(name: .wisprAltTranscriptWritten, object: nil)
+                AppNotifications.notify(title: "Custom Transcription Complete",
+                                        body: picked.deletingPathExtension().lastPathComponent)
+            } catch {
+                if Self.isCancellation(error) || ErrorLog.outcome(error) == .cancelled {
+                    Log.info("Online file job cancelled.", category: "transcribe")
+                    return
+                }
+                Log.error("Online file job failed: \(ErrorLog.describe(error))", category: "transcribe")
+                let message: String
+                if let e = error as? OnlineFileError { message = e.errorDescription ?? "" }
+                else if case .failed(let kind) = ErrorLog.outcome(error) {
+                    message = Self.failureMessage(kind, mode: .online)
+                } else { message = Self.failureMessage(.other, mode: .online) }
+                AppNotifications.notify(title: "Custom Transcription Failed", body: message)
+            }
+        }
+    }
+
+    /// The Online job's `defer`, in one main-actor turn: clear its handle and
+    /// UI, then resume a saved Local job if the mode is Local now.
+    @MainActor
+    func onlineJobDidEnd() {
+        onlineJobTask = nil
+        recordingState.onlineJobID = nil
+        recordingState.phase = nil
+        recordingState.chunkIndex = nil
+        recordingState.totalChunks = nil
+        fileJobsInFlight -= 1
+        applyModeEvent(.onlineJobEnded)
     }
 
     /// Drives transcode → upload for a picked audio/video file. Sets

@@ -806,11 +806,12 @@ private struct QuickActionsSection: View {
     /// SwiftUI `.sheet(isPresented:)` lifecycle drives the fetch.
     @State private var showingServerLogSheet: Bool = false
 
-    /// True while the current activeJobID indicates a transcription is in
-    /// flight (post-upload, post-cancel-with-server-still-finishing, or
+    /// True while a file job is in flight: the Online job, or a Local one
+    /// (post-upload, post-cancel-with-server-still-finishing, or
     /// resumed-from-launch). Used to gate Cancel + View-server-log controls.
     private var hasInFlightJob: Bool {
-        recordingState.activeJobID != nil
+        recordingState.onlineJobID != nil
+            || recordingState.activeJobID != nil
             || recordingState.serverFinishingJobID != nil
             || recordingState.uploadFraction > 0
             || recordingState.uploadError != nil
@@ -882,14 +883,16 @@ private struct QuickActionsSection: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.accentColor)
-            .disabled(!isLocal || recordingState.serverFinishingJobID != nil)
+            .disabled(isLocal && recordingState.serverFinishingJobID != nil)
             .help(
-                recordingState.serverFinishingJobID != nil
+                !isLocal
+                    ? "Pick any audio or video file. WisprAlt sends it to OpenAI and saves TXT + JSON."
+                    : recordingState.serverFinishingJobID != nil
                     ? "A previous transcription is still finishing on the server. New uploads are blocked until it completes."
                     : "Pick any audio or video file. WisprAlt extracts the audio locally and the server transcribes it."
             )
             if !isLocal {
-                Text("File transcription in Online arrives with this mission's file step — switch to Local")
+                Text("Online saves TXT + JSON. Subtitles (SRT/VTT) need Local mode.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

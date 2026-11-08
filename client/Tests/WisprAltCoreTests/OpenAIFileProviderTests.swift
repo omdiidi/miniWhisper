@@ -29,6 +29,19 @@ extension StubURLSuites {
             #expect(body.range(of: Data("filename=\"audio.wav\"".utf8)) != nil)
         }
 
+        @Test func transcribeAudio_sendsFilenameTypeAndPrompt() async throws {
+            StubURLProtocol.reset([.http(503, Data()), ok])
+            let result = try await provider().transcribe(audio: Data([1, 2, 3]), filename: "talk.m4a",
+                                                         contentType: "audio/mp4", prompt: "earlier words",
+                                                         durationSeconds: 300)
+            #expect(result.text == "hello world")
+            #expect(StubURLProtocol.requests.count == 2)   // same one-retry rule as dictation
+            let body = String(decoding: StubURLProtocol.requests[1].httpBody ?? Data(), as: UTF8.self)
+            #expect(body.contains("filename=\"talk.m4a\""))
+            #expect(body.contains("Content-Type: audio/mp4"))
+            #expect(body.contains("earlier words"))
+        }
+
         @Test func transient503_thenOK_retriesOnce() async throws {
             StubURLProtocol.reset([.http(503, Data()), ok])
             let rec = try recording()
