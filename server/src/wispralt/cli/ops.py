@@ -43,6 +43,7 @@ from wispralt.cli.system import EXIT_DOCTOR, CliError, version
 from wispralt.database import Database
 from wispralt.jobs.store import JobStore
 from wispralt.ops import backup as offline
+from wispralt.setup_code import FILENAME as SETUP_CODE
 
 if TYPE_CHECKING:
     import argparse
@@ -565,6 +566,51 @@ def _delete(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+# What WisprAlt itself creates in a data dir. ``--purge-data`` deletes only these
+# (the data dir may be a folder the owner also uses, e.g. ``--data-dir ~/Work``).
+_OWNED_FILES = tuple(offline.DB_NAME + s for s in ("", "-wal", "-shm", "-journal")) + (SETUP_CODE,)
+_OWNED_TREES = ("outputs", "staging")
+
+
+def _owned(data: Path) -> list[Path]:
+    names = (*_OWNED_FILES, *_OWNED_TREES)
+    return [data / n for n in names if (data / n).exists() or (data / n).is_symlink()]
+
+
+def _purge_backup(ctx: Ctx) -> Path | None:
+    """Back up whatever WisprAlt data exists: a full backup with a DB, else a file copy."""
+    p = ctx.paths
+    if p.db_path.exists():
+        return offline.backup(p.data_dir, new_backup_dest(ctx))
+    found = [x for x in _owned(p.data_dir) if not x.is_symlink()]
+    if not found:
+        return None
+    base = new_backup_dest(ctx)
+    dest = base.with_name(base.name + "-files")
+    dest.mkdir(mode=0o700)
+    for src in found:
+        if src.is_dir():
+            shutil.copytree(src, dest / src.name, symlinks=True)
+        else:
+            shutil.copy2(src, dest / src.name)
+    print(f"no database in {p.data_dir}; copied its WisprAlt files (not restorable as a backup)")
+    return dest
+
+
+def _purge_data(ctx: Ctx) -> str:
+    """Delete WisprAlt's own files in the data dir; the dir itself only if then empty."""
+    data = ctx.paths.data_dir
+    for path in _owned(data):
+        _delete(path)
+    try:
+        data.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return f"deleted WisprAlt's data in {data} (other files there were kept)"
+    return f"deleted {data}"
+
+
 def cmd_uninstall(ctx: Ctx, args: argparse.Namespace) -> int:
     p = ctx.paths
     state = ctx.state
@@ -587,8 +633,7 @@ def cmd_uninstall(ctx: Ctx, args: argparse.Namespace) -> int:
         return 0
     launchd.remove(ctx)
     launchd.wait_stopped(ctx)
-    if args.purge_data and not args.no_backup and p.db_path.exists():
-        dest = offline.backup(p.data_dir, new_backup_dest(ctx))
+    if args.purge_data and not args.no_backup and (dest := _purge_backup(ctx)) is not None:
         print(f"backup written: {dest}")
     for item in state.artifacts:
         if item == UV_TOOL:
@@ -599,9 +644,10 @@ def cmd_uninstall(ctx: Ctx, args: argparse.Namespace) -> int:
         else:
             print(f"skipped {path}: outside {p.root}", file=sys.stderr)
     if args.purge_data:
-        for path in (p.data_dir, p.env_file, offline.lock_path(p.data_dir), p.state_file):
+        done = _purge_data(ctx)
+        for path in (p.env_file, offline.lock_path(p.data_dir), p.state_file):
             _delete(path)
-        print(f"deleted {p.data_dir} and {p.env_file}; backups stay in {p.backup_dir}")
+        print(f"{done} and {p.env_file}; backups stay in {p.backup_dir}")
     else:
         state.artifacts = [a for a in state.artifacts if a == UV_TOOL]
         state.save(p.state_file)
