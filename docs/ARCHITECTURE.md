@@ -670,6 +670,14 @@ duplicate, a row error or a failed write removes only those temps. The first-run
 duplicate abort does not apply here: the same file in two folders is an expected
 duplicate.
 
+**Entry point.** `wispralt.importer` exports `run_export`, `run_snapshot_import` and
+`run_file_import` (what the Part 5 `wispralt import …` CLI will wrap);
+`python -m wispralt.importer export | snapshot DIR | files PATH… --owner ID` is the
+interim operator command (`--dry-run`, `--yes`, `--owner-map PG=LOCAL`; exit codes
+0 ok, 1 error, 2 refused, 3 BLOCKED, 4 integrity). A real import needs `--yes` or an
+interactive confirmation after the dry-run report. Runbook:
+[ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files).
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output
