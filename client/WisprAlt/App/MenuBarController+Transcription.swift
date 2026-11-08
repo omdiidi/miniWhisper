@@ -683,6 +683,20 @@ extension MenuBarController {
 
     // MARK: - Custom transcription (file-pick) flow
 
+    /// Shows a short notice and returns true while an invite redeem is in
+    /// flight: it is about to replace the Local server URL and key, so a Local
+    /// file job started now would be stranded on the old server.
+    @MainActor
+    private func refuseLocalFileJobDuringInvite() -> Bool {
+        guard inviteRedeemInFlight else { return false }
+        Log.info("Transcribe file refused: an invite is being redeemed.", category: "transcribe")
+        AppNotifications.notify(
+            title: "Joining a Server",
+            body: "Wait a moment for the invite to finish, then pick the file again."
+        )
+        return true
+    }
+
     /// Public entry point invoked from the SwiftUI "Transcribe file…" button.
     /// Activates the app, presents an `NSOpenPanel`, and on user selection
     /// hands off to the async pipeline.
@@ -698,6 +712,7 @@ extension MenuBarController {
             )
             return
         }
+        if Settings.shared.mode == .local, refuseLocalFileJobDuringInvite() { return }
         // Bring the app to front so the modal sheet appears reliably above
         // the menubar popover (which is .transient and will dismiss).
         NSApp.activate(ignoringOtherApps: true)
@@ -720,6 +735,9 @@ extension MenuBarController {
             startOnlineFileJob(picked)
             return
         }
+
+        // An invite may have started redeeming while the panel was open.
+        if refuseLocalFileJobDuringInvite() { return }
 
         // Decouple the panel cleanup from the async pipeline. The Task is
         // held in `activeJobTask` so `cancelActiveTranscription()` stops its

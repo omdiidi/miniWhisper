@@ -147,7 +147,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
         // A file may have been picked while the dialog was open.
         guard !refuseInviteForLocalJob() else { return }
+        // Until the redeem settles no Local file job may start (see
+        // `transcribePickedFile`), so none can be stranded by the new server.
+        menuBarController.inviteRedeemInFlight = true
         Task { @MainActor in
+            defer { menuBarController.inviteRedeemInFlight = false }
             do {
                 let request = link.redeemRequest(deviceLabel: Host.current().localizedName)
                 let (data, response) = try await URLSession.shared.data(for: request)
@@ -171,7 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shows why and returns true while a Local file job exists: redeeming
     /// would point that job at the new server and strand its transcript.
     @MainActor private func refuseInviteForLocalJob() -> Bool {
-        guard menuBarController.refusesInviteForLocalJob else { return false }
+        guard menuBarController.localFileJobActiveOrSaved else { return false }
         Log.info("Invite refused: a Local file job is active or saved.", category: "app")
         showAlert(InviteLink.localJobBusyTitle, info: InviteLink.localJobBusyMessage)
         return true

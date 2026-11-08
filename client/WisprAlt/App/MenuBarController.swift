@@ -236,9 +236,16 @@ final class MenuBarController: NSObject {
                              meFetchedThisLaunch: meFetchedThisLaunch)
     }
 
-    /// Whether a Local file job exists (converting, uploading, polled, or its
-    /// id saved for resume). An invite is refused while this is true.
-    @MainActor var refusesInviteForLocalJob: Bool {
+    /// True while an invite redeem (`POST /invites/redeem`) is in flight.
+    /// `transcribePickedFile` refuses a Local file job meanwhile: the redeem
+    /// is about to repoint the server URL and key, which would strand it.
+    var inviteRedeemInFlight = false
+
+    /// The one "Local file job active or saved" predicate: converting,
+    /// uploading, polled, or its id saved for resume. While it is true an
+    /// invite is refused and Settings locks the Local server URL and API key
+    /// (either change would point that job at another server and strand it).
+    @MainActor var localFileJobActiveOrSaved: Bool {
         let saved = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey)
         return InviteLink.refusedForLocalJob(phase: localUploadPhase, pollerRunning: activeJobTask != nil,
                                              hasSavedJobID: saved?.isEmpty == false)
