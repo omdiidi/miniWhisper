@@ -620,6 +620,27 @@ with a `(source, source_id)` once, idempotently. A real import holds the offline
 `<data_dir>.lock` (`importer/lock.py`, replaced by Part 4's `ops.backup.server_lock`
 when that lands).
 
+**Supabase export (read-only).** `importer/supabase_export.py` copies the old
+Postgres history (`users` without `token_hash`, `usage_events`, `fallback_events`)
+into `~/WisprAlt-Backups/supabase-snapshot-YYYY-MM-DD[-N]/` (dir 0700, files 0600):
+one canonical-JSON line per row in `<table>.jsonl`, plus `counts.json` per table
+(`source_count`, `exported`, `columns`, `max_id`, `sha256` of the JSONL bytes,
+`exported_at`). Supabase is never written: `PsqlSource` only sends
+`BEGIN TRANSACTION READ ONLY; <one allowlisted SELECT>; COMMIT;` through
+`psql -X -q -At -v ON_ERROR_STOP=1` with `PGOPTIONS=-c default_transaction_read_only=on`;
+table names are fixed, columns come from `information_schema` and are
+identifier-checked, and `_wrap` refuses any statement with a write verb. The
+connection string (env `WISPRALT_IMPORT_PG_URL`, else Keychain item
+`co.wispralt.import-pg`) reaches `psql` only as `PG*` env vars. Rows are paged by
+`id > after`; `count(*)`/`max(id)` are read before and after each table and must
+match the rows written, else the table is retried once and then fails. A fresh
+snapshot dir is created per run (`-2`, `-3`, … on the same day); files are created
+with `O_EXCL`, a failed attempt's `.partN` file is kept, and nothing is ever
+deleted or overwritten. An unreachable or paused project raises `ExportBlocked`
+and leaves `BLOCKED.json`; nothing ever calls a Supabase management API or
+unpauses it. `JsonPagesSource(dir)` reads `<table>.json` arrays saved by hand from
+the same SELECTs (read-only MCP fallback).
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output

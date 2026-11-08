@@ -85,6 +85,7 @@ This section describes the rollback strategy that was in place during Phases 1â€
 | `server/tests/conftest.py` | shared harness: `DATA_DIR` set before import, per-test `settings.data_dir = tmp_path`, migrated `db` fixture, `accounts` / `usage` stores, `make_user`, `wire(app)` |
 | `server/tests/test_accounts.py` | `AccountStore` lookup / rotate / revoke / disable, first-admin bootstrap, no token in logs |
 | `server/tests/test_usage_store.py` | `UsageStore` record, overview, user totals, p50, drilldown filters, CSV rows |
+| `server/tests/test_supabase_export.py` | Part 7 read-only export against `FakeSource` and a fake `psql` (`subprocess.run` patched; never contacts Supabase): modes, suffixes, paging, retry, read-only SQL proof, BLOCKED, no-delete grep gate. Shared fakes live in `tests/_import_fakes.py`. |
 | `server/tests/test_imports.py` | Part 7 history writer: `import_rows` idempotency + per-row `RowError`s, input validation, `link_existing`, `import_runs` resume, offline lock, `0003` across the `0002` gap |
 | `server/tests/test_database.py` | `Database` migrations (fresh, idempotent, failed, edited, missing, newer), pragmas, rollback, concurrent writers, `check()`, `DATA_DIR` validation |
 | `server/tests/test_db_health.py` | `/readyz/db` ok / `schema_outdated` / `db_error`; usage middleware writes one row per tracked POST; a failing write is counted, response kept |
