@@ -660,6 +660,16 @@ run resumes the same run row; a first run with any duplicate, or a write that do
 not account for every planned row, marks the run `failed`. A dry run only reads and
 prints the counts and the owner proposal.
 
+**Transcript files.** `importer/files.py` imports TXT/JSON/SRT/VTT transcripts as
+`jobs` rows (`source='files'`, `status='done'`, `mode='file'`, `wav_path=''`, with
+`estimated=1` when the time is a file mtime); see
+[TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#importing-old-transcript-files-part-7).
+Each group's files are copied to `.import-<id><ext>.part` temps in `outputs/` before
+the batch commits and renamed to `<id><ext>` only for rows actually inserted; a
+duplicate, a row error or a failed write removes only those temps. The first-run
+duplicate abort does not apply here: the same file in two folders is an expected
+duplicate.
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output

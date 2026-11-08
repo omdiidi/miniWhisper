@@ -75,3 +75,23 @@ Let me share my screen.
 TXT is one segment per line, plain text.
 
 Multi-speaker transcripts written by older servers used `Speaker: text` (SRT), `<v Speaker>text</v>` voice tags (VTT) and `[Speaker] text` (TXT). The server's writers still render those prefixes for any non-`single` transcript, but nothing produces one today.
+
+## Importing old transcript files (Part 7)
+
+`python -m wispralt.importer files PATH… --owner ID` (`importer/files.py`) turns
+transcript files you already have into history rows (`jobs`, kind `file`) for one
+local user. It never moves or edits the source files.
+
+- Files are grouped by folder + name stem (`a.json`, `a.txt`, `a.srt`, `a.vtt` are one
+  transcript). Symlinks, dotfiles and dot folders are skipped.
+- The text comes from the first readable file in the order JSON → TXT → SRT → VTT.
+  JSON uses the locked schema above (`segments[].text` joined with spaces, as the
+  server does); SRT/VTT keep only the cue text (no index or `-->` timing lines).
+  Files must be UTF-8 (a BOM is fine). An unreadable JSON falls back to the TXT and
+  the report says so; a group with no text at all is counted `malformed`.
+- Time: JSON `created_at` when present. Otherwise the newest file modification time
+  in the group, and the row is marked `estimated=1` (the time is a guess).
+- Identity: JSON `job_id` when present, else the sha256 of the primary file plus the
+  owner, so the same file found twice (or a re-run) is a `duplicate`, never a second row.
+- Every file in the group is copied to `outputs/<new job id>.<ext>` (the normal output
+  layout), so downloads work like any other file job.
