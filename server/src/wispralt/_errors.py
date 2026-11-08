@@ -21,6 +21,11 @@ class InviteInvalid(Exception):
     enabled admin. Deliberately one class: the public route answers every case identically."""
 
 
+class LastActiveKey(Exception):
+    """Key revoke refused: it is the acting admin's own last active key (they would be
+    locked out). Checked and revoked in one transaction (HTTP 400)."""
+
+
 class DedupConflict(Exception):
     """The dictation dedup id is already stored for another user (HTTP 409 ``dedup_conflict``)."""
 
