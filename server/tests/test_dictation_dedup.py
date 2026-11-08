@@ -390,3 +390,25 @@ def test_whole_file_without_header_still_saves(
         assert _whole(client, a, None).json()["saved"] is True
     assert [r[2] for r in _rows(db)] == [None, None]
 
+
+
+def test_blank_text_is_never_stored_whole_or_streamed(
+    client: TestClient, app: FastAPI, users: tuple, db: Database
+) -> None:
+    """Both dictation routes skip saving blank text and report ``saved: true``."""
+    a, _ = users
+
+    async def silence(audio_bytes: bytes) -> tuple[str, float]:
+        return "  ", 5.0
+
+    app.state.parakeet_service.transcribe = silence
+    whole = _whole(client, a, _new())
+    assert whole.status_code == 200, whole.text
+    assert whole.json()["saved"] is True
+
+    sid, dedup = _new(), _new()
+    assert _chunk(client, a, sid, dedup).status_code == 202
+    streamed = _finalize(client, a, sid, header=dedup)
+    assert streamed.status_code == 200, streamed.text
+    assert streamed.json()["saved"] is True and not streamed.json()["text"].strip()
+    assert _rows(db) == []

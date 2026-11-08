@@ -263,19 +263,24 @@ async def _finalize(
             observability.streaming_sessions_aborted_total.increment("gap")
             raise HTTPException(409, "Partial transcripts have gaps") from exc
 
-        saved = await dedup.persist(
-            request,
-            job_store,
-            user_id=int(user.id),
-            text=joined,
-            duration_ms=int(total_inference_ms),
-            client_app_version=request.headers.get("X-WisprAlt-Client-Version"),
-            dedup_id=did,
-            created_at=speech_started_at,
-        )
-        if isinstance(saved, JSONResponse):
-            return saved  # session stays "finalizing" → finally aborts it
-        text, ok = saved
+        # Blank text is not stored (same rule as /transcribe/dictate): there is
+        # nothing to keep, so it reports saved=true.
+        if not joined.strip():
+            text, ok = joined, True
+        else:
+            saved = await dedup.persist(
+                request,
+                job_store,
+                user_id=int(user.id),
+                text=joined,
+                duration_ms=int(total_inference_ms),
+                client_app_version=request.headers.get("X-WisprAlt-Client-Version"),
+                dedup_id=did,
+                created_at=speech_started_at,
+            )
+            if isinstance(saved, JSONResponse):
+                return saved  # session stays "finalizing" → finally aborts it
+            text, ok = saved
 
         async with session.lock:
             session.status = "finalized"
