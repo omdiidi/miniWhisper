@@ -473,31 +473,31 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 
 **Diagnosis ladder:**
 
-1. **Was the token revoked, or the user disabled?** Open `/admin/users` on the Mac mini admin UI. If their row shows `revoked` (`disabled_at` is set), this is expected — text them a new token via the **Mint** flow (mint also re-enables the user). There is no token cache: every request looks the key up in `wispralt.db`, so a revoke, disable or mint applies to the very next request.
+1. **Was the key revoked, or the person disabled?** Open **People** → their page in the portal. If they show `disabled`, or that device's key shows `revoked`, this is expected — send an **Add device** invite, or **Rotate key** (rotate revokes all their keys, shows one new key and re-enables them). There is no token cache: every request looks the key up in `wispralt.db`, so a revoke, disable or mint applies to the very next request.
 2. **Is the local database healthy?**
    ```bash
    curl -s --max-time 4 https://transcribe.<your-domain>/readyz/db
    tail -100 ~/Library/Logs/WisprAlt/wispralt.log | grep -i 'sqlite\|database\|migration'
    ```
    A DB error makes auth answer **503** (never 401, and there is no fallback admin). `/readyz/db` gives the reason (`db_error` / `schema_outdated`); see "Local database" above.
-3. **Right token?** A token's plaintext is shown **once** by `/admin/users/<id>/mint`. If the employee misplaced it, mint a new one — there is no recovery for the old plaintext.
+3. **Right token?** A key's plaintext is shown **once** (Add employee, Rotate key, or an invite redeemed by the app). If the employee misplaced it, send an invite or rotate — there is no recovery for the old plaintext.
 
 ---
 
 ### Admin UI returns 401 / 403
 
-**Symptom:** Browsing to `/admin/` or curling `/admin/users` returns 401 or 403.
+**Symptom:** Browsing to `/admin/` or curling `/admin/people` returns 401 or 403.
 
 **Diagnosis:**
 
 - **401** means the bearer / cookie was missing or invalid. Check that you're sending `Authorization: Bearer <token>` (curl) or that the `wispralt_admin_token` cookie is set in your browser (visit `/admin/login` to set it).
-- **403** means the bearer is valid but the user's `role` is not `'admin'`. Open `/admin/users` (with an admin token) and confirm — only admin-role tokens can access the rest of the UI.
+- **403** means the bearer is valid but the user's `role` is not `'admin'`. Open `/admin/people` (with an admin token) and confirm — only admin-role tokens can access the rest of the UI.
 
 **Fix:**
 
 - For 401 from a browser: visit `/admin/login`, paste the admin token, submit. The cookie is set with `max_age=8h`.
 - For 403: use the admin token, not an employee token. There is no env-var admin key and no break-glass admin. If the admin token is lost, mint a new one on the server's terminal: `cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin` (prints the new token once; add `--user-id N` when there are several admins).
-- **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Revoke, Mint, Rotate) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (the `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
+- **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Rotate, Disable, Revoke device, Invites, AI runs, Settings) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (the `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
 - **503** instead of 401/403: the account lookup hit a `sqlite3.Error`. Check `/readyz/db` and the "Local database" section; there is no fallback admin.
 
 ---
@@ -512,6 +512,70 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 
 - In production, the Cloudflare Tunnel (`https://transcribe.<your-domain>`) terminates HTTPS for you; the cookie works as long as you use the public URL, not `127.0.0.1`.
 - For local development against an HTTP-only server: edit `routes/admin_ui.py:login_submit` and temporarily set `secure=False`, or use the `Authorization: Bearer ...` header path (curl/Postman) instead of the cookie.
+
+---
+
+## Portal: setup, invites, search and AI insights
+
+### No admin yet / where is the setup code?
+
+While no enabled admin exists the server writes a one-time code to `DATA_DIR/setup-code`
+(mode 0600) at startup and logs its path (`grep setup-code ~/Library/Logs/WisprAlt/wispralt.log`).
+On the server: `cat "$DATA_DIR/setup-code"` and paste it at `/admin/setup`. Wrong code → 403.
+`/admin/setup` returns **404** once an enabled admin exists (by design); a lost admin key is
+recovered on the server's terminal with `python -m wispralt.bootstrap --rotate-admin`. The code
+file is deleted after a successful setup, and a stale one is removed at the next start.
+
+### Invite says `invite_invalid`
+
+`POST /invites/redeem` answers every failure with the same `400 {"error":"invite_invalid"}`
+on purpose. Usual causes: the invite is older than **10 minutes**, was already used (each is
+single use), was revoked on `/admin/invites`, the admin who created it was disabled, or (for
+"add device") the person is disabled. Create a new invite. `429 rate_limited` means more than
+10 attempts a minute from one network: wait a minute.
+
+### History search misses a record, or `/me/history?q=` errors
+
+Search needs 2+ characters and matches whole words plus a prefix of the last word
+(`roadm` finds `roadmap`; `oadmap` does not). Deleted rows never match. If a record that
+exists is not found, check the full-text index on the server (safe while the server runs;
+it changes nothing):
+
+```bash
+sqlite3 "$DATA_DIR/wispralt.db" \
+  "INSERT INTO dictations_fts(dictations_fts, rank) VALUES('integrity-check', 1);
+   INSERT INTO jobs_fts(jobs_fts) VALUES('integrity-check');"
+```
+
+No output means both indexes match their tables. An error (`database disk image is
+malformed`) means the index drifted: rebuild it with
+`INSERT INTO dictations_fts(dictations_fts) VALUES('rebuild');` and, for jobs,
+`DELETE FROM jobs_fts; INSERT INTO jobs_fts(text, job_id) SELECT transcript_text, id FROM jobs WHERE transcript_text IS NOT NULL;`
+(take a backup first). A server whose SQLite lacks FTS5 refuses to migrate with
+`MigrationError: SQLite lacks FTS5`.
+
+### AI insights do not appear, or a run stopped
+
+- **"AI interpretation is off"** — an admin must turn it on in **Settings** after accepting
+  the disclosure; measured stats work without it.
+- **Runs cannot start / "OPENROUTER_API_KEY is not configured"** — set the key in
+  `server/.env` (the CLI does this) and restart.
+- **Data → AI runs shows a status other than `done`:**
+
+  | Status / error | Meaning | What to do |
+  |---|---|---|
+  | `aborted` · `budget` | The 30-day spending cap was reached (checked before every call). | Wait for older spend to age out, or raise the cap in Settings. |
+  | `aborted` · `rate_limit` | OpenRouter returned 429. | The scheduler retries after 6 hours; or start the week again later. |
+  | `failed` · `all_people_failed` | Every person's reply was unusable or errored. | See the failures column (`openrouter_error`, `json_decode`, `schema`); check the model id in Settings. |
+  | `failed` · `<ExceptionName>` | The run crashed. | Check `wispralt.log` around the start time (logs hold ids and classes, never text). |
+  | `skipped` · `ai_disabled` / `no_client` | AI is off, or no key. | See above. |
+
+- **A person is missing from AI insights** — they need 5+ dictations or 1+ file
+  transcription in that week.
+- **"Older format" notice** — the insight predates source refs; run that week again with
+  **Regenerate existing**.
+- **"stale" notice** — records arrived after the insight was generated; regenerate to
+  include them.
 
 ---
 

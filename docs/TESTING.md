@@ -95,6 +95,14 @@ This section describes the rollback strategy that was in place during Phases 1�
 | `server/tests/test_auth.py` | per-request key lookup: revoked / disabled / unknown → 401, `sqlite3.Error` → 503, out-of-process revoke, disable → mint → new key works |
 | `server/tests/test_job_store.py` | `JobStore` on the shared DB: transitions + cancel rules, `requeue_interrupted` refund, FK `IntegrityError`, relative→absolute `wav_path`, `recover_orphans` policy + `reenqueue_pending` on absolute paths, dictation insert under a running job, `dictation_counts`, one insight row per scope, `stats_by_user` = `compute_user_stats` |
 | `server/tests/test_insights_cron.py` | the cron with a stub `InsightsClient`: a week with only a `file` transcript yields a person insight |
+| `server/tests/test_history_search.py` | Part 6 FTS5: query quoting, backfill on migrate, triggers keep `'integrity-check'` clean through every mutation, 10 adversarial queries never cross users, filters, snippets |
+| `server/tests/test_portal_render.py` | Part 6 shell: every page renders for admin (sidebar, stylesheet), employees 403 on admin pages and see no admin links, no `<style>` blocks |
+| `server/tests/test_first_admin_setup.py` | Part 6 `/admin/setup`: 0600 code never logged, wrong code 403, one admin once, concurrent setups → one admin |
+| `server/tests/test_invites.py`, `test_portal_keys.py` | Part 6 invites (shown once, hash only, atomic single-use redeem, uniform 400, 429) and people/devices (rotate vs revoke device vs disable, CSRF, roles) |
+| `server/tests/test_monitoring.py` | Part 6 `/admin/system` snapshot: every key, disk walk, active vs recent clients, broken DB → `db.ok=false` |
+| `server/tests/test_portal_access.py` | Part 6 search UI + record scope: highlighted and escaped snippets, 404 for another user's record, employees 403 on team records |
+| `server/tests/test_measured_stats.py` | Part 6 measured stats against a hand-built fixture; tiles link to exactly their records; works with AI off |
+| `server/tests/test_insights_sources.py`, `test_insights_runs.py` | Part 6 AI v2 (stub client, no network): refs validated against the prompt, render-time hiding, stale/legacy/recurring; runs, scheduler, cap, 429, backfill, estimate, settings + disclosure |
 | `server/tests/test_bootstrap.py` | `python -m wispralt.bootstrap` subprocesses under a pty: TTY refusal, client config + one token, already-exists, `--check`, `--rotate-admin`, bad `DATA_DIR` |
 | `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | 11-row injection truth table |
 | `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | 5-case secure-field refusal pin |

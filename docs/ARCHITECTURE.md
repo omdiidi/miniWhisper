@@ -500,28 +500,34 @@ After `call_next`, `_ObservabilityMiddleware` (main.py) writes **one** `usage_ev
 
 Best-effort: a `sqlite3.Error` loses that row, increments `usage_write_failures_total` and logs only the error type; the response is unaffected. The counter is exposed in `/metrics` and in the `/readyz/db` body, so a loss is visible. There is no queue and no background drainer.
 
-Tracked routes: `transcribe/dictate`, `transcribe/file` (`kind = "file"`), `v1/audio/transcriptions` (`kind = "v1_dictate"`), plus the `/v1/models` and translations probes, **POST only**. Each stream chunk POST still records a row (request telemetry). The admin overview's Dictations 24h/7d/30d tiles count `dictations` rows (`JobStore.dictation_counts`), not requests; the user-detail page's tiles still count that user's `usage_events` requests.
+Tracked routes: `transcribe/dictate`, `transcribe/file` (`kind = "file"`), `v1/audio/transcriptions` (`kind = "v1_dictate"`), plus the `/v1/models` and translations probes, **POST only**. Each stream chunk POST still records a row (request telemetry). The admin overview's Dictations 24h/7d/30d tiles count `dictations` rows (`JobStore.dictation_counts`), not requests; the person page's tiles still count that user's `usage_events` requests. Since Part 6 each row also records the authenticating `key_id`, which gives every device its own "last seen" and drives the active/recent client list on `/admin/system`.
 
 ### Admin UI
 
 ```
 ┌────── /admin (FastAPI APIRouter) ─────────────────┐
 │                                                     │
-│  public_router  ─► /admin/login (GET, POST)        │  no auth
+│  public_router  ─► /admin/login, /admin/setup      │  no auth (setup gated)
 │                                                     │
 │  me_router      ─► /admin/me                       │  Depends=[require_api_key]
 │                                                     │  any role — admin or employee
 │                                                     │
 │  authed_router  ─► everything else                  │  Depends=[require_admin]
-│      /admin/                                        │
-│      /admin/users  /admin/users/{id}               │
-│      /admin/users/{id}/mint  …/revoke              │
+│      /admin/  /admin/people[/new|/{id}]             │
+│      /admin/people/{id}/rotate …/disable           │
+│      /admin/keys/{key_id}/revoke   (one device)     │
+│      /admin/integrations[/new|/{id}/rotate|revoke]  │
 │      /admin/usage  /admin/usage.csv                 │
+│  admin_invites ─► /admin/invites[/{id}/revoke]      │  require_admin
+│  admin_system  ─► /admin/system[/snapshot]          │  require_admin
+│  admin_data    ─► /admin/data[/runs…] /records      │  require_admin per route
+│                   /admin/settings                   │
 └─────────────────────────────────────────────────────┘
+   public: POST /invites/redeem (admin_invites.public_router)
 ```
 
-Source: `server/src/wispralt/routes/admin_ui.py` +
-`server/src/wispralt/admin/templates/*.html.j2`.
+Source: `server/src/wispralt/routes/{admin_ui,admin_invites,admin_system,admin_data}.py`
++ `server/src/wispralt/admin/templates/*.html.j2` + `admin/static/portal.css`.
 
 Three-router pattern (be720a1 split out `me_router`):
 
@@ -532,9 +538,8 @@ Three-router pattern (be720a1 split out `me_router`):
   → `/admin/`, employee → `/admin/me`.
 - **`me_router`** carries `/admin/me`, gated by `require_api_key` (NOT
   `require_admin`). Admins are 303'd to `/admin/`. Employees see their
-  own `user_detail` page; admin nav (Overview/Users/Usage) is hidden by
-  `base.html.j2` for non-admin sessions and replaced with a single "My
-  Usage" link. Header title flips to "Wispralt Portal".
+  own person page without admin actions; `base.html.j2` shows the Admin nav
+  group only for admins (employees get My history / My insights / My usage).
 - **`authed_router`** has `dependencies=[Depends(require_admin)]`, so a
   browser hitting `/admin/` without a valid admin token gets 401/403.
   Every page reads `AccountStore` / `UsageStore` in a worker thread.
@@ -547,7 +552,7 @@ a dependency that declares `require_api_key` as its own sub-dependency (so
 auth always resolves first and records `request.state.auth_via`) and skips
 the token only when `auth_via == "bearer"`; otherwise the `X-CSRF-Token`
 header or `csrf_token` form field must match the `wispralt_csrf` cookie, or
-403. The six admin mutations take it as a parameter through
+403. Every admin mutation takes it as a parameter through
 `require_admin_csrf`; `PATCH /me` and the `/me/history` mutations through
 `require_csrf` beside `forbid_integration_kind`. Pages that render those
 forms mint the token (`admin_ui._form_page`). `SameSite=Strict` stays as a
@@ -562,6 +567,23 @@ Templates use the `.html.j2` extension. Jinja2's default autoescape list
 does **not** include this extension; `select_autoescape(enabled_extensions=("html.j2", "html", "j2"))`
 is set explicitly so user-supplied fields (label, notes, error_class)
 render escaped, closing the stored-XSS hole on the admin UI.
+
+**Part 6 portal rules.** One stylesheet (`admin/static/portal.css`: CSS variables,
+light/dark via `prefers-color-scheme`, sidebar → top strip under 768 px, tables scroll
+inside `.table-wrap`) and the `_ui.html.j2` macros; no `<style>` blocks, no build
+step, no CDN. Every page that shows a secret (a new key, an invite, the first-admin
+key) sends `Cache-Control: no-store` and renders it through `secret_once`. HTMX
+partials that poll or swap (`/admin/system/snapshot`, `/admin/data/runs/current`,
+range tabs) never mint or rotate the CSRF cookie, so forms already on the page keep
+working. **First-admin setup**: while no enabled admin exists the lifespan writes
+`data_dir/setup-code` (0600, 128-bit) and logs its path; `/admin/setup` needs CSRF and
+that content (constant-time compare), then calls `bootstrap_first_admin` (race-safe:
+`AlreadyBootstrapped` → 404) and deletes the file. `request.client.host` is loopback
+for every tunnelled request, so it is never used as an auth signal. **Invites**: a
+`secrets.token_urlsafe(32)` token stored as sha256 with a 10-minute TTL;
+`POST /invites/redeem` validates and redeems in one `BEGIN IMMEDIATE` (so concurrent
+redeems issue one key), answers every failure with the same `400 invite_invalid`, and
+is rate-limited per client IP.
 
 ---
 
@@ -591,8 +613,33 @@ Part 4 moves the Local-mode host onto **one SQLite file**, `data_dir/wispralt.db
   `"schema_outdated"`.
 
 `0001_initial.sql` holds the full schema (users, api_keys, invites, usage_events,
-dictations, jobs, weekly_insights, settings). Callers move onto it task by task
-during Part 4; until then the sections below describe the current stores.
+dictations, jobs, weekly_insights, settings). `0002_portal.sql` (Part 6) adds the
+full-text indexes, `insight_runs`, `usage_events.key_id` and the AI settings seeds;
+`0003_import_runs.sql` (Part 7) adds `import_runs`. The runner applies files in sorted
+order, so numbers may arrive out of merge order.
+
+**Full-text search (Part 6, `0002_portal.sql`).** `dictations_fts` is an
+*external-content* FTS5 table over `dictations.text` (`content_rowid='id'`, a stable
+`INTEGER PRIMARY KEY`). `jobs_fts(text, job_id UNINDEXED)` is a *regular* FTS5 table:
+`jobs.id` is TEXT, and implicit rowids can change under `VACUUM` / `VACUUM INTO` (the
+backup path), so the job id is stored as a column. Tokenizer `unicode61
+remove_diacritics 2` (`cafe` finds `café`). Six triggers keep both exact for every
+writer (routes, retention purge, the Part 7 importer, restore): insert; update of the
+text column guarded by `WHEN old IS NOT new` (jobs get `transcript_text` late, NULL →
+text, and may go back to NULL); delete. An external-content delete must pass the
+**old** text (`INSERT INTO dictations_fts(dictations_fts, rowid, text)
+VALUES('delete', old.id, old.text)`) or the index is corrupted; the tests run
+`'integrity-check'` after every kind of mutation. Soft delete leaves the index entry:
+every query joins back to the source row and filters `deleted_at IS NULL`, so restore
+needs no reindex. Deleting from `jobs_fts` by the UNINDEXED `job_id` scans `jobs_fts`;
+at file-job volume (thousands of rows) that is fine, and a retention purge of N jobs
+costs N such scans offline. Queries never pass user input raw to `MATCH`
+(`jobs.store.fts_query`: each token quoted, ANDed, last token a prefix, 200 chars / 12
+tokens). The owner is bound in SQL: `search_history(user_id, q)` for `/me`, a separate
+admin-only `search_history_team` — there is no "all users" wildcard. Snippets come back
+raw with `\x02…\x03` sentinels and are rendered by `web.templates_env.highlight`
+(escape first, then `<mark>`). A SQLite build without FTS5 fails the migration with
+`MigrationError("SQLite lacks FTS5")`.
 
 **Server lock.** The lifespan takes `fcntl.flock(LOCK_EX | LOCK_NB)` on the
 sibling `<data_dir>.lock` (`ops.backup.server_lock`) before it opens the DB and
@@ -795,231 +842,172 @@ worker crashes and mid-upload client upgrades. Missing → stored as NULL.
 
 ## Weekly insights
 
-Phase 2 of the portal effort. The capture loop (transcript persistence above)
-runs continuously; the **analysis loop** here turns the previous week's
-captured transcripts into per-employee + team summaries every Sunday night.
-The render loop (`Data portal` below) is what employees and admins see in the
-browser.
+The analysis loop: it turns a week of captured transcripts into per-person and team
+summaries. Since Part 6 it is **opt-in** and every AI claim is tied to the records it
+came from; the numbers people see are **measured** from the database, never asked of
+the model.
 
-Source: `server/src/wispralt/insights/{__init__.py, client.py, prompts.py, cron.py}`
-and the `weekly_insights` table + 5 helpers in `jobs/store.py`.
+Source: `server/src/wispralt/insights/{client,prompts,sources,measured,settings,cron,timewindow}.py`
+and `jobs/store.py` (`weekly_insights`, `insight_runs`, refs, measured reads).
 
-### Schedule
+### Measured vs AI
 
-The cron fires at **23:00 in `settings.insights_timezone`** (default
-`America/Los_Angeles`) every Sunday. It's an **in-process asyncio task**
-launched from the FastAPI lifespan — not a separate launchd plist. The
-trade-off: in-process loses the process-isolation that a separate plist would
-buy (a runaway insights pass could in principle starve the dictation loop)
-but gains a warm OpenRouter client + reuse of the existing SQLite/`JobStore`
-connection. The startup-catchup branch (next section) covers the
-reboot-during-fire case, so the in-process path is effectively reliable in
-practice; we accepted the trade.
+| | Measured (`insights/measured.py`) | AI interpretation (`insights/cron.py` + `sources.py`) |
+|---|---|---|
+| Source | DB rows: `dictations`, `jobs`, `usage_events` | OpenRouter, only when enabled |
+| When | Every page view, any range | Weekly (scheduled) or a run/backfill from the portal |
+| What | counts, words, active days, file audio minutes, filler words (regex `um/uh/like/you know`), time saved (**estimate**, 40 wpm), dictation latency p50/p95, error rate, 8-week trend, hour of day | digest, action items, decisions, blockers, projects, topics, quotable line; team: themes, action items, blockers, decisions, knowledge gaps |
+| Numbers | yes | **none**: `pct_time`, `filler_word_count`, `wow_delta`, `tool_mentions` were removed |
 
-`_seconds_until_next_fire(tz, *, iso_weekday, hour)` in `insights/cron.py`
-computes the sleep interval via `datetime.now(ZoneInfo(...))` arithmetic,
-which is DST-correct (`zoneinfo` handles the spring-forward / fall-back
-delta automatically) — verified by hand against both the 2026 PST→PDT
-and PDT→PST transitions. The parameterized form lets ops dry-runs and
-the catchup path retarget specific weekdays/hours without code edits;
-the back-compat alias `_seconds_until_sunday_23_local(tz)` is retained
-for one release. The lifespan installs an `asyncio.Lock` on
-`app.state.weekly_insights_lock`; `run_weekly_insights` short-circuits
-with a warning if the lock is already held (catchup overlap → no
-double-bill).
+Measured counts come from `dictations` rows (a streamed dictation is one row however
+many chunk requests it took); `usage_events` only feeds latency and error rates.
+`dictations.duration_ms` is inference time, so audio minutes cover file jobs
+(`jobs.audio_duration_s`) only. Weeks, trend buckets and the hour chart use the
+insights timezone (DB setting, else `INSIGHTS_TIMEZONE`, else the host zone from
+`/etc/localtime`, else UTC).
 
-### Startup catchup
+### Source refs (insight schema v2)
 
-Gated behind `settings.insights_catchup_enabled` (defaults **False** — opt-in
-only). When True, on lifespan startup the cron checks whether the most-recent
-completed ISO week has a row in `weekly_insights` for any user **and** ended
-less than 72 hours ago; if both conditions hold, it runs the insights pass
-immediately rather than waiting for the next Sunday. The operator opts in via
-`.env` only after verifying OpenRouter model availability + pricing — leaving
-it False on a fresh deploy prevents an accidental Wednesday-after-deploy
-charge.
+1. **Assemble.** Each record goes into the prompt behind a bracketed ref: `[d:12]`
+   (dictation 12) or `[f:<job id>]`, newest first, capped at `insights_input_word_cap`
+   words. `sources.assemble` returns the set of refs actually placed in the prompt.
+2. **Parse.** The reply is parsed with pydantic models (`extra='ignore'`). A wrong
+   shape (`sources` not a list, a non-object) is an `InsightShapeError` and counts as
+   a person failure; bad JSON likewise.
+3. **Validate.** Each item keeps only refs from the prompt set and is dropped when none
+   remain, so an invented ref, or another person's record (it was never in this
+   person's prompt), can never survive. `quotable_line` is kept only when its text is an
+   exact substring of the record it cites. The team pass receives the validated person
+   insights and its items may cite only refs those insights cite.
+4. **Render.** `sources.build_view` re-checks refs at view time
+   (`JobStore.refs_exist(refs, viewer, is_admin)`): refs to deleted records, or to
+   records the viewer may not open, are hidden, and an item left with none is hidden.
+   Each ref links to `/me/history/{kind}/{id}` (own) or `/admin/records/{kind}/{id}`
+   (admin). A **stale** notice appears when records of that week were created after
+   `generated_at` (`count_records_after`); a topic also present in the previous 4 weeks'
+   stored insights shows "seen N weeks" (`recent_topic_labels`, computed, not asked).
+   Rows without `schema_version: 2` render a "regenerate" notice (no converter: the old
+   host was wiped and Part 7 imports no insights).
+
+The prompts carry no ids beyond the refs (no `user_id`, no `api_key_id`). Logs carry
+ids, error classes and lengths, never transcript or response text.
+
+### Enablement, scheduler and runs
+
+AI settings live in the DB `settings` table (`insights/settings.py`): `insights_enabled`
+(effective only together with `insights_disclosure_ack_at`), `insights_model`,
+`insights_cap_30d_usd` (default 8), `insights_timezone`. They are edited at
+`/admin/settings`; enabling requires acknowledging the disclosure that transcript text
+will be sent to OpenRouter. The OpenRouter key comes only from `server/.env`. Readers
+fail closed (no store or a DB error = off).
+
+`scheduler_loop` (an in-process asyncio task from the lifespan) checks once an hour
+(first after 60 s) whether the **last full ISO week** is due: AI enabled, a client
+present, no `done` scheduled run for that week, and no scheduled attempt in the last 6
+hours. This replaces the old Sunday-23:00 sleep and the opt-in startup catch-up: a
+missed week self-heals at the next tick, and sleep or DST cannot skip it. Older weeks
+run only by an explicit backfill.
+
+`run_weeks(app, weeks, trigger, force)` runs weeks one after another under
+`app.state.weekly_insights_lock` (a held lock → the call returns None; nothing
+overlaps or double-bills). Each week writes an `insight_runs` row:
+
+```sql
+CREATE TABLE insight_runs(
+  id INTEGER PRIMARY KEY, trigger TEXT NOT NULL CHECK (trigger IN ('scheduled','manual','backfill')),
+  iso_year INTEGER NOT NULL, iso_week INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running','done','failed','aborted','skipped')),
+  people_total INTEGER NOT NULL DEFAULT 0, people_done INTEGER NOT NULL DEFAULT 0,
+  failures_json TEXT NOT NULL DEFAULT '[]',   -- [{user_id, error_class}] only
+  estimated_usd REAL, cost_usd REAL NOT NULL DEFAULT 0, error_class TEXT,
+  started_at REAL NOT NULL, finished_at REAL);
+```
+
+Progress is updated after every person; the portal polls it every 2 s. A run ends
+`done`; `failed` (`all_people_failed`, or a crash with its exception class); `aborted`
+(`budget` or `rate_limit`); or `skipped` (`ai_disabled`, `no_client`). Without `force`
+a week is restart-safe (people who already have a row are skipped, so nobody is paid
+for twice); `force` regenerates them.
 
 ### Cost control
 
-A hard 30-day rolling cap (`settings.insights_max_30d_cost_usd`, default
-**$8**) gates the cron at two seams:
-
-1. **Pre-call check.** Before issuing any OpenRouter call, the cron reads
-   `JobStore.rolling_insights_cost_usd(days=30)` and skips the entire run if
-   the figure is already at or above the cap.
-2. **Mid-run check.** Inside the per-user loop, an `accumulated_run_cost`
-   counter tracks spend for the current invocation. After each call the cron
-   re-checks `baseline_30d_cost + accumulated_run_cost ≥ BUDGET` and stops
-   mid-run rather than blowing through the cap on the last few employees.
-
-Cost is extracted from the OpenRouter response body's `usage.cost` field
-(verified to exist on `x-ai/grok-4.3` responses on 2026-05-14 via Task 0).
-If a future model strips the field, `InsightsClient` falls back to a
-hardcoded `INSIGHTS_PRICING_PER_1K` rate-card keyed by model id; the
-`_default` entry is intentionally set high so the fallback fails closed (we'd
-rather skip a run than under-bill against a missing rate).
-
-The OpenRouter 429 rate-limit response is surfaced as `RateLimitedError`
-which aborts the entire current run; the next scheduled Sunday fire will
-retry. We don't sleep-and-retry inside the loop — Sunday-to-Sunday cadence
-gives more than enough recovery time.
+- The **30-day cap** is checked before **every** OpenRouter call (person and team),
+  against the 30-day spend at the start of the run plus this run's spend.
+  `rolling_insights_cost_usd` takes the larger of the stored insights' cost and the
+  runs' recorded spend (a forced rerun overwrites a row's cost; runs also count replies
+  that were billed but unusable).
+- Cost comes from the response's `usage.cost`, else the `INSIGHTS_PRICING_PER_1K` rate
+  card (`_default` is deliberately high, so an unknown model fails closed).
+- A 429 (`RateLimitedError`) aborts the run; the next due tick (after 6 h) retries.
+- Before any portal-started run the admin sees an **estimate**: words actually sent
+  (per qualifying person, capped) × 1.35 tokens/word ÷ 1000 × the model's input rate.
 
 ### Data shapes
 
-```sql
-CREATE TABLE weekly_insights(
-  iso_year INTEGER NOT NULL, iso_week INTEGER NOT NULL,
-  scope_key TEXT NOT NULL,                       -- 'team' or 'user:<id>'
-  user_id INTEGER REFERENCES users(id),           -- NULL for the team row
-  insight_json TEXT NOT NULL, input_tokens INTEGER NOT NULL,
-  output_tokens INTEGER NOT NULL, cost_usd REAL NOT NULL,
-  model TEXT NOT NULL, generated_at REAL NOT NULL,
-  PRIMARY KEY (iso_year, iso_week, scope_key),
-  CHECK (scope_key = CASE WHEN user_id IS NULL THEN 'team' ELSE 'user:' || user_id END));
-```
-
-The non-null `scope_key` closes the old duplicate-team-row hole (a nullable
-column in the primary key never conflicted). `upsert_weekly_insight(user_id=…)`
-derives the key and uses `ON CONFLICT (iso_year, iso_week, scope_key)
-DO UPDATE` so a re-run for the same week overwrites the previous row
-idempotently — useful for catchup, manual re-runs via the
-`python -m wispralt.insights.cron --manual` entrypoint, and prompt
-iteration during development.
-
-Per-person `insight_json` schema:
+`weekly_insights` keeps one row per `(iso_year, iso_week, scope_key)` (`'team'` or
+`'user:<id>'`; `upsert_weekly_insight` overwrites). Person `insight_json` (v2):
 
 ```json
 {
-  "digest": ["3-bullet summary of the employee's week"],
-  "action_items": [{"text": "ship migration", "owner": "Sarah", "eta": "Fri"}],
-  "projects": [{"name": "Acme proposal", "pct_time": 0.40}],
-  "decisions": ["we decided to..."],
-  "blockers": ["mercury timeouts mentioned 6x"],
-  "topics": [{"label": "billing", "weight": 0.3}],
-  "filler_word_count": 47,
-  "quotable_line": "the migration WILL ship on Friday"
+  "schema_version": 2,
+  "digest": [{"text": "Planned the Q4 launch", "sources": ["d:12"]}],
+  "action_items": [{"text": "ship the migration", "owner": "self", "sources": ["f:3f2a…"]}],
+  "decisions": [{"text": "go with vendor B", "sources": ["d:14"]}],
+  "blockers": [{"text": "waiting on legal", "sources": ["d:13"]}],
+  "projects": [{"name": "Acme proposal", "sources": ["d:12", "d:15"]}],
+  "topics": [{"label": "billing", "sources": ["d:12"]}],
+  "quotable_line": {"text": "the migration ships on Friday", "source": "d:12"}
 }
 ```
 
-Team `insight_json` schema:
-
-```json
-{
-  "themes": [{"label": "client onboarding", "rank": 1, "wow_delta": "+2"}],
-  "team_action_items": [...],
-  "team_blockers": [...],
-  "tool_mentions": {"Mercury": 6, "Cloudflare": 4},
-  "knowledge_gaps": ["questions raised without follow-up"]
-}
-```
-
-### Hallucination guard
-
-`_scrub_hallucinations` in `insights/cron.py` is **two-tier**:
-
-- **`quotable_line` — strict exact substring (case-insensitive).** Must appear
-  verbatim in the week's transcript blob for that user, because the UI
-  renders this field as a literal quote. If absent, the field is replaced
-  with `null` rather than risk attributing made-up words to the employee.
-- **`action_items` / `decisions` / `blockers` — 8-character sliding window.**
-  Each item must share an 8-char substring with the transcript blob. This is
-  paraphrase-tolerant (the LLM legitimately summarizes "we decided X" without
-  copying the exact words) at the cost of false-positives on common phrases.
-  The UI surfaces an **"AI-generated, may be inaccurate"** disclaimer on
-  every card to set user expectations accordingly.
+Team: `{schema_version: 2, themes: [{label, sources}], team_action_items: [{text, owner,
+sources}], team_blockers, decisions, knowledge_gaps: [{text, sources}]}`.
 
 ### Scope semantics
 
-- **`scope = 'person'`** rows are emitted per employee that hit the
-  data-floor gate: at least **5 dictations OR at least 1 file job** (history kind `file`) in
-  the week. Users below the floor are skipped silently (no row written) to
-  avoid charging for thin-data summaries.
-- **The team row** (`scope_key = 'team'`, `user_id = NULL`) is one row per week. It's
-  written **only when at least 2 employees had successful person-scope
-  insights** — a one-person team aggregate would just be a re-rendering of
-  that person's row.
+- A person row is written for each active person with at least **5 dictations or 1 file
+  transcription** that week; below that they are skipped (no call, no charge).
+- The team row is written when at least one person insight succeeded in the run.
 
 ---
 
 ## Data portal
 
-The render loop. All three surfaces share the same base template + vendored
-JS so a single design language covers admin + employee views.
-
-Source: `server/src/wispralt/routes/{me.py, admin_data.py}` +
-`server/src/wispralt/admin/templates/{me_login, me_insights, data,
-_insight_cards, _stats_grid_partial}.html.j2`.
+The render loop: one shell (`base.html.j2` + `portal.css` + `_ui.html.j2`) for admins
+and employees.
 
 ### Surfaces
 
-- **Admin Data tab — `GET /admin/data`.** Admin-only (handler-level
-  `require_admin`); people come from `AccountStore`. Renders the team `weekly_insights`
-  card stack on top + a per-user leaderboard underneath. The optional
-  `?user_id=N` query param drills into one employee using the same
-  `_insight_cards.html.j2` macro layout the employee self-view renders, so
-  the admin sees exactly what the employee sees.
-- **Employee self-view — `GET /me/insights`.** Authenticated user only.
-  Shows that user's `'person'`-scope insight (most recent week) plus a
-  time-range stats grid (Today / 7d / 30d / 90d / 1y / All).
-- **Employee login — `GET /me/login` / `POST /me/login`.** Token-paste form
-  mirroring the admin login flow. On success it sets the **same**
-  `wispralt_admin_token` cookie that admin login sets, but with `path="/"`
-  so a single cookie scopes across both `/admin/*` and `/me/*` surfaces
-  (the admin login handler was simultaneously broadened to `path="/"` so
-  the cookie is interchangeable in both directions).
+- **Admin Data — `GET /admin/data`.** Measured (team, or `?user_id=N`), the AI panel,
+  the per-person table and the AI runs panel. Admin-only.
+- **My insights — `GET /me/insights`.** The caller's Measured stats and their AI panel.
+- **Records — `GET /admin/records`** (admin) and **My history — `GET /me/history`**
+  (own rows only): see "Personal history" below.
+- **Login — `/admin/login`, `/me/login`.** Both set the same `wispralt_admin_token`
+  cookie with `path="/"`, so one sign-in covers `/admin/*` and `/me/*`.
 
 ### HTMX partial swaps
 
-The time-range tabs are wired through HTMX. Each surface route inspects the
-`HX-Request: true` header (via the shared `web.htmx.is_htmx` dep): when
-present, the handler returns a *body partial* — `_me_insights_body.html.j2`
-for `/me/insights`, `_admin_data_body.html.j2` for `/admin/data` — which
-includes BOTH the stats grid AND the insight cards. Each partial is
-swapped into the page's `#insights-body` wrapper without a full reload, so
-one range-tab click refreshes both the stats grid AND the insight cards
-in a single round-trip. The Alpine `<nav>` tabs sit outside the swap
-target so their `active` state survives the swap; an `htmx:historyRestore`
-handler in `base.html.j2` dispatches a `range-changed` custom event so the
-Alpine tabs re-sync from the URL on browser back/forward.
+Range tabs swap `#insights-body` with `_me_insights_body.html.j2` or
+`_admin_data_body.html.j2` (Measured + AI panel) when `HX-Request: true`; the partial
+branch never mints a CSRF cookie. The Alpine tabs sit outside the swap target; an
+`htmx:historyRestore` handler in `base.html.j2` re-syncs them on back/forward. The runs
+list (`_runs_list.html.j2`) re-polls itself every 2 s only while a run is going.
 
 ### Shared helpers
 
-`web/templates_env.py` exports a single `Jinja2Templates` singleton (with
-`select_autoescape` on `*.html.j2` / `*.html` / `*.j2`) used by
-`routes/admin_ui.py`, `routes/admin_data.py`, and `routes/me.py` so the
-escape policy + template dir stay in sync. `web/htmx.py` exports
-`is_htmx(request)`. `insights/timewindow.py` exports
-`last_full_iso_week` / `iso_week_epoch_bounds` / `epoch_for_range` —
-the cron + both routes share one source of truth for week boundaries
-and the Today/7d/30d/90d/1y/All range tabs. `auth.set_session_cookie`
-/ `clear_session_cookie` / `set_csrf_cookie` / `verify_csrf` centralize
-the `wispralt_admin_token` cookie issuance (path="/", samesite=strict,
-secure, httponly, 8 h) AND the double-submit CSRF token used by both
-`/admin/login` and `/me/login` forms (constant-time compare via
-`hmac.compare_digest`). `JobStore.has_any_insight_for_week`,
-`list_filler_counts_for_week`, and `compute_user_stats` are the public
-read paths the routes use instead of reaching into the private `_exec`.
-
-### CSS scoping
-
-The frosted-glass card rules added to `base.html.j2` are scoped under the
-`.data-page` class so the new visual treatment applies only to
-`me_insights.html.j2` and `data.html.j2`. Existing admin pages (`/admin/`,
-`/admin/users`, `/admin/usage`) inherit the old flat styling unchanged —
-the scoping is a defensive choice so a regression in the new CSS can't
-visually break the existing admin surfaces.
+`web/templates_env.py` (one `Jinja2Templates`, autoescape on `.html.j2`, the `highlight`
+and `ts` filters), `web/htmx.py` (`is_htmx`), `web/records.py` (time window, row
+decoration), `insights/timewindow.py` (ISO weeks, range tabs, `host_timezone`), `auth`
+cookie + CSRF helpers.
 
 ### Vendored JS
 
-HTMX 2.0.4 (`/admin/static/htmx.min.js`, ~50 KB) and Alpine 3.14.8
-(`/admin/static/alpine.min.js`, ~44 KB) are checked in to the repo and
-served by FastAPI's `StaticFiles` mount at `/admin/static`. CDN delivery
-was rejected for two reasons: (1) it would force a CSP carve-out for
-`unpkg.com` (or similar), expanding the supply-chain surface; (2) the
-mini's network egress isn't guaranteed — vendoring locally keeps the
-portal functional during an internet outage at the office. Refresh
-procedure (out-of-band): `curl -fsSL -o ...` from the upstream CDN,
-verify SHA-256 against the published release, commit.
+HTMX 2.0.4 (`/admin/static/htmx.min.js`) and Alpine 3.14.8 (`/admin/static/alpine.min.js`)
+are checked in and served by the `/admin/static` `StaticFiles` mount with SRI hashes.
+CDN delivery was rejected: it would widen the supply-chain surface and the portal must
+work during an internet outage. Refresh out-of-band: download, verify the SHA-256
+against the release, commit.
 
 ---
 
@@ -1027,11 +1015,10 @@ verify SHA-256 against the published release, commit.
 
 Plan A's headline employee surface. Every authenticated employee can browse
 their own dictations + file transcriptions (including legacy meeting rows) in one
-chronological list, filter by range / kind / search term, expand any row to
+chronological list, filter by range / kind, full-text search it (Part 6), expand any row to
 see the full transcript text, soft-delete with a one-click undo path, and
 download an individual transcript as `.txt` or `.json`. Sits in the same
-sidebar as `/me/insights` and inherits the data-portal frosted-glass
-treatment.
+sidebar as `/me/insights`.
 
 Source: `server/src/wispralt/routes/me.py` (handlers) +
 `server/src/wispralt/admin/templates/{me_history, _me_history_body,
@@ -1045,7 +1032,7 @@ A "history row" is either a dictation (from the `dictations` table) or a
 file transcript (from the `jobs` table). Both legs carry `user_id`, so
 per-user scoping is free. `JobStore.transcripts_in_range_filtered`
 runs two parameterized SQL queries — one per leg — applies the range +
-optional kind + optional `LIKE` search filter, ORDERs each by
+optional kind filter, ORDERs each by
 `(created_at DESC, row_id DESC)`, then merge-sorts the two streams in
 Python.
 
@@ -1056,8 +1043,13 @@ Filters live entirely server-side:
   insights page agree on what "30d" means.
 - `kind` (optional) — `dictation` or `file` (every `jobs` row; displayed as "File transcriptions"). `meeting` URLs from before Part 4 404. Empty string from the
   `<select>` element is normalized to None at the handler.
-- `search` (optional) — minimum **3 characters** after `.strip()`; shorter
-  strings are silently dropped to keep the `LIKE '%…%'` scan bounded.
+- `q` (optional, Part 6) — 2+ characters after `.strip()` switch the page to
+  **full-text search**: `JobStore.search_history(user_id, q, since, until, kind,
+  limit, offset)` over the FTS5 indexes (see "Local database → Full-text search"),
+  newest first, offset paging, snippets highlighted via `|highlight`. Shorter input
+  shows the plain list. The old `LIKE` filter is gone.
+- `since` / `until` (optional, unix seconds) — override the range tab; the Measured
+  tiles link here with them.
 
 ### Per-leg cursor pagination
 
@@ -1105,9 +1097,11 @@ Both mutating routes (`DELETE`, `POST /restore`) take the
 `X-CSRF-Token` header) must match the cookie set by the page render (same
 double-submit pattern as `/admin/login` and `/me/login`); a Bearer-authenticated
 request needs no token. Every read AND mutation re-checks
-ownership: `get_history_row(user_id, kind, row_id)` filters on
-`user_id` so a malicious or stale row_id from another user uniformly
-returns **404** — we never leak existence to non-owners.
+ownership: `get_history_row(user_id, kind, row_id)` (=
+`get_record_scoped(kind, row_id, viewer_id, is_admin=False)`) filters on
+`user_id` in SQL, so a malicious or stale row_id from another user uniformly
+returns **404** — we never leak existence to non-owners. Admins read any record only
+through `/admin/records/{kind}/{id}` (`is_admin=True`).
 
 ### HTMX render contract
 
@@ -1117,7 +1111,8 @@ Three template shapes, picked at the handler based on request kind:
 |---|---|---|
 | Fresh page load | `me_history.html.j2` | Full chrome (nav, filter bar, table shell + first page). |
 | HTMX nav (range/kind/search change) | `_me_history_body.html.j2` | Body fragment swapped into `#history-body`. |
-| HTMX Load-more | `_me_history_page.html.j2` | Just the next batch of `<tr>` rows + the updated Load-more button. |
+| HTMX Load-more | `_me_history_page.html.j2` | Just the next batch of `<tr>` rows + the updated Load-more button (`_load_more.html.j2`: cursors, or `offset` in search mode; `hx-vals` via `|tojson`). |
+| Record link (no `HX-Request`) | `record_detail.html.j2` | Full page for one record; the target of AI source links. |
 | Row expand | `_me_history_row_expanded.html.j2` | Swaps the compact row in place; transcript text + per-row Delete/Download buttons. |
 | Row collapse / restore | `_me_history_row.html.j2` | Compact row partial. |
 
