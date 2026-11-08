@@ -37,6 +37,7 @@ LABEL_ENV = "WISPRALT_LABEL"
 DEFAULT_LABEL = "co.wispralt.host"
 LEGACY_LABEL = "co.wispralt.server"
 DEFAULT_PORT = 8000
+APP_NAME = "WisprAlt.app"
 DB_NAME = "wispralt.db"  # mirrors ops.backup.DB_NAME / Settings.db_path
 
 _KEY_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
@@ -49,6 +50,7 @@ class Paths:
     label: str
     data_dir: Path
     backup_dir: Path
+    rerooted: bool = False
 
     @classmethod
     def resolve(cls, *, data_dir: Path | None = None, backup_dir: Path | None = None) -> Paths:
@@ -62,6 +64,7 @@ class Paths:
             label=os.environ.get(LABEL_ENV) or DEFAULT_LABEL,
             data_dir=_abs(data_dir) if data_dir else support / "host",
             backup_dir=_abs(backup_dir) if backup_dir else root / "WisprAlt-Backups",
+            rerooted=bool(os.environ.get(ROOT_ENV)),
         )
 
     @property
@@ -88,6 +91,11 @@ class Paths:
     @property
     def db_path(self) -> Path:
         return self.data_dir / DB_NAME
+
+    @property
+    def app(self) -> Path:
+        """The client app; a re-rooted (E2E) install never touches /Applications."""
+        return (self.root / "Applications" if self.rerooted else Path("/Applications")) / APP_NAME
 
     @property
     def launch_agents(self) -> Path:

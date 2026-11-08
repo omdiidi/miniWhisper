@@ -11,16 +11,20 @@ No other ``cli`` module calls ``subprocess`` or ``os.execv``.
 from __future__ import annotations
 
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from importlib import metadata
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from pathlib import Path
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_DOCTOR = 0, 1, 2, 3
 
@@ -78,6 +82,19 @@ def http_get(url: str, timeout: float) -> int | None:
         return None
 
 
+def version() -> str:
+    try:
+        return metadata.version("wispralt")
+    except metadata.PackageNotFoundError:
+        return "0+unknown"
+
+
+def _disk_free(path: Path) -> int:
+    while not path.exists():
+        path = path.parent
+    return shutil.disk_usage(path).free
+
+
 def _execv(argv: list[str]) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
@@ -95,3 +112,8 @@ class Deps:
     ask: Callable[[str], str] = input
     stdin_isatty: bool = field(default_factory=lambda: sys.stdin.isatty())
     stdout_isatty: bool = field(default_factory=lambda: sys.stdout.isatty())
+    machine: str = field(default_factory=platform.machine)
+    macos: str = field(default_factory=lambda: platform.mac_ver()[0])
+    which: Callable[[str], str | None] = shutil.which
+    disk_free: Callable[[Path], int] = _disk_free
+    load_fn: Any = None  # Parakeet ``LoadFn`` override for the warm-up (tests)

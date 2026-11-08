@@ -170,6 +170,10 @@ def deps(runner: FakeRunner, http: FakeHttp, execs: Execs, answers: list[str]) -
         ask=lambda _q: answers.pop(0),
         stdin_isatty=False,
         stdout_isatty=False,
+        machine="arm64",
+        macos="15.4",
+        which=lambda name: f"/opt/homebrew/bin/{name}",
+        disk_free=lambda _p: 100 * 10**9,
     )
 
 

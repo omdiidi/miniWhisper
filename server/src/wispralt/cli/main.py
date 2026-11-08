@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from wispralt.cli import host, launchd
+from wispralt.cli import host, launchd, ops
 from wispralt.cli.paths import Ctx, InstallState, Paths
-from wispralt.cli.system import EXIT_USAGE, CliError, Deps
+from wispralt.cli.system import EXIT_USAGE, CliError, Deps, version
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,13 +25,6 @@ if TYPE_CHECKING:
 
 def _todo(_ctx: Ctx, args: argparse.Namespace) -> int:
     raise CliError(EXIT_USAGE, f"`{args.command}` is not implemented yet")
-
-
-def version() -> str:
-    try:
-        return metadata.version("wispralt")
-    except metadata.PackageNotFoundError:
-        return "0+unknown"
 
 
 def _common() -> argparse.ArgumentParser:
@@ -84,9 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--rebuild", action="store_true", help="rebuild the client even if current")
     s.add_argument("--_resumed", action="store_true", dest="resumed", help=argparse.SUPPRESS)
 
-    p = cmd("status", _todo, "service state, URL, sizes and retention")
+    p = cmd("status", ops.cmd_status, "service state, URL, sizes and retention")
     p.add_argument("--client", action="store_true", help="also show the client app")
-    p = cmd("doctor", _todo, "check this Mac and the install (exit 3 on failures)")
+    p = cmd("doctor", ops.cmd_doctor, "check this Mac and the install (exit 3 on failures)")
     p.add_argument("--warmup", action="store_true", help="load the dictation model once")
     p.add_argument("--client", action="store_true", help="also check the client toolchain")
     cmd("start", launchd.cmd_start, "start the host service")
