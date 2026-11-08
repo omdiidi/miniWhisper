@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     # setup
-    s = cmd("setup", _todo, "install or repair the host and/or client (safe to rerun)")
+    s = cmd("setup", host.cmd_setup, "install or repair the host and/or client (safe to rerun)")
     s.add_argument("--role", choices=["host", "client", "both"])
     s.add_argument("--source", type=Path, help="the repo clone (default: recorded or ./)")
     s.add_argument("--data-dir", type=Path, help="host data directory")

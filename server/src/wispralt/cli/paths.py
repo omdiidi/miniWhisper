@@ -145,7 +145,7 @@ class InstallState:
         self.last_run = time.time()
         write_private(path, json.dumps(asdict(self), indent=2, sort_keys=True) + "\n")
 
-    def add(self, bucket: str, *items: Path) -> None:
+    def add(self, bucket: str, *items: Path | str) -> None:
         """Record created paths under ``artifacts`` or ``data`` (no duplicates)."""
         target: list[str] = getattr(self, bucket)
         for item in items:

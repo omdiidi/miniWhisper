@@ -9,7 +9,6 @@ check opens a ``mode=ro`` connection, Keychain checks use presence lookups
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import plistlib
@@ -17,7 +16,7 @@ import sqlite3
 import stat
 import sys
 from contextlib import closing, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -25,7 +24,15 @@ from typing import TYPE_CHECKING, Any
 from wispralt._errors import BackupRefused, InsufficientSpace, RestoreRefused, ServerRunning
 from wispralt.accounts.store import AccountStore
 from wispralt.cli import client, launchd
-from wispralt.cli.host import describe_retention, server_url
+from wispralt.cli.host import (
+    Check,
+    describe_retention,
+    human,
+    platform_checks,
+    server_url,
+    verdict,
+    warmup,
+)
 from wispralt.cli.paths import LEGACY_LABEL, env_value, private_dir
 from wispralt.cli.system import EXIT_DOCTOR, CliError, version
 from wispralt.database import Database
@@ -38,9 +45,6 @@ if TYPE_CHECKING:
 
     from wispralt.cli.paths import Ctx
 
-GB = 1_000_000_000
-MIN_FREE_HOST = 6 * GB
-MIN_MACOS = 14
 CLOUDFLARED_LABEL = "co.wispralt.cloudflared"
 MANIFEST = "manifest.json"
 
@@ -64,15 +68,6 @@ def allocated(path: Path) -> int:
             else:
                 total += entry.stat(follow_symlinks=False).st_blocks * 512
     return total
-
-
-def human(n: int) -> str:
-    size = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1000 or unit == "GB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1000
-    return f"{size:.1f} GB"
 
 
 def list_backups(ctx: Ctx) -> list[Path]:
@@ -136,18 +131,10 @@ def _client_facts(ctx: Ctx) -> dict[str, Any]:
     return {
         "app": str(app),
         "installed": app.is_dir(),
-        "version": app_version(app),
+        "version": client.app_version(app),
         "running": running,
         "server_url": url or None,
     }
-
-
-def app_version(app: Path) -> str | None:
-    try:
-        with (app / "Contents" / "Info.plist").open("rb") as f:
-            return str(plistlib.load(f).get("CFBundleShortVersionString") or "") or None
-    except (OSError, plistlib.InvalidFileException):
-        return None
 
 
 def cmd_status(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -207,41 +194,6 @@ def _print_status(r: dict[str, Any]) -> None:
 # ── doctor ───────────────────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True, slots=True)
-class Check:
-    status: str  # "ok" | "warn" | "fail" | "info"
-    name: str
-    detail: str
-    fix: str = ""
-
-
-def _ok(cond: bool, name: str, detail: str, fix: str, *, warn: bool = False) -> Check:
-    return Check("ok" if cond else ("warn" if warn else "fail"), name, detail, "" if cond else fix)
-
-
-def platform_checks(ctx: Ctx, *, host: bool) -> list[Check]:
-    d = ctx.deps
-    major = int(d.macos.split(".")[0]) if d.macos else 0
-    checks = [
-        _ok(
-            d.machine == "arm64",
-            "apple-silicon",
-            d.machine,
-            "the host needs Apple Silicon (MLX); use this Mac as a client only",
-            warn=not host,
-        ),
-        _ok(major >= MIN_MACOS, "macos", d.macos or "unknown", f"update to macOS {MIN_MACOS}+"),
-    ]
-    if host:
-        free = d.disk_free(ctx.paths.models_dir)
-        checks += [
-            _ok(free >= MIN_FREE_HOST, "disk", f"{human(free)} free", "free at least 6 GB"),
-            _ok(bool(d.which("ffmpeg")), "ffmpeg", "on PATH", "brew install ffmpeg"),
-            _ok(bool(d.which("uv")), "uv", "on PATH", "brew install uv"),
-        ]
-    return checks
-
-
 def integrity(db_path: Path) -> str:
     """``PRAGMA integrity_check`` on a read-only connection ("ok" when healthy)."""
     try:
@@ -259,11 +211,11 @@ def host_checks(ctx: Ctx) -> list[Check]:
         st = env.stat()
         good = stat.S_IMODE(st.st_mode) == 0o600 and st.st_uid == os.getuid()
         out.append(
-            _ok(good, "env-file", f"{env} {oct(stat.S_IMODE(st.st_mode))}", f"chmod 600 {env}")
+            verdict(good, "env-file", f"{env} {oct(stat.S_IMODE(st.st_mode))}", f"chmod 600 {env}")
         )
         configured = env_value(env, "DATA_DIR")
         out.append(
-            _ok(
+            verdict(
                 configured == str(p.data_dir),
                 "env-data-dir",
                 f"DATA_DIR={configured}",
@@ -275,19 +227,23 @@ def host_checks(ctx: Ctx) -> list[Check]:
     if p.data_dir.is_dir():
         mode = stat.S_IMODE(p.data_dir.stat().st_mode)
         out.append(
-            _ok(mode == 0o700, "data-dir", f"{p.data_dir} {oct(mode)}", f"chmod 700 '{p.data_dir}'")
+            verdict(
+                mode == 0o700, "data-dir", f"{p.data_dir} {oct(mode)}", f"chmod 700 '{p.data_dir}'"
+            )
         )
     else:
         out.append(Check("fail", "data-dir", f"{p.data_dir} missing", "wispralt setup --role host"))
     if p.db_path.exists():
         res = integrity(p.db_path)
         out.append(
-            _ok(res == "ok", "db-integrity", res, "restore the newest backup: wispralt restore DIR")
+            verdict(
+                res == "ok", "db-integrity", res, "restore the newest backup: wispralt restore DIR"
+            )
         )
     svc = launchd.service(ctx)
     run_at_load = _plist_flag(p.plist, "RunAtLoad")
     out.append(
-        _ok(
+        verdict(
             svc.loaded and run_at_load,
             "service",
             f"{p.label} {svc.state}" + ("" if run_at_load else " (no RunAtLoad plist)"),
@@ -297,7 +253,7 @@ def host_checks(ctx: Ctx) -> list[Check]:
     for path in ("/healthz", "/readyz/dictation", "/readyz/db"):
         code = ctx.deps.http_get(f"{ctx.url}{path}", 3.0)
         out.append(
-            _ok(
+            verdict(
                 code == 200,
                 path,
                 f"HTTP {code}" if code else "no answer",
@@ -357,11 +313,11 @@ def client_checks(ctx: Ctx) -> list[Check]:
     )
     full_xcode = bool(xcode) and "CommandLineTools" not in xcode
     return [
-        _ok(full_xcode, "xcode", xcode or "none", "install Xcode from the App Store (building the app needs it; a DMG install does not)", warn=True),
-        _ok("Apple Development" in ids, "signing-identity", "Apple Development" if "Apple Development" in ids else "none", "Xcode > Settings > Accounts: add your Apple ID and create an Apple Development certificate", warn=True),
-        _ok(app.is_dir(), "app", str(app), "wispralt setup --role client"),
-        _ok(running, "app-running", "running" if running else "not running", f"open '{app}'", warn=True),
-        _ok(has_key or has_openai, "keychain", f"local key: {has_key}, OpenAI key: {has_openai}", "add a key in WisprAlt > Settings", warn=True),
+        verdict(full_xcode, "xcode", xcode or "none", "install Xcode from the App Store (building the app needs it; a DMG install does not)", warn=True),
+        verdict("Apple Development" in ids, "signing-identity", "Apple Development" if "Apple Development" in ids else "none", "Xcode > Settings > Accounts: add your Apple ID and create an Apple Development certificate", warn=True),
+        verdict(app.is_dir(), "app", str(app), "wispralt setup --role client"),
+        verdict(running, "app-running", "running" if running else "not running", f"open '{app}'", warn=True),
+        verdict(has_key or has_openai, "keychain", f"local key: {has_key}, OpenAI key: {has_openai}", "add a key in WisprAlt > Settings", warn=True),
     ]  # fmt: skip
 
 
@@ -379,35 +335,6 @@ def _plist_flag(path: Path, key: str) -> bool:
             return bool(plistlib.load(f).get(key))
     except (OSError, plistlib.InvalidFileException):
         return False
-
-
-def tone_wav(seconds: float = 1.0, hz: float = 440.0, rate: int = 16_000) -> bytes:
-    import numpy as np
-    import soundfile as sf
-
-    t = np.arange(int(seconds * rate), dtype=np.float32) / rate
-    buf = io.BytesIO()
-    sf.write(buf, 0.2 * np.sin(2 * np.pi * hz * t), rate, format="WAV", subtype="PCM_16")
-    return buf.getvalue()
-
-
-def warmup(ctx: Ctx) -> Check:
-    """Load the dictation model in-process and transcribe a 1 s tone (text may be empty)."""
-    import asyncio
-
-    os.environ["HF_HOME"] = str(ctx.paths.models_dir)
-    os.environ.setdefault("DATA_DIR", str(ctx.paths.data_dir))  # parakeet imports Settings
-    os.environ.setdefault("SERVER_URL", ctx.url)
-    from wispralt.dictate.parakeet import ParakeetService
-
-    svc = ParakeetService(ctx.deps.load_fn)
-    try:
-        svc.load()
-        asyncio.run(svc.transcribe(tone_wav()))
-    except (ImportError, OSError, RuntimeError, ValueError) as exc:
-        fix = "wispralt setup --role host (re-verifies the models)"
-        return Check("fail", "warmup", f"{type(exc).__name__}: {exc}", fix)
-    return Check("ok", "warmup", f"{svc.model_id} transcribed a test tone")
 
 
 def cmd_doctor(ctx: Ctx, args: argparse.Namespace) -> int:

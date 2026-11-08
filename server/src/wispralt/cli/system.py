@@ -117,3 +117,4 @@ class Deps:
     which: Callable[[str], str | None] = shutil.which
     disk_free: Callable[[Path], int] = _disk_free
     load_fn: Any = None  # Parakeet ``LoadFn`` override for the warm-up (tests)
+    hub: Any = None  # ``host.Hub``; None → Hugging Face (``host.HfHub``)
