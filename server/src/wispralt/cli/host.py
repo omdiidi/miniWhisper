@@ -557,10 +557,14 @@ def reinstall_cli(ctx: Ctx, source: Path, *, extra: bool = True, reinstall: bool
     ctx.runner.run([*argv, *(["--reinstall"] if reinstall else []), target])
 
 
+def installed_exe() -> str:
+    """The ``wispralt`` entry point beside this interpreter (what ``uv tool install`` wrote)."""
+    return str(Path(sys.executable).with_name("wispralt"))
+
+
 def exec_self(ctx: Ctx, *extra: str) -> None:
     """Replace this process with the freshly installed ``wispralt`` (never half-imported code)."""
-    exe = str(Path(sys.executable).with_name("wispralt"))
-    ctx.deps.execv([exe, *ctx.argv, *extra])
+    ctx.deps.execv([installed_exe(), *ctx.argv, *extra])
 
 
 def preflight(ctx: Ctx) -> None:

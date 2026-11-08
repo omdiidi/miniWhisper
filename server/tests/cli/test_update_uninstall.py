@@ -8,14 +8,20 @@ from typing import TYPE_CHECKING
 import pytest
 
 from wispralt.cli import ops
+from wispralt.cli.host import installed_exe
 from wispralt.cli.paths import InstallState, Paths
+from wispralt.ops.backup import server_lock
 
 from .conftest import make_app
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from wispralt.cli.system import Deps
+
     from .conftest import CliFn, Execs, FakeHttp, FakeHub, FakeRunner
+
+EXE = installed_exe()
 
 
 @pytest.fixture
@@ -38,10 +44,10 @@ def test_update_order(
 ) -> None:
     assert cli("update")[0] == 0
     steps = [_short(c) for c in runner.calls if c[:2] != ["launchctl", "print"]]
-    assert steps == ["git -C", "git -C", "launchctl bootout", "uv tool"]
+    assert steps == ["git -C", "git -C", "launchctl bootout", "uv tool", f"{EXE} --version"]
     assert runner.calls[0][3:] == ["status", "--porcelain"]
     assert runner.calls[1][3:] == ["pull", "--ff-only"]
-    assert runner.calls[-1] == [
+    assert runner.calls[-2] == [
         "uv", "tool", "install", "--force", "--python", "3.11", "--reinstall", f"{clone}/server[host]",
     ]  # fmt: skip
     [bk] = _backups(installed)
@@ -110,6 +116,43 @@ def test_interrupted_phase1_still_restarts_the_old_service(
     monkeypatch.setattr(ops, "reinstall_cli", interrupted)
     with pytest.raises(RuntimeError, match="boom"):
         cli("update", "--no-backup")
+    assert runner.verbs()[-1] == "bootstrap" and execs.calls == []
+
+
+def test_stop_timeout_rebootstraps_the_agent(
+    installed: Paths, cli: CliFn, runner: FakeRunner, execs: Execs
+) -> None:
+    """R3 fix: the bootout happened, then the lock wait timed out: the agent comes back."""
+    with server_lock(installed.data_dir):  # the "old server" never lets go
+        code, _, err = cli("update", "--no-backup")
+    assert code == 1 and "still holds" in err and "restarted" in err
+    verbs = runner.verbs()
+    assert "bootout" in verbs and verbs[-1] == "bootstrap" and execs.calls == []
+    assert not any(c[:2] == ["uv", "tool"] for c in runner.calls)
+
+
+def test_missing_new_executable_restarts_the_service(
+    installed: Paths, cli: CliFn, runner: FakeRunner, deps: Deps
+) -> None:
+    """R3 fix: an execv that fails (binary gone) must not leave the host stopped."""
+
+    def missing(_argv: list[str]) -> None:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    deps.execv = missing
+    code, _, err = cli("update")
+    assert code == 1 and "cannot run" in err and "FileNotFoundError" in err
+    assert "restarted and is answering" in err and "wispralt restore" in err
+    assert runner.verbs()[-1] == "bootstrap"
+
+
+def test_broken_new_executable_restarts_without_exec(
+    installed: Paths, cli: CliFn, runner: FakeRunner, execs: Execs
+) -> None:
+    """R3 fix: a new install that cannot even print its version is never exec'd into."""
+    runner.on(EXE, rc=1, err="ModuleNotFoundError: No module named 'wispralt'")
+    code, _, err = cli("update", "--no-backup")
+    assert code == 1 and "ModuleNotFoundError" in err and "restarted" in err
     assert runner.verbs()[-1] == "bootstrap" and execs.calls == []
 
 
