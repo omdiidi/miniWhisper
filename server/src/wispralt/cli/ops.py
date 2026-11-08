@@ -503,20 +503,40 @@ def cmd_update(ctx: Ctx, args: argparse.Namespace) -> int:
     return 0  # only reached when execv is faked
 
 
+def _start_after_failure(ctx: Ctx) -> str:
+    """Best effort to bring the service back after a failed update; says what happened."""
+    try:
+        launchd.start(ctx)
+    except CliError as exc:
+        return f"the service could NOT be restarted ({exc.msg}); run `wispralt start`"
+    if launchd.wait_healthy(ctx):
+        return f"the service was restarted and is answering at {ctx.url}"
+    return f"the service was restarted but {ctx.url}/healthz is not answering"
+
+
 def _update_phase2(ctx: Ctx, args: argparse.Namespace) -> int:
-    """Runs in the freshly installed code: re-verify models, restart, wait for health."""
+    """Runs in the freshly installed code: re-verify models, restart, wait for health.
+
+    Phase 1 left the service stopped; any failure here still tries to start it.
+    """
     state = ctx.need_state()
     source = find_source(ctx, None)
     if state.role in {"host", "both"}:
-        ensure_models(ctx, state)
-        state.version = version()
-        state.save(ctx.paths.state_file)
-        launchd.restart(ctx)
+        hint = f"; to roll back the data: wispralt restore {args.backup}" if args.backup else ""
+        try:
+            ensure_models(ctx, state)
+            state.version = version()
+            state.save(ctx.paths.state_file)
+            launchd.restart(ctx)
+        except (CliError, OSError) as exc:
+            why = exc.msg if isinstance(exc, CliError) else f"{type(exc).__name__}: {exc}"
+            raise CliError(
+                1, f"update failed after the reinstall: {why}\n{_start_after_failure(ctx)}{hint}"
+            ) from exc
         healthy = (
             launchd.wait_healthy(ctx) and ctx.deps.http_get(f"{ctx.url}/readyz/db", 3.0) == 200
         )
         if not healthy:
-            hint = f"; to roll back the data: wispralt restore {args.backup}" if args.backup else ""
             raise CliError(
                 1, f"the updated service is not healthy (see {ctx.paths.logs_dir}){hint}"
             )

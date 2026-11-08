@@ -170,3 +170,33 @@ def test_uninstall_client_moves_app_to_trash(
     ] in runner.calls
     assert transcripts.is_dir()
     assert not any(c[0] == "security" for c in runner.calls)
+
+
+def test_failed_phase2_still_restarts_the_service(
+    installed: Paths, cli: CliFn, runner: FakeRunner, hub: FakeHub, tmp_path: Path
+) -> None:
+    """Review fix: model verification failing after the reinstall must not leave it stopped."""
+    runner.on("launchctl", "print", rc=113)  # phase 1 booted it out: not loaded
+    hub.offline = True
+    state = InstallState.load(installed.state_file)
+    assert state is not None
+    state.models = {}  # no verified copy to fall back on
+    state.save(installed.state_file)
+    code, _, err = cli("update", "--_phase2", "--_backup", str(tmp_path / "bk"))
+    assert code == 1 and "update failed after the reinstall" in err
+    assert "bootstrap" in runner.verbs()  # it tried to start the service again
+    assert "restarted and is answering" in err and f"wispralt restore {tmp_path / 'bk'}" in err
+
+
+def test_failed_phase2_reports_a_failed_restart(
+    installed: Paths, cli: CliFn, runner: FakeRunner, hub: FakeHub
+) -> None:
+    runner.on("launchctl", "print", rc=113)
+    runner.on("launchctl", "bootstrap", rc=1, err="Bootstrap failed: 5")
+    hub.offline = True
+    state = InstallState.load(installed.state_file)
+    assert state is not None
+    state.models = {}
+    state.save(installed.state_file)
+    code, _, err = cli("update", "--_phase2")
+    assert code == 1 and "could NOT be restarted" in err and "wispralt start" in err
