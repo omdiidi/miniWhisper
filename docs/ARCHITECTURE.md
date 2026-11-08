@@ -6,10 +6,10 @@ title: Architecture
 
 ## System Overview
 
-WisprAlt is a two-component system: a native macOS menubar client running on your MacBook and a FastAPI server running on your always-on Mac mini, connected via a Cloudflare Tunnel.
+WisprAlt has two modes. In **Online** mode (the default) the native macOS menubar client sends audio straight to OpenAI with the user's own key (Keychain `co.wispralt.openai`); no server is involved. In **Local** mode the client sends audio to a self-hosted FastAPI host on an always-on Apple Silicon Mac, reached through `tailscale serve` or an optional Cloudflare Tunnel. The diagram below shows Local mode.
 
 ```
-┌─────────────────────────  Client (MacBook Air M4)  ──────────────────────────┐
+┌─────────────────────────  Client (macOS menubar)  ────────────────────────────┐
 │ FNKeyMonitor (CGEventTap, serial queue)                                       │
 │   └ hold ──▶ DictationRecorder  (AVAudioEngine)                               │
 │ "Transcribe file…" ──▶ source file (any container) ──▶ FileJobAPI             │
@@ -487,7 +487,7 @@ Key invariants:
 - **Lookup on every request.** There is no token cache: one indexed join per request (about the cost of a cache check), so a revoke, disable or rotate, made in this process or by another one (the Part 5 CLI), applies to the very next request.
 - **Identity vs credentials.** `users` holds identity (`role admin|employee`, `kind employee|integration`, `disabled_at`); `api_keys` holds credentials (`token_hash`, `revoked_at`). Rotating a user's key revokes its active keys, inserts one new key and clears `disabled_at` in one transaction (`AccountStore.rotate_user_key`); the portal's Revoke disables the user.
 - **Plaintext tokens exist only in `accounts/service.py`** and the one page or terminal that shows them. Logs carry ids only.
-- **First admin:** `python -m wispralt.bootstrap --label NAME` (TTY-only) creates it and prints the client config once; `--rotate-admin` replaces a lost admin key. There is no env admin key and no break-glass path.
+- **First admin:** `wispralt setup --role host` creates it and hands over the key once (terminal or a new `--token-file`); `wispralt keys rotate-admin` replaces a lost admin key (`python -m wispralt.bootstrap` remains as a TTY-only shim over the same code). There is no env admin key and no break-glass path.
 - **`request.state.user`** is set for every authenticated request; the usage middleware reads it.
 - **Cookie fallback:** `require_api_key` falls back to the `wispralt_admin_token` cookie when no Bearer header is present (`/v1` never does). Set by `POST /admin/login` / `POST /me/login`; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`.
 
@@ -764,7 +764,7 @@ stay in the snapshot only. The **owner** — the one enabled Supabase admin — 
 *linked* to the one enabled local admin (`link_existing`) instead of inserted; the
 mapping must be confirmed (`--yes` only when unambiguous, or `--owner-map PG=LOCAL`),
 an earlier link counts as confirmed, and with no local admin the import refuses
-until `python -m wispralt.bootstrap` has run. `usage_events` keep their kind
+until `wispralt setup --role host` has created one. `usage_events` keep their kind
 (`meeting` → `file`), `fallback_events` land in `usage_events` as `fallback_<kind>`,
 and `user_id` is remapped through the imported users (unknown → unmatched). Rows go
 in batches of 500, each committed with its `import_runs` checkpoint, so a crashed
@@ -923,7 +923,7 @@ AI settings live in the DB `settings` table (`insights/settings.py`): `insights_
 (effective only together with `insights_disclosure_ack_at`), `insights_model`,
 `insights_cap_30d_usd` (default 8), `insights_timezone`. They are edited at
 `/admin/settings`; enabling requires acknowledging the disclosure that transcript text
-will be sent to OpenRouter. The OpenRouter key comes only from `server/.env`. Readers
+will be sent to OpenRouter. The OpenRouter key comes only from the host `.env` (`~/.config/wispralt/.env`). Readers
 fail closed (no store or a DB error = off).
 
 `scheduler_loop` (an in-process asyncio task from the lifespan) checks once an hour
@@ -1234,14 +1234,15 @@ transcription, etc.) are unchanged from the v0.4.6 layout.
 Three launchd entries keep both sides of WisprAlt alive across reboots, crashes, and logins.
 
 ```
-Mac mini — launchd gui/<UID>
+Host — launchd gui/<UID>
   │
-  ├── co.wispralt.server  (~/Library/LaunchAgents/co.wispralt.server.plist)
+  ├── co.wispralt.host  (~/Library/LaunchAgents/co.wispralt.host.plist; written by `wispralt setup`)
   │     RunAtLoad: true
-  │     KeepAlive: true
-  │     → uvicorn on 127.0.0.1:8000
+  │     KeepAlive: {SuccessfulExit: false}
+  │     ThrottleInterval: 30
+  │     → uvicorn on 127.0.0.1:<port> (default 8000), cwd ~/.config/wispralt
   │
-  └── co.wispralt.cloudflared  (~/Library/LaunchAgents/co.wispralt.cloudflared.plist)
+  └── co.wispralt.cloudflared  (optional; ~/Library/LaunchAgents/co.wispralt.cloudflared.plist)
         RunAtLoad: true
         KeepAlive: {SuccessfulExit: false, NetworkState: true}
         ThrottleInterval: 10
@@ -1256,6 +1257,6 @@ Client Mac — SMAppService (registered by AppDelegate at first launch)
         Configurable via in-app Settings → Launch at login toggle
 ```
 
-Both Mac mini LaunchAgents run at user level (`gui/$UID`) — not system level — so they have access to the user's Keychain, home directory, and environment without requiring sudo. `EnvironmentVariables/PATH` is set explicitly in each plist because launchd provides a minimal PATH that may not include Homebrew.
+Both host LaunchAgents run at user level (`gui/$UID`) — not system level — so they have access to the user's Keychain, home directory, and environment without requiring sudo. `EnvironmentVariables/PATH` is set explicitly in each plist because launchd provides a minimal PATH that may not include Homebrew.
 
 The SMAppService entry on the client is registered via `SMAppService.mainApp.register()` and requires an Apple-issued code-signing identity (Apple Development or Developer ID). Ad-hoc signed builds cannot use SMAppService.

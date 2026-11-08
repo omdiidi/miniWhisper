@@ -2,6 +2,25 @@
 
 All notable changes to WisprAlt are documented here.
 
+## [Unreleased] - 2026-11-07 — Part 8: release cleanup
+
+### Changed
+
+- **Updates go through the CLI.** The app's update button no longer runs the retired
+  curl installer: **Copy update command** copies `wispralt update --client`. The
+  releases it polls come from the bundle's `WisprAltReleaseRepo` key, stamped from the
+  clone's GitHub `origin` by `scripts/build-client-local.sh` (no hardcoded owner).
+- **Add employee** shows the clone + `./install.sh --role client --client-mode local`
+  command, the server URL and the key, instead of the retired curl one-liner.
+- **CI:** the client job runs `scripts/test-client.sh` (adds the log-privacy gate);
+  the installer lint also syntax-checks `scripts/*.sh`.
+- **Docs** match the SQLite host, the `wispralt` CLI and `/admin/people`; new concise
+  `README.md` and `AGENTS.md`. Personal names and domains replaced with placeholders.
+
+### Removed
+
+- `server/migrations/` (the Supabase-era Postgres SQL) and stray `.gitkeep` files.
+
 ## [Unreleased] - 2026-11-07 — Part 6: modern portal, Data & Insights
 
 ### Added

@@ -55,7 +55,7 @@ host is a per-user agent, so it runs only while you are logged in.
 
 ### Native wheel build fails (Xcode tools)
 
-**Symptom:** `uv sync` fails with a build error mentioning missing C++ headers, missing compiler, or `clang` not found. (Historically also triggered by `CTranslate2`; that dep was removed in Phase 10 but the symptom can still surface for other native wheels like `torch`.)
+**Symptom:** `./install.sh` or `wispralt setup` (`uv tool install`) fails with a build error mentioning missing C++ headers, missing compiler, or `clang` not found. (Historically also triggered by `CTranslate2`; that dep was removed in Phase 10 but the symptom can still surface for other native wheels like `torch`.)
 
 **Diagnosis:** Xcode Command Line Tools are missing or outdated.
 
@@ -63,7 +63,7 @@ host is a per-user agent, so it runs only while you are logged in.
 ```bash
 xcode-select --install
 ```
-Wait for installation to complete, then re-run `uv sync`. If already installed, update it:
+Wait for installation to complete, then re-run `./install.sh`. If already installed, update it:
 ```bash
 sudo rm -rf /Library/Developer/CommandLineTools
 xcode-select --install
@@ -118,7 +118,7 @@ Verify: `ls -la ~/.config/wispralt/.env` should show `-rw-------`.
 **Diagnosis:** WisprAlt processes one file job at a time (enforced by `asyncio.Semaphore(1)` in `jobs/runner.py`). This includes a job you just cancelled: Whisper transcribes the whole file in one call, so a cancelled running job holds the slot until that call returns, then its result is discarded.
 
 **Fix:**
-1. Check `GET /metrics` for `meeting.active: true` (the `meeting` block is the file-job block) and `meeting.active_job_id`.
+1. Check `GET /metrics` for `file.active: true` and `file.active_job_id`.
 2. Wait for the current job to finish, then resubmit.
 3. A 429 with `"code": "insufficient_memory"` means less than 2 GiB of RAM is free; check `memory.available_mb`. A 429 with no `code` is the per-IP rate limiter.
 
@@ -129,9 +129,9 @@ Verify: `ls -la ~/.config/wispralt/.env` should show `-rw-------`.
 **Symptom:** Dictation round-trip is consistently > 500ms after warmup.
 
 **Diagnosis steps:**
-1. Check `GET /metrics` for `meeting.active: true` — if a file job is running, dictation competes for unified memory.
+1. Check `GET /metrics` for `file.active: true` — if a file job is running, dictation competes for unified memory.
 2. Check `GET /readyz/dictation` for the `X-Dictation-Degraded: true` header — this confirms memory pressure.
-3. Check `parakeet.p50_ms` in `/metrics` — if > 300ms, the Mac mini may be thermally throttled.
+3. Check `parakeet.p50_ms` in `/metrics` — if > 300ms, the host may be thermally throttled.
 
 **Fix:**
 - Wait for the file job to complete (the file model is evicted shortly after).
@@ -199,9 +199,9 @@ the server on failure.
 Two outages in May 2026 had the same shape: code trusted a return value or
 flag instead of verifying the invariant it claimed to enforce.
 
-- 2026-05-17 (asyncpg): `db.health_check` returned False; the watcher's
-  rebuild branch should have run; an over-narrow exception class caused
-  the failure to escape into the outer Exception handler instead.
+- 2026-05-17 (the former Postgres pool): `db.health_check` returned False;
+  the watcher's rebuild branch should have run; an over-narrow exception
+  class caused the failure to escape into the outer Exception handler instead.
 - 2026-05-19 (mlx-whisper): `evict_if_idle()` logged "released
   models" and set `models_warm = False`; 2.7 GB of MLX active memory
   stayed resident because mlx_whisper's internal `ModelHolder.model`
@@ -216,15 +216,15 @@ After a file job finishes and `idle_seconds > 120`:
 
     TOKEN=$(security find-generic-password -w -s co.wispralt)
     curl -fsS -H "Authorization: Bearer $TOKEN" \
-      https://transcribe.integrateapi.ai/metrics | jq '.memory, .meeting'
+      http://127.0.0.1:8000/metrics | jq '.memory, .file'
 
 Expected steady-state (post-eviction, no jobs running):
 
     memory.mlx_active_mb: ~1218       (Parakeet baseline only)
     memory.mlx_cache_mb: 0
-    meeting.models_warm: false
-    meeting.idle_seconds: > 60
-    meeting.eviction_failures_total: 0  (cumulative; non-zero = regression)
+    file.models_warm: false
+    file.idle_seconds: > 60
+    file.eviction_failures_total: 0  (cumulative; non-zero = regression)
 
 If `mlx_active_mb > 2000 AND models_warm=false AND idle_seconds > 120`,
 the eviction invariant is broken. Check
@@ -235,15 +235,15 @@ the eviction invariant is broken. Check
 
 Two settings control the gate (see `config.py`):
 
-- `meeting_eviction_delta_floor_mb` (default 1000; the name is kept from the meeting era): minimum MB the
+- `file_eviction_delta_floor_mb` (default 1000): minimum MB the
   active memory must drop during eviction. Lower if you want stricter
   detection; raise if you see false positives.
-- `meeting_eviction_pre_active_gate_mb` (default 1500): only fire when
+- `file_eviction_pre_active_gate_mb` (default 1500): only fire when
   active was above this BEFORE eviction. Excludes cold-start and
   partial-load failures.
 
-Override at deploy via env vars:
-    WISPRALT_MEETING_EVICTION_DELTA_FLOOR_MB=1500
+Override in `~/.config/wispralt/.env`, then `wispralt restart`:
+    FILE_EVICTION_DELTA_FLOOR_MB=1500
 
 ---
 
@@ -356,7 +356,7 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 **Diagnosis:** The poll loop in `MenuBarController+Transcription` enforces a deadline of `max(600 s, min(6 h, 3 × audio duration + 300 s))`. When the deadline elapses the client cancels the job via `DELETE /transcribe/file/{job_id}` and surfaces a `pollTimedOut` error notification. If you see the error, the server-side pipeline likely crashed or was killed mid-run.
 
 **Fix:**
-1. Check `GET /metrics` for `meeting.active` and `meeting.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/wispralt.log` for Python tracebacks.
+1. Check `GET /metrics` for `file.active` and `file.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/wispralt.log` for Python tracebacks.
 2. Restart the server (`wispralt restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staged source.
 3. If the server is healthy but the job consistently times out for long files, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
 
@@ -392,9 +392,9 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 ## Server Auto-start and Cloudflare Tunnel
 
-### Cloudflared not running after Mac mini reboot
+### Cloudflared not running after a host reboot
 
-**Symptom:** The public endpoint (`https://transcribe.yourdomain.com`) is unreachable after a reboot or power cycle.
+**Symptom:** The public endpoint (`https://wispralt.example.com`) is unreachable after a reboot or power cycle.
 
 **Diagnosis:**
 ```bash
@@ -412,9 +412,9 @@ Look for `state = running`. If the service is absent from the output, the Launch
 
 ---
 
-### Mac mini rebooted with no internet
+### Host rebooted with no internet
 
-**Symptom:** Mac mini rebooted while the network was down. cloudflared didn't come up.
+**Symptom:** The host rebooted while the network was down. cloudflared didn't come up.
 
 **Diagnosis:** This is expected and self-healing. The LaunchAgent uses `KeepAlive: {NetworkState: true}` — launchd waits for a network interface to come up before starting cloudflared. Once the network returns, launchd starts the process automatically. `ThrottleInterval: 10` enforces at most one restart per 10 seconds during flapping.
 
@@ -498,14 +498,14 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 
 ### API key rejected (employee install)
 
-**Symptom:** Employee runs the `install.sh` curl one-liner (see [INSTALL.md](INSTALL.md)) with their texted token in `WISPRALT_API_KEY`, the app launches, and Test Connection returns `401 Invalid bearer token`. Or dictation worked previously and now starts returning 401.
+**Symptom:** Employee installs the client (see [INSTALL.md](INSTALL.md)), pastes the server URL and their texted key into Settings, and Test Connection returns `401 Invalid bearer token`. Or dictation worked previously and now starts returning 401.
 
 **Diagnosis ladder:**
 
 1. **Was the key revoked, or the person disabled?** Open **People** → their page in the portal. If they show `disabled`, or that device's key shows `revoked`, this is expected — send an **Add device** invite, or **Rotate key** (rotate revokes all their keys, shows one new key and re-enables them). There is no token cache: every request looks the key up in `wispralt.db`, so a revoke, disable or mint applies to the very next request.
 2. **Is the local database healthy?**
    ```bash
-   curl -s --max-time 4 https://transcribe.<your-domain>/readyz/db
+   curl -s --max-time 4 https://wispralt.example.com/readyz/db
    tail -100 ~/Library/Logs/WisprAlt/wispralt.log | grep -i 'sqlite\|database\|migration'
    ```
    A DB error makes auth answer **503** (never 401, and there is no fallback admin). `/readyz/db` gives the reason (`db_error` / `schema_outdated`); see "Local database" above.
@@ -588,7 +588,7 @@ malformed`) means the index drifted: rebuild it with
 - **"AI interpretation is off"** — an admin must turn it on in **Settings** after accepting
   the disclosure; measured stats work without it.
 - **Runs cannot start / "OPENROUTER_API_KEY is not configured"** — set the key in
-  `server/.env` (the CLI does this) and restart.
+  `~/.config/wispralt/.env` (`OPENROUTER_API_KEY=…`), then `wispralt restart`.
 - **Data → AI runs shows a status other than `done`:**
 
   | Status / error | Meaning | What to do |
@@ -644,7 +644,7 @@ dictation/timing: inject_ms=18.7 total_ms=1873.5
 2. If `net_total_ms` >> server-side `parakeet.p50_ms` (visible in `GET /metrics`) — the gap is upload + tunnel. For a 3-sentence (≈3-second) clip at 48kHz Float32 mono, the WAV is ~580 KB. On a typical home connection that's ~50-150ms upload. If `net_total_ms` minus server inference exceeds 800ms, suspect the Cloudflare Tunnel route (cross-region, slow first-byte) or local network egress.
 3. If `stop_ms` > 100ms — `AVAudioFile` close is taking unexpectedly long; investigate the dictation IO queue.
 
-**Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the Mac mini at `~/Library/Logs/WisprAlt/wispralt.log`.
+**Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the host at `~/Library/Logs/WisprAlt/wispralt.log`.
 
 ## Reading client logs
 

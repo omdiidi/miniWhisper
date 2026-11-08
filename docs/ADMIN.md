@@ -22,8 +22,8 @@ phone; light and dark follow the system setting.
 
 ## When to use it
 
-- Onboarding a new person: send an invite link, or create them and send the
-  install command.
+- Onboarding a new person: create them (**Add employee**) and send the install
+  command, server URL and key.
 - Adding a device for someone who already has an account: **Add device** on their page.
 - Off-boarding: disable the person; their next request gets 401.
 - Spot-checking usage: who's been active, what error rates look like, which
@@ -154,11 +154,12 @@ Invite a new person (label + role) or, from a person page, add a device. Each in
 is **single use**, expires after **10 minutes**, and is stored only as a sha256 hash.
 The result page shows, once and with `Cache-Control: no-store`:
 
-- the join link `wispralt://join?host=<SERVER_URL>&invite=<token>` (the app consumes
-  it; the client handler is Part 5), and
-- the raw invite code, for pasting into the app.
+- the join link `wispralt://join?host=<SERVER_URL>&invite=<token>`, and
+- the raw invite code.
 
-The app redeems it with `POST /invites/redeem` (see [API.md](API.md#post-invitesredeem)),
+**The macOS app does not handle join links or invite codes yet**, so for now onboard
+people with **Add employee** (below). Any client can redeem an invite through the API:
+it calls with `POST /invites/redeem` (see [API.md](API.md#post-invitesredeem)),
 which creates the person (new invites) or adds a key (add device) atomically. The list
 shows each invite as pending, expired or redeemed; **Revoke** expires a pending one.
 An invite also stops working when the admin who made it is disabled.
@@ -213,7 +214,7 @@ chosen model. Turning it on requires ticking the acknowledgement once (its time 
 recorded). Also here: the **model** (default `x-ai/grok-4.3`), the **30-day spending
 cap** (default $8) and the **timezone** for weeks and charts (blank = the server's
 zone, else UTC). The OpenRouter key is never entered in the portal: the page shows
-whether `OPENROUTER_API_KEY` is configured in `server/.env`.
+whether `OPENROUTER_API_KEY` is configured in the host `.env` (`~/.config/wispralt/.env`).
 
 ### `GET /admin/system` — System
 
@@ -253,38 +254,33 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
 
 ## Adding a new employee
 
-Prefer an **invite** (`/admin/invites`): the app signs itself in from the link and
-no key is ever pasted. To create the person directly instead:
-
 1. Open `/admin/people` and click **Add employee** (top-right).
 2. Enter a `label` (1–80 chars, no control characters — e.g.
-   `nicholas`, `alex-laptop`, `contractor-q2`), optionally enter a
+   `sam`, `alex-laptop`, `contractor-q2`), optionally enter a
    `display_name` (1–40 chars, no control characters — e.g. `Sarah Chen`;
    leaving it blank lets the employee set it themselves on first launch),
    and pick a role (default `employee`). Submit.
-3. The result page shows the install one-liner pre-baked with the
-   freshly-minted token and the server URL from `settings.server_url`:
+3. The result page shows, once, the install command, the server URL (from
+   `settings.server_url`) and the freshly-minted key:
 
    ```bash
-   curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-     | WISPRALT_API_KEY=<token> WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
+   git clone <repo-url> wispralt && cd wispralt
+   ./install.sh --role client --client-mode local
    ```
 
-   Click **Copy install command**, paste into Signal / iMessage. The
-   plaintext token is shown **once** — closing the page without copying
-   means rotating via **Rotate key** on the person's page.
-4. The employee pastes the command into Terminal on their Mac. The
-   installer downloads the latest signed DMG from GitHub Releases,
-   copies the app to `/Applications`, seeds the token into the Keychain,
-   and opens the System Settings panes for the three macOS permissions.
+   Send them by Signal / iMessage, never email. Closing the page without
+   copying the key means rotating via **Rotate key** on the person's page.
+4. The employee runs the command on their Mac (see [INSTALL.md](INSTALL.md)):
+   it builds and opens WisprAlt in Local mode. They paste the server URL and
+   key into Settings > Advanced (the key goes to the Keychain item
+   `co.wispralt`) and grant the three macOS permissions.
 5. Their first dictation populates `usage_events`; they appear on
    `/admin/people` with a non-null last seen.
 
 The route handlers live at `routes/admin_ui.py:people_add_form` (GET) and
 `people_add_submit` (POST). Both are gated by `require_admin`; the latter
 calls `accounts.service.create_user` and renders
-`employee_added.html.j2` with the install one-liner composed from
-`settings.server_url`.
+`employee_added.html.j2` with the install command, `settings.server_url` and the key.
 
 ## Integration Keys
 
@@ -318,7 +314,7 @@ the `kind` column (`'employee'` or `'integration'`).
    - A ready-to-paste OpenAI env-var snippet:
 
      ```bash
-     export OPENAI_BASE_URL=https://transcribe.integrateapi.ai/v1
+     export OPENAI_BASE_URL=https://wispralt.example.com/v1
      export OPENAI_API_KEY=<token>
      ```
 
@@ -392,7 +388,7 @@ new file, created 0600) or the command refuses (exit 2) before minting.
 
 ## Server env vars (admin-relevant)
 
-These are read from `server/.env` (mode 0600). For the full
+These are read from `~/.config/wispralt/.env` (mode 0600; `wispralt setup` writes it). For the full
 configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 
 | Variable | Required | Notes |
@@ -414,13 +410,14 @@ Dictations tiles count `dictations` rows, which `/v1` does not write). Per-perso
 `v1_dictate` rows alongside `dictate` and `file` rows so you can see
 which path generated each request.
 
-To split out third-party traffic, query the table directly:
+To split out third-party traffic, query the host's `wispralt.db` (SQLite; `ts` is
+epoch seconds) directly:
 
 ```sql
-SELECT count(*) FROM wispralt.usage_events
- WHERE user_id = $1
+SELECT count(*) FROM usage_events
+ WHERE user_id = ?
    AND kind = 'v1_dictate'
-   AND ts > now() - interval '7 days';
+   AND ts > unixepoch() - 7 * 86400;
 ```
 
 This is by design — the same employee can dictate via the macOS client
@@ -434,8 +431,9 @@ should count toward "their usage" for billing/quota conversations.
 The old host's database was wiped, so the only surviving history is the usage
 metadata in Supabase (who used it, when, how much: **no dictation text**) plus any
 transcript files you kept. Part 7's importer brings both into the local
-`wispralt.db`. Run every command from `server/` with the same `.env` the server uses
-(`DATA_DIR` set). Supabase is only ever read, and nothing it writes is ever deleted.
+`wispralt.db`. Run every command from `~/.config/wispralt` (the `.env` the server
+uses, with `DATA_DIR` set) with the Python `wispralt` is installed in
+(`"$(uv tool dir)/wispralt/bin/python" -m wispralt.importer …`). Supabase is only ever read, and nothing it writes is ever deleted.
 
 1. **Export (read-only).** Put a Postgres connection string for the Supabase project
    in the Keychain (`security add-generic-password -s co.wispralt.import-pg -a wispralt -w`

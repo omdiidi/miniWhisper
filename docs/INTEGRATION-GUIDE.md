@@ -19,11 +19,11 @@ For the full WisprAlt-native API (async file jobs, /me, admin), see
 
 ## Prerequisites
 
-- WisprAlt server is running and reachable. The default public URL is
-  `https://transcribe.integrateapi.ai` (see [SETUP-SERVER.md](SETUP-SERVER.md)
-  if you need to deploy your own).
+- A WisprAlt host is running and reachable. The examples use
+  `https://wispralt.example.com`; substitute your host's URL (see
+  [SETUP-SERVER.md](SETUP-SERVER.md) to run your own).
 - You have a WisprAlt **integration** API key. Mint one at
-  `https://transcribe.integrateapi.ai/admin/keys/new` (admin only), or ask
+  `https://wispralt.example.com/admin/integrations/new` (admin only), or ask
   your operator to mint one for you (see
   [ADMIN.md → Integration Keys](ADMIN.md#integration-keys)). Integration
   keys are scoped to `/v1/*` only — they cannot access `/me/*`. For programs, that's exactly what you want.
@@ -36,7 +36,7 @@ Set these two environment variables in your project. The env var names follow
 OpenAI conventions so existing libraries auto-pick them up:
 
 ```bash
-export OPENAI_BASE_URL=https://transcribe.integrateapi.ai/v1
+export OPENAI_BASE_URL=https://wispralt.example.com/v1
 export OPENAI_API_KEY=<your-wispralt-token>
 ```
 
@@ -82,7 +82,7 @@ console.log(resp.text);
 ### curl
 
 ```bash
-curl https://transcribe.integrateapi.ai/v1/audio/transcriptions \
+curl https://wispralt.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -F file=@audio.wav \
   -F model=whisper-1 \
@@ -113,7 +113,7 @@ has no Whisper-BPE IDs).
 ### SRT (SubRip) export
 
 ```bash
-curl https://transcribe.integrateapi.ai/v1/audio/transcriptions \
+curl https://wispralt.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -F file=@audio.wav \
   -F response_format=srt \
@@ -126,7 +126,7 @@ into VLC, Premiere, or any subtitle workflow.
 ### VTT (WebVTT) export
 
 ```bash
-curl https://transcribe.integrateapi.ai/v1/audio/transcriptions \
+curl https://wispralt.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -F file=@audio.wav \
   -F response_format=vtt \
@@ -223,7 +223,7 @@ your own pipeline, do it yourself.
 ## Troubleshooting
 
 - **401 invalid_api_key**: token wrong, expired, or revoked. Mint a fresh one
-  at `https://transcribe.integrateapi.ai/admin/keys/new` (or ask your admin).
+  at `https://wispralt.example.com/admin/integrations/new` (or ask your admin).
 - **413 file_too_large**: clip exceeds 25 MB. Chunk the audio client-side or
   use the native async API.
 - **400 audio_too_long**: clip exceeds 15 minutes. Use the native async

@@ -18,7 +18,7 @@ and runs `wispralt setup`, which:
 The CLI code lives in `src/wispralt/cli/`. See `../docs/INSTALL.md` (command
 reference) and `../docs/SETUP-SERVER.md` (host details).
 
-**Note on `uv.lock`**: not committed yet. After installing `uv` (`brew install uv`), run `cd server && uv lock` to generate it. Commit the lockfile to ensure reproducible installs in CI.
+Dependencies are locked in `uv.lock`; run `uv lock` here after changing `pyproject.toml`.
 
 ## Manual Start (development)
 
@@ -27,8 +27,8 @@ cd server
 cp .env.example .env
 # fill in .env values
 chmod 600 .env
-uv sync
-uv run uvicorn wispralt.main:app --port 8000 --workers 1
+uv sync --extra host --extra dev
+uv run --extra host uvicorn wispralt.main:app --port 8000 --workers 1
 ```
 
 The server **must** run with `--workers 1` — multiple workers would load duplicate

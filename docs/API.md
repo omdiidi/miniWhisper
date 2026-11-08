@@ -862,7 +862,7 @@ From this point the client polls `GET /transcribe/file/{job_id}` exactly as it w
 
 ### `POST /admin/rotate-key` (removed)
 
-Removed in Part 4 with the env admin key. The first admin comes from `python -m wispralt.bootstrap --label NAME`; a lost admin key is replaced with `python -m wispralt.bootstrap --rotate-admin` (both run from `server/` in a terminal and print the token once). Employee and integration keys are rotated from the admin UI (`/admin/users/{id}/mint`, `/admin/keys/{id}/rotate`).
+Removed in Part 4 with the env admin key. The first admin comes from `wispralt setup --role host`; a lost admin key is replaced with `wispralt keys rotate-admin` (both print the token once, or write it to a new `--token-file`). Employee and integration keys are rotated from the admin UI (`/admin/people/{id}/rotate`, `/admin/integrations/{id}/rotate`) or `wispralt keys rotate <user_id>`.
 
 ---
 

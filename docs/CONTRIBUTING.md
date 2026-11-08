@@ -46,10 +46,6 @@ Paste the printed `sparkle:edSignature` and `length` values into `appcast.xml`.
 
 ## Apple Developer Program
 
-Signing and notarization require enrollment in the Apple Developer Program ($99/yr at developer.apple.com/enroll). The CI workflow does not support ad-hoc signing for distribution — use ad-hoc only for local development builds.
-
-## Apple Developer Program
-
 Signing and notarization require enrollment in the [Apple Developer Program](https://developer.apple.com/enroll) ($99/yr). The CI workflow does not support ad-hoc signing for distribution — use ad-hoc only for local development builds that will not be distributed.
 
 **Ad-hoc fallback for personal builds:**
@@ -79,6 +75,7 @@ See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) "TCC permissions and Apple Develo
 **Server (Python):**
 - Formatter: `ruff format` (line length 100)
 - Linter: `ruff check` + `pyright --strict`
+- Dependencies are locked in `server/uv.lock`; run `uv lock` in `server/` after changing `pyproject.toml`.
 - Run both before submitting: `cd server && uv run --extra dev --extra host ruff format . && uv run --extra dev --extra host ruff check . && uv run --extra dev --extra host pyright` (name both extras so `uv run` does not strip the MLX stack)
 
 **Client (Swift):**
@@ -92,18 +89,18 @@ See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) "TCC permissions and Apple Develo
 
 Every code change must update the documentation files listed for that source file in [docs/OVERVIEW.md](OVERVIEW.md). That file contains the file-to-doc map.
 
-From Claude Code, use `/docs-check` to diff the file-to-doc map against recent edit timestamps and find stale docs.
+From Claude Code, use `/docs-check` to diff the file-to-doc map against recent edit timestamps and find stale docs. `.claude/settings.json` is the shared Claude Code permission allow-list (personal overrides go in the git-ignored `.claude/settings.local.json`). `scripts/README.md` describes each script.
 
 ---
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request and on pushes to `main` that touch `server/**`, `client/**` or the workflow itself. It has two jobs:
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main` that touch `server/**`, `client/**`, `scripts/test-client.sh`, `scripts/check-log-privacy.py` or the workflow itself. It has two jobs:
 
 - **server** (ubuntu-latest, Python 3.11): installs `ffmpeg` and the minimal test dependencies, stubs the Apple-Silicon-only MLX modules (`parakeet_mlx`, `mlx.core`), then runs `cd server && pytest tests/ -v`. No Hugging Face token is needed. `tmp/mission/part2/run-pytest.sh` reproduces this job locally.
-- **client** (macos-latest): `cd client && swift build && swift test` (Swift Testing). `scripts/test-client.sh` reproduces it locally, including on a CommandLineTools-only Mac, and then runs the log-privacy gate (`scripts/check-log-privacy.py`; see [TESTING.md](TESTING.md#log-privacy-gate)). New `Log.` calls must log counts, status codes or `ErrorLog.describe(error)`, never text, paths, URLs or error strings.
+- **client** (macos-latest): `bash scripts/test-client.sh`: `swift build && swift test` in `client/` (Swift Testing; the Keychain tests are skipped because `CI` is set), then the log-privacy gate (`scripts/check-log-privacy.py`; see [TESTING.md](TESTING.md#log-privacy-gate)). New `Log.` calls must log counts, status codes or `ErrorLog.describe(error)`, never text, paths, URLs or error strings.
 
-`build-client.yml` (signed release build) and `lint-install.yml` (installer lint) are separate.
+`build-client.yml` (signed release build, on `v*` tags) and `lint-install.yml` are separate. The latter runs on macOS's bash 3.2 when `install.sh` or `scripts/**` change: `bash -n` on `install.sh` and every `scripts/*.sh`, a sourced-function smoke of `install.sh`, and a check that `install.sh` never calls `python3`.
 
 ## PR Workflow
 

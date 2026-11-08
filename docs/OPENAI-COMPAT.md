@@ -11,11 +11,11 @@ This page is the canonical reference. For a quick getting-started, see [INTEGRAT
 ## Setup
 
 ```bash
-export OPENAI_BASE_URL=https://transcribe.integrateapi.ai/v1
+export OPENAI_BASE_URL=https://wispralt.example.com/v1
 export OPENAI_API_KEY=<your-integration-key>
 ```
 
-Get a key from the admin UI: <https://transcribe.integrateapi.ai/admin/keys/new>. See [ADMIN.md](ADMIN.md#integration-keys) for the flow.
+Get a key from the admin UI: <https://wispralt.example.com/admin/integrations/new>. See [ADMIN.md](ADMIN.md#integration-keys) for the flow.
 
 ## Auth
 
@@ -258,8 +258,8 @@ Break-glass admin tokens bypass the per-token limit.
 ## Key kinds: employee vs integration
 
 WisprAlt tokens have a `kind` field:
-- **`kind='employee'`** — minted via `/admin/users/new`. For human employees using the macOS client. Has access to `/v1/*`, `/me/*`, and (if `role='admin'`) `/admin/*`.
-- **`kind='integration'`** — minted via `/admin/keys/new`. For third-party programs. Has access to `/v1/*` ONLY. Blocked from `/me/*` with a 403 (that surface is for humans, not programs).
+- **`kind='employee'`** — minted via `/admin/people/new` (or an invite). For human employees using the macOS client. Has access to `/v1/*`, `/me/*`, and (if `role='admin'`) `/admin/*`.
+- **`kind='integration'`** — minted via `/admin/integrations/new`. For third-party programs. Has access to `/v1/*` ONLY. Blocked from `/me/*` with a 403 (that surface is for humans, not programs).
 
 For drop-in use with `openai-python` or similar, mint a `kind='integration'` key.
 
@@ -282,7 +282,7 @@ The following clients have been verified against WisprAlt's `/v1` (or are expect
 
 | Symptom | Likely cause |
 |---|---|
-| 401 `invalid_api_key` | Token revoked or wrong. Mint a new one via `/admin/keys/new`. |
+| 401 `invalid_api_key` | Token revoked or wrong. Mint a new one via `/admin/integrations/new`. |
 | 401 with valid token | Sending cookie instead of `Authorization: Bearer ...` |
 | 400 `unsupported_file_type` | ffmpeg can't decode the file. Pre-convert to wav/mp3 locally. |
 | 400 `audio_too_long` | Audio > 15 min. Use the native async `/transcribe/file` for longer clips. |
@@ -302,4 +302,4 @@ The following clients have been verified against WisprAlt's `/v1` (or are expect
 
 ## Getting an API key
 
-See [ADMIN.md](ADMIN.md#integration-keys) for the `/admin/keys/new` flow.
+See [ADMIN.md](ADMIN.md#integration-keys) for the `/admin/integrations/new` flow.
