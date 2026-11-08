@@ -47,7 +47,7 @@ Your friend installs only the client — they connect to your existing Mac mini 
 Send your friend:
 - The `WisprAlt.dmg` download link (or the built `.app` directly).
 - Your server URL (`https://transcribe.yourdomain.com`).
-- Your API key (use Settings → Export API Key to generate a `.wispralt-key` file; see [Backing up your API key](#backing-up-your-api-key)).
+- Your API key, over a private channel (see [Moving your API key](#moving-your-api-key)). They paste it into Settings → API Key.
 
 Your friend will see the same Gatekeeper warning and the same permission wizard described above. The `xattr -dr` step applies to their machine too.
 
@@ -156,10 +156,6 @@ The dropdown lists every input device macOS sees (built-in, AirPods, USB interfa
 
 Device enumeration lives in `client/WisprAlt/Audio/MicEnumerator.swift` (AVFoundation discovery + CoreAudio HAL property reads).
 
-### Copy your API key
-
-In the popover → Show advanced settings → API Key Backup section, the **Copy API Key** button puts your token on the clipboard for one-shot pastes. The clipboard auto-clears after 60 seconds, but only if you haven't copied something else in the meantime (uses `NSPasteboard.changeCount` snapshot — survives Universal Clipboard correctly).
-
 ### Smart formatting
 
 The popover has a **Smart formatting** toggle in the Settings section. When ON, every dictation is sent to the server with the `X-Smart-Format: true` header; for dictations of at least 100 words, the server hands the raw Parakeet output to OpenRouter Mercury 2, which fixes punctuation and casing, removes obvious fillers ("um", "uh", repeated words), and adds bullet-list formatting where you're clearly enumerating items. Meaning is preserved — no rephrasing, no summarization. Below 100 words the call short-circuits and you get raw Parakeet output. The threshold targets long-form dictation (e.g. LLM prompts, notes) where the cleanup is actually visible.
@@ -206,35 +202,17 @@ If the toggle shows "requires approval" in System Settings, click it to turn it 
 
 ---
 
-## Backing up your API key
+## Moving your API key
 
-Your API key is stored in the macOS Keychain. To move it to another Mac or share it with a friend, use the export/import flow in Settings.
+Your keys live only in the macOS Keychain (`co.wispralt` for the Local server key, `co.wispralt.openai` for OpenAI). WisprAlt has no export, import or "Copy API Key" button: a key never lands in a file or on the clipboard from the app.
 
-**Export:**
-1. Open the WisprAlt settings popover → **Export API Key…**
-2. Save the file to your **Desktop** (the default location).
-3. The file is a plain text `.wispralt-key` file set to mode `0600`.
+To set up another Mac, get the key again from where it was issued (your server operator for the Local key, the OpenAI dashboard for an OpenAI key) and paste it into Settings → Advanced on the new Mac, or add it from Terminal:
 
-**IMPORTANT — treat this file like a password. Never save the export file to:**
-- `~/Documents/` (likely synced to iCloud Drive)
-- iCloud Drive
-- Dropbox
-- Google Drive
-- Any cloud-synced location
+```bash
+security add-generic-password -U -s co.wispralt.openai -a default -w
+```
 
-Once you have moved the file to the destination Mac (e.g. via AirDrop or a USB drive), delete the export file from your Desktop.
-
-**Import:**
-1. On the destination Mac, open Settings → **Import API Key…**
-2. Select the `.wispralt-key` file. The key is written to the Keychain immediately.
-3. Click **Test Connection** to confirm the key works.
-
-### Restoring on a new Mac
-
-1. Export the key from your current Mac (Settings → Export API Key).
-2. Transfer via AirDrop or a USB drive. **Do not email or message it.**
-3. Import on the new Mac (Settings → Import API Key).
-4. Delete the export file from both Macs once the import succeeds.
+(`-w` with no value prompts for the key, so it never appears in your shell history.) Never email or message a key.
 
 ---
 

@@ -1,5 +1,6 @@
 import AppKit
 import ServiceManagement
+import WisprAltCore
 
 /// Root application delegate.
 ///
@@ -62,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 suite.set(true, forKey: didAutoRegisterKey)
             } catch {
                 Log.warning(
-                    "SMAppService.register() failed: \(error). Verify the app is signed with Apple Development identity.",
+                    "SMAppService.register() failed: \(ErrorLog.describe(error)). Verify the app is signed with Apple Development identity.",
                     category: "lifecycle"
                 )
                 // Do NOT set the flag on failure so we retry next launch.
@@ -112,16 +113,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Private helpers
 
     private func logPermissionResults(_ results: [PermissionStatus]) {
-        let names = ["Accessibility", "Input Monitoring", "Microphone"]
+        let labels = ["Accessibility", "Input Monitoring", "Microphone"]
         for (i, status) in results.enumerated() {
-            let name = i < names.count ? names[i] : "Permission \(i + 1)"
+            let label = i < labels.count ? labels[i] : "Permission \(i + 1)"
             switch status {
             case .granted:
-                Log.info("\(name): granted.", category: "permissions")
+                Log.info("\(label): granted.", category: "permissions")
             case .denied:
-                Log.warning("\(name): denied.", category: "permissions")
+                Log.warning("\(label): denied.", category: "permissions")
             case .unknown:
-                Log.warning("\(name): unknown status.", category: "permissions")
+                Log.warning("\(label): unknown status.", category: "permissions")
             }
         }
     }

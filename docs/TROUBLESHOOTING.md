@@ -248,7 +248,7 @@ Override at deploy via env vars:
 **Cause 2 — `AVAudioFile` Float→Int16 amplification.** The second version asked AVAudioFile.write to convert Float32 buffers to Int16 PCM inline. AVAudioFile's internal converter applies a buggy ~140x normalization: a clean 0.24-peak voice landed in the WAV as a 32750/32767 (rail-clipped) Int16. Audio "decoded" fine on the server side (right format, right size), but Parakeet saw heavily distorted speech and returned random one-word hallucinations. **Fixed:** the recorder now writes **Float32 PCM** at native rate, format-matched to the tap buffer so AVAudioFile streams the float bytes verbatim without any conversion.
 
 **How to verify the fix is working:**
-1. Console.app, filter by `co.wispralt`.
+1. Console.app, filter by `co.wispralt`. (Release builds log messages as `<private>`; read them in a DEBUG build, or see [Reading client logs](#reading-client-logs).)
 2. FN-hold and speak a sentence in TextEdit.
 3. Look for a log line like:
    ```
@@ -555,3 +555,8 @@ dictation/timing: inject_ms=18.7 total_ms=1873.5
 3. If `stop_ms` > 100ms — `AVAudioFile` close is taking unexpectedly long; investigate the dictation IO queue.
 
 **Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the Mac mini at `~/Library/Logs/WisprAlt/wispralt.log`.
+
+## Reading client logs
+
+Client log messages are `.private` in release builds, so Console.app and `log stream` show `<private>` for them; DEBUG builds (`swift build`, `swift run`) log them in full. Either way the client never logs transcript text, server responses or reasons, file names, paths, URLs or keys; errors appear only as a type and code (for example `server(status: 500)` or `NSURLErrorDomain#-1009`). To see message text on a release build, run a DEBUG build from source.
+

@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import WisprAltCore
 
 /// v0.5.0 — lightweight in-app update awareness.
 ///
@@ -105,7 +106,7 @@ final class UpdateChecker {
                 MenuBarController.shared?.setUpdateBadge(visible: badgeOn)
             }
         } catch {
-            Log.warning("UpdateChecker: fetchLatestTag failed: \(error)", category: "update")
+            Log.warning("UpdateChecker: fetchLatestTag failed: \(ErrorLog.describe(error))", category: "update")
             await MainActor.run {
                 Settings.shared.lastUpdateCheck = Date()
             }
@@ -146,7 +147,8 @@ final class UpdateChecker {
         """
         var errorInfo: NSDictionary?
         guard let script = NSAppleScript(source: scriptSource) else {
-            fallbackToClipboard(reason: "NSAppleScript init returned nil")
+            Log.warning("UpdateChecker: NSAppleScript init returned nil — copying install command to clipboard.", category: "update")
+            fallbackToClipboard()
             return
         }
         _ = script.executeAndReturnError(&errorInfo)
@@ -156,18 +158,18 @@ final class UpdateChecker {
             // -1744: user denied access via TCC prompt.
             // -1728: app not running / can't get reference (Terminal not installed).
             if [-1743, -1744, -1728].contains(code) {
-                fallbackToClipboard(reason: "AppleScript error \(code): \(info)")
+                Log.warning("UpdateChecker: AppleScript error \(code) — copying install command to clipboard.", category: "update")
+                fallbackToClipboard()
                 return
             }
             Log.warning(
-                "UpdateChecker: AppleScript executed with non-fatal error \(code): \(info)",
+                "UpdateChecker: AppleScript executed with non-fatal error \(code).",
                 category: "update"
             )
         }
     }
 
-    private func fallbackToClipboard(reason: String) {
-        Log.warning("UpdateChecker: \(reason) — copying install command to clipboard.", category: "update")
+    private func fallbackToClipboard() {
         // -q so a malformed ~/.curlrc can't make this fetch print an empty-host curl
         // error or fail before the script runs (matches the Terminal path above).
         let command = "curl -q -fsSL \(Self.installURL) | bash"

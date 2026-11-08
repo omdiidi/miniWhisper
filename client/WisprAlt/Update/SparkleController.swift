@@ -1,5 +1,6 @@
 import AppKit
 import Sparkle
+import WisprAltCore
 
 /// Manages Sparkle 2 auto-update lifecycle.
 ///
@@ -78,7 +79,7 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     /// notification, since the only way this fires today is if someone manually
     /// invokes Sparkle while the appcast is still a placeholder.
     func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
-        Log.error("Sparkle update aborted: \(error.localizedDescription)", category: "update")
+        Log.error("Sparkle update aborted: \(ErrorLog.describe(error))", category: "update")
         menuBarController?.lastUpdateError = error.localizedDescription
     }
 
@@ -96,7 +97,7 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
         error: Error?
     ) {
         if let error {
-            Log.error("Sparkle update cycle finished with error: \(error.localizedDescription)", category: "update")
+            Log.error("Sparkle update cycle finished with error: \(ErrorLog.describe(error))", category: "update")
         }
     }
 }

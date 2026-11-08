@@ -58,10 +58,9 @@ enum ServerError: Error, LocalizedError {
             return "The file is too large for the server to accept. Check the server MAX_UPLOAD_BYTES setting."
         case .uploadTruncated:
             return "The upload appears incomplete or corrupted. Please try again."
-        case .server(let status, let body):
-            if let body {
-                return "Server error \(status): \(body)"
-            }
+        case .server(let status, _):
+            // The body stays on the value for code paths; it never reaches
+            // user-facing or log text.
             return "Server error \(status)."
         case .decoding(let underlying):
             return "Could not parse the server response: \(underlying.localizedDescription)"

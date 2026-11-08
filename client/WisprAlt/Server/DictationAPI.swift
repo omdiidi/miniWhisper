@@ -132,7 +132,7 @@ enum DictationAPI {
             let (data, http) = try await ServerClient.shared.execute(request, retryOnReset: true)
             let decoded = try JSONDecoder().decode(TranscribeResponse.self, from: data)
             Log.debug(
-                "Dictation response: \"\(decoded.text)\" in \(decoded.duration_ms)ms via \(decoded.model_id) (status=\(http.statusCode))",
+                "Dictation response: chars=\(decoded.text.count) in \(decoded.duration_ms)ms (status=\(http.statusCode))",
                 category: "dictation"
             )
             return AttemptResult(result: .success(decoded.text))

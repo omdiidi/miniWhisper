@@ -94,7 +94,10 @@ Optional: set `SPARKLE_ED_PRIVATE_KEY` to a key file path to generate an
 appcast snippet at `client/build/appcast-snippet.xml`.
 
 ### `test-client.sh`
-Builds the client and runs its Swift Testing suite (`swift build && swift test` in `client/`). On a CommandLineTools-only Mac it adds the flags that find the CLT `Testing.framework`. Exports `WISPRALT_KEYCHAIN_TESTS=1` unless `CI` is set. See `docs/TESTING.md`.
+Builds the client and runs its Swift Testing suite (`swift build && swift test` in `client/`), then the log-privacy gate (`check-log-privacy.py --self-test`, then the scan). On a CommandLineTools-only Mac it adds the flags that find the CLT `Testing.framework`. Exports `WISPRALT_KEYCHAIN_TESTS=1` unless `CI` is set. See `docs/TESTING.md`.
+
+### `check-log-privacy.py`
+Python 3 scan of every `Log.info/debug/warning/error(` call in `client/WisprAlt` and `client/WisprAltCore` (multi-line calls joined; `//` and `///` comment lines skipped). Each `\(expr)` passes if it ends in `.count`, `.statusCode`, `.code` or `.rawValue` or is `ErrorLog.describe(…)`; otherwise it fails on transcript, error, URL, body, reason, file-name identifiers or `.path` / `.host` / `localizedDescription` / `absoluteString` / `errorDescription`, printing `file:line`. `--self-test` checks the checker against known leaks and known-safe lines. Exit 0 clean, 1 on any finding.
 
 ### `online-assumptions/run-all.sh`
 **Costs real money (OpenAI).** Builds the `WisprAltProbe` developer tool and runs `preflight` (P5 Keychain read, P1 ten-minute clip report) and `suite-file` (every file model on a short clip, one direct m4a upload). The probe reads the key from the Keychain itself, enforces the spend caps and appends every call to `tmp/mission/part3/openai-spend.jsonl`. Exit 0 PASS / 1 FAIL / 2 BLOCKED. See `docs/TESTING.md`.

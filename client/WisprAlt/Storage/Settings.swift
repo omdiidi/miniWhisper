@@ -43,7 +43,7 @@ final class Settings: ObservableObject {
             if let url = serverURL {
                 guard url.scheme == "https" else {
                     Log.warning(
-                        "serverURL rejected — scheme must be https: \(url.absoluteString)",
+                        "serverURL rejected — scheme must be https.",
                         category: "settings"
                     )
                     // Revert to previous persisted value without triggering another didSet.
@@ -259,7 +259,7 @@ extension Settings {
                 }
                 objectWillChange.send()
             } catch {
-                Log.warning("Launch-at-login toggle failed: \(error)", category: "lifecycle")
+                Log.warning("Launch-at-login toggle failed: \(ErrorLog.describe(error))", category: "lifecycle")
             }
         }
     }

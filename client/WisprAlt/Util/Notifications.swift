@@ -1,5 +1,6 @@
 import Foundation
 import UserNotifications
+import WisprAltCore
 
 /// App-level notification helpers.
 ///
@@ -19,7 +20,7 @@ enum AppNotifications {
             options: [.alert, .sound]
         ) { granted, error in
             if let error {
-                Log.error("Notification authorization error: \(error.localizedDescription)", category: "notifications")
+                Log.error("Notification authorization error: \(ErrorLog.describe(error))", category: "notifications")
                 return
             }
             if granted {
@@ -58,7 +59,7 @@ enum AppNotifications {
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
                 Log.error(
-                    "Failed to post notification '\(title)': \(error.localizedDescription)",
+                    "Failed to post notification: \(ErrorLog.describe(error))",
                     category: "notifications"
                 )
             }

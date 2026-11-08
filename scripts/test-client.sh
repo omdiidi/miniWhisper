@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the macOS client and run its Swift Testing suite (WisprAltCoreTests).
+# Build the macOS client, run its Swift Testing suite (WisprAltCoreTests),
+# then the log-privacy gate.
 # Every commit runs this plus the server pytest runner.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,3 +22,7 @@ if [[ "$(xcode-select -p)" == *CommandLineTools* ]]; then
 fi
 
 (cd "$ROOT/client" && swift build && swift test ${TEST_FLAGS[@]+"${TEST_FLAGS[@]}"})
+
+# Log-privacy gate: no transcript text, bodies, server reasons, paths, URLs or
+# keys in any Log call. The self-test proves the checker still catches leaks.
+(cd "$ROOT" && python3 scripts/check-log-privacy.py --self-test && python3 scripts/check-log-privacy.py)

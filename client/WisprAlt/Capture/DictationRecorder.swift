@@ -486,7 +486,7 @@ final class DictationRecorder {
             )
             audioFile = file
         } catch {
-            Log.error("DictationRecorder: failed to open AVAudioFile: \(error)", category: "capture")
+            Log.error("DictationRecorder: failed to open AVAudioFile: \(ErrorLog.describe(error))", category: "capture")
             audioFileURL = nil
             try? FileManager.default.removeItem(at: tempURL)
             throw DictationError.engineStartFailed(error)
@@ -621,7 +621,7 @@ final class DictationRecorder {
                     try file.write(from: buffer)
                     self.frameCounter.withLock { $0 &+= buffer.frameLength }
                 } catch {
-                    Log.error("DictationRecorder: write failed: \(error)", category: "capture")
+                    Log.error("DictationRecorder: write failed: \(ErrorLog.describe(error))", category: "capture")
                     self.writeError.withLock { existing in
                         if existing == nil { existing = error }
                     }

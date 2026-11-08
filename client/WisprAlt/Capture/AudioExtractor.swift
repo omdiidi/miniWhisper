@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import WisprAltCore
 
 /// Pre-upload helper that extracts the audio track from a video container into
 /// a temp `.m4a` (or `.mp4` fallback). The original video is left untouched.
@@ -41,7 +42,7 @@ enum AudioExtractor {
             audioTracks = try await asset.loadTracks(withMediaType: .audio)
         } catch {
             Log.warning(
-                "AudioExtractor: track probe failed (\(error.localizedDescription)) — using original.",
+                "AudioExtractor: track probe failed (\(ErrorLog.describe(error))) — using original.",
                 category: "transcribe"
             )
             return url
@@ -65,7 +66,7 @@ enum AudioExtractor {
             try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         } catch {
             Log.warning(
-                "AudioExtractor: failed to create temp dir (\(error.localizedDescription)) — using original.",
+                "AudioExtractor: failed to create temp dir (\(ErrorLog.describe(error))) — using original.",
                 category: "transcribe"
             )
             return url
@@ -118,8 +119,11 @@ enum AudioExtractor {
         }
 
         guard export.status == .completed else {
-            let err = export.error?.localizedDescription ?? "status=\(export.status.rawValue)"
-            Log.warning("AudioExtractor: export failed (\(err)) — using original.", category: "transcribe")
+            let cause = export.error.map { ErrorLog.describe($0) } ?? "none"
+            Log.warning(
+                "AudioExtractor: export failed (status=\(export.status.rawValue), \(cause)) — using original.",
+                category: "transcribe"
+            )
             return url
         }
 

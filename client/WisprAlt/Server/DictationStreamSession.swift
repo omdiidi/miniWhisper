@@ -1,4 +1,5 @@
 import Foundation
+import WisprAltCore
 
 /// Failures surfaced by the streaming dictation path. The caller
 /// (`DictationAPI.transcribe`) treats any of these as a signal to fall back
@@ -87,7 +88,7 @@ actor DictationStreamSession {
                 // they latch `aborted`, which makes finalize() throw.
                 await self.chunkFinished(index)
             } catch {
-                await self.markAborted(reason: "\(error)")
+                await self.markAborted(cause: ErrorLog.describe(error))
                 throw error
             }
         }
@@ -116,7 +117,7 @@ actor DictationStreamSession {
                 try await group.waitForAll()
             } catch {
                 group.cancelAll()
-                self.markAborted(reason: "chunk_failed")
+                self.markAborted(cause: "chunk_failed")
                 throw error
             }
             return try await self.postFinalize(tail: tail, smartFormat: smartFormat)
@@ -133,12 +134,13 @@ actor DictationStreamSession {
         inFlight.removeAll()
     }
 
-    private func markAborted(reason: String) {
+    /// `cause` is a fixed label or `ErrorLog.describe` output, never raw error text.
+    private func markAborted(cause: String) {
         if aborted { return }
         aborted = true
         for t in inFlight.values { t.cancel() }
         Log.warning(
-            "stream session aborted: \(reason) sessionId=\(sessionId)",
+            "stream session aborted: \(cause) sessionId=\(sessionId)",
             category: "dictation"
         )
     }

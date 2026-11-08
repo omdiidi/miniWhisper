@@ -48,7 +48,7 @@ final class LastTranscriptCaptionViewModel: ObservableObject {
         fd = open(folderURL.path, O_EVTONLY)
         guard fd >= 0 else {
             Log.warning(
-                "LastTranscriptCaptionViewModel: open() failed for \(folderURL.path)",
+                "LastTranscriptCaptionViewModel: open() failed for transcripts folder",
                 category: "captions"
             )
             refresh()

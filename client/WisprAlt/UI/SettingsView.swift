@@ -54,12 +54,8 @@ struct SettingsView: View {
     @State private var isTesting: Bool = false
     /// File picker presented when "Browse" is tapped.
     @State private var showingFolderPicker: Bool = false
-    /// Error message shown below the export/import buttons when an operation fails.
-    @State private var exportImportError: String?
-    /// Reveals the Server URL / API Key / Export-Import block at the bottom of the form.
+    /// Reveals the Server URL / API Key block at the bottom of the form.
     @State private var showAdvanced: Bool = false
-    @State private var copyFeedback: String?
-    @State private var hasStoredAPIKey: Bool = false
     /// Shown for ~5s when UpdateChecker.triggerInstall() couldn't open Terminal
     /// (TCC denied / Terminal missing) and fell back to copying the install
     /// command to the clipboard. Listens for `.updaterFallbackToClipboard`.
@@ -117,7 +113,6 @@ struct SettingsView: View {
                 if isLocal {
                     serverSection
                     apiKeySection
-                    apiKeyExportImportSection
                 }
                 aboutAndQuitSection
             }
@@ -327,74 +322,6 @@ struct SettingsView: View {
                 Button("Open Login Items in System Settings") {
                     SMAppService.openSystemSettingsLoginItems()
                 }
-            }
-        }
-    }
-
-    private var apiKeyExportImportSection: some View {
-        Section("API Key Backup") {
-            HStack {
-                Button("Copy API Key") {
-                    copyAPIKeyToClipboard()
-                }
-                .disabled(!hasStoredAPIKey)
-                .help(hasStoredAPIKey ? "Copy your API key. Auto-cleared from clipboard after 60 seconds." : "Paste an API key first")
-
-                Button("Export API Key…") {
-                    let panel = NSSavePanel()
-                    panel.allowedContentTypes = [.text]
-                    panel.nameFieldStringValue = "wispralt-api-key.wispralt-key"
-                    panel.directoryURL = FileManager.default.urls(
-                        for: .desktopDirectory, in: .userDomainMask
-                    ).first
-                    panel.message = "Exports your API key. Treat this file like a password."
-                    guard panel.runModal() == .OK, let url = panel.url else { return }
-                    do {
-                        try KeychainHelper.exportAPIKey(to: url)
-                        exportImportError = nil
-                    } catch {
-                        Log.error("API key export failed: \(error)", category: "storage")
-                        exportImportError = "Export failed: \(error.localizedDescription)"
-                    }
-                }
-
-                Button("Import API Key…") {
-                    let panel = NSOpenPanel()
-                    panel.allowedContentTypes = [.text]
-                    panel.directoryURL = FileManager.default.urls(
-                        for: .desktopDirectory, in: .userDomainMask
-                    ).first
-                    panel.message = "Importing replaces any existing API key in the Keychain."
-                    guard panel.runModal() == .OK, let url = panel.url else { return }
-                    do {
-                        try KeychainHelper.importAPIKey(from: url)
-                        exportImportError = nil
-                        // Refresh the in-memory text field so the UI reflects the new key.
-                        do {
-                            apiKeyText = (try KeychainHelper.getAPIKey()) ?? ""
-                        } catch {
-                            Log.error("Failed to re-read API key after import: \(error)", category: "settings")
-                        }
-                    } catch {
-                        Log.error("API key import failed: \(error)", category: "storage")
-                        exportImportError = "Import failed: \(error.localizedDescription)"
-                    }
-                }
-            }
-
-            Text("Save exports to your Desktop, not Documents (Documents may sync to iCloud).")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            if let msg = exportImportError {
-                Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-            if let msg = copyFeedback {
-                Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(.green)
             }
         }
     }
@@ -628,9 +555,8 @@ struct SettingsView: View {
         do {
             apiKeyText = (try KeychainHelper.getAPIKey()) ?? ""
         } catch {
-            Log.error("Failed to read API key from Keychain: \(error)", category: "settings")
+            Log.error("Failed to read API key from Keychain: \(ErrorLog.describe(error))", category: "settings")
         }
-        hasStoredAPIKey = ((try? KeychainHelper.getAPIKey()) ?? nil)?.isEmpty == false
     }
 
     /// Local `/healthz` for the status line. Never runs in Online (the Local
@@ -691,7 +617,7 @@ struct SettingsView: View {
             return
         }
         settings.serverURL = url
-        Log.info("Server URL saved: \(url.absoluteString)", category: "settings")
+        Log.info("Server URL saved.", category: "settings")
     }
 
     /// Commit the in-progress `nameDraft` to the server via `PATCH /me`.
@@ -718,7 +644,7 @@ struct SettingsView: View {
             nameDraft = nil   // exit edit mode ONLY on success
             nameError = nil
         } catch {
-            Log.warning("display_name update failed: \(error)", category: "settings")
+            Log.warning("display_name update failed: \(ErrorLog.describe(error))", category: "settings")
             nameError = "Couldn't save: \(error.localizedDescription)"
             // KEEP nameDraft so user can retry without retyping.
         }
@@ -731,40 +657,7 @@ struct SettingsView: View {
             try KeychainHelper.setAPIKey(trimmed)
             Log.info("API key saved to Keychain.", category: "settings")
         } catch {
-            Log.error("Failed to save API key: \(error)", category: "settings")
-        }
-    }
-
-    private func copyAPIKeyToClipboard() {
-        do {
-            guard let key = try KeychainHelper.getAPIKey(), !key.isEmpty else {
-                copyFeedback = "No API key to copy."
-                return
-            }
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(key, forType: .string)
-            let mark = pb.changeCount  // post-write changeCount
-            copyFeedback = "Copied! Auto-clearing in 60s."
-            Log.info("API key copied to clipboard.", category: "settings")
-
-            // Two timers: caption fades fast, clipboard auto-clears slow.
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 2 * 1_000_000_000)
-                copyFeedback = nil
-            }
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
-                if NSPasteboard.general.changeCount == mark {
-                    NSPasteboard.general.clearContents()
-                    Log.info("Auto-cleared API key from clipboard (changeCount unchanged).", category: "settings")
-                } else {
-                    Log.info("Skipped clipboard auto-clear — pasteboard changed.", category: "settings")
-                }
-            }
-        } catch {
-            Log.error("Copy API key failed: \(error)", category: "settings")
-            copyFeedback = "Copy failed: \(error.localizedDescription)"
+            Log.error("Failed to save API key: \(ErrorLog.describe(error))", category: "settings")
         }
     }
 
@@ -774,9 +667,9 @@ struct SettingsView: View {
             // Gain a security-scoped bookmark for sandboxed access (future hardened runtime use).
             _ = url.startAccessingSecurityScopedResource()
             settings.meetingsPath = url
-            Log.info("Transcripts folder set to: \(url.path)", category: "settings")
+            Log.info("Transcripts folder set.", category: "settings")
         case .failure(let error):
-            Log.error("Folder picker failed: \(error)", category: "settings")
+            Log.error("Folder picker failed: \(ErrorLog.describe(error))", category: "settings")
         }
     }
 
@@ -853,7 +746,7 @@ struct SettingsView: View {
         guard let base = settings.serverURL else { return }
         let url = base.appendingPathComponent("admin/login")
         NSWorkspace.shared.open(url)
-        Log.info("Opened portal: \(url.absoluteString)", category: "settings")
+        Log.info("Opened portal.", category: "settings")
     }
 }
 
@@ -988,7 +881,7 @@ private struct QuickActionsSection: View {
                     withIntermediateDirectories: true
                 )
                 NSWorkspace.shared.open(url)
-                Log.info("Opened custom transcriptions folder: \(url.path)", category: "settings")
+                Log.info("Opened custom transcriptions folder.", category: "settings")
             }
             .buttonStyle(.bordered)
             .help("Opens the File Transcriptions folder in Finder.")
@@ -997,7 +890,7 @@ private struct QuickActionsSection: View {
                 let url = settings.meetingsPath
                 try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
                 NSWorkspace.shared.open(url)
-                Log.info("Opened transcripts folder: \(url.path)", category: "settings")
+                Log.info("Opened transcripts folder.", category: "settings")
             }
             .buttonStyle(.bordered)
             .help("Opens \(settings.meetingsPath.path) in Finder.")
@@ -1024,7 +917,7 @@ private struct QuickActionsSection: View {
             guard let base = settings.serverURL else { return }
             let url = base.appendingPathComponent("admin/login")
             NSWorkspace.shared.open(url)
-            Log.info("Opened portal: \(url.absoluteString)", category: "settings")
+            Log.info("Opened portal.", category: "settings")
         }
         .buttonStyle(.bordered)
         .disabled(settings.serverURL == nil)
@@ -1043,7 +936,7 @@ private struct QuickActionsSection: View {
             comps?.queryItems = [URLQueryItem(name: "next", value: "/me/history")]
             guard let url = comps?.url else { return }
             NSWorkspace.shared.open(url)
-            Log.info("Opened /me/login?next=/me/history: \(url.absoluteString)", category: "settings")
+            Log.info("Opened /me/login?next=/me/history.", category: "settings")
         }
         .buttonStyle(.bordered)
         .disabled(settings.serverURL == nil)
@@ -1232,7 +1125,7 @@ private struct QuickActionsSection: View {
             let count = try CustomTranscriptionsStore.copyToPasteboard(url)
             copyToast = (button, "Copied — \(count.formatted(.number)) chars")
         } catch {
-            Log.warning("copyToPasteboard failed for \(url.path): \(error)", category: "settings")
+            Log.warning("copyToPasteboard failed: \(ErrorLog.describe(error))", category: "settings")
             copyToast = (button, "Copy failed: \(error.localizedDescription)")
         }
         Task { @MainActor in
@@ -1258,7 +1151,7 @@ private struct QuickActionsSection: View {
             } catch ServerError.unauthorized {
                 copyToast = ("last-dictation", "API key rejected.")
             } catch {
-                Log.warning("Copy-last-dictation failed: \(error)", category: "settings")
+                Log.warning("Copy-last-dictation failed: \(ErrorLog.describe(error))", category: "settings")
                 copyToast = ("last-dictation", "Couldn't fetch — try again.")
             }
             try? await Task.sleep(nanoseconds: 1_800_000_000)
@@ -1333,10 +1226,10 @@ private struct ServerLogSheet: View {
             } else {
                 loadError = "Failed to fetch log: \(error.localizedDescription)"
             }
-            Log.warning("ServerLogSheet fetch failed: \(error)", category: "ui")
+            Log.warning("ServerLogSheet fetch failed: \(ErrorLog.describe(error))", category: "ui")
         } catch {
             loadError = "Failed to fetch log: \(error.localizedDescription)"
-            Log.warning("ServerLogSheet fetch failed: \(error)", category: "ui")
+            Log.warning("ServerLogSheet fetch failed: \(ErrorLog.describe(error))", category: "ui")
         }
     }
 }

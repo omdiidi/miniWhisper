@@ -318,7 +318,7 @@ extension MenuBarController {
             } catch ServerError.transport(let underlying) {
                 lastError = underlying
                 Log.warning(
-                    "Poll transport error (attempt \(attempt + 1)): \(underlying.localizedDescription) — backing off.",
+                    "Poll transport error (attempt \(attempt + 1)): \(ErrorLog.describe(underlying)) — backing off.",
                     category: "transcribe"
                 )
             }
@@ -535,7 +535,7 @@ extension MenuBarController {
                     // "cancelled by user" is a silent end; anything else is
                     // logged (resume never toasts).
                     if reason != FileJobContract.cancelledByUserReason {
-                        Log.warning("Resumed-job failed: \(reason)", category: "transcribe")
+                        Log.warning("Resumed-job failed (server_failed)", category: "transcribe")
                     }
                     recordingState.activeJobID = nil
                     recordingState.serverFinishingJobID = nil
@@ -703,7 +703,7 @@ extension MenuBarController {
             subdir = try CustomTranscriptionsStore.makeJobDirectory(forStem: stem)
         } catch {
             let message = formatTranscriptionError(error)
-            Log.error("Custom transcription: makeJobDirectory failed: \(message)", category: "transcribe")
+            Log.error("Custom transcription: makeJobDirectory failed: \(ErrorLog.describe(error))", category: "transcribe")
             guard mayWrite(gen) else { return }
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)
             localUploadPhase = .none
@@ -717,7 +717,7 @@ extension MenuBarController {
             try FileManager.default.copyItem(at: picked, to: originalDestination)
         } catch {
             let message = formatTranscriptionError(error)
-            Log.error("Custom transcription: copy source file failed: \(message)", category: "transcribe")
+            Log.error("Custom transcription: copy source file failed: \(ErrorLog.describe(error))", category: "transcribe")
             try? FileManager.default.removeItem(at: subdir)
             guard mayWrite(gen) else { return }
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)
@@ -755,7 +755,7 @@ extension MenuBarController {
                 stem: stem,
                 gen: gen
             )
-            Log.info("Custom transcription complete — \(stem)", category: "transcribe")
+            Log.info("Custom transcription complete — chars=\(stem.count)", category: "transcribe")
             guard mayWrite(gen) else { return }
 
             NotificationCenter.default.post(name: .wisprAltTranscriptWritten, object: nil)
@@ -770,11 +770,11 @@ extension MenuBarController {
         } catch {
             if Self.isCancellation(error) {
                 // User cancelled; cancelActiveTranscription() already reset state.
-                Log.info("Custom transcription cancelled — \(stem)", category: "transcribe")
+                Log.info("Custom transcription cancelled — chars=\(stem.count)", category: "transcribe")
                 return
             }
             let message = formatTranscriptionError(error)
-            Log.error("Custom transcription failed: \(message)", category: "transcribe")
+            Log.error("Custom transcription failed: \(ErrorLog.describe(error))", category: "transcribe")
             guard mayWrite(gen) else { return }
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)
             localUploadPhase = .none
