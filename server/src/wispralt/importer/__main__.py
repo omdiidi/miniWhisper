@@ -75,9 +75,7 @@ def _open_db() -> Database:
 
     db = Database(settings.db_path)
     if not db.path.exists():
-        raise ExportUnavailable(
-            f"{db.path} does not exist: run `wispralt setup --role host` first"
-        )
+        raise ExportUnavailable(f"{db.path} does not exist: run `wispralt setup --role host` first")
     return db
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from wispralt.importer.supabase_export import TableDump
+
 USER_COLS = [
     "id", "label", "token_hash", "role", "created_at", "last_seen_at", "revoked_at", "notes",
     "display_name", "kind",
@@ -56,12 +58,13 @@ class FakeSource:
         rows = self.rows.get(table, [])
         return list(rows[0]) if rows else []
 
-    def count(self, table: str) -> tuple[int, int | None]:
-        self.calls.append(("count", table))
-        rows = self.rows[table]
-        return len(rows), max((r["id"] for r in rows), default=None)
-
-    def page(self, table: str, cols: list[str], after_id: int, limit: int) -> list[dict]:
-        self.calls.append(("page", table))
-        got = sorted((r for r in self.rows[table] if r["id"] > after_id), key=lambda r: r["id"])
-        return [{c: r[c] for c in cols} for r in got[:limit]]
+    def dump(self, plan: dict[str, list[str]]) -> dict[str, TableDump]:
+        self.calls.append(("dump", ",".join(plan)))
+        out = {}
+        for table, cols in plan.items():
+            rows = sorted(self.rows[table], key=lambda r: r["id"])
+            out[table] = TableDump(
+                len(rows), max((r["id"] for r in rows), default=None),
+                [{c: r[c] for c in cols} for r in rows],
+            )  # fmt: skip
+        return out
