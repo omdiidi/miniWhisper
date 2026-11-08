@@ -70,6 +70,18 @@ ditto --norsrc --noextattr "$EXEC_PATH" "$APP_PATH/Contents/MacOS/WisprAlt"
 ditto --norsrc --noextattr "$CLIENT_DIR/WisprAlt/Info.plist" "$APP_PATH/Contents/Info.plist"
 ditto --norsrc --noextattr "$SPARKLE_PATH" "$APP_PATH/Contents/Frameworks/Sparkle.framework"
 
+# The app's update check polls this clone's GitHub releases (owner/name from
+# `origin`, or WISPRALT_RELEASE_REPO). A non-GitHub clone gets no key and skips it.
+RELEASE_REPO="${WISPRALT_RELEASE_REPO:-}"
+if [[ -z "$RELEASE_REPO" ]]; then
+    ORIGIN="$(git -C "$CLIENT_DIR" remote get-url origin 2>/dev/null || true)"
+    RELEASE_REPO="$(printf '%s' "$ORIGIN" | sed -nE 's#^.*github\.com[:/]([^/]+/[^/]+)$#\1#p' | sed 's#\.git$##')"
+fi
+if [[ -n "$RELEASE_REPO" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :WisprAltReleaseRepo string $RELEASE_REPO" \
+        "$APP_PATH/Contents/Info.plist"
+fi
+
 # Compile the asset catalog with actool. SPM does NOT auto-run actool on .xcassets
 # resources — it just copies the directory raw. We compile manually so the bundle
 # ships a proper Assets.car.

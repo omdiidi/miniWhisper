@@ -136,7 +136,8 @@ def test_add_employee_creates_user_and_install_command(
         "/admin/people/new", data={"label": "  nicholas  ", "role": "employee"}, headers=admin[1]
     )
     assert resp.status_code == 200, resp.text
-    assert "WISPRALT_API_KEY=" in resp.text and "WISPRALT_SERVER=https://example.test" in resp.text
+    assert "./install.sh --role client --client-mode local" in resp.text
+    assert "https://example.test" in resp.text and "curl" not in resp.text
     [token] = set(re.findall(r"\b[0-9a-f]{64}\b", resp.text))
     user = accounts.lookup_key(hash_token(token))
     assert user is not None and user.label == "nicholas" and user.kind == "employee"

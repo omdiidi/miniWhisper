@@ -12,15 +12,17 @@
 
   {% call ui.card("1. Install command (send this to " ~ label ~ ")") %}
     {{ ui.secret_once(install_command, "install-cmd") }}
+    <p class="muted small">Replace <code>&lt;repo-url&gt;</code> with your WisprAlt repository's URL.</p>
   {% endcall %}
-  {% call ui.card("2. Just the key (to paste into Settings)") %}
+  {% call ui.card("2. Server URL and key (to paste into Settings)") %}
+    <p>Server URL: <code>{{ server_url }}</code></p>
     {{ ui.secret_once(plaintext, "token") }}
   {% endcall %}
   {% call ui.card("What the employee does") %}
     <ol>
-      <li>Opens Terminal on the Mac they dictate from.</li>
-      <li>Pastes the install command and presses Enter.</li>
-      <li>The script downloads, signs in and launches WisprAlt.</li>
+      <li>Opens Terminal on the Mac they dictate from and runs the install command.</li>
+      <li>The installer builds and opens WisprAlt in Local mode.</li>
+      <li>In WisprAlt Settings &gt; Advanced, pastes the server URL and the key.</li>
       <li>Grants the three macOS permissions (Accessibility, Input Monitoring, Microphone).</li>
     </ol>
   {% endcall %}

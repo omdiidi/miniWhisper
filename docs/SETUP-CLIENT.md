@@ -257,8 +257,7 @@ security add-generic-password -U -s co.wispralt.openai -a default -w
 
 ## Auto-Updates
 
-**Tier 1.5 distribution** (the current path) uses GitHub Releases via
-the `/wispralt-update` Claude Code slash command. Sparkle is **disabled**
+Updates come from the clone via `wispralt update --client`. Sparkle is **disabled**
 in be720a1 — the framework is bundled but the auto-updater never runs:
 
 - `SUEnableAutomaticChecks=false` in `Info.plist`
@@ -272,8 +271,9 @@ The previous `Info.plist` had a placeholder `SUFeedURL` that triggered
 dialog completely.
 
 **To update:** run `wispralt update --client`: it pulls the clone,
-rebuilds the app and swaps it into place. (The in-app update check still
-points at the retired release installer until it is retargeted.)
+rebuilds the app and swaps it into place. The app polls the clone's GitHub
+releases and, when one is newer, Settings > Updates offers **Copy update
+command** (see [ARCHITECTURE.md](ARCHITECTURE.md#in-app-updater)).
 
 When we move to Tier 2 distribution (Apple Developer Program +
 notarized builds + signed appcast), flip `SUEnableAutomaticChecks=true`

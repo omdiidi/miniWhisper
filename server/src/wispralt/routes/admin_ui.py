@@ -285,16 +285,12 @@ def _validate_optional_display_name(raw: str) -> tuple[str | None, str | None]:
     return cleaned, None
 
 
-def _build_install_command(server_url: str, plaintext: str) -> str:
-    """Compose the curl one-liner. Env vars sit on the bash side of the pipe
-    (the curl-side form drops them — see CHANGELOG.md [0.1.1]).
-    """
-    # -q makes curl ignore the employee's ~/.curlrc, so a malformed config (a stray
-    # url/proxy line) can't make this fetch print "curl: (6) Could not resolve host:"
-    # or fail before the script runs.
+def _build_install_command() -> str:
+    """What the employee runs on their Mac (docs/INSTALL.md): install the app from a
+    clone in Local mode. The server URL and key are pasted into the app's Settings."""
     return (
-        "curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \\\n"
-        f"  | WISPRALT_API_KEY={plaintext} WISPRALT_SERVER={server_url} bash"
+        "git clone <repo-url> wispralt && cd wispralt\n"
+        "./install.sh --role client --client-mode local"
     )
 
 
@@ -372,7 +368,8 @@ async def people_add_submit(
             "role": user.role,
             "display_name": clean_display_name,
             "plaintext": plaintext,
-            "install_command": _build_install_command(settings.server_url, plaintext),
+            "server_url": settings.server_url,
+            "install_command": _build_install_command(),
         },
         headers=NO_STORE,
     )

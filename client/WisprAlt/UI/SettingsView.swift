@@ -56,13 +56,8 @@ struct SettingsView: View {
     @State private var showingFolderPicker: Bool = false
     /// Reveals the Server URL / API Key block at the bottom of the form.
     @State private var showAdvanced: Bool = false
-    /// Shown for ~5s when UpdateChecker.triggerInstall() couldn't open Terminal
-    /// (TCC denied / Terminal missing) and fell back to copying the install
-    /// command to the clipboard. Listens for `.updaterFallbackToClipboard`.
-    @State private var updateFallbackToastVisible: Bool = false
-    /// Shown for ~5s when the user pressed "Install now…" while a dictation
-    /// or file job was in progress. Listens for `.updaterDictationBusy`.
-    @State private var updateBusyToastVisible: Bool = false
+    /// Shown for ~5s after "Copy update command". Listens for `.updaterCommandCopied`.
+    @State private var updateCopiedVisible: Bool = false
 
     // Identity (display_name) editing state. Tri-state Optional<String> fixes the
     // snap-back bug:
@@ -333,7 +328,7 @@ struct SettingsView: View {
         }
     }
 
-    /// Update awareness — shows "Update available: vX.Y.Z" + Install button when
+    /// Update awareness — shows "Update available: vX.Y.Z" + a copy-command button when
     /// `Settings.shared.updateAvailable` is set; otherwise shows the current
     /// version + a manual "Check for updates" button. Set by UpdateChecker.
     private var updateSection: some View {
@@ -345,13 +340,13 @@ struct SettingsView: View {
                     Text("Update available: v\(remote)")
                         .font(.body.weight(.medium))
                     Spacer()
-                    Button("Install now…") {
-                        UpdateChecker.shared.triggerInstall()
+                    Button("Copy update command") {
+                        UpdateChecker.shared.copyUpdateCommand()
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
                 }
-                Text("Opens Terminal to download and install the latest WisprAlt. The current version will quit during the install.")
+                Text("Run `\(UpdateChecker.updateCommand)` in Terminal. It updates and reinstalls WisprAlt, which quits during the install, so finish any dictation or file transcription first.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -365,31 +360,18 @@ struct SettingsView: View {
                     .buttonStyle(.bordered)
                 }
             }
-            if updateFallbackToastVisible {
-                Text("Couldn't open Terminal — install command copied to clipboard. Paste it into a new Terminal window.")
+            if updateCopiedVisible {
+                Text("Copied. Paste it into Terminal and press Return.")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .transition(.opacity)
             }
-            if updateBusyToastVisible {
-                Text("Finish your current dictation or file transcription before installing — the installer will quit the app.")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .transition(.opacity)
-            }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .updaterFallbackToClipboard)) { _ in
-            updateFallbackToastVisible = true
+        .onReceive(NotificationCenter.default.publisher(for: .updaterCommandCopied)) { _ in
+            updateCopiedVisible = true
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
-                updateFallbackToastVisible = false
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .updaterDictationBusy)) { _ in
-            updateBusyToastVisible = true
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
-                updateBusyToastVisible = false
+                updateCopiedVisible = false
             }
         }
     }

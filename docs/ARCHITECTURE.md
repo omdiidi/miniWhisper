@@ -1177,15 +1177,12 @@ labels them so users can tell which dictations went through the old path.
 
 ---
 
-## In-app updater (v0.5.0)
+## In-app updater
 
 A lightweight in-app update checker runs alongside the still-disabled Sparkle
-wrapper. The new module lives at
-`client/WisprAlt/Update/UpdateChecker.swift` and is **deliberately not Sparkle**
-— it shells the old `install.sh` curl one-liner. Part 5 replaced that
-installer (it now needs a clone and prints "clone first" when piped), so until
-the checker is retargeted at `wispralt update --client` the in-app update does
-not install anything.
+wrapper. It lives at `client/WisprAlt/Update/UpdateChecker.swift` and is
+**deliberately not Sparkle**: it only notices a release; installing is
+`wispralt update --client`.
 
 - **Polling.** The checker fires 60 s after launch and then every 6 h,
   debounced via `Settings.shared.lastUpdateCheck` so a wake-from-sleep doesn't
@@ -1193,18 +1190,16 @@ not install anything.
   `https://api.github.com/repos/<owner>/<repo>/releases/latest` and compares the
   `tag_name` (minus the leading `v`) against the bundled
   `CFBundleShortVersionString` via a SemVer-aware numeric compare.
-- **Badge.** When a newer release is found, the checker flips
+  `<owner>/<repo>` is the bundle's `WisprAltReleaseRepo` key, which
+  `scripts/build-client-local.sh` stamps from the clone's GitHub `origin`
+  (`WISPRALT_RELEASE_REPO` overrides it). Without the key the check is skipped.
+- **Badge.** When a newer release is found, the checker sets
   `Settings.shared.updateAvailable` (UserDefaults-backed) and calls
-  `MenuBarController.shared.setUpdateBadge(visible: true)` — the latter
-  composites a subtle orange dot onto the menubar mic icon. The badge is only
-  rendered when `Settings.shared.serverURL != nil` so a half-configured install
-  doesn't show a misleading update prompt.
-- **Install now.** Settings → Advanced → Updates shows the current version, the
-  latest tag, and an "Install now…" button. The button shells out to
-  `Terminal.app` via `NSAppleScript` with the canonical curl install one-liner
-  pre-typed; if Automation TCC is denied (no Terminal scripting permission)
-  the command is dropped onto the clipboard with a "Paste this into Terminal"
-  toast as a fallback so the user is never stuck.
+  `MenuBarController.shared.setUpdateBadge(visible: true)`, which composites a
+  subtle orange dot onto the menubar mic icon.
+- **Update.** Settings → Advanced → Updates shows the new version and a
+  **Copy update command** button that puts `wispralt update --client` on the
+  clipboard, to paste into Terminal (the app quits while it is reinstalled).
 
 Source: `client/WisprAlt/Update/UpdateChecker.swift` +
 `client/WisprAlt/Storage/Settings.swift` (`updateAvailable`,

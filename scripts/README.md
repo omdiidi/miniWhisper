@@ -18,7 +18,7 @@ deploy, model-download and uninstall scripts were folded into it in Part 5.
 - Verifies tunnel via `curl $SERVER_URL/healthz`; explains HTTP 401 / 000 / 502 codes
 
 ### `build-client-local.sh`
-Builds an Apple-Development-signed `client/build/WisprAlt.app`. `wispralt setup --role client` runs it and installs the result.
+Builds an Apple-Development-signed `client/build/WisprAlt.app`. `wispralt setup --role client` runs it and installs the result. It stamps `WisprAltReleaseRepo` (`owner/name` from the clone's GitHub `origin`, or `WISPRALT_RELEASE_REPO`) into the built Info.plist for the app's update check.
 
 ### `verify-openai-compat.sh`
 Smoke test of the `/v1` OpenAI-compatible endpoints. `BASE_URL` defaults to the local host (`http://127.0.0.1:8000/v1`); `API_KEY` is required.

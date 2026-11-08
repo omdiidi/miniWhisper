@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # release-client.sh — Local-only release script.
 #
-# Omid runs this on his MacBook to ship a WisprAlt release to GitHub.
+# Run on a Mac with an Apple Development identity to ship a WisprAlt release to GitHub.
 # Bumps Info.plist version, builds the signed .app via build-client-local.sh,
 # packages a DMG, computes a SHA256 sidecar (bare filename so `shasum -c`
 # works in the employee's CWD), tags, pushes, and creates a GitHub Release.
@@ -92,8 +92,7 @@ echo "==> Computing SHA256 sidecar"
 # 5. Tag + push + GitHub Release with both assets.
 echo "==> Committing version bump"
 git add client/WisprAlt/Info.plist
-git -c user.email="zomid777@gmail.com" -c user.name="omid zahrai" \
-    commit -m "release: ${TAG}" || true
+git commit -m "release: ${TAG}" || true
 
 echo "==> Tagging ${TAG}"
 git tag "${TAG}"
@@ -112,4 +111,4 @@ gh release create "${TAG}" \
 
 echo ""
 echo "Release ${TAG} shipped."
-echo "Employees can install via the curl one-liner in docs/INSTALL.md or run /wispralt-update in Claude Code."
+echo "Each Mac updates with: wispralt update --client (fresh installs: docs/INSTALL.md)."

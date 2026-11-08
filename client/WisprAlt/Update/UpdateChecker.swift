@@ -2,31 +2,24 @@ import Foundation
 import AppKit
 import WisprAltCore
 
-/// v0.5.0 — lightweight in-app update awareness.
+/// Lightweight in-app update awareness: polls the GitHub Releases API.
 ///
-/// Replaces the disabled Sparkle path with a poll of the GitHub Releases API.
-/// `checkSoon()` schedules a one-shot check ~60 s after launch (so we don't
-/// race app startup), and `check(force:)` debounces subsequent checks to
-/// 6 h.  When `tag_name` from `/releases/latest` is semver-greater than
-/// the bundled `CFBundleShortVersionString`, we:
+/// `checkSoon()` schedules a one-shot check ~60 s after launch, then every
+/// 6 h; `check(force:)` debounces to 6 h. When `tag_name` from
+/// `/releases/latest` is semver-greater than the bundled
+/// `CFBundleShortVersionString`, it sets `Settings.shared.updateAvailable`
+/// (Settings > Updates shows "Update available") and badges the menubar icon.
 ///
-///   1. Set `Settings.shared.updateAvailable` to the remote tag (sans
-///      leading "v"), which causes the `updateSection` in
-///      `SettingsView.advanced` to surface "Update available: vX.Y.Z" plus
-///      an "Install now…" button.
-///   2. Ask `MenuBarController.shared` to flip its update-badge dot on.
+/// The repository polled is the `WisprAltReleaseRepo` Info.plist key
+/// (`owner/name`), which `scripts/build-client-local.sh` stamps from the
+/// clone's GitHub `origin`. Without it (a non-GitHub clone) checks are skipped.
 ///
-/// Triggering the install (`triggerInstall()`) opens Terminal.app and
-/// pastes the curl-install one-liner so the existing
-/// `scripts/install.sh` path runs unchanged.  If AppleScript fails (TCC
-/// prompt declined, sandboxed environment, etc.) we fall back to
-/// copying the command to the clipboard and posting
-/// `.updaterFallbackToClipboard` so callers can render a toast.
+/// Installing is the CLI's job: `copyUpdateCommand()` copies
+/// `wispralt update --client` (pull, reinstall, rebuild the app) for the user
+/// to paste into Terminal.
 ///
 /// All `Settings.shared` and `MenuBarController.shared` mutations happen
-/// inside `await MainActor.run { }` so the actor isolation rules
-/// for `@MainActor`-bound singletons are respected even when `check()`
-/// is invoked from a detached background task.
+/// inside `await MainActor.run { }`.
 final class UpdateChecker {
 
     // MARK: - Singleton
@@ -35,9 +28,15 @@ final class UpdateChecker {
 
     // MARK: - Constants
 
-    private static let repoOwner = "omdiidi"
-    private static let repoName = "miniWhisper"
-    private static let installURL = "https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh"
+    /// What the user runs to update (see `wispralt update -h`).
+    static let updateCommand = "wispralt update --client"
+
+    /// `owner/name` of the GitHub repository whose releases are polled.
+    private static let releaseRepo: String? = {
+        let raw = Bundle.main.infoDictionary?["WisprAltReleaseRepo"] as? String ?? ""
+        let parts = raw.split(separator: "/")
+        return parts.count == 2 ? raw : nil
+    }()
 
     /// 6 hours between automatic polls.  A manual "Check for updates"
     /// press from Settings can override via `check(force: true)`.
@@ -87,10 +86,14 @@ final class UpdateChecker {
             return
         }
 
+        guard let repo = Self.releaseRepo else {
+            Log.debug("UpdateChecker: no WisprAltReleaseRepo in the bundle; skipping.", category: "update")
+            return
+        }
         let bundled = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
 
         do {
-            let remote = try await fetchLatestTag()
+            let remote = try await fetchLatestTag(repo: repo)
             let newer = Self.isNewer(remote: remote, bundled: bundled)
             Log.info(
                 "UpdateChecker: bundled=\(bundled) remote=\(remote) newer=\(newer)",
@@ -99,11 +102,7 @@ final class UpdateChecker {
             await MainActor.run {
                 Settings.shared.lastUpdateCheck = Date()
                 Settings.shared.updateAvailable = newer ? remote : nil
-                // Only badge when a server URL is configured — otherwise
-                // the install one-liner won't have a working
-                // post-install handoff anyway.
-                let badgeOn = newer && Settings.shared.serverURL != nil
-                MenuBarController.shared?.setUpdateBadge(visible: badgeOn)
+                MenuBarController.shared?.setUpdateBadge(visible: newer)
             }
         } catch {
             Log.warning("UpdateChecker: fetchLatestTag failed: \(ErrorLog.describe(error))", category: "update")
@@ -113,70 +112,15 @@ final class UpdateChecker {
         }
     }
 
-    // MARK: - Install trigger
+    // MARK: - Update command
 
-    /// Open Terminal.app and run the canonical curl-install one-liner.
-    /// On AppleScript failure (TCC prompt declined, no Terminal, etc.)
-    /// fall back to copying the command to the pasteboard and posting
-    /// `.updaterFallbackToClipboard` so a caller can render a toast.
-    ///
-    /// Refuses to run while the app is busy (`MenuBarController.isBusy`: a
-    /// dictation recording or still transcribing, or a file upload / job in
-    /// flight) — install.sh kills the running app, which would lose that
-    /// work. Posts `.updaterDictationBusy` so a caller can show a "finish
-    /// first" message.
-    func triggerInstall() {
-        if MenuBarController.shared?.isBusy == true {
-            Log.warning(
-                "UpdateChecker: refusing to install while a dictation or file job is in progress.",
-                category: "update"
-            )
-            NotificationCenter.default.post(name: .updaterDictationBusy, object: nil)
-            return
-        }
-        // Hardcoded so a compromised UpdateChecker can't inject a
-        // different command: the script source is a literal, no
-        // interpolation, no callable.
-        // -q makes curl ignore ~/.curlrc so a malformed user config can't make this
-        // fetch print an empty-host "curl: (6)" error or fail before the script runs.
-        let scriptSource = """
-        tell application "Terminal"
-            activate
-            do script "curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash"
-        end tell
-        """
-        var errorInfo: NSDictionary?
-        guard let script = NSAppleScript(source: scriptSource) else {
-            Log.warning("UpdateChecker: NSAppleScript init returned nil — copying install command to clipboard.", category: "update")
-            fallbackToClipboard()
-            return
-        }
-        _ = script.executeAndReturnError(&errorInfo)
-        if let info = errorInfo {
-            let code = (info[NSAppleScript.errorNumber] as? Int) ?? 0
-            // -1743: not authorized to send Apple events (TCC declined).
-            // -1744: user denied access via TCC prompt.
-            // -1728: app not running / can't get reference (Terminal not installed).
-            if [-1743, -1744, -1728].contains(code) {
-                Log.warning("UpdateChecker: AppleScript error \(code) — copying install command to clipboard.", category: "update")
-                fallbackToClipboard()
-                return
-            }
-            Log.warning(
-                "UpdateChecker: AppleScript executed with non-fatal error \(code).",
-                category: "update"
-            )
-        }
-    }
-
-    private func fallbackToClipboard() {
-        // -q so a malformed ~/.curlrc can't make this fetch print an empty-host curl
-        // error or fail before the script runs (matches the Terminal path above).
-        let command = "curl -q -fsSL \(Self.installURL) | bash"
+    /// Copy `wispralt update --client` to the clipboard and post
+    /// `.updaterCommandCopied` so Settings can say so.
+    func copyUpdateCommand() {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(command, forType: .string)
-        NotificationCenter.default.post(name: .updaterFallbackToClipboard, object: nil)
+        pb.setString(Self.updateCommand, forType: .string)
+        NotificationCenter.default.post(name: .updaterCommandCopied, object: nil)
     }
 
     // MARK: - GitHub Releases fetch
@@ -185,8 +129,8 @@ final class UpdateChecker {
         let tag_name: String
     }
 
-    private func fetchLatestTag() async throws -> String {
-        let urlString = "https://api.github.com/repos/\(Self.repoOwner)/\(Self.repoName)/releases/latest"
+    private func fetchLatestTag(repo: String) async throws -> String {
+        let urlString = "https://api.github.com/repos/\(repo)/releases/latest"
         guard let url = URL(string: urlString) else {
             throw UpdateCheckerError.badStatus(0)
         }
@@ -244,14 +188,7 @@ enum UpdateCheckerError: Error {
 // MARK: - Notification names
 
 extension Notification.Name {
-    /// Posted when `UpdateChecker.triggerInstall()` could not launch Terminal
-    /// via AppleScript and fell back to copying the install command to the
-    /// system pasteboard. Listeners can render a "Command copied — open
-    /// Terminal and paste" toast.
-    static let updaterFallbackToClipboard = Notification.Name("co.wispralt.updaterFallbackToClipboard")
-
-    /// Posted when `UpdateChecker.triggerInstall()` was invoked while the app
-    /// is busy (`MenuBarController.isBusy`). Install is refused so an
-    /// in-progress dictation or file job isn't lost when install.sh kills the app.
-    static let updaterDictationBusy = Notification.Name("co.wispralt.updaterDictationBusy")
+    /// Posted when `UpdateChecker.copyUpdateCommand()` put the update command
+    /// on the pasteboard, so Settings can show a "copied" note.
+    static let updaterCommandCopied = Notification.Name("co.wispralt.updaterCommandCopied")
 }
