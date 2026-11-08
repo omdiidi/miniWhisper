@@ -22,7 +22,7 @@ private func machToSeconds(_ machTime: UInt64) -> Double {
 ///
 /// Tap mask: `flagsChanged | keyDown`.
 /// - Hold ≥ `holdThreshold` seconds → `dictationStart()` on FN-down confirmation, `dictationStop()` on FN-up.
-/// - Triple-tap within `tripleWindow` seconds → `toggleMeetingRecording()`.
+/// - Short tap (< `holdThreshold`) → ignored.
 /// - FN + other key → ignored (pass-through for FN-arrow, FN-delete, etc.).
 ///
 /// All state mutations happen on the private serial queue `q`. Delegate calls
@@ -41,22 +41,15 @@ final class FNKeyMonitor {
 
     // MARK: - Configuration
     //
-    // holdThreshold and tripleWindow are read from Settings at use-site so that
+    // holdThreshold is read from Settings at use-site so that
     // changes in the Settings UI take effect immediately without restarting the
-    // monitor.  Values are clamped to sane ranges on read.
+    // monitor. The value is clamped to a sane range on read.
 
     /// Seconds FN must be held before dictation is confirmed.
     /// Clamped to [0.10, 1.00] at read time; persisted clamping is in Settings.
     private var holdThreshold: Double {
         let v = Settings.shared.holdMinDuration
         return min(max(v, 0.10), 1.00)
-    }
-
-    /// Window in seconds within which three FN taps trigger meeting toggle.
-    /// Clamped to [0.20, 0.80] at read time; persisted clamping is in Settings.
-    private var tripleWindow: Double {
-        let v = Settings.shared.tripleTapWindow
-        return min(max(v, 0.20), 0.80)
     }
 
     // MARK: - Private state — ALL mutations on `q`
@@ -68,16 +61,12 @@ final class FNKeyMonitor {
     private var fnDownTime: Double?
 
     /// Set to true when a non-FN key-down event is observed while FN is held.
-    /// Prevents treat of FN modifier combos (FN+arrow, FN+delete, etc.) as taps/holds.
+    /// Prevents treating FN modifier combos (FN+arrow, FN+delete, etc.) as holds.
     private var otherKeyDuringFN: Bool = false
 
     /// Pending work item that fires after `holdThreshold` to confirm a hold.
     /// v3 P4#12: fires on `q`, NOT on `.main`.
     private var holdWorkItem: DispatchWorkItem?
-
-    /// Records the DOWN timestamps for recent taps (R3#1: tap time = DOWN time, not UP).
-    /// Cleared when a hold is confirmed to prevent stale taps poisoning future triple-taps.
-    private var tapTimes: [Double] = []
 
     // MARK: - CGEventTap lifecycle
 
@@ -160,7 +149,6 @@ final class FNKeyMonitor {
             self?.holdWorkItem?.cancel()
             self?.holdWorkItem = nil
             self?.fnDownTime = nil
-            self?.tapTimes = []
         }
 
         Log.info("FNKeyMonitor: tap removed.", category: "hotkeys")
@@ -210,9 +198,6 @@ final class FNKeyMonitor {
                   self.fnDownTime != nil,
                   !self.otherKeyDuringFN else { return }
 
-            // CRITICAL: clear tapTimes to prevent stale taps poisoning future triple-taps.
-            self.tapTimes.removeAll()
-
             let del = self.delegate
             DispatchQueue.main.async {
                 del?.dictationStart()
@@ -233,39 +218,15 @@ final class FNKeyMonitor {
         fnDownTime = nil
 
         // FN + another key: ignore entirely — these are modifier combos (FN+arrow etc.).
-        // Invariant: tapTimes must not contain spurious modifier-combo presses, so clear it.
         if otherKeyDuringFN {
-            tapTimes.removeAll()
             return
         }
 
+        // Confirmed hold release → stop dictation. Short taps are ignored.
         if duration >= holdThreshold {
-            // Confirmed hold release → stop dictation.
-            // Clear tapTimes so stale short-press records from before the hold
-            // cannot poison a subsequent triple-tap window.
-            tapTimes.removeAll()
             let del = delegate
             DispatchQueue.main.async {
                 del?.dictationStop()
-            }
-        } else {
-            // Short tap: record the DOWN time (not UP) per R3#1.
-            recordTap(at: downTime)
-        }
-    }
-
-    private func recordTap(at downTime: Double) {
-        tapTimes.append(downTime)
-
-        // Keep only taps within the triple-tap window.
-        let cutoff = downTime - tripleWindow
-        tapTimes = tapTimes.filter { $0 > cutoff }
-
-        if tapTimes.count >= 3 {
-            tapTimes.removeAll()
-            let del = delegate
-            DispatchQueue.main.async {
-                del?.toggleMeetingRecording()
             }
         }
     }

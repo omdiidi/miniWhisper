@@ -1,0 +1,50 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Usage · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head"><h1>Usage</h1></div>
+
+  <form class="filters" method="get" action="/admin/usage" aria-label="Filter requests">
+    <label class="sr-only" for="f-kind">Kind</label>
+    <input id="f-kind" type="text" name="kind" value="{{ filters.kind or '' }}" placeholder="kind (dictate / file)">
+    <label class="sr-only" for="f-status">Status</label>
+    <input id="f-status" type="number" name="status" value="{{ filters.status if filters.status is not none else '' }}" placeholder="status">
+    <label class="sr-only" for="f-user">User id</label>
+    <input id="f-user" type="number" name="user_id" value="{{ filters.user_id if filters.user_id is not none else '' }}" placeholder="user id">
+    <label class="sr-only" for="f-since">Since</label>
+    <input id="f-since" type="datetime-local" name="since" value="{{ filters.since or '' }}">
+    <label class="sr-only" for="f-until">Until</label>
+    <input id="f-until" type="datetime-local" name="until" value="{{ filters.until or '' }}">
+    <button type="submit">Filter</button>
+    <a href="/admin/usage.csv?{{ csv_query }}">Download CSV</a>
+  </form>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>When</th><th>User</th><th>Kind</th><th>Status</th><th class="num">Duration (ms)</th><th class="num">Bytes in</th><th>Error</th><th>Request ID</th></tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+          <tr>
+            <td>{{ e.ts.strftime('%Y-%m-%d %H:%M:%S') if e.ts else '—' }}</td>
+            <td>{% if e.user_id is not none %}<a href="/admin/people/{{ e.user_id }}">{{ e.user_label or e.user_id }}</a>{% else %}—{% endif %}</td>
+            <td>{{ e.kind }}</td>
+            <td>{{ e.status }}</td>
+            <td class="num">{% if e.duration_ms is not none %}{{ "%.0f" | format(e.duration_ms) }}{% else %}—{% endif %}</td>
+            <td class="num">{{ e.bytes_in if e.bytes_in is not none else '—' }}</td>
+            <td>{{ e.error_class or '—' }}</td>
+            <td><code>{{ e.request_id or '—' }}</code></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="8">{{ ui.empty_state("No requests match.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="row">
+    {% if prev_offset is not none %}<a href="/admin/usage?{{ prev_query }}">Newer</a>{% endif %}
+    {% if next_offset is not none %}<a href="/admin/usage?{{ next_query }}">Older</a>{% endif %}
+  </div>
+{% endblock %}

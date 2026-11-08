@@ -1,6 +1,6 @@
 # WisprAlt Client
 
-macOS 14+ menubar app. Hold FN to dictate; triple-tap FN to start/stop meeting recording.
+macOS 14+ menubar app. Hold FN to dictate; "Transcribe file…" transcribes an audio or video file on the server.
 Transcription is handled by the companion [WisprAlt server](../server/README.md).
 
 ---
@@ -71,12 +71,12 @@ client/
 │   ├── App/
 │   │   ├── AppDelegate.swift      Launch: instantiate MenuBarController, run PermissionGate
 │   │   ├── MenuBarController.swift NSStatusItem, mode state machine, mic-exclusion stub
-│   │   └── PermissionGate.swift   4-step sequential wizard (incl. 14.4+ quit-reopen sheet)
+│   │   └── PermissionGate.swift   3-step sequential wizard (incl. 14.4+ quit-reopen sheet)
 │   ├── Storage/
 │   │   ├── Settings.swift         UserDefaults (serverURL, paths, hotkey timing)
 │   │   └── KeychainHelper.swift   API key in Keychain (service co.wispralt)
 │   ├── Update/
-│   │   └── SparkleController.swift Sparkle 2 wrapper (meeting-guard gated)
+│   │   └── SparkleController.swift Sparkle 2 wrapper (deferred while busy)
 │   ├── UI/
 │   │   ├── SettingsView.swift     Server URL, API key, folder, timing, Test Connection
 │   │   └── PermissionsView.swift  Visual checklist with Re-check and per-row Settings links
@@ -85,8 +85,8 @@ client/
 │
 │   (Wave 1b — handled by other agents)
 │   ├── Hotkeys/FNKeyMonitor.swift + HotkeyEvents.swift
-│   ├── Capture/DictationRecorder.swift + MeetingRecorder.swift + ...
-│   ├── Server/ServerClient.swift + DictationAPI.swift + MeetingAPI.swift + ...
+│   ├── Capture/DictationRecorder.swift + AudioExtractor.swift + ...
+│   ├── Server/ServerClient.swift + DictationAPI.swift + FileJobAPI.swift + ...
 │   └── Inject/TextInjector.swift + ...
 ```
 
@@ -98,8 +98,7 @@ client/
 |---|---|---|
 | Accessibility | Insert text via AXUIElement | Privacy_Accessibility |
 | Input Monitoring | Detect FN-key via CGEventTap | Privacy_ListenEvent |
-| Microphone | Record dictation and meeting audio | Privacy_Microphone |
-| Screen Recording | Capture system audio via SCStream | Privacy_ScreenCapture |
+| Microphone | Record dictation audio | Privacy_Microphone |
 
 On **macOS 14.4+**, Input Monitoring requires a process restart after the first grant.
 WisprAlt shows a "Quit and Reopen Required" sheet to enforce this.
@@ -110,7 +109,6 @@ WisprAlt shows a "Quit and Reopen Required" sheet to enforce this.
 
 - `LSUIElement = true` — no Dock icon; menubar only.
 - API key is stored exclusively in the macOS Keychain (`co.wispralt` service). It is never in `UserDefaults` or any plist.
-- Dictation is a no-op if a meeting recording is active (mic mutual exclusion).
-- Sparkle update prompts are deferred while a meeting is recording.
+- Update relaunches are refused while busy (dictating, uploading or processing a file job, or a dictation still in flight).
 
 For full usage instructions see [docs/SETUP-CLIENT.md](../docs/SETUP-CLIENT.md).

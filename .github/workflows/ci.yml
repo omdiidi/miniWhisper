@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - "client/**"
+      - "scripts/test-client.sh"
+      - "scripts/test-server.sh"
+      - "scripts/check-log-privacy.py"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - "client/**"
+      - "scripts/test-client.sh"
+      - "scripts/test-server.sh"
+      - "scripts/check-log-privacy.py"
+      - ".github/workflows/ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    # The server's dictation/file models (parakeet-mlx, mlx, mlx-whisper) are
+    # Apple-Silicon only. CI installs just the deps the tests touch and stubs
+    # the MLX modules; the tests never call into a real model.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install ffmpeg
+        # The real-staging tests decode uploads through ffmpeg.
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Run pytest
+        # Same runner as local: test venv + MLX stubs (scripts/test-server.sh).
+        run: bash scripts/test-server.sh -v
+
+  client:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test the Swift client, then the log-privacy gate
+        run: bash scripts/test-client.sh

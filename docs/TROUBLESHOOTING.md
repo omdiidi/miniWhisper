@@ -8,26 +8,54 @@ Each entry follows the format: **Symptom → Diagnosis → Fix**.
 
 ---
 
+## `wispralt doctor`
+
+`wispralt doctor` (add `--client` on a client, `--json` for scripts) runs
+read-only checks and exits 3 if any fails. Each failing line ends with
+`-> <fix>`; the table explains them.
+
+| Check | Fails when | Fix |
+|---|---|---|
+| `apple-silicon` | the Mac is not arm64 (a warning on a client-only Mac) | the host needs MLX on Apple Silicon; use this Mac as a client |
+| `macos` | older than macOS 14 | update macOS |
+| `disk` | under 6 GB free where the models live | free space, then `wispralt setup --role host` |
+| `ffmpeg` / `uv` | not on `PATH` | `brew install ffmpeg` / `brew install uv` (or rerun `./install.sh`) |
+| `env-file` | `~/.config/wispralt/.env` missing, not 0600 or not yours | `chmod 600 ~/.config/wispralt/.env`; if missing, `wispralt setup --role host` |
+| `env-data-dir` | the `.env`'s `DATA_DIR` differs from the data dir in `install-state.json` | make them agree (edit `DATA_DIR`, or rerun setup with the matching `--data-dir`) |
+| `data-dir` | the data dir is missing or not 0700 | `chmod 700` it, or `wispralt setup --role host` |
+| `db-integrity` | `PRAGMA integrity_check` (read-only) is not `ok` | `wispralt restore <newest backup> --yes` |
+| `service` | the LaunchAgent is not loaded or its plist lacks `RunAtLoad` | `wispralt restart` |
+| `/healthz`, `/readyz/dictation`, `/readyz/db` | a probe is not HTTP 200 | read `~/Library/Logs/WisprAlt/server.err.log` and `wispralt.log`, then `wispralt restart`. `/readyz/dictation` stays 503 while the model loads (up to a minute after start) |
+| `legacy-agent` | the mini-era `co.wispralt.server` is loaded (fail: it competes for the port) or its plist is still in LaunchAgents (warning) | `wispralt setup --role host` boots it out and moves its plist to `~/.config/wispralt/legacy/` |
+| `cloudflared` (warning) | the tunnel agent is loaded but its token file is missing | rerun `scripts/setup-cloudflared.sh`, or `launchctl bootout gui/$UID/co.wispralt.cloudflared` |
+| `warmup` (`--warmup` only) | the dictation model cannot load or transcribe a test tone | `wispralt setup --role host` (re-verifies and repairs the models) |
+| `xcode`, `signing-identity` (client, warnings) | only Command Line Tools, or no Apple Development identity | needed only to build the app: install Xcode, then Xcode > Settings > Accounts. A DMG install needs neither |
+| `app` (client) | `/Applications/WisprAlt.app` is missing | `wispralt setup --role client` |
+| `app-running`, `keychain` (client, warnings) | the app is not running / no key is stored | open the app; add a key in its Settings |
+
+Two lines are information only: the FileVault status, and a reminder that the
+host is a per-user agent, so it runs only while you are logged in.
+
+---
+
 ## Server Issues
 
-### HuggingFace token denied (401 during model download)
+### Model download fails
 
-**Symptom:** `download-models.sh` or server startup fails with a 401 or "gated model" error mentioning `pyannote/speaker-diarization-3.1` or `pyannote/segmentation-3.0`.
+**Symptom:** `wispralt setup` stops with "cannot fetch <repo>" or "download of <repo> failed".
 
-**Diagnosis:** Either the token is invalid, or you have not accepted the model license terms for one or both gated models.
+**Diagnosis:** Both models (`mlx-community/parakeet-tdt-0.6b-v2`, `mlx-community/whisper-large-v3-turbo`) are public, so no token or license acceptance is involved. The failure is network access to huggingface.co, a rate limit (HTTP 429), or a full disk.
 
 **Fix:**
-1. Accept terms for both models (must be done while logged in):
-   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-2. Verify your token is valid: `huggingface-cli whoami` (should print your username).
-3. If you regenerated the token after setup, update `HF_TOKEN` in `server/.env` and restart the server.
+1. Check connectivity: `curl -fsSI https://huggingface.co` should return 200.
+2. On HTTP 429, wait a few minutes and re-run `wispralt setup --role host` (downloads resume; a verified model is not fetched again).
+3. Confirm ≥ 6 GB free on `$HOME` (`df -h ~`).
 
 ---
 
 ### Native wheel build fails (Xcode tools)
 
-**Symptom:** `uv sync` fails with a build error mentioning missing C++ headers, missing compiler, or `clang` not found. (Historically also triggered by `CTranslate2`; that dep was removed in Phase 10 but the symptom can still surface for other native wheels like `torch` or `pyannote`.)
+**Symptom:** `./install.sh` or `wispralt setup` (`uv tool install`) fails with a build error mentioning missing C++ headers, missing compiler, or `clang` not found. (Historically also triggered by `CTranslate2`; that dep was removed in Phase 10 but the symptom can still surface for other native wheels like `torch`.)
 
 **Diagnosis:** Xcode Command Line Tools are missing or outdated.
 
@@ -35,7 +63,7 @@ Each entry follows the format: **Symptom → Diagnosis → Fix**.
 ```bash
 xcode-select --install
 ```
-Wait for installation to complete, then re-run `uv sync`. If already installed, update it:
+Wait for installation to complete, then re-run `./install.sh`. If already installed, update it:
 ```bash
 sudo rm -rf /Library/Developer/CommandLineTools
 xcode-select --install
@@ -57,57 +85,42 @@ xcode-select --install
 
 ---
 
-### WAV upload fails with 413 (Content Too Large)
+### File upload fails with 413 (Content Too Large)
 
-**Symptom:** Meeting WAV upload returns HTTP 413.
+**Symptom:** "Transcribe file…" fails with HTTP 413.
 
-**Diagnosis:** The recording exceeds `MAX_UPLOAD_BYTES` (default 2 GiB, which covers ~4h of dual-channel 16kHz Float32 audio). Alternatively, the Cloudflare free-tier network-level limit (~100 MB, community-reported) was reached before the server responded.
-
-**Fix:**
-- The client should warn the user at 60 minutes and stop automatically at 90 minutes. A 90-minute recording is ~460 MB.
-- For recordings over ~100 MB, the Cloudflare free tier may truncate the body at the network level before it reaches the server. Consider upgrading your Cloudflare plan or splitting long meetings.
-- Do not increase `MAX_UPLOAD_BYTES` above the Cloudflare limit for your plan — the server limit is moot if Cloudflare drops the connection first.
-
----
-
-### WAV upload fails with 422 "truncated" or MD5 mismatch
-
-**Symptom:** Meeting WAV upload returns HTTP 422 with a message about "truncated" or "Content-MD5 mismatch".
-
-**Diagnosis:** Cloudflare's free-tier body limit (~100 MB, community-reported) silently truncated the upload before it reached the server. The server detects this via `Content-MD5` header verification.
+**Diagnosis:** The file exceeds `MAX_UPLOAD_BYTES` (default 2 GiB), or the chunked-upload ceiling (4 GB). Files over 50 MiB are uploaded in 50 MiB chunks, so Cloudflare's ~100 MB body cap does not apply to them; a 413 from a single-shot upload below 50 MiB points at a proxy in between.
 
 **Fix:**
-1. Test with a short recording (< 10 MB) to confirm the tunnel is working.
-2. If short uploads succeed, the issue is the Cloudflare plan body limit. Options:
-   - Upgrade to a Cloudflare paid plan.
-   - Connect directly (VPN or LAN) when recording sessions expected to exceed 100 MB.
+- For video files the client extracts the audio track first; if a huge file still fails, export just the audio (m4a) and retry.
+- Do not raise `MAX_UPLOAD_BYTES` past what your disk can stage twice (the disk gate needs free ≥ 2× the upload).
 
 ---
 
 ### `.env` permissions warning at startup
 
-**Symptom:** Server log shows `SECURITY WARNING: server/.env has mode 6XX, expected 0600`.
+**Symptom:** Server log shows `SECURITY WARNING: .env has mode 6XX, expected 0600` (or `wispralt doctor` fails `env-file`).
 
 **Diagnosis:** The `.env` file was created with overly permissive mode (e.g. 0644 set by a text editor).
 
 **Fix:**
 ```bash
-chmod 600 server/.env
+chmod 600 ~/.config/wispralt/.env
 ```
-Verify: `ls -la server/.env` should show `-rw-------`.
+Verify: `ls -la ~/.config/wispralt/.env` should show `-rw-------`.
 
 ---
 
-### 429 "Meeting in progress"
+### 429 "previous transcription still finishing"
 
-**Symptom:** `POST /transcribe/meeting` returns 429 with `{"error": "Another meeting is currently being transcribed"}`.
+**Symptom:** `POST /transcribe/file` (or chunked finalize) returns 429 with `"code": "file_job_busy"`; the client shows "previous transcription still finishing".
 
-**Diagnosis:** WisprAlt processes one meeting at a time (enforced by `asyncio.Semaphore(1)` in `jobs/runner.py`).
+**Diagnosis:** WisprAlt processes one file job at a time (enforced by `asyncio.Semaphore(1)` in `jobs/runner.py`). This includes a job you just cancelled: Whisper transcribes the whole file in one call, so a cancelled running job holds the slot until that call returns, then its result is discarded.
 
 **Fix:**
-1. Check `GET /metrics` for `meeting.active: true` and `meeting.current_eta_s`.
-2. Wait for the current job to complete, then resubmit.
-3. If `meeting.active` is `false` but you still get 429, check `memory.available_mb` — the OOM guard also returns 429 if less than 2 GiB of RAM is free.
+1. Check `GET /metrics` for `file.active: true` and `file.active_job_id`.
+2. Wait for the current job to finish, then resubmit.
+3. A 429 with `"code": "insufficient_memory"` means less than 2 GiB of RAM is free; check `memory.available_mb`. A 429 with no `code` is the per-IP rate limiter.
 
 ---
 
@@ -116,81 +129,80 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 **Symptom:** Dictation round-trip is consistently > 500ms after warmup.
 
 **Diagnosis steps:**
-1. Check `GET /metrics` for `meeting.active: true` — if a meeting is running, dictation competes for unified memory.
+1. Check `GET /metrics` for `file.active: true` — if a file job is running, dictation competes for unified memory.
 2. Check `GET /readyz/dictation` for the `X-Dictation-Degraded: true` header — this confirms memory pressure.
-3. Check `parakeet.p50_ms` in `/metrics` — if > 300ms, the Mac mini may be thermally throttled.
+3. Check `parakeet.p50_ms` in `/metrics` — if > 300ms, the host may be thermally throttled.
 
 **Fix:**
-- Wait for the meeting job to complete.
-- If consistently slow without a meeting running, check Activity Monitor for other processes consuming unified memory (ML workloads, large Xcode builds, etc.).
+- Wait for the file job to complete (the file model is evicted shortly after).
+- If consistently slow without a file job running, check Activity Monitor for other processes consuming unified memory (ML workloads, large Xcode builds, etc.).
 
 ---
 
 ### Server disk full (507)
 
-**Symptom:** `POST /transcribe/meeting` returns 507. Server log shows "insufficient storage".
+**Symptom:** `POST /transcribe/file` returns 507. Server log shows "insufficient storage".
 
-**Diagnosis:** The staging directory or meeting output directory is on a full or nearly full volume.
+**Diagnosis:** The staging directory or file-job output directory is on a full or nearly full volume.
 
 **Fix:**
 1. Check `GET /metrics` for `disk.free_gb` and `disk.staging_count`.
-2. Clean up stale staging files: `ls -lh $STAGING_DIR` and remove any `.wav` files older than a few days.
-3. Clean up old meeting outputs from `MEETING_OUTPUT_DIR`.
-4. The disk guard requires free space ≥ 1.5× the upload size before accepting a WAV.
+2. Clean up stale staging files: `ls -lh $STAGING_DIR` and remove any files older than a few days.
+3. Clean up old file-job outputs from `$DATA_DIR/outputs`. Retention is the DB setting `retention_days` (default 0 = keep forever); when it is set, the daily purge removes finished jobs and dictations older than that. Also check for old `<DATA_DIR>.pre-restore-*` directories: a restore keeps the replaced tree aside and never deletes it.
+4. The disk guard requires free space ≥ 2× the upload size before accepting a file.
 
 ---
 
-## DB pool watcher — diagnosing a stuck state
+## Local database (`/readyz/db`) and usage-write failures
 
-### Symptoms
-- `/me/*` or `/admin/*` returns 503 for >2 minutes.
-- Dictation: mic light is on but no text appears.
+Users, API keys and usage events live in `DATA_DIR/wispralt.db` (SQLite). There is no pool to rebuild and no watcher.
 
-### Healthy state
-- `curl https://transcribe.integrateapi.ai/readyz/db` → 200 `{"status":"ok"}`
-- `tail -200 ~/Library/Logs/WisprAlt/wispralt.log | grep db_watcher` shows
-  EITHER nothing (steady-state) OR alternating `pool unhealthy` / `pool rebuilt`
-  pairs (transient recovery).
-
-### Stuck state (what we hit on 2026-05-17)
-- `/readyz/db` returns 503 for >2 consecutive probes.
-- Log shows `db_watcher: unexpected error; continuing loop` repeating
-  every 10s without an intervening `pool rebuilt`.
-
-### Inline grep recipe (run on the mini)
-```bash
-# Count "unexpected error" lines since last "pool rebuilt".
-# Healthy: small number. Stuck: counts grow without bound at ~6/min.
-tail -2000 ~/Library/Logs/WisprAlt/wispralt.log \
-  | awk '/db_watcher: pool rebuilt/{c=0; next} /db_watcher: unexpected error/{c++} END{print c+0}'
-```
-
-### Recovery
-1. `launchctl kickstart -k gui/501/co.wispralt.server` — restarts the server,
-   which rebuilds the pool on startup.
-2. Investigate WHY the watcher didn't self-heal — almost certainly a missed
-   exception class. Search `db.py` and `main.py` for `except asyncpg.PostgresError`
-   and consider broadening to `asyncpg.Error`.
-3. After fix, set `WISPRALT_DEV_FAULTS=1` on a STAGING mini, deploy, and run
-   `scripts/check-watcher.sh` to confirm self-healing works end-to-end.
+- `curl https://transcribe.<your-domain>/readyz/db` → 200 `{"status":"ok","usage_write_failures":0,"dictation_save_failures":0}` when healthy.
+- 503 `reason: "db_error"` — the DB file is missing or unreadable (`ls -l "$DATA_DIR/wispralt.db"`; it should be 0600 and owned by the server user; check free disk). Every authenticated request returns 503 "Auth temporarily unavailable" meanwhile — there is no fallback admin.
+- 503 `reason: "schema_outdated"` — a migration is not applied; restart the server (it migrates at startup) and check its log for `MigrationError`.
+- `usage_write_failures` > 0 (also `usage_write_failures_total` in `/metrics`) — that many usage rows were lost to a `sqlite3.Error`; the requests themselves succeeded. The log line `usage write failed: <ErrorType>` names the cause (usually `OperationalError: database is locked` under heavy contention).
+- `dictation_save_failures` > 0 (also `dictation_save_failures_total` in `/metrics`) — that many dictations were returned to the client with `"saved": false` (log line `dictation save failed: <ErrorType>`). The client kept those recordings under Retry; a Retry with the same dictation id saves them once the DB is healthy.
 
 ### IMPORTANT: /readyz/db is observability-only
 Do NOT wire `/readyz/db` into Cloudflare origin health-check (use `/healthz`),
 launchd KeepAlive (uses process exit), or any liveness probe that RESTARTS
-the server on failure. A flaky pool causing cascading restarts would amplify
-the outage this endpoint is meant to detect.
+the server on failure.
 
----
+## History import
+
+`wispralt import …` (runbook in [ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files)).
+
+- **Exit 3 / `BLOCKED.json`** — the Supabase project is paused or unreachable (DNS,
+  connection refused, timeout, "Tenant or user not found"). The snapshot folder holds
+  only `BLOCKED.json`. Nothing tried to unpause it: resume the project yourself in the
+  Supabase dashboard if you want the export, then run `export` again (a new `-2`
+  folder). Transcript-file import still works meanwhile.
+- **Exit 1 `ExportUnavailable`** — `psql` is missing (`brew install libpq` or
+  `postgresql`), no connection string (env `WISPRALT_IMPORT_PG_URL` or Keychain
+  `co.wispralt.import-pg`), or Postgres refused the query (e.g. permissions).
+- **Exit 4 integrity failure** — a `.jsonl` file no longer matches `counts.json`
+  (edited or truncated), the export's psql output did not match its own counts, a
+  first import found rows already present, or not every planned row was written.
+  Nothing from the failing batch was written; export a fresh snapshot rather than
+  editing one.
+- **Exit 2 refused** — no terminal and no `--yes`; the owner mapping is ambiguous
+  (more than one enabled admin on either side: use `--owner-map PG_ID=LOCAL_ID`); no
+  local admin yet (run `wispralt setup --role host`); or the server holds
+  `<DATA_DIR>.lock` (stop it first with `wispralt stop`).
+- **`unmatched` rows** — usage rows whose Supabase user is not in the snapshot (or was
+  malformed). They stay in the snapshot and are listed in the report.
+- **A crash mid-import** — just run the same command again: it resumes after the last
+  committed batch, and already-imported rows count as duplicates.
 
 ## Trust invariants, not flags — eviction & release checks
 
 Two outages in May 2026 had the same shape: code trusted a return value or
 flag instead of verifying the invariant it claimed to enforce.
 
-- 2026-05-17 (asyncpg): `db.health_check` returned False; the watcher's
-  rebuild branch should have run; an over-narrow exception class caused
-  the failure to escape into the outer Exception handler instead.
-- 2026-05-19 (mlx-whisper): `evict_if_idle()` logged "released meeting
+- 2026-05-17 (the former Postgres pool): `db.health_check` returned False;
+  the watcher's rebuild branch should have run; an over-narrow exception
+  class caused the failure to escape into the outer Exception handler instead.
+- 2026-05-19 (mlx-whisper): `evict_if_idle()` logged "released
   models" and set `models_warm = False`; 2.7 GB of MLX active memory
   stayed resident because mlx_whisper's internal `ModelHolder.model`
   cache survived our reset.
@@ -198,55 +210,40 @@ flag instead of verifying the invariant it claimed to enforce.
 Lesson: every release/cleanup function should ALSO verify its effect.
 Flags are necessary but not sufficient.
 
-### Check recipe — meeting eviction (manual)
+### Check recipe — file-model eviction (manual)
 
-After a meeting finishes and `idle_seconds > 120`:
+After a file job finishes and `idle_seconds > 120`:
 
     TOKEN=$(security find-generic-password -w -s co.wispralt)
     curl -fsS -H "Authorization: Bearer $TOKEN" \
-      https://transcribe.integrateapi.ai/metrics | jq '.memory, .meeting'
+      http://127.0.0.1:8000/metrics | jq '.memory, .file'
 
 Expected steady-state (post-eviction, no jobs running):
 
     memory.mlx_active_mb: ~1218       (Parakeet baseline only)
     memory.mlx_cache_mb: 0
-    meeting.models_warm: false
-    meeting.idle_seconds: > 60
-    meeting.eviction_failures_total: 0  (cumulative; non-zero = regression)
-
-Also exposed without auth on /readyz/meeting:
-
-    curl -fsS https://transcribe.integrateapi.ai/readyz/meeting | jq .
-    # response includes: mlx_active_mb, models_warm, idle_seconds
+    file.models_warm: false
+    file.idle_seconds: > 60
+    file.eviction_failures_total: 0  (cumulative; non-zero = regression)
 
 If `mlx_active_mb > 2000 AND models_warm=false AND idle_seconds > 120`,
 the eviction invariant is broken. Check
 `~/Library/Logs/WisprAlt/server.err.log` for a CRITICAL line containing
 "Eviction invariant failed".
 
-### Why `mlx_active_mb` is on an unauthenticated endpoint
-
-`/readyz/meeting` is intentionally no-auth so external uptime monitors
-can probe without credential management. Exposing `mlx_active_mb` is
-the cost of buying an outside-the-process observability gate that
-doesn't trust our own logs. The number itself is not sensitive — it
-reveals only that MLX is the runtime (already publicly known per the
-docs) and how much memory a model occupies (also derivable from the
-public mlx-whisper / parakeet-mlx documentation).
-
 ### Tuning the self-check
 
 Two settings control the gate (see `config.py`):
 
-- `meeting_eviction_delta_floor_mb` (default 1000): minimum MB the
+- `file_eviction_delta_floor_mb` (default 1000): minimum MB the
   active memory must drop during eviction. Lower if you want stricter
   detection; raise if you see false positives.
-- `meeting_eviction_pre_active_gate_mb` (default 1500): only fire when
+- `file_eviction_pre_active_gate_mb` (default 1500): only fire when
   active was above this BEFORE eviction. Excludes cold-start and
   partial-load failures.
 
-Override at deploy via env vars:
-    WISPRALT_MEETING_EVICTION_DELTA_FLOOR_MB=1500
+Override in `~/.config/wispralt/.env`, then `wispralt restart`:
+    FILE_EVICTION_DELTA_FLOOR_MB=1500
 
 ---
 
@@ -254,7 +251,7 @@ Override at deploy via env vars:
 
 ### FN tap not detected
 
-**Symptom:** Holding FN or triple-tapping FN has no effect. The menubar icon does not change.
+**Symptom:** Holding FN has no effect. The menubar icon does not change.
 
 **Diagnosis:** Input Monitoring permission is not granted, or (on macOS 14.4+) the app has not been restarted after the permission was granted.
 
@@ -279,7 +276,7 @@ Override at deploy via env vars:
 **Cause 2 — `AVAudioFile` Float→Int16 amplification.** The second version asked AVAudioFile.write to convert Float32 buffers to Int16 PCM inline. AVAudioFile's internal converter applies a buggy ~140x normalization: a clean 0.24-peak voice landed in the WAV as a 32750/32767 (rail-clipped) Int16. Audio "decoded" fine on the server side (right format, right size), but Parakeet saw heavily distorted speech and returned random one-word hallucinations. **Fixed:** the recorder now writes **Float32 PCM** at native rate, format-matched to the tap buffer so AVAudioFile streams the float bytes verbatim without any conversion.
 
 **How to verify the fix is working:**
-1. Console.app, filter by `co.wispralt`.
+1. Console.app, filter by `co.wispralt`. (Release builds log messages as `<private>`; read them in a DEBUG build, or see [Reading client logs](#reading-client-logs).)
 2. FN-hold and speak a sentence in TextEdit.
 3. Look for a log line like:
    ```
@@ -302,7 +299,7 @@ Override at deploy via env vars:
 
 **Symptom:** Dictation completes successfully (status returns to idle) but the focused field initially looks unchanged in Electron apps (VS Code, Slack, Discord, Cursor, Notion, Figma, Linear, …) or in **Apple Messages** (`com.apple.MobileSMS`) and **Pane** (`com.dcouple.pane`).
 
-**Diagnosis:** These apps do not honour `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` — either they silently no-op the write or they don't expose a usable `kAXValueAttribute`. `AccessibilityInjector.tryInsertWith` detects this by reading `kAXValueAttribute` before and after the write; if both reads return the same value (or fail), the predicate `didInjectionLand(...)` returns `false` and `TextInjector` falls through to `ClipboardInjector.injectViaCmdV` which writes the text to `NSPasteboard.general`, synthesises ⌘V, and restores the original pasteboard 200 ms later. iMessages and Pane are expected to take this path — it's not a bug.
+**Diagnosis:** These apps do not honour `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` — either they silently no-op the write or they don't expose a usable `kAXValueAttribute`. `AccessibilityInjector.tryInsertWith` detects this by reading `kAXValueAttribute` before and after the write; if both reads return the same value (or fail), the predicate `didInjectionLand(...)` returns `false` and `TextInjector` falls through to `ClipboardInjector.injectViaCmdV` which writes the text to `NSPasteboard.general`, synthesises ⌘V, and leaves the text on the clipboard. iMessages and Pane are expected to take this path — it's not a bug.
 
 **Diagnostic log line format:**
 
@@ -319,28 +316,26 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 2. Ensure Accessibility permission is granted (Step 1 of the permission wizard).
 3. Confirm the focused app accepts ⌘V from a synthetic `CGEvent`. A handful of niche apps (custom event loops) ignore it; record the bundle ID in an issue.
 
-**Honest caveat about clipboard managers (Maccy, Raycast Clipboard History, Paste.app, Alfred Clipboard).** These tools watch `NSPasteboard.general` and copy every change into their history. WisprAlt restores your original clipboard 200 ms after pasting, **but** if a clipboard manager wrote during that window the restore is skipped (we won't stomp something the user just copied) and your previous clipboard contents are lost. If you rely on clipboard history, avoid selecting items from it immediately after dictating into a clipboard-fallback app.
+**The text stays on the clipboard.** When the Cmd+V fallback is used, WisprAlt cannot confirm the paste landed, so it leaves the dictation on the clipboard instead of restoring what was there before (a restore could erase the only copy). Clipboard managers will record it. **Copy last dictation** also returns it for 7 days.
 
 **Web password caveat.** The native secure-field gate (next section) catches AppKit `NSSecureTextField` and SwiftUI `SecureField`, but **web password inputs** (Safari, Chrome, Electron `<input type="password">`) usually do **not** surface `kAXSubroleAttribute == AXSecureTextField`, so the gate cannot detect them. **Do not dictate web passwords** — they may transit the system pasteboard where any clipboard manager could capture them.
 
 **Known limitation: secure-field skip notification debounce.** When dictation is refused due to a secure field, you'll see one local notification "Dictation Skipped — `<bundleID>` is asking for a password. Type the value manually." Subsequent skips against the same focus within 60 seconds are logged but not re-notified, to avoid spamming Notification Center if the field stays focused (e.g. unlocking 1Password).
 
-**Known limitation: repeat dictation within 200 ms.** Two FN-tap dictations in rapid succession can interact with the clipboard restore window: the second snapshot captures the first dictation's text rather than your true original, so when both restores complete the clipboard ends up holding the first dictation's text. Avoid back-to-back dictations if your clipboard contents matter.
-
 **Known limitation: post-capture focus shift on the clipboard path.** The secure-field gate captures focus context once at the top of `TextInjector.inject` and uses it to decide whether to refuse and which AX element to write to. The synthesised ⌘V, however, goes to whatever app is focused at the moment the `CGEvent` posts — which is usually the same app, but if you click into a different field (especially a password field) during the brief window inside `inject(_:)` between focus capture and the synthesised ⌘V (typically sub-millisecond, up to a few hundred ms if the AX-attempt times out on a hung target), the paste will land in the new focus. The gate cannot prevent this. If you need to switch fields right after dictating, wait for the text to land first.
 
 ---
 
-### Meeting upload progress stuck
+### File upload progress stuck
 
-**Symptom:** The menubar shows "Uploading" for an unusually long time (more than a few minutes for a typical 30-minute meeting).
+**Symptom:** The menubar shows "Uploading" for an unusually long time (more than a few minutes for a typical 30-minute recording).
 
-**Diagnosis:** Either the Cloudflare Tunnel body limit was hit and the upload stalled, or the network connection is slow.
+**Diagnosis:** The network connection is slow or dropped. (Files over 50 MiB go up in chunks, so the Cloudflare body cap is not the cause; a 120 s stall watchdog fails a truly stuck upload.)
 
 **Fix:**
 1. Open Activity Monitor → Network tab; check upload bytes/sec for WisprAlt.
 2. If upload speed is near zero, the connection may have been dropped by Cloudflare. Cancel and retry.
-3. Check `MEETING_OUTPUT_DIR` free space with `doctor.sh`.
+3. Check free space with `wispralt status` (sizes) and `wispralt doctor` (`disk`).
 
 ---
 
@@ -354,26 +349,16 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 ---
 
-### Speaker rename failed with "name conflict"
+### File job stuck in "Processing" indefinitely
 
-**Symptom:** Attempting to rename a speaker shows an error about a name conflict.
+**Symptom:** The menubar shows "Processing" for far longer than expected, and the job never transitions to done.
 
-**Diagnosis:** The chosen name is already used by another speaker in the same transcript. `TranscriptDocument.renameSpeaker(raw:to:)` throws `.speakerNameConflict` when `display_name` collision is detected.
-
-**Fix:** Choose a unique name that is not already assigned to another speaker in this transcript.
-
----
-
-### Meeting stuck in "Processing" indefinitely
-
-**Symptom:** The menubar shows "Processing" for far longer than expected (more than twice the recording duration), and the job never transitions to done.
-
-**Diagnosis:** The poll loop in `MenuBarController` enforces a deadline of `max(2 × recording_duration, 600 s)`. When the deadline elapses the client automatically cancels the job via `DELETE /transcribe/meeting/{job_id}` and surfaces a `pollTimedOut` error notification. If you see the error, the server-side pipeline likely crashed or was killed mid-run.
+**Diagnosis:** The poll loop in `MenuBarController+Transcription` enforces a deadline of `max(600 s, min(6 h, 3 × audio duration + 300 s))`. When the deadline elapses the client cancels the job via `DELETE /transcribe/file/{job_id}` and surfaces a `pollTimedOut` error notification. If you see the error, the server-side pipeline likely crashed or was killed mid-run.
 
 **Fix:**
-1. Check `GET /metrics` for `meeting.active` and `meeting.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/wispralt.log` for Python tracebacks.
-2. Restart the server (`scripts/server-launchd.sh restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staging WAV.
-3. If the server is healthy but the job consistently times out for long recordings, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
+1. Check `GET /metrics` for `file.active` and `file.active_job_id`. If active is `false` but the client was still polling, the runner task died silently — inspect `~/Library/Logs/WisprAlt/wispralt.log` for Python tracebacks.
+2. Restart the server (`wispralt restart`). At startup, `recover_orphans` will mark the abandoned job as `failed` and clean up the staged source.
+3. If the server is healthy but the job consistently times out for long files, consider whether available RAM (`memory.available_mb` in `/metrics`) was below 2 GiB when the job started.
 
 ---
 
@@ -391,26 +376,13 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 ---
 
-### Meeting transcript has a "warnings" field with "mono input"
-
-**Symptom:** The downloaded meeting transcript JSON contains a `"warnings"` array with an entry like `"mono input — dual-channel mode unavailable"`. Speaker diarization may be less accurate than expected.
-
-**Diagnosis:** `MeetingRecorder` is supposed to produce a 2-channel WAV (ch1 = mic, ch2 = system audio). The server's `pipeline.py` probes the file at the start of processing and detected only 1 channel. This usually means `SCStream` did not deliver system-audio frames during the recording (e.g. screen capture permission was denied or no system audio was playing), so `AlignedRingBuffer` had nothing to mix into channel 2 and the WAV was written as mono.
-
-**Fix:**
-1. Open **System Settings → Privacy & Security → Screen & System Audio Recording** and confirm WisprAlt is listed and enabled.
-2. On macOS 14.4+, this permission requires a process restart after granting — use the in-app permission wizard (Settings → Permissions).
-3. Re-record the meeting after confirming the permission is active. If system audio is intentionally absent (e.g. in-person meeting with no system playback), the mono path is expected and diarization will run on mic audio only — quality may be lower for multi-speaker scenarios.
-
----
-
 ### Sparkle update not appearing or blocked
 
 **Symptom:** "Check for Updates…" reports no update, or the update sheet is deferred.
 
-**Diagnosis (deferred):** Sparkle updates are intentionally deferred while a meeting recording is active (`SparkleController` checks `MeetingRecorder.isActive`). This is by design to prevent interrupting an in-progress recording.
+**Diagnosis (deferred):** Updates are intentionally deferred while the app is busy (`MenuBarController.isBusy`: dictating, uploading or processing a file job, or a dictation still in flight). This prevents an update relaunch from killing in-progress work.
 
-**Fix (deferred):** Stop the current recording, then check for updates again.
+**Fix (deferred):** Let the dictation or file job finish, then check for updates again.
 
 **Diagnosis (not appearing):** The appcast URL may be unreachable, or the Sparkle EdDSA signature may not match the embedded `SUPublicEDKey` in `Info.plist` (affects self-built versions).
 
@@ -420,9 +392,9 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 
 ## Server Auto-start and Cloudflare Tunnel
 
-### Cloudflared not running after Mac mini reboot
+### Cloudflared not running after a host reboot
 
-**Symptom:** The public endpoint (`https://transcribe.yourdomain.com`) is unreachable after a reboot or power cycle.
+**Symptom:** The public endpoint (`https://wispralt.example.com`) is unreachable after a reboot or power cycle.
 
 **Diagnosis:**
 ```bash
@@ -440,9 +412,9 @@ Look for `state = running`. If the service is absent from the output, the Launch
 
 ---
 
-### Mac mini rebooted with no internet
+### Host rebooted with no internet
 
-**Symptom:** Mac mini rebooted while the network was down. cloudflared didn't come up.
+**Symptom:** The host rebooted while the network was down. cloudflared didn't come up.
 
 **Diagnosis:** This is expected and self-healing. The LaunchAgent uses `KeepAlive: {NetworkState: true}` — launchd waits for a network interface to come up before starting cloudflared. Once the network returns, launchd starts the process automatically. `ThrottleInterval: 10` enforces at most one restart per 10 seconds during flapping.
 
@@ -501,7 +473,7 @@ This is a one-time step per version. After the app is approved, all subsequent l
 
 ### TCC prompts returned out of nowhere — I didn't rebuild
 
-**Symptom:** Accessibility, Input Monitoring, Microphone, or Screen Recording prompts appeared even though you haven't installed a new version.
+**Symptom:** Accessibility, Input Monitoring, or Microphone prompts appeared even though you haven't installed a new version.
 
 **Diagnosis:** This is most likely the annual Apple Development certificate renewal. Xcode auto-renews the cert while signed in, but the renewed cert has a new SHA-1 and a new Designated Requirement — macOS TCC sees the next launch as a new app identity.
 
@@ -516,10 +488,9 @@ A "Not Before" date within the past few days confirms a recent renewal.
 ```bash
 tccutil reset Accessibility   co.wispralt.WisprAlt
 tccutil reset ListenEvent     co.wispralt.WisprAlt
-tccutil reset ScreenCapture   co.wispralt.WisprAlt
 tccutil reset Microphone      co.wispralt.WisprAlt
 ```
-Then reopen WisprAlt and grant all four permissions. This happens at most once a year.
+Then reopen WisprAlt and grant all three permissions. This happens at most once a year.
 
 ---
 
@@ -527,36 +498,36 @@ Then reopen WisprAlt and grant all four permissions. This happens at most once a
 
 ### API key rejected (employee install)
 
-**Symptom:** Employee runs the `install.sh` curl one-liner (see [INSTALL.md](INSTALL.md)) with their texted token in `WISPRALT_API_KEY`, the app launches, and Test Connection returns `401 Invalid bearer token`. Or dictation worked previously and now starts returning 401.
+**Symptom:** Employee installs the client (see [INSTALL.md](INSTALL.md)), pastes the server URL and their texted key into Settings, and Test Connection returns `401 Invalid bearer token`. Or dictation worked previously and now starts returning 401.
 
 **Diagnosis ladder:**
 
-1. **Was the token revoked?** Open `/admin/users` on the Mac mini admin UI. If their row has a non-null `revoked_at`, this is expected — text them a new token via the **Mint** flow.
-2. **Cache TTL window.** Token state is cached in-process for 60 seconds (`TokenCache._TTL_S`). If the row was just rotated, cache hits for the OLD hash will keep failing for up to 60s. Wait one minute, retry. For instant lockout: restart the launchd agent (`bash scripts/server-launchd.sh restart`).
-3. **Can the server reach Postgres?**
+1. **Was the key revoked, or the person disabled?** Open **People** → their page in the portal. If they show `disabled`, or that device's key shows `revoked`, this is expected — send an **Add device** invite, or **Rotate key** (rotate revokes all their keys, shows one new key and re-enables them). There is no token cache: every request looks the key up in `wispralt.db`, so a revoke, disable or mint applies to the very next request.
+2. **Is the local database healthy?**
    ```bash
-   curl -s --max-time 4 https://transcribe.<your-domain>/healthz
-   tail -100 ~/Library/Logs/WisprAlt/server.log | grep -i 'postgres\|asyncpg\|db_pool'
+   curl -s --max-time 4 https://wispralt.example.com/readyz/db
+   tail -100 ~/Library/Logs/WisprAlt/wispralt.log | grep -i 'sqlite\|database\|migration'
    ```
-   If the log shows `Postgres unavailable at startup; only break-glass admin will work`, the asyncpg pool failed to initialize. Check `SUPABASE_DATABASE_URL` in `server/.env` (mode 0600), check Supabase project status, restart the agent.
-4. **Right token?** A token's plaintext is shown **once** by `/admin/users/<id>/mint`. If the employee misplaced it, mint a new one — there is no recovery for the old plaintext.
+   A DB error makes auth answer **503** (never 401, and there is no fallback admin). `/readyz/db` gives the reason (`db_error` / `schema_outdated`); see "Local database" above.
+3. **Right token?** A key's plaintext is shown **once** (Add employee, Rotate key, or an invite redeemed by the app). If the employee misplaced it, send an invite or rotate — there is no recovery for the old plaintext.
 
 ---
 
 ### Admin UI returns 401 / 403
 
-**Symptom:** Browsing to `/admin/` or curling `/admin/users` returns 401 or 403.
+**Symptom:** Browsing to `/admin/` or curling `/admin/people` returns 401 or 403.
 
 **Diagnosis:**
 
 - **401** means the bearer / cookie was missing or invalid. Check that you're sending `Authorization: Bearer <token>` (curl) or that the `wispralt_admin_token` cookie is set in your browser (visit `/admin/login` to set it).
-- **403** means the bearer is valid but the user's `role` is not `'admin'`. Open `/admin/users` (with an admin token) and confirm — only admin-role tokens can access the rest of the UI.
+- **403** means the bearer is valid but the user's `role` is not `'admin'`. Open `/admin/people` (with an admin token) and confirm — only admin-role tokens can access the rest of the UI.
 
 **Fix:**
 
 - For 401 from a browser: visit `/admin/login`, paste the admin token, submit. The cookie is set with `max_age=8h`.
-- For 403: use the admin token, not an employee token. If you don't have an admin token in hand, the env-var `WISPRALT_API_KEY` from `server/.env` is the break-glass admin and resolves to the seeded admin row (or to the synthetic `User(id=-1)` if Postgres is unreachable).
-- If you see **503** instead of 401/403 with body "Admin UI unavailable: Postgres degraded.": the asyncpg pool is `None`. The break-glass path lets you authenticate to `/transcribe/*`, but the admin UI requires Postgres. Fix the DB URL, restart the agent.
+- For 403: use the admin token, not an employee token. There is no env-var admin key and no break-glass admin. If the admin token is lost, mint a new one on the host's terminal: `wispralt keys rotate-admin` (prints the new token once, or writes it to a new `--token-file`; add `--user-id N` when there are several admins).
+- **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Rotate, Disable, Revoke device, Invites, AI runs, Settings) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (it is bound to the session, so it changes when you sign in again; the login form's own `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
+- **503** instead of 401/403: the account lookup hit a `sqlite3.Error`. Check `/readyz/db` and the "Local database" section; there is no fallback admin.
 
 ---
 
@@ -564,12 +535,83 @@ Then reopen WisprAlt and grant all four permissions. This happens at most once a
 
 **Symptom:** Hitting `/admin/login` in a browser shows a "Not Secure" warning, or the login form posts but the cookie never appears in DevTools → Application → Cookies.
 
-**Diagnosis:** The session cookie is set with `secure=True`, which means browsers refuse to attach it unless the connection is HTTPS. If you're hitting `http://` (e.g. `http://localhost:8000/admin/login` for local dev), the cookie is silently dropped.
+**Diagnosis:** The session and CSRF cookies are `Secure`, so browsers drop them on plain `http://` to a non-loopback host (a LAN IP, or a hostname other than `localhost`). Plain http to a loopback host (`http://127.0.0.1:8000/admin`, `http://localhost:8000/admin`) gets cookies without `Secure` and works.
 
 **Fix:**
 
-- In production, the Cloudflare Tunnel (`https://transcribe.<your-domain>`) terminates HTTPS for you; the cookie works as long as you use the public URL, not `127.0.0.1`.
-- For local development against an HTTP-only server: edit `routes/admin_ui.py:login_submit` and temporarily set `secure=False`, or use the `Authorization: Bearer ...` header path (curl/Postman) instead of the cookie.
+- Use the public HTTPS URL (the Cloudflare Tunnel), or `http://127.0.0.1:8000/admin` on the host itself.
+- For scripts, use the `Authorization: Bearer ...` header instead of the cookie.
+
+---
+
+## Portal: setup, invites, search and AI insights
+
+### No admin yet / where is the setup code?
+
+While no enabled admin exists the server writes a one-time code to `DATA_DIR/setup-code`
+(mode 0600) at startup and logs its path (`grep setup-code ~/Library/Logs/WisprAlt/wispralt.log`).
+On the server: `cat "$DATA_DIR/setup-code"` and paste it at `/admin/setup`. Wrong code → 403.
+`/admin/setup` returns **404** once an enabled admin exists (by design); a lost admin key is
+recovered on the server's terminal with `python -m wispralt.bootstrap --rotate-admin`. The code
+file is deleted after a successful setup, and a stale one is removed at the next start.
+
+### Invite says `invite_invalid`
+
+`POST /invites/redeem` answers every failure with the same `400 {"error":"invite_invalid"}`
+on purpose. Usual causes: the invite is older than **10 minutes**, was already used (each is
+single use), was revoked on `/admin/invites`, the admin who created it was disabled, or (for
+"add device") the person is disabled. Create a new invite. `429 rate_limited` means more than
+10 attempts a minute from one network: wait a minute.
+
+### History search misses a record, or `/me/history?q=` errors
+
+Search needs 2+ characters and matches whole words plus a prefix of the last word
+(`roadm` finds `roadmap`; `oadmap` does not). Deleted rows never match. If a record that
+exists is not found, check the full-text index on the server (safe while the server runs;
+it changes nothing):
+
+```bash
+sqlite3 "$DATA_DIR/wispralt.db" \
+  "INSERT INTO dictations_fts(dictations_fts, rank) VALUES('integrity-check', 1);
+   INSERT INTO jobs_fts(jobs_fts) VALUES('integrity-check');"
+```
+
+No output means both indexes match their tables. An error (`database disk image is
+malformed`) means the index drifted: rebuild it with
+`INSERT INTO dictations_fts(dictations_fts) VALUES('rebuild');` and, for jobs,
+`DELETE FROM jobs_fts; INSERT INTO jobs_fts(text, job_id) SELECT transcript_text, id FROM jobs WHERE transcript_text IS NOT NULL;`
+(take a backup first). A server whose SQLite lacks FTS5 refuses to migrate with
+`MigrationError: SQLite lacks FTS5`.
+
+### AI insights do not appear, or a run stopped
+
+- **"AI interpretation is off"** — an admin must turn it on in **Settings** after accepting
+  the disclosure; measured stats work without it.
+- **A run started but no new row appears** — another run is already `running`
+  (perhaps a `python -m wispralt.insights.cron --manual` in a terminal): one run at a
+  time, enforced in the database. A row left `running` by a crash stops blocking after
+  2 hours.
+- **Runs cannot start / "OPENROUTER_API_KEY is not configured"** — set the key in
+  `~/.config/wispralt/.env` (`OPENROUTER_API_KEY=…`), then `wispralt restart`.
+- **Data → AI runs shows a status other than `done`:**
+
+  | Status / error | Meaning | What to do |
+  |---|---|---|
+  | `aborted` · `budget` | The next call's worst-case cost (prompt + a full reply at the rate card) would cross the 30-day cap (checked before every call). | Wait for older spend to age out, or raise the cap in Settings. |
+  | `aborted` · `rate_limit` | OpenRouter returned 429. | The scheduler retries after 6 hours; or start the week again later. |
+  | `failed` · `all_people_failed` | Every person's reply was unusable or errored. | See the failures column (`openrouter_error`, `json_decode`, `schema`); check the model id in Settings. |
+  | `failed` · `some_people_failed` | At least one person's reply was unusable or errored; the others were saved, and no team summary was written (it would have left them out). | The scheduler retries after 6 hours (or start the week again): only the failed people and the team summary are paid for. A person who fails every time keeps the team summary away; check the failures column. |
+  | `aborted` · `cancelled` | The server shut down mid-run. | Start the week again (or let the scheduler). |
+  | `failed` · `team_openrouter_error` / `team_unusable` | People were analysed but the team summary call errored, or its reply was unusable twice. | The scheduler retries after 6 hours (or start the week again); saved people are not paid for twice. |
+  | `failed` · `<ExceptionName>` | The run crashed. | Check `wispralt.log` around the start time (logs hold ids and classes, never text). |
+  | `skipped` · `ai_disabled` / `no_client` | AI is off, or no key. | See above. |
+
+- **A person is missing from AI insights** — they need 5+ dictations or 1+ file
+  transcription in that week.
+- **"Older format" notice** — the insight predates source refs; run that week again with
+  **Regenerate existing**.
+- **"stale" notice** — records arrived after the insight was generated; regenerate to
+  include them.
 
 ---
 
@@ -609,4 +651,29 @@ dictation/timing: inject_ms=18.7 total_ms=1873.5
 2. If `net_total_ms` >> server-side `parakeet.p50_ms` (visible in `GET /metrics`) — the gap is upload + tunnel. For a 3-sentence (≈3-second) clip at 48kHz Float32 mono, the WAV is ~580 KB. On a typical home connection that's ~50-150ms upload. If `net_total_ms` minus server inference exceeds 800ms, suspect the Cloudflare Tunnel route (cross-region, slow first-byte) or local network egress.
 3. If `stop_ms` > 100ms — `AVAudioFile` close is taking unexpectedly long; investigate the dictation IO queue.
 
-**Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the Mac mini at `~/Library/Logs/WisprAlt/wispralt.log`.
+**Next step:** the timestamps are deltas, not absolute boundaries. To correlate with server-side inference, cross-reference the OSLog event time with the matching server log line (`dictate: queue_wait_ms=… inference_ms=… chars=…`) on the host at `~/Library/Logs/WisprAlt/wispralt.log`.
+
+## Reading client logs
+
+Client log messages are `.private` in release builds, so Console.app and `log stream` show `<private>` for them; DEBUG builds (`swift build`, `swift run`) log them in full. Either way the client never logs transcript text, server responses or reasons, file names, paths, URLs or keys; errors appear only as a type and code (for example `server(status: 500)` or `NSURLErrorDomain#-1009`). To see message text on a release build, run a DEBUG build from source.
+
+### Online: holding FN does nothing ("key missing")
+
+**Symptom:** in Online mode FN shows a notice and opens the popover at the OpenAI key field; the status line reads `Online · <model> · key missing`.
+
+**Fix:** paste the key in **Show advanced settings → OpenAI API Key**, or run `security add-generic-password -U -s co.wispralt.openai -a default -w` in Terminal (works while the app runs; the next FN press picks it up). After a new build, macOS asks once for Keychain access: choose **Always Allow**. "OpenAI rejected the API key" means the key itself is wrong or revoked; "quota exceeded" means the OpenAI project's budget is used up.
+
+### Online file transcription failed
+
+- "This file type needs Local mode": this Mac cannot decode the file (e.g. a video whose audio is not AAC). Use Local mode, or convert it to m4a first.
+- "This video has no usable audio track" / "Could not extract audio": the video has no sound, or the audio could not be copied out of it.
+- Nothing is written to the transcripts folder unless the whole file succeeded, and a job interrupted by quit is not resumed: pick the file again.
+
+### A dictation failed: Retry, Export…, Discard
+
+**Symptom:** "Dictation Failed … Audio saved under Retry." or "N saved recordings from last session — see Retry".
+
+**What happened:** the audio of a failed, possibly cut-off, or "No speech detected" dictation is kept in `~/Library/Application Support/WisprAlt/retry/` (newest 2, 7 days, 16 kHz mono). A crash or quit mid-dictation leaves it in `spool/`, and the next launch moves it to Retry. Nothing is re-sent automatically.
+
+**Fix:** open the popover → **Retry N**. **Retry** re-sends it in the mode it was recorded in and puts the text on the clipboard (and in **Copy last dictation**). A recording from the other mode shows "Switch to Local to retry" (or Online). **Export…** saves the audio file; **Discard** deletes it. A Local server that answers 410 `dictation_deleted` or 409 `dedup_conflict` refuses that dictation for good: its recording is discarded.
+

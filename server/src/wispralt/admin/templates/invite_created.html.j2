@@ -1,0 +1,17 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Invite created · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <h1>{% if add_device %}New device invite for {{ label }}{% else %}Invite for {{ label }}{% endif %}</h1>
+  </div>
+  <p class="notice warn"><strong>Send this now.</strong> It is shown only once, works once, and expires in {{ ttl_min }} minutes.</p>
+  {% call ui.card("Join link (opens the WisprAlt app)") %}
+    {{ ui.secret_once(link, "join-link") }}
+  {% endcall %}
+  {% call ui.card("Or paste the invite code into the app") %}
+    {{ ui.secret_once(token, "invite-token") }}
+    <p class="muted small">Server: <code>{{ server_url }}</code></p>
+  {% endcall %}
+  <p>{% if add_device %}<a href="/admin/people/{{ user_id }}">Back to {{ label }}</a>{% else %}<a href="/admin/invites">Back to invites</a>{% endif %}</p>
+{% endblock %}

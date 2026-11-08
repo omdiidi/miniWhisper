@@ -1,0 +1,53 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Overview · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head"><h1>Overview</h1></div>
+
+  <div class="tiles">
+    {{ ui.tile("Active users", totals.active_users or 0) }}
+    {{ ui.tile("Dictations 24h", totals.dictations_24h or 0) }}
+    {{ ui.tile("Dictations 7d", totals.dictations_7d or 0) }}
+    {{ ui.tile("Dictations 30d", totals.dictations_30d or 0) }}
+    {{ ui.tile("Errors 24h", totals.errors_24h or 0) }}
+    {{ ui.tile("p50 latency 24h", ("%.0f ms" | format(totals.p50_24h)) if totals.p50_24h else "—") }}
+    {{ ui.tile("Integration keys", integration_count or 0, href="/admin/integrations") }}
+  </div>
+
+  <h2>Top 5 active users (last 7 days)</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>User</th><th>Role</th><th class="num">Requests</th></tr></thead>
+      <tbody>
+        {% for u in top_users %}
+          <tr>
+            <td><a href="/admin/people/{{ u.id }}">{{ u.label }}</a></td>
+            <td>{{ u.role }}</td>
+            <td class="num">{{ u.n }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3">{{ ui.empty_state("No activity yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Last 14 days</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Day</th><th class="num">Requests</th><th>Volume</th></tr></thead>
+      <tbody>
+        {% set max_n = (daily | map(attribute='n') | list | max) if daily else 0 %}
+        {% for row in daily %}
+          <tr>
+            <td>{{ row.day }}</td>
+            <td class="num">{{ row.n }}</td>
+            <td class="bar"><div style="width: {{ (100 * row.n / max_n) | round(1) if max_n else 0 }}%"></div></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3">{{ ui.empty_state("No usage events recorded yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

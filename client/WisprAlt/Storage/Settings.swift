@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import WisprAltCore
 import ServiceManagement
 
 /// Persistent user preferences backed by UserDefaults.
@@ -24,25 +25,25 @@ final class Settings: ObservableObject {
         static let serverURL = "serverURL"
         static let meetingsPath = "meetingsPath"
         static let holdMinDuration = "holdMinDuration"
-        static let tripleTapWindow = "tripleTapWindow"
-        static let maxMeetingMinutes = "maxMeetingMinutes"
         static let preferredInputDeviceUID = "preferredInputDeviceUID"
         static let smartFormatting = "smartFormatting"
         static let displayName = "displayName"  // mirror of server-side display_name; source of truth is server
         static let updateAvailable = "updateAvailable"
         static let lastUpdateCheck = "lastUpdateCheck"
+        static let mode = "mode"
+        static let openAIModel = "openAIModel"
     }
 
     // MARK: - Published properties
 
-    /// The transcription server base URL. Must use https scheme.
+    /// The Local server base URL: https, or http only to this Mac (`LocalURLPolicy`).
     /// Set to nil to clear. Validated on assignment.
     @Published var serverURL: URL? {
         didSet {
             if let url = serverURL {
-                guard url.scheme == "https" else {
+                guard LocalURLPolicy.isAllowed(url) else {
                     Log.warning(
-                        "serverURL rejected — scheme must be https: \(url.absoluteString)",
+                        "serverURL rejected — https, or http only to this Mac.",
                         category: "settings"
                     )
                     // Revert to previous persisted value without triggering another didSet.
@@ -56,8 +57,25 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// Local directory where completed meeting transcripts are saved.
-    /// Defaults to ~/Documents/WisprAlt/Meetings.
+    /// Online (OpenAI) or Local (self-hosted server). Absent → `TranscriptionMode.default`.
+    /// Write through `MenuBarController.applyModeSwitch(to:)` so the Local job
+    /// poller follows the switch; a change applies to the next dictation.
+    @Published var mode: TranscriptionMode {
+        didSet { defaults.set(mode.rawValue, forKey: Key.mode) }
+    }
+
+    /// OpenAI model id for Online dictation. An unknown stored id reads back
+    /// as the default (`OpenAIModels.resolve`).
+    @Published var openAIModel: String {
+        didSet { defaults.set(openAIModel, forKey: Key.openAIModel) }
+    }
+
+    /// Local directory where completed file transcripts are saved
+    /// (custom transcriptions land in its `Custom Transcriptions` subfolder).
+    /// Default (`TranscriptsFolderDefault`): ~/Documents/WisprAlt/Meetings if
+    /// it already exists, else ~/Documents/WisprAlt/Transcripts; the result is
+    /// pinned on first launch so the folder never moves. The property name and
+    /// its UserDefaults key are kept from the meeting era.
     @Published var meetingsPath: URL {
         didSet {
             defaults.set(meetingsPath.path, forKey: Key.meetingsPath)
@@ -77,32 +95,6 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// Window (seconds) within which three FN taps must occur to trigger meeting recording. Default 0.40.
-    /// Clamped to [0.20, 0.80] on set.
-    @Published var tripleTapWindow: Double {
-        didSet {
-            let clamped = min(max(tripleTapWindow, 0.20), 0.80)
-            if clamped != tripleTapWindow {
-                tripleTapWindow = clamped
-                return
-            }
-            defaults.set(tripleTapWindow, forKey: Key.tripleTapWindow)
-        }
-    }
-
-    /// Maximum meeting recording duration in minutes. Default 90.
-    /// Clamped to [5, 240] on set.
-    @Published var maxMeetingMinutes: Int {
-        didSet {
-            let clamped = min(max(maxMeetingMinutes, 5), 240)
-            if clamped != maxMeetingMinutes {
-                maxMeetingMinutes = clamped
-                return
-            }
-            defaults.set(maxMeetingMinutes, forKey: Key.maxMeetingMinutes)
-        }
-    }
-
     @Published var preferredInputDeviceUID: String? {
         didSet {
             if let uid = preferredInputDeviceUID {
@@ -113,10 +105,10 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// Whether dictation requests should ask the server to apply smart formatting
-    /// (punctuation, casing, paragraph breaks) via the `X-Smart-Format` header.
-    /// Off by default. Adds ~250ms latency. Server silently ignores the flag if
-    /// `OPENROUTER_API_KEY` is not configured.
+    /// Smart formatting (punctuation, casing, paragraph breaks) by Mercury 2 on
+    /// OpenRouter, run by the client in both modes (`MercuryStep`) for
+    /// dictations of 20+ words. Off by default. Needs the OpenRouter key
+    /// (Keychain `co.wispralt.openrouter`); sends text only, never audio.
     @Published var smartFormatting: Bool {
         didSet {
             defaults.set(smartFormatting, forKey: Key.smartFormatting)
@@ -167,18 +159,26 @@ final class Settings: ObservableObject {
         self.defaults = suite
 
         // Load persisted values; fall back to defaults.
-        let storedMeetingsPath = suite.string(forKey: Key.meetingsPath).flatMap {
-            URL(fileURLWithPath: $0, isDirectory: true)
-        } ?? Settings.defaultMeetingsPath()
+        let rawMeetingsPath = suite.string(forKey: Key.meetingsPath)
+        let storedMeetingsPath = TranscriptsFolderDefault.resolve(
+            stored: rawMeetingsPath,
+            docs: Settings.documentsDirectory(),
+            exists: { FileManager.default.fileExists(atPath: $0.path) }
+        )
+        if rawMeetingsPath?.isEmpty ?? true {
+            // Pin the resolved default so the folder never moves later.
+            suite.set(storedMeetingsPath.path, forKey: Key.meetingsPath)
+        }
 
         let storedHold = suite.object(forKey: Key.holdMinDuration) as? Double ?? 0.30
-        let storedTriple = suite.object(forKey: Key.tripleTapWindow) as? Double ?? 0.40
-        let storedMaxMeetingMinutes = suite.object(forKey: Key.maxMeetingMinutes) as? Int ?? 90
         let storedPreferredInputUID = suite.string(forKey: Key.preferredInputDeviceUID)
         let storedSmart = suite.object(forKey: Key.smartFormatting) as? Bool ?? false
         let storedName = suite.string(forKey: Key.displayName)
         let storedUpdate = suite.string(forKey: Key.updateAvailable)
         let storedLastEpoch = suite.object(forKey: Key.lastUpdateCheck) as? Double
+        let storedMode = suite.string(forKey: Key.mode).flatMap(TranscriptionMode.init(rawValue:))
+            ?? TranscriptionMode.default
+        let storedModel = OpenAIModels.resolve(id: suite.string(forKey: Key.openAIModel)).id
 
         // Drop stale updateAvailable if persisted value is no longer newer
         // than the bundled version (e.g., user just installed the version
@@ -194,10 +194,10 @@ final class Settings: ObservableObject {
 
         // @Published properties must be set before the object is fully initialised;
         // assign directly via stored property (bypasses didSet observers).
+        self._mode = Published(initialValue: storedMode)
+        self._openAIModel = Published(initialValue: storedModel)
         self._meetingsPath = Published(initialValue: storedMeetingsPath)
         self._holdMinDuration = Published(initialValue: storedHold)
-        self._tripleTapWindow = Published(initialValue: storedTriple)
-        self._maxMeetingMinutes = Published(initialValue: storedMaxMeetingMinutes)
         self._preferredInputDeviceUID = Published(initialValue: storedPreferredInputUID)
         self._smartFormatting = Published(initialValue: storedSmart)
         self._displayName = Published(initialValue: storedName)
@@ -218,19 +218,16 @@ final class Settings: ObservableObject {
     private func loadServerURL(from store: UserDefaults) -> URL? {
         guard let raw = store.string(forKey: Key.serverURL),
               let url = URL(string: raw),
-              url.scheme == "https"
+              LocalURLPolicy.isAllowed(url)
         else { return nil }
         return url
     }
 
-    private static func defaultMeetingsPath() -> URL {
-        let docs = FileManager.default.urls(
+    private static func documentsDirectory() -> URL {
+        FileManager.default.urls(
             for: .documentDirectory,
             in: .userDomainMask
         ).first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents")
-        return docs
-            .appendingPathComponent("WisprAlt", isDirectory: true)
-            .appendingPathComponent("Meetings", isDirectory: true)
     }
 }
 
@@ -262,7 +259,7 @@ extension Settings {
                 }
                 objectWillChange.send()
             } catch {
-                Log.warning("Launch-at-login toggle failed: \(error)", category: "lifecycle")
+                Log.warning("Launch-at-login toggle failed: \(ErrorLog.describe(error))", category: "lifecycle")
             }
         }
     }

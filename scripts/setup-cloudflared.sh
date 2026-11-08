@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # setup-cloudflared.sh — Install cloudflared and configure it as a user-level
-# LaunchAgent, persisting SERVER_URL to server/.env.
+# LaunchAgent, persisting SERVER_URL to the host config .env
+# (${WISPRALT_ROOT:-$HOME}/.config/wispralt/.env, written by `wispralt setup`).
+# Optional: the host binds 127.0.0.1 only; a tunnel (or `tailscale serve`) is
+# how other Macs reach it.
 #
 # Security contract:
 #   - The Cloudflare Tunnel token is read from stdin (never echoed to terminal).
@@ -22,24 +25,26 @@ set -euo pipefail
 # including unexpected set -e aborts between read and unset.
 trap 'unset CF_TOKEN TOKEN_VALUE NEW_TOKEN' EXIT
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENV_FILE="$REPO_ROOT/server/.env"
+ENV_FILE="${WISPRALT_ROOT:-$HOME}/.config/wispralt/.env"
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "ERROR: $ENV_FILE not found; run \`wispralt setup --role host\` first." >&2
+    exit 1
+fi
 
-# ── Helper: write/replace a key=value line in server/.env ────────────────────
+# ── Helper: write/replace a key=value line in the host .env ──────────────────
 persist_env_var() {
     local KEY="$1"
     local VALUE="$2"
-    if [[ ! -f "$ENV_FILE" ]]; then
-        if [[ -f "$REPO_ROOT/server/.env.example" ]]; then
-            cp "$REPO_ROOT/server/.env.example" "$ENV_FILE"
-        else
-            touch "$ENV_FILE"
-        fi
-    fi
     if grep -q "^${KEY}=" "$ENV_FILE" 2>/dev/null; then
-        TMP_ENV="$(dirname "$ENV_FILE")/.env.tmp.$$"
-        sed "s@^${KEY}=.*@${KEY}=${VALUE}@" "$ENV_FILE" > "$TMP_ENV"
+        # The .env holds the API key: the temp copy is 0600 from creation (mkstemp
+        # under umask 077), never world-readable even for a moment.
+        local TMP_ENV
+        TMP_ENV="$(umask 077 && mktemp "$(dirname "$ENV_FILE")/.env.tmp.XXXXXX")"
+        chmod 600 "$TMP_ENV"
+        if ! sed "s@^${KEY}=.*@${KEY}=${VALUE}@" "$ENV_FILE" > "$TMP_ENV"; then
+            rm -f "$TMP_ENV"
+            return 1
+        fi
         mv "$TMP_ENV" "$ENV_FILE"
     else
         printf '\n%s=%s\n' "$KEY" "$VALUE" >> "$ENV_FILE"
@@ -196,10 +201,14 @@ if [ "$SUPPORTS_TOKEN_FILE" = "true" ]; then
 EOF
 else
     # Legacy path: cloudflared < 2025.4.0 does not support --token-file.
-    # Inline the token into ProgramArguments. Plist gets mode 0600 to limit exposure.
+    # Inline the token into ProgramArguments. The plist is 0600 from the moment it
+    # exists: an old file is removed (a `>` redirect keeps an existing file's mode)
+    # and the new one is created under umask 077, so the token is never readable
+    # by others, not even before the chmod below.
     # Re-run this script after upgrading cloudflared to migrate to the --token-file path.
     TOKEN_VALUE="$(cat "$TOKEN_FILE")"
-    cat > "$PLIST" <<EOF
+    rm -f "$PLIST"
+    (umask 077 && cat > "$PLIST") <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -287,7 +296,7 @@ case "$HTTP_CODE" in
         ;;
     502)
         echo "INFO: Got HTTP 502 — tunnel is routing to this machine, but FastAPI is not"
-        echo "  running yet. Run: bash scripts/server-launchd.sh install"
+        echo "  running yet. Run: wispralt restart"
         ;;
     *)
         echo "WARNING: Unexpected HTTP $HTTP_CODE from $SERVER_URL/healthz." >&2
@@ -302,4 +311,4 @@ echo "  Token file:  $TOKEN_FILE (mode 0600)"
 echo "  Logs:        $LOG_DIR/cloudflared.{log,err.log}"
 echo ""
 echo "Token rotation: see docs/DEPLOYMENT-NOTES.md for the canonical rotation procedure."
-echo "Next step: bash scripts/server-launchd.sh install   (registers FastAPI as a LaunchAgent)"
+echo "Next step: wispralt restart   (the host reads the new SERVER_URL at start)"

@@ -1,342 +1,130 @@
 """
-test_admin_keys.py — Coverage for /admin/keys/* (Add API Key flow).
+test_admin_keys.py — /admin/integrations/* (integration API keys) on a real tmp SQLite DB.
 
-These tests exercise the integration-key minting / revoking / rotating routes
-without touching Postgres. We stub:
-
-  - ``users_store.mint`` to return a synthetic ``(User, plaintext)`` tuple.
-  - ``users_store.set_kind`` to assert it gets called with ``kind='integration'``.
-  - ``users_store.revoke`` / ``users_store.rotate`` to assert the
-    token-cache invalidation path runs.
-  - ``users_store.lookup_by_id`` + ``users_store.fetch_profile_by_id`` so the
-    success-page render has values to template against.
-
-Auth is enforced for real — :func:`require_api_key` is overridden to inject
-an admin (or employee, for the 403 case).
+Auth is real: requests carry a Bearer token minted by ``make_user`` on the
+per-test DB, and the routes write through ``AccountStore``.
 """
 from __future__ import annotations
 
-import os
-from typing import Any
-from unittest.mock import MagicMock
-
-# Pydantic Settings reads these at import time — set defaults BEFORE any
-# wispralt_server import so the tests work on a bare dev box without a .env.
-os.environ.setdefault("HF_TOKEN", "stub")
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
-os.environ.setdefault("SERVER_URL", "http://test.local")
-os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
-os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
-os.environ.setdefault("STAGING_DIR", "/tmp/wispralt-test-staging")
-
-from datetime import UTC, datetime
+import re
+from typing import TYPE_CHECKING
 
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from wispralt_server import auth as auth_mod
-from wispralt_server.auth import require_api_key
-from wispralt_server.routes import admin_ui
-from wispralt_server.users import store as users_store
-from wispralt_server.users.store import User, UserProfile
+from wispralt.accounts.service import hash_token
+from wispralt.routes import admin_ui
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+if TYPE_CHECKING:
+    from wispralt.accounts.store import AccountStore
 
-
-def _stub_pool() -> object:
-    """Sentinel pool; admin_ui only checks for None."""
-    return object()
-
-
-def _override_admin(app: FastAPI) -> None:
-    async def _admin(_request: Any = None) -> User:
-        return User(id=1, label="omid", role="admin")
-
-    app.dependency_overrides[require_api_key] = _admin
-
-
-def _override_employee(app: FastAPI) -> None:
-    async def _employee(_request: Any = None) -> User:
-        return User(id=42, label="alice", role="employee")
-
-    app.dependency_overrides[require_api_key] = _employee
+    from .conftest import MakeUser, Wire
 
 
 @pytest.fixture
-def app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
-    """Minimal app mounting the admin UI routers + stubbed dependencies.
-
-    Same pattern as tests/test_admin_routes_auth.py.
-    """
-    application = FastAPI()
-    application.include_router(admin_ui.public_router)
-    application.include_router(admin_ui.authed_router)
-    application.state.db_pool = _stub_pool()
-
-    # Stub the SQL aggregator so overview() never hits Postgres.
-    async def _fake_aggregate_stats(_pool: Any) -> dict[str, Any]:
-        return {"totals": {}, "top_users": [], "daily": []}
-
-    monkeypatch.setattr(admin_ui, "_aggregate_stats", _fake_aggregate_stats)
-
-    # Stub count_kind — overview reads it for the integration-key tile.
-    async def _fake_count_kind(_pool: Any, _kind: str) -> int:
-        # Return a sentinel value we can assert against in the tile test
-        return 7 if _kind == "integration" else 0
-
-    monkeypatch.setattr(users_store, "count_kind", _fake_count_kind)
-
-    # Default: list_integrations returns empty — most tests don't care about it
-    async def _fake_list_integrations(_pool: Any) -> list[Any]:
-        return []
-
-    monkeypatch.setattr(users_store, "list_integrations", _fake_list_integrations)
-
-    return application
+def client(wire: Wire) -> TestClient:
+    app = FastAPI()
+    app.include_router(admin_ui.public_router)
+    app.include_router(admin_ui.authed_router)
+    return TestClient(wire(app))
 
 
-# ── access control ────────────────────────────────────────────────────────────
+@pytest.fixture
+def admin_headers(make_user: MakeUser) -> dict[str, str]:
+    _admin, token = make_user(role="admin", label="dana")
+    return {"Authorization": f"Bearer {token}"}
 
 
-class TestKeysAccessControl:
-    def test_get_keys_requires_admin(self, app: FastAPI) -> None:
-        _override_employee(app)
-        try:
-            resp = TestClient(app).get("/admin/keys")
-            assert resp.status_code == 403
-        finally:
-            app.dependency_overrides.clear()
+def test_get_keys_requires_admin(client: TestClient, make_user: MakeUser) -> None:
+    _emp, token = make_user()
+    resp = client.get("/admin/integrations", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 403
 
 
-# ── form GET ─────────────────────────────────────────────────────────────────
+def test_get_new_form_renders(client: TestClient, admin_headers: dict[str, str]) -> None:
+    resp = client.get("/admin/integrations/new", headers=admin_headers)
+    assert resp.status_code == 200
+    assert "Add API key" in resp.text
 
 
-class TestKeysAddForm:
-    def test_get_new_form_renders(self, app: FastAPI) -> None:
-        _override_admin(app)
-        try:
-            resp = TestClient(app).get("/admin/keys/new")
-            assert resp.status_code == 200
-            # Template title surfaces "Add API key".
-            assert "Add API key" in resp.text
-        finally:
-            app.dependency_overrides.clear()
+def test_post_new_creates_integration_user_and_shows_token_once(
+    client: TestClient, admin_headers: dict[str, str], accounts: AccountStore
+) -> None:
+    resp = client.post("/admin/integrations/new", data={"program_name": "Open WebUI"}, headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    assert "OPENAI_BASE_URL=" in resp.text and "OPENAI_API_KEY=" in resp.text
+    [row] = accounts.list_integrations()
+    assert row.label == "key-open-webui" and row.display_name == "Open WebUI"
+    assert row.kind == "integration" and row.role == "employee"
+    # The page shows the one plaintext that authenticates as that user.
+    [token] = set(re.findall(r"\b[0-9a-f]{64}\b", resp.text))
+    user = accounts.lookup_key(hash_token(token))
+    assert user is not None and user.id == row.id and user.kind == "integration"
 
 
-# ── mint ─────────────────────────────────────────────────────────────────────
+def test_post_new_invalid_program_name(
+    client: TestClient, admin_headers: dict[str, str], accounts: AccountStore
+) -> None:
+    resp = client.post("/admin/integrations/new", data={"program_name": "   "}, headers=admin_headers)
+    assert resp.status_code == 400, resp.text
+    assert accounts.list_integrations() == []
 
 
-class TestKeysAddSubmit:
-    def test_post_new_mints_integration_kind(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _override_admin(app)
-        mint_calls: dict[str, Any] = {}
-        set_kind_calls: list[tuple[int, str]] = []
-
-        async def _fake_mint(
-            _pool: Any, *, label: str, role: str, display_name: str | None
-        ) -> tuple[User, str]:
-            mint_calls["label"] = label
-            mint_calls["role"] = role
-            mint_calls["display_name"] = display_name
-            return (
-                User(id=99, label=label, role=role, kind="employee"),
-                "f" * 64,
-            )
-
-        async def _fake_set_kind(_pool: Any, *, user_id: int, kind: str) -> None:
-            set_kind_calls.append((user_id, kind))
-
-        async def _fake_lookup_by_id(_pool: Any, _user_id: int) -> User:
-            return User(id=99, label="key-buzz", role="employee", kind="integration")
-
-        monkeypatch.setattr(users_store, "mint", _fake_mint)
-        monkeypatch.setattr(users_store, "set_kind", _fake_set_kind)
-        monkeypatch.setattr(users_store, "lookup_by_id", _fake_lookup_by_id)
-
-        try:
-            resp = TestClient(app).post(
-                "/admin/keys/new", data={"program_name": "Buzz"}
-            )
-            assert resp.status_code == 200, resp.text
-            # mint() ran first — order matters because set_kind needs the row.
-            assert mint_calls["role"] == "employee"
-            assert mint_calls["label"].startswith("key-")
-            # set_kind flipped the row to integration AFTER mint.
-            assert set_kind_calls == [(99, "integration")]
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_post_new_renders_openai_env_snippet(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _override_admin(app)
-
-        async def _fake_mint(
-            _pool: Any, *, label: str, role: str, display_name: str | None
-        ) -> tuple[User, str]:
-            return User(id=99, label=label, role=role, kind="employee"), "f" * 64
-
-        async def _fake_set_kind(_pool: Any, *, user_id: int, kind: str) -> None:
-            return None
-
-        async def _fake_lookup_by_id(_pool: Any, _user_id: int) -> User:
-            return User(id=99, label="key-open-webui", role="employee", kind="integration")
-
-        monkeypatch.setattr(users_store, "mint", _fake_mint)
-        monkeypatch.setattr(users_store, "set_kind", _fake_set_kind)
-        monkeypatch.setattr(users_store, "lookup_by_id", _fake_lookup_by_id)
-
-        try:
-            resp = TestClient(app).post(
-                "/admin/keys/new", data={"program_name": "Open WebUI"}
-            )
-            assert resp.status_code == 200, resp.text
-            assert "OPENAI_BASE_URL=" in resp.text
-            assert "OPENAI_API_KEY=" in resp.text
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_post_new_renders_plaintext_token(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _override_admin(app)
-        secret = "a1b2c3d4" * 8  # 64 hex chars
-
-        async def _fake_mint(
-            _pool: Any, *, label: str, role: str, display_name: str | None
-        ) -> tuple[User, str]:
-            return User(id=99, label=label, role=role, kind="employee"), secret
-
-        async def _fake_set_kind(_pool: Any, *, user_id: int, kind: str) -> None:
-            return None
-
-        async def _fake_lookup_by_id(_pool: Any, _user_id: int) -> User:
-            return User(id=99, label="key-x", role="employee", kind="integration")
-
-        monkeypatch.setattr(users_store, "mint", _fake_mint)
-        monkeypatch.setattr(users_store, "set_kind", _fake_set_kind)
-        monkeypatch.setattr(users_store, "lookup_by_id", _fake_lookup_by_id)
-
-        try:
-            resp = TestClient(app).post(
-                "/admin/keys/new", data={"program_name": "MyTool"}
-            )
-            assert resp.status_code == 200, resp.text
-            assert secret in resp.text
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_post_new_invalid_program_name(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _override_admin(app)
-
-        # mint() must not be called on a validation failure.
-        async def _fake_mint(*_a: Any, **_kw: Any) -> Any:
-            raise AssertionError("mint must not be called when program_name is empty")
-
-        monkeypatch.setattr(users_store, "mint", _fake_mint)
-        try:
-            resp = TestClient(app).post(
-                "/admin/keys/new", data={"program_name": "   "}
-            )
-            assert resp.status_code == 400, resp.text
-        finally:
-            app.dependency_overrides.clear()
+def test_revoke_disables_the_key_for_the_next_request(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    make_user: MakeUser,
+    accounts: AccountStore,
+) -> None:
+    key_user, token = make_user(kind="integration", label="key-buzz")
+    assert accounts.lookup_key(hash_token(token)) is not None
+    resp = client.post(f"/admin/integrations/{key_user.id}/revoke", headers=admin_headers, follow_redirects=False)
+    assert resp.status_code == 303
+    assert accounts.lookup_key(hash_token(token)) is None
+    assert accounts.list_integrations() == []
 
 
-# ── revoke ───────────────────────────────────────────────────────────────────
+def test_rotate_replaces_the_key(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    make_user: MakeUser,
+    accounts: AccountStore,
+) -> None:
+    key_user, old = make_user(kind="integration", label="key-buzz")
+    accounts.update_display_name(key_user.id, "Buzz")
+    resp = client.post(f"/admin/integrations/{key_user.id}/rotate", headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    assert "rotated" in resp.text.lower() and "Buzz" in resp.text
+    assert accounts.lookup_key(hash_token(old)) is None
+    assert old not in resp.text
 
 
-class TestKeysRevoke:
-    def test_post_revoke_calls_revoke_and_invalidates_cache(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _override_admin(app)
-        revoke_calls: list[int] = []
-        invalidate_calls: list[str] = []
-
-        async def _fake_revoke(_pool: Any, user_id: int) -> str | None:
-            revoke_calls.append(user_id)
-            return "stale_hash_value"
-
-        monkeypatch.setattr(users_store, "revoke", _fake_revoke)
-        monkeypatch.setattr(
-            auth_mod.token_cache,
-            "invalidate",
-            MagicMock(side_effect=lambda th: invalidate_calls.append(th)),
-        )
-
-        try:
-            # follow_redirects=False so the 303 doesn't bounce into /admin/keys.
-            resp = TestClient(app).post(
-                "/admin/keys/55/revoke", follow_redirects=False
-            )
-            assert resp.status_code in (302, 303), resp.text
-            assert revoke_calls == [55]
-            assert invalidate_calls == ["stale_hash_value"]
-        finally:
-            app.dependency_overrides.clear()
+def test_rotate_unknown_user_is_404(client: TestClient, admin_headers: dict[str, str]) -> None:
+    assert client.post("/admin/integrations/9999/rotate", headers=admin_headers).status_code == 404
 
 
-# ── rotate ───────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("action", ["revoke", "rotate"])
+def test_integration_routes_refuse_people_and_admins(
+    client: TestClient, make_user: MakeUser, accounts: AccountStore, action: str
+) -> None:
+    admin, admin_token = make_user(role="admin", label="dana")
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    person, person_token = make_user(label="alice")
+    for target, token in ((admin, admin_token), (person, person_token)):
+        resp = client.post(f"/admin/integrations/{target.id}/{action}", headers=headers,
+                           follow_redirects=False)
+        assert resp.status_code in (400, 404), (target.label, resp.status_code)
+        assert accounts.lookup_key(hash_token(token)) is not None  # still works, still enabled
+    assert client.post(f"/admin/integrations/9999/{action}", headers=headers).status_code == 404
 
 
-class TestKeysRotate:
-    def test_post_rotate_renders_with_mode_rotate(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _override_admin(app)
-        rotate_secret = "z" * 64
-
-        async def _fake_rotate(_pool: Any, _user_id: int) -> tuple[str, str | None]:
-            return rotate_secret, "old_hash"
-
-        async def _fake_lookup_by_id(_pool: Any, _user_id: int) -> User:
-            return User(id=55, label="key-buzz", role="employee", kind="integration")
-
-        async def _fake_fetch_profile_by_id(_pool: Any, _user_id: int) -> UserProfile:
-            return UserProfile(
-                id=55,
-                label="key-buzz",
-                display_name="Buzz",
-                role="employee",
-                created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                last_seen_at=None,
-            )
-
-        monkeypatch.setattr(users_store, "rotate", _fake_rotate)
-        monkeypatch.setattr(users_store, "lookup_by_id", _fake_lookup_by_id)
-        monkeypatch.setattr(
-            users_store, "fetch_profile_by_id", _fake_fetch_profile_by_id
-        )
-        monkeypatch.setattr(auth_mod.token_cache, "invalidate", MagicMock())
-
-        try:
-            resp = TestClient(app).post("/admin/keys/55/rotate")
-            assert resp.status_code == 200, resp.text
-            # mode='rotate' headline copy comes from the template.
-            assert "rotated" in resp.text.lower()
-            assert rotate_secret in resp.text
-        finally:
-            app.dependency_overrides.clear()
-
-
-# ── overview tile ────────────────────────────────────────────────────────────
-
-
-class TestOverviewTile:
-    def test_overview_shows_integration_count(self, app: FastAPI) -> None:
-        _override_admin(app)
-        try:
-            resp = TestClient(app).get("/admin/")
-            assert resp.status_code == 200, resp.text
-            # Tile label is hard-coded in overview.html.j2; the count value
-            # comes from our _fake_count_kind stub (returns 7).
-            assert "Integration keys" in resp.text
-            assert ">7<" in resp.text or "> 7" in resp.text or "7" in resp.text
-        finally:
-            app.dependency_overrides.clear()
+def test_overview_shows_integration_count(
+    client: TestClient, admin_headers: dict[str, str], make_user: MakeUser
+) -> None:
+    for _ in range(3):
+        make_user(kind="integration")
+    resp = client.get("/admin/", headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    assert "Integration keys" in resp.text
+    assert re.search(r"Integration keys</a></div>\s*<div class=\"value\">3</div>", resp.text)

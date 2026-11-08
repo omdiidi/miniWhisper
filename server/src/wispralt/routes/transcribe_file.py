@@ -1,0 +1,819 @@
+"""
+routes/transcribe_file.py — Container-agnostic transcription endpoint.
+
+POST /transcribe/file accepts any audio/video container (m4a, mp3, mp4, mov,
+wav, aac, flac, opus, ogg, webm, m4v, caf, aiff). The route streams the upload
+to staging in its original container, then hands it to the file-job runner
+(`submit_source_or_429`) which runs ffprobe + ffmpeg + the mono Whisper
+pipeline in the background.
+
+There is no ``mode`` field: every job is a single-speaker file job. An
+undeclared ``mode`` form field from an old client is ignored by FastAPI, and
+chunked finalize ignores any ``mode`` key left in a pre-upgrade ``meta.json``.
+
+Busy 429 bodies are ``{"error", "retry_after_s": 60, "code"}`` where ``code``
+is ``file_job_busy`` or ``insufficient_memory`` (FileJobInProgressError.code).
+
+Job routes (declared after the chunked routes):
+
+GET    /transcribe/file/{job_id}                 Poll job status.
+GET    /transcribe/file/{job_id}/download/{fmt}  Stream a completed output.
+DELETE /transcribe/file/{job_id}                 Cancel (202) or remove (204).
+
+Ownership: the caller sees a job only if ``job.user_id == user.id`` or the
+caller is an admin. A job owned by someone else looks exactly like a missing
+one (404 on GET, 204 on DELETE), so existence never leaks.
+
+Auth: ``Bearer`` via ``Depends(require_bearer)``.
+Usage telemetry: ``usage.events.kind_for_path`` maps the submit and the
+chunked finalize to ``file`` and the chunked init / pieces to ``file_chunk``;
+the middleware emits the usage_events row, the route does not call any recorder.
+
+Resource gates (Phase 2):
+- Disk: free < content_length × 2 → 507 + Retry-After 300.
+- RAM: psutil.virtual_memory().available < 4 GiB → 503 + Retry-After 60.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import re
+import secrets
+import shutil
+import time
+from pathlib import Path
+
+import psutil
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from .._errors import FileJobInProgressError
+from ..auth import require_bearer
+from ..config import settings
+from ..files.output import remove_job_outputs
+from ..jobs.runner import PHASE_LABELS, FileJobRunner
+from ..jobs.store import Job
+from ..ops import staging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/transcribe/file",
+    dependencies=[Depends(require_bearer)],
+)
+
+_4GiB = 4 * 1024**3
+
+# ── Chunked upload constants ──────────────────────────────────────────────────
+#
+# 50 MiB chunks leave ~50 MB of margin under Cloudflare's 100 MB free/pro/biz
+# request-body limit (the limit applies to the chunk body, not the assembled
+# total). 22 chars is the exact length of `secrets.token_urlsafe(16)` output.
+# Max chunks 1000 caps a single upload at 50 GB worst case — well above the
+# 4 GB ceiling we apply in `/init` below.
+_CHUNK_SIZE = 50 * 1024 * 1024
+_CHUNK_SLACK = 1024  # accept up to CHUNK_SIZE+slack before 413 (R-H)
+_MAX_CHUNKS = 1000
+_MAX_TOTAL_BYTES = 4_000_000_000  # R-J: Cloudflare 100s proxy timeout ceiling
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{22}$")  # exact `token_urlsafe(16)` shape
+
+
+class ChunkedInitRequest(BaseModel):
+    """Body for ``POST /transcribe/file/chunked/init``."""
+
+    total_bytes: int = Field(..., gt=0)
+    chunk_count: int = Field(..., gt=0, le=_MAX_CHUNKS)
+    original_filename: str = Field(..., min_length=1, max_length=512)
+
+
+class ChunkedInitResponse(BaseModel):
+    upload_id: str
+    chunk_size: int
+
+
+def _sanitize_upload_id(upload_id: str) -> str:
+    """Validate *upload_id* matches the `secrets.token_urlsafe(16)` shape.
+
+    Raises HTTPException(400) on mismatch. Prevents path traversal because we
+    build the chunked-dir path by concatenation below.
+    """
+    if not _UPLOAD_ID_RE.match(upload_id):
+        raise HTTPException(400, "Invalid upload_id")
+    return upload_id
+
+
+def _chunked_root() -> Path:
+    return settings.staging_dir / "chunked"
+
+
+def _load_meta_or_404(chunked_dir: Path) -> dict:
+    meta_path = chunked_dir / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(404, "upload not found")
+    try:
+        return json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Corrupt meta.json at %s: %s", meta_path, exc)
+        raise HTTPException(500, "Upload metadata corrupt") from exc
+
+
+def _require_owner(request: Request, meta: dict) -> None:
+    """R-B: caller's authenticated user.id must match the one recorded at init.
+
+    Raises HTTPException(403) on mismatch, 401 when no user is authenticated.
+    """
+    user = getattr(request.state, "user", None)
+    if user is None or not hasattr(user, "id"):
+        raise HTTPException(401, "Unauthenticated")
+    if meta.get("user_id") != int(user.id):
+        raise HTTPException(403, "Upload owned by a different API key")
+
+
+def _runner(request: Request) -> FileJobRunner:
+    return request.app.state.file_runner  # type: ignore[no-any-return]
+
+
+def _busy_response(exc: FileJobInProgressError) -> JSONResponse:
+    """429 for a busy/low-memory runner. ``code`` lets the client branch."""
+    return JSONResponse(
+        {"error": str(exc), "retry_after_s": 60, "code": exc.code},
+        status_code=429,
+        headers={"Retry-After": "60"},
+    )
+
+
+@router.post("", summary="Submit any audio/video file for transcription")
+async def submit_file(
+    request: Request,
+    file: UploadFile,
+    content_length: int | None = Header(None, alias="Content-Length"),
+) -> JSONResponse:
+    """Accept any supported container and enqueue a transcription job.
+
+    Returns
+    -------
+    202 ``{"job_id": str, "status": "pending"}``
+    413  Upload exceeds MAX_UPLOAD_BYTES.
+    415  Unsupported source extension.
+    422  ffprobe / ffmpeg rejected the source (no audio stream, decode failed).
+    429  A file job is already in progress (``code=file_job_busy``) or RAM is
+         insufficient (``code=insufficient_memory``).
+    503  Server low on memory (<4 GiB available) — try again in 60s.
+    507  Insufficient storage on the staging filesystem.
+    """
+    if content_length is not None and content_length > settings.max_upload_bytes:
+        raise HTTPException(413, "Upload too large")
+
+    # Pre-flight: ensure the staging dir exists before disk_usage is called
+    # on it (otherwise OSError on first-ever submission after install).
+    settings.staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # Disk gate: require ≥ 2× the upload size free so we have room for both
+    # the source AND the canonical-WAV transcode beside it.
+    if content_length is not None:
+        try:
+            free = shutil.disk_usage(str(settings.staging_dir)).free
+        except OSError:
+            free = 0
+        if free < content_length * 2:
+            return JSONResponse(
+                {
+                    "error": "Insufficient disk space for upload + transcode",
+                    "retry_after_s": 300,
+                },
+                status_code=507,
+                headers={"Retry-After": "300"},
+            )
+
+    # RAM gate: bumped from the runner's 2 GiB inner check to 4 GiB at the
+    # boundary. Reject early so the upload bytes are not even streamed.
+    if psutil.virtual_memory().available < _4GiB:
+        return JSONResponse(
+            {"error": "Server low on memory", "retry_after_s": 60},
+            status_code=503,
+            headers={"Retry-After": "60"},
+        )
+
+    src_path = await staging.stream_to_staging_raw(
+        file,
+        settings.max_upload_bytes,
+        settings.staging_dir,
+    )
+
+    runner = _runner(request)
+    # Phase 1 transcript-storage: capture client version + owning user at
+    # submit time so they survive worker crashes and restart re-enqueue.
+    client_version = request.headers.get("X-WisprAlt-Client-Version")
+    user = getattr(request.state, "user", None)
+    if user is None:
+        src_path.unlink(missing_ok=True)
+        raise HTTPException(401, "Unauthenticated")
+    try:
+        # Worker (_run_source) runs ffprobe + ffmpeg + pipeline. Route returns
+        # 202 immediately so Cloudflare Tunnel doesn't see a long-running
+        # request.
+        jid = await runner.submit_source_or_429(
+            src_path,
+            user_id=int(user.id),
+            client_version=client_version,
+        )
+    except FileJobInProgressError as exc:
+        src_path.unlink(missing_ok=True)
+        return _busy_response(exc)
+
+    logger.info("File job %s submitted (source=%s).", jid, src_path.name)
+    return JSONResponse({"job_id": jid, "status": "pending"}, status_code=202)
+
+
+# ── Chunked upload routes ─────────────────────────────────────────────────────
+#
+# Three-step flow used by the Swift client for files >50 MB so Cloudflare's
+# 100 MB request-body limit on free/pro/biz plans never sees the full payload:
+#
+#   1. POST /transcribe/file/chunked/init       → returns {upload_id, chunk_size}
+#   2. POST /transcribe/file/chunked/{id}/{i}   → raw chunk bytes
+#   3. POST /transcribe/file/chunked/{id}/finalize → returns {job_id}
+#
+# After finalize, the assembled file is fed through the SAME `submit_source_or_429`
+# code path the single-shot route uses — transcription, output writing and the
+# job-poll API are identical from there on. Stale chunked directories older
+# than 1 h are reaped by `staging.sweep_chunked` at startup (see main.py).
+
+
+@router.post(
+    "/chunked/init",
+    summary="Initialize a chunked upload (returns upload_id)",
+)
+async def init_chunked(
+    req: ChunkedInitRequest,
+    request: Request,
+) -> JSONResponse:
+    """Reserve a staging directory + persist metadata for a chunked upload.
+
+    Returns 200 with ``{upload_id, chunk_size}``.
+
+    Errors
+    ------
+    413  total_bytes > max_upload_bytes OR > 4 GB Cloudflare ceiling.
+    415  Unsupported source extension.
+    422  chunk_count invalid (validated by Pydantic).
+    503  RAM gate (<4 GiB available).
+    507  Insufficient disk space (need ≥ 2× total_bytes free).
+    """
+    # R-F: validate filename suffix against the same set the single-shot route
+    # accepts so users get the same 415 they would get from the regular path.
+    ext = Path(req.original_filename).suffix.lower()
+    if ext not in staging._ALLOWED_EXTENSIONS:
+        raise HTTPException(415, f"Unsupported file extension: {ext}")
+
+    if req.total_bytes > settings.max_upload_bytes:
+        raise HTTPException(413, "Upload exceeds max_upload_bytes")
+    # R-J: stay under Cloudflare's 100s proxy ceiling for the finalize concat.
+    # On Mac mini M4, 4 GB copies in ~8s — well within budget; 8 GB would risk
+    # timing out the finalize HTTP response.
+    if req.total_bytes > _MAX_TOTAL_BYTES:
+        raise HTTPException(
+            413,
+            f"Upload exceeds chunked-upload ceiling ({_MAX_TOTAL_BYTES} bytes)",
+        )
+
+    # Ensure base staging dirs exist before disk_usage.
+    settings.staging_dir.mkdir(parents=True, exist_ok=True)
+    chunked_root = _chunked_root()
+    chunked_root.mkdir(parents=True, exist_ok=True)
+
+    # Disk gate: need 2× the total so chunks AND the assembled file fit during
+    # the brief window before chunks are deleted post-concat. Mirrors the
+    # single-shot route's gate.
+    try:
+        free = shutil.disk_usage(str(settings.staging_dir)).free
+    except OSError:
+        free = 0
+    if free < req.total_bytes * 2:
+        return JSONResponse(
+            {
+                "error": "Insufficient disk space for chunked upload",
+                "retry_after_s": 300,
+            },
+            status_code=507,
+            headers={"Retry-After": "300"},
+        )
+
+    # RAM gate at init too — finalize re-checks (R-I) but reject early so the
+    # client doesn't push 50 chunks before learning the server is OOM.
+    if psutil.virtual_memory().available < _4GiB:
+        return JSONResponse(
+            {"error": "Server low on memory", "retry_after_s": 60},
+            status_code=503,
+            headers={"Retry-After": "60"},
+        )
+
+    user = getattr(request.state, "user", None)
+    if user is None:
+        raise HTTPException(401, "Unauthenticated")
+
+    upload_id = secrets.token_urlsafe(16)
+    chunked_dir = chunked_root / upload_id
+    try:
+        chunked_dir.mkdir(parents=False, exist_ok=False)
+    except FileExistsError:
+        # Astronomically unlikely token collision — surface as 500 rather
+        # than silently overwriting another upload's state.
+        raise HTTPException(500, "upload_id collision; retry")
+
+    meta = {
+        "total_bytes": req.total_bytes,
+        "chunk_count": req.chunk_count,
+        "original_filename": req.original_filename,
+        "ext": ext,
+        "created_at": time.time(),
+        "user_id": int(user.id),  # R-B: persist owner for chunk/finalize
+        # Phase 1 transcript-storage: capture client version at init so the
+        # value reflects the ORIGINATING client even if the user upgrades
+        # mid-multi-hour-upload. Reads as None on in-flight uploads from
+        # before this code shipped — row gets NULL client_app_version, no
+        # migration needed.
+        "client_app_version": request.headers.get("X-WisprAlt-Client-Version"),
+    }
+    (chunked_dir / "meta.json").write_text(json.dumps(meta))
+
+    logger.info(
+        "Chunked upload %s initialized (bytes=%d, chunks=%d, ext=%s).",
+        upload_id, req.total_bytes, req.chunk_count, ext,
+    )
+    return JSONResponse(
+        ChunkedInitResponse(upload_id=upload_id, chunk_size=_CHUNK_SIZE).model_dump()
+    )
+
+
+@router.post(
+    # Starlette ``:int`` path converter constrains ``chunk_index`` to a digit
+    # run. Without this, ``/chunked/{id}/finalize`` would route here first
+    # (Starlette matches in registration order) and Pydantic would fail to
+    # coerce ``"finalize"`` → int, returning RequestValidationError → 422
+    # before the finalize handler ever runs. The 422 reaches the client as
+    # ``{"detail": [...]}`` (a list, not a string), which the Swift error
+    # mapper interprets as a truncated upload. Surface bug: every chunked
+    # upload finalize 422'd. Don't drop ``:int`` without re-ordering routes.
+    "/chunked/{upload_id}/{chunk_index:int}",
+    summary="Upload a single chunk (raw bytes body)",
+)
+async def upload_chunk(
+    upload_id: str,
+    chunk_index: int,
+    request: Request,
+    content_length: int | None = Header(None, alias="Content-Length"),
+) -> JSONResponse:
+    """Stream a single chunk's bytes to disk.
+
+    Body MUST be ``application/octet-stream`` (raw bytes, NOT multipart). A
+    Content-Length header is required so we can validate against bytes-written.
+
+    Errors
+    ------
+    400  bytes_written != Content-Length (corrupt chunk).
+    403  Caller's API key does not match the one that ran /init.
+    404  upload_id not found.
+    411  Missing Content-Length header.
+    413  Chunk exceeds CHUNK_SIZE + 1 KiB slack.
+    422  chunk_index out of range for this upload.
+    """
+    upload_id = _sanitize_upload_id(upload_id)
+    chunked_dir = _chunked_root() / upload_id
+    if not chunked_dir.exists():
+        raise HTTPException(404, "upload not found")
+    meta = _load_meta_or_404(chunked_dir)
+    _require_owner(request, meta)
+
+    if chunk_index < 0 or chunk_index >= int(meta["chunk_count"]):
+        raise HTTPException(422, "chunk_index out of range")
+
+    if content_length is None:
+        raise HTTPException(411, "Content-Length header required for chunk")
+    if content_length < 0 or content_length > _CHUNK_SIZE + _CHUNK_SLACK:
+        # R-H: hard ceiling on declared size BEFORE we start streaming so the
+        # client gets a quick 413 instead of pushing megabytes that will be
+        # rejected.
+        raise HTTPException(413, "Chunk too large")
+
+    target = chunked_dir / f"chunk-{chunk_index:04d}.part"
+    target_tmp = target.with_suffix(".part.tmp")
+    bytes_written = 0
+    try:
+        # R-A: sync open() inside an async route — same pattern as
+        # `staging.stream_to_staging_raw`. Repo deliberately has no async-file
+        # dependency; the OS buffer cache absorbs the cost at our scale.
+        with open(target_tmp, "wb") as fh:
+            async for blob in request.stream():
+                if not blob:
+                    continue
+                bytes_written += len(blob)
+                if bytes_written > _CHUNK_SIZE + _CHUNK_SLACK:
+                    # R-H: abort mid-stream if the body claims more than
+                    # Content-Length allowed (chunked transfer or buggy client).
+                    raise HTTPException(413, "Chunk body exceeds size limit")
+                fh.write(blob)
+    except HTTPException:
+        target_tmp.unlink(missing_ok=True)
+        raise
+    except Exception:
+        target_tmp.unlink(missing_ok=True)
+        raise
+
+    if bytes_written != content_length:
+        # R-G: declared vs observed mismatch — reject so we never assemble a
+        # corrupt blob from a truncated chunk.
+        target_tmp.unlink(missing_ok=True)
+        raise HTTPException(400, "Chunk size mismatch with Content-Length")
+
+    # Atomic publish + bump meta.json mtime so the sweep TTL resets while the
+    # upload is actively progressing (R-M signal).
+    target_tmp.rename(target)
+    try:
+        (chunked_dir / "meta.json").touch()
+    except OSError:
+        pass
+
+    logger.info(
+        "chunked upload %s: chunk %d/%d received (%d bytes)",
+        upload_id,
+        chunk_index + 1,
+        int(meta["chunk_count"]),
+        bytes_written,
+    )
+    return JSONResponse({"ok": True, "received_bytes": bytes_written})
+
+
+def _concat_chunks(parts: list[Path], out_path: Path) -> None:
+    """Concatenate *parts* into *out_path*; the parts are left in place.
+
+    Runs in a thread executor (see finalize) to keep the event loop free
+    during the multi-GB I/O. Finalize deletes the parts only once the
+    runner has accepted the job, so a failed concat or a 429 can be retried without
+    re-uploading (the disk gate already requires room for one more copy).
+    """
+    with open(out_path, "wb") as out:
+        for p in parts:
+            with open(p, "rb") as inp:
+                shutil.copyfileobj(inp, out, length=8 * 1024 * 1024)
+
+
+# Upload ids with a finalize in flight (finding: concurrent finalizes raced on
+# the same assembled path). Per-process is enough: the server is one uvicorn
+# process, like the runner's own submit lock.
+_finalizing: set[str] = set()
+
+
+@router.post(
+    "/chunked/{upload_id}/finalize",
+    summary="Concatenate chunks and submit the assembled file to the runner",
+)
+async def finalize_chunked(
+    upload_id: str,
+    request: Request,
+) -> JSONResponse:
+    """Verify all chunks are present, concatenate, then submit to the runner.
+
+    Returns 202 with ``{"job_id": str, "status": "pending"}`` matching the
+    single-shot route's response shape.
+
+    One finalize per upload at a time: a second one while the first is still
+    running gets 409 (it would write the same assembled path and could delete
+    the chunks, or the submitted job's source, under the first).
+
+    Errors
+    ------
+    403  Ownership mismatch.
+    404  upload_id not found (also after a finalize that created its job).
+    409  Missing chunks, total-bytes mismatch, or a finalize already running.
+    429  A file job is already in progress. The chunks are kept, so the same
+         finalize can be retried; only the re-creatable assembled copy goes.
+    503  RAM gate (<4 GiB available).
+    507  Disk gate (free < total_bytes).
+    """
+    upload_id = _sanitize_upload_id(upload_id)
+    # Claim before the first await: one event loop, so check-and-add is atomic.
+    if upload_id in _finalizing:
+        raise HTTPException(409, "Finalize already in progress for this upload")
+    _finalizing.add(upload_id)
+    try:
+        return await _finalize_claimed(upload_id, request)
+    finally:
+        _finalizing.discard(upload_id)
+
+
+async def _finalize_claimed(upload_id: str, request: Request) -> JSONResponse:
+    """The finalize body, run while this request holds the upload's claim."""
+    chunked_dir = _chunked_root() / upload_id
+    if not chunked_dir.exists():
+        raise HTTPException(404, "upload not found")
+    meta = _load_meta_or_404(chunked_dir)
+    _require_owner(request, meta)
+
+    total_bytes = int(meta["total_bytes"])
+    chunk_count = int(meta["chunk_count"])
+    ext: str = meta["ext"]
+
+    # Re-check disk now: the concat lands another `total_bytes` beside the
+    # chunks, which stay until the runner has accepted the job.
+    try:
+        free = shutil.disk_usage(str(settings.staging_dir)).free
+    except OSError:
+        free = 0
+    if free < total_bytes:
+        return JSONResponse(
+            {"error": "Insufficient disk space to finalize", "retry_after_s": 300},
+            status_code=507,
+            headers={"Retry-After": "300"},
+        )
+
+    # R-I: RAM gate at finalize — submit_source_or_429 will load models.
+    if psutil.virtual_memory().available < _4GiB:
+        return JSONResponse(
+            {"error": "Server low on memory", "retry_after_s": 60},
+            status_code=503,
+            headers={"Retry-After": "60"},
+        )
+
+    # Exactly chunk-0000 … chunk-(N-1), by name: never count whatever the
+    # directory holds (a stray or temp file must not stand in for a chunk).
+    parts = [chunked_dir / f"chunk-{i:04d}.part" for i in range(chunk_count)]
+    missing = [i for i, p in enumerate(parts) if not p.is_file()]
+    if missing:
+        raise HTTPException(
+            409,
+            f"Missing chunk {missing[0]} of {chunk_count}",
+        )
+    # R-G: pre-flight total size check before any I/O work — catches
+    # truncation cheaply.
+    observed_total = 0
+    for p in parts:
+        try:
+            observed_total += p.stat().st_size
+        except OSError as exc:
+            raise HTTPException(409, f"Chunk stat failed: {exc}") from exc
+    if observed_total != total_bytes:
+        raise HTTPException(
+            409,
+            f"Chunk total {observed_total} != declared {total_bytes}",
+        )
+
+    # Concat off the event loop (R-J: keep handler responsive within
+    # Cloudflare's 100s ceiling).
+    out_path = settings.staging_dir / f"{upload_id}{ext}"
+    loop = asyncio.get_running_loop()
+    part_sizes_pre = [p.stat().st_size for p in parts]
+    concat_started = time.monotonic()
+    try:
+        await loop.run_in_executor(None, _concat_chunks, parts, out_path)
+    except OSError as exc:
+        # Drop only the partial output: the accepted chunks stay, so the
+        # client can retry finalize (the 1 h chunked sweep reaps abandons).
+        out_path.unlink(missing_ok=True)
+        logger.error("Chunked finalize concat failed: %s", exc)
+        raise HTTPException(500, "Concat failed") from exc
+    concat_elapsed_ms = int((time.monotonic() - concat_started) * 1000)
+    logger.info(
+        "chunked upload %s: concat finished in %d ms (%d parts, sizes=%s)",
+        upload_id,
+        concat_elapsed_ms,
+        len(part_sizes_pre),
+        part_sizes_pre,
+    )
+
+    # Sanity: assembled size must match declaration.
+    try:
+        actual = out_path.stat().st_size
+    except OSError:
+        actual = 0
+    if actual != total_bytes:
+        out_path.unlink(missing_ok=True)  # chunks kept: finalize can be retried
+        raise HTTPException(500, "Assembled size mismatch")
+
+    # Submit to runner using the same path as the single-shot route. The chunks
+    # stay until the runner has accepted the job: a 429 drops only the
+    # assembled copy (R-C: no orphan beside a busy runner) and keeps the chunks
+    # + meta.json, so the client retries this finalize without re-uploading.
+    # Any ``mode`` key in a pre-upgrade meta.json is ignored: every job is a
+    # file job.
+    runner = _runner(request)
+    # Phase 1 transcript-storage: read client version that was captured at
+    # /init (more robust than the live header — survives mid-upload client
+    # upgrade). The owner is verified above.
+    client_version = meta.get("client_app_version")
+    user_id = int(meta["user_id"])
+    try:
+        jid = await runner.submit_source_or_429(
+            out_path,
+            user_id=user_id,
+            client_version=client_version,
+        )
+    except FileJobInProgressError as exc:
+        out_path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):  # the upload is alive: restart its sweep TTL
+            (chunked_dir / "meta.json").touch()
+        return _busy_response(exc)
+
+    # Accepted: the job owns out_path now; rmtree drops the chunks, meta.json
+    # and the dir itself.
+    shutil.rmtree(chunked_dir, ignore_errors=True)
+    logger.info(
+        "Chunked upload %s finalized → job %s (bytes=%d).",
+        upload_id, jid, total_bytes,
+    )
+    return JSONResponse({"job_id": jid, "status": "pending"}, status_code=202)
+
+
+# ── Job poll / download / delete ──────────────────────────────────────────────
+#
+# Declared after the chunked routes. The chunked routes are POST-only, so
+# there is no path overlap with these GET/DELETE ``/{job_id}`` routes.
+
+_JOB_ID_RE = re.compile(r"[0-9a-f-]{36}")
+_VALID_FORMATS = frozenset({"json", "srt", "vtt", "txt"})
+_MEDIA_TYPES: dict[str, str] = {
+    "json": "application/json",
+    "srt": "application/x-subrip",
+    "vtt": "text/vtt",
+    "txt": "text/plain",
+}
+_ACTIVE_STATUSES = frozenset({"pending", "running"})
+
+
+def _owned_job(request: Request, job_id: str) -> Job | None:
+    """Return the job if the caller owns it or is an admin, else None.
+
+    400 on a malformed job_id (server-issued UUIDs only; this also keeps
+    path-traversal shapes out of the output-path join). A missing job, a job
+    owned by someone else, and a job whose outputs were removed (DELETE after
+    download; the row stays for history) all return None so existence never
+    leaks.
+    """
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(400, "Invalid job_id format")
+    job = request.app.state.job_store.get(job_id)
+    user = getattr(request.state, "user", None)
+    if job is None or user is None or job.outputs_removed_at is not None:
+        return None
+    if getattr(user, "role", None) == "admin":
+        return job
+    if int(job.user_id) == int(user.id):
+        return job
+    return None
+
+
+@router.get("/{job_id}", summary="Poll file job status")
+def poll_file_job(request: Request, job_id: str) -> JSONResponse:
+    """Return the current status of a file job.
+
+    Returns
+    -------
+    200 ``{"job_id", "status", ["mode"], ["error"],
+        ["progress"], ["serverFinishing"], ["formats", "outputs"]}``
+    400 Malformed job_id.
+    404 Job not found (or not visible to the caller).
+    """
+    job = _owned_job(request, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+
+    body: dict[str, object] = {"job_id": job.id, "status": job.status}
+    if job.mode is not None:
+        body["mode"] = job.mode
+    if job.error is not None:
+        body["error"] = job.error
+
+    if job.status == "running":
+        phase = job.phase
+        progress: dict[str, object] = {
+            "phase": phase,
+            "phase_label": PHASE_LABELS.get(phase) if phase else None,
+            "chunk_index": job.chunk_index,
+            "total_chunks": job.total_chunks,
+        }
+        if job.phase_started_at is not None:
+            progress["phase_elapsed_s"] = round(
+                time.time() - float(job.phase_started_at), 2
+            )
+        if job.audio_duration_s is not None:
+            progress["audio_duration_s"] = job.audio_duration_s
+        body["progress"] = progress
+        # serverFinishing: cancel was requested but the executor is still
+        # running (Whisper transcribes the whole file in one call, so the
+        # result is discarded only once that call returns).
+        if job.cancel_requested:
+            body["serverFinishing"] = True
+
+    if job.status == "done":
+        # `formats` kept for backward compat; `outputs` maps each format to
+        # its download URL so the client needs no URL-building knowledge.
+        body["formats"] = sorted(_VALID_FORMATS)
+        body["outputs"] = {
+            fmt: f"/transcribe/file/{job.id}/download/{fmt}"
+            for fmt in sorted(_VALID_FORMATS)
+        }
+
+    return JSONResponse(body)
+
+
+@router.get(
+    "/{job_id}/download/{fmt}",
+    summary="Stream a completed transcript output file",
+)
+def download_file_job(request: Request, job_id: str, fmt: str) -> StreamingResponse:
+    """Stream one of the four output formats (json, srt, vtt, txt).
+
+    Returns
+    -------
+    200  Streaming file response.
+    400  Unknown format or malformed job_id.
+    404  Job not found, not visible to the caller, or not yet done.
+    410  Output file missing from disk (e.g. swept by retention).
+    """
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(400, "Invalid job_id format")
+    if fmt not in _VALID_FORMATS:
+        raise HTTPException(400, f"Unknown format '{fmt}'; valid: {sorted(_VALID_FORMATS)}")
+
+    job = _owned_job(request, job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(404, "Job not found or not yet complete")
+
+    output_path = settings.outputs_dir / f"{job_id}.{fmt}"
+    if not output_path.exists():
+        raise HTTPException(410, "Output file missing; the job may have been cleaned up")
+
+    def _gen():
+        with open(output_path, "rb") as fh:
+            while chunk := fh.read(1 << 20):
+                yield chunk
+
+    return StreamingResponse(_gen(), media_type=_MEDIA_TYPES[fmt])
+
+
+@router.delete(
+    "/{job_id}",
+    status_code=204,
+    summary="Cancel a pending/running file job, or remove a finished one",
+)
+def delete_file_job(request: Request, job_id: str) -> Response:
+    """Cancel a file job, or remove a finished job's outputs.
+
+    Returns
+    -------
+    202  The job is pending or running, or the runner is still executing it
+         (a watchdog-``failed`` row whose executor has not returned): cancel
+         is requested and the runner finishes it (``failed: cancelled by
+         user``, outputs discarded).
+    204  Missing / not-visible job (idempotent, no leak), or a finished job
+         whose outputs are now removed. The row and its transcript text stay
+         (``outputs_removed_at``) for ``/me/history`` and retention; on
+         ``/transcribe/file/*`` the job is then invisible (poll/download 404).
+    400  Malformed job_id.
+    """
+    job = _owned_job(request, job_id)
+    if job is None:
+        return Response(status_code=204)
+
+    store = request.app.state.job_store
+    runner = getattr(request.app.state, "file_runner", None)
+
+    def executing() -> bool:
+        return runner is not None and runner.active_job_id == job_id
+
+    if job.status in _ACTIVE_STATUSES or executing():
+        store.set_cancel_requested(job_id)
+        # Re-read: the runner may have finished between the GET above and
+        # the cancel flag landing. The runner's conditional set_running /
+        # set_done refuse a cancelled row, so a still-active job here is
+        # guaranteed to end failed.
+        job = store.get(job_id)
+        if job is None:
+            return Response(status_code=204)
+        if job.status in _ACTIVE_STATUSES or executing():
+            logger.info("File job %s cancel requested.", job_id)
+            return Response(status_code=202)
+
+    if not remove_job_outputs(settings.outputs_dir, job_id):
+        # Keep the row visible: a retried DELETE or the retention purge
+        # finds and removes the leftover transcript files.
+        logger.warning("File job %s: some outputs could not be removed; retry.", job_id)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "could not remove job outputs; retry the delete"},
+        )
+    store.mark_outputs_removed(job_id)
+    logger.info("File job %s outputs removed (row kept).", job_id)
+    return Response(status_code=204)

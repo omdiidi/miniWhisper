@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Visual checklist of the four required permissions.
+/// Visual checklist of the three required permissions.
 ///
 /// Shows a per-permission status row with an "Open System Settings" button.
 /// A "Re-check" button re-runs PermissionGate.checkAll() to refresh the UI.
@@ -94,7 +94,7 @@ struct PermissionsView: View {
     private func runCheck() async {
         isChecking = true
         let results = await PermissionGate.checkAll()
-        // Map results back to rows (same order: a, im, mic, sr).
+        // Map results back to rows (same order: a, im, mic).
         for (i, status) in results.enumerated() {
             if i < statuses.count {
                 statuses[i].status = status
@@ -121,20 +121,14 @@ struct PermissionsView: View {
             ),
             PermissionRow(
                 name: "Input Monitoring",
-                description: "Detect FN-key holds and taps for dictation and meeting recording.",
+                description: "Detect FN-key holds for dictation.",
                 settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
                 status: .unknown
             ),
             PermissionRow(
                 name: "Microphone",
-                description: "Record your voice for dictation and meeting transcription.",
+                description: "Record your voice for dictation.",
                 settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
-                status: .unknown
-            ),
-            PermissionRow(
-                name: "Screen Recording",
-                description: "Capture system audio for dual-channel meeting transcription.",
-                settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
                 status: .unknown
             )
         ]

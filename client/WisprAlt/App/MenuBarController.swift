@@ -3,44 +3,92 @@ import AVFoundation
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import WisprAltCore
 
 // MARK: - MenuBarController
 
-/// Controls the menubar status item, popover, and the app's recording mode state machine.
+/// Controls the menubar status item, popover, dictation and file-job state.
 ///
 /// This class is intentionally NSObject only — not ObservableObject — because it
 /// drives AppKit directly. SwiftUI views that need state observe Settings or
 /// other ObservableObjects injected from AppDelegate.
-///
-/// Mic mutual exclusion (v3 delta):
-///   `tryStartDictation()` returns false and logs a warning toast if `isMeetingActive` is true.
-///   The `meetingActive` flag is kept in sync with `MeetingRecorder.shared.isActive`.
 final class MenuBarController: NSObject {
-    // MARK: - Mode state machine
+    // MARK: - Activity state (main thread only)
 
-    /// Represents all valid UI states for the menubar icon and popover.
-    enum Mode {
-        case idle
-        case dictating
-        case meetingRecording
-        case converting
-        case uploading
-        case processing
-        case done
+    /// The menubar icon's states (Core `ActivityIcon`).
+    typealias Mode = ActivityIcon
+
+    /// The icon, derived from state. It is never written and never branched
+    /// on: dictation and job logic read `currentSession`, `localUploadPhase`
+    /// and `onlineJobTask` directly.
+    var mode: Mode {
+        ActivityState.icon(dictating: currentSession != nil, local: localUploadPhase,
+                           onlineJob: onlineJobTask != nil, doneFlash: localDoneFlash)
     }
 
-    var mode: Mode = .idle {
+    /// The dictation being recorded. Set in `dictationStart` only after
+    /// `recorder.start` returned true; cleared by `beginRun` (FN-up, cap,
+    /// device change). The only "dictation in progress" check. A mode switch
+    /// never touches it, so a recording finishes on its FN-press route.
+    var currentSession: DictationSession? = nil {
         didSet { updateIcon() }
     }
 
-    // MARK: - Meeting active flag
-    // Kept in sync with MeetingRecorder.shared.isActive.
-    // Exposed as `isMeetingActive` computed property so the rest of the app
-    // reads a stable interface.
-    var meetingActive: Bool = false
+    /// Phase of the Local file job. Mirrored to `recordingState` for the
+    /// popover (mode-picker lock).
+    var localUploadPhase: LocalUploadPhase = .none {
+        didSet {
+            recordingState.localUploadPhase = localUploadPhase
+            updateIcon()
+        }
+    }
 
-    /// True when a meeting recording is in progress. Used for mic mutual exclusion.
-    var isMeetingActive: Bool { meetingActive }
+    /// The 3 s "done" icon after a Local file job completes.
+    var localDoneFlash: Bool = false {
+        didSet { updateIcon() }
+    }
+
+    /// The Online file job (Online file transcription assigns it). No mode
+    /// switch ever cancels it.
+    var onlineJobTask: Task<Void, Never>? = nil {
+        didSet { updateIcon() }
+    }
+
+    /// Poll generation fence. Bumped on every Local job/poller start and every
+    /// cancel; the job wrapper and the resume poller write state only while
+    /// `PollFence.mayWrite` holds for the generation they captured.
+    var pollGeneration: Int = 0
+
+    /// `/me` runs at most once per launch (Local only).
+    var meFetchedThisLaunch: Bool = false
+
+    // MARK: - Busy signal (update gate)
+
+    /// Number of dictation transcription Tasks still running after the FN key
+    /// was released. `beginRun` increments it in the same main-actor turn that
+    /// clears `currentSession`, and the spawned Task's first statement is
+    /// `defer { dictationsInFlight -= 1 }`, so there is no turn in which a
+    /// finishing dictation reads as not-busy. Main-thread only. Mirrored to
+    /// `recordingState` for the popover's "transcribing N"; not an icon state.
+    var dictationsInFlight: Int = 0 {
+        didSet {
+            updateIcon()
+            recordingState.dictationsInFlight = dictationsInFlight
+        }
+    }
+
+    /// Number of file-transcription Tasks (pick → upload → poll → download)
+    /// still running. Incremented before the Task is created and decremented
+    /// by the Task's own `defer`. Main-thread only.
+    var fileJobsInFlight: Int = 0
+
+    /// True while a dictation is recording or still transcribing/injecting, or
+    /// a file upload / server job is in flight. `UpdateChecker` and
+    /// `SparkleController` refuse to relaunch the app while this is true, so an
+    /// update can never kill a dictation or an in-flight file job.
+    var isBusy: Bool {
+        currentSession != nil || dictationsInFlight > 0 || fileJobsInFlight > 0
+    }
 
     // MARK: - Sparkle update error
 
@@ -68,10 +116,6 @@ final class MenuBarController: NSObject {
     /// Owned dictation recorder — created once and reused across dictation sessions.
     let dictationRecorder = DictationRecorder()
 
-    // MARK: - Meeting filename rename support
-    var meetingRecordingStart: Date?
-    var meetingStartFileURL: URL?
-
     // MARK: - Status item
 
     let statusItem: NSStatusItem
@@ -97,29 +141,15 @@ final class MenuBarController: NSObject {
     /// observers with no cleanup path.
     var didResignActiveObserver: NSObjectProtocol?
 
-    // MARK: - Pending-uploads drain triggers
-
-    /// Process-local last-shown timestamp for debounced toasts. 10-min window
-    /// per kind so flapping connectivity doesn't spam the user.
-    private enum ToastKind: String {
-        case meetingOffline
-        case fallbackUnavailable
-    }
-    private var lastToastShown: [ToastKind: Date] = [:]
-    private static let toastDebounceSec: TimeInterval = 600
-
-    /// Held so the timer survives across foreground/background transitions.
-    var pendingUploadsDrainTimer: Timer?
-    /// Held to remove the foreground observer on deinit.
-    var didBecomeActiveObserver: NSObjectProtocol?
     /// Token for the `.dictationMaxDurationReached` observer; removed in deinit.
     var dictationMaxDurationObserver: NSObjectProtocol?
 
     // MARK: - Active-job task handles
 
-    /// Strong handle to the currently-running `runFileTranscriptionJob` task.
-    /// `cancelActiveTranscription()` calls `.cancel()` on this to abort the
-    /// poll loop. Nil between jobs.
+    /// Strong handle to the running Local job task (pick → upload → poll, or a
+    /// resumed poller). `cancelActiveTranscription()` and a switch to Online
+    /// cancel it. The task's `defer` clears it only while its generation is
+    /// current, so `activeJobTask != nil` means "a Local poller is running".
     var activeJobTask: Task<Void, Error>? = nil
     /// Strong handle to the URLSession used for the in-flight upload. We hold
     /// it so `cancelActiveTranscription()` can call `invalidateAndCancel()` to
@@ -136,6 +166,10 @@ final class MenuBarController: NSObject {
     /// `resumeInFlightJobIfNeeded()` on app launch so a process restart can
     /// re-attach to a server-side job that's still running.
     static let activeJobIDDefaultsKey = "wispralt.activeJobID"
+    /// UserDefaults key for that job's `SavedJobOutput` (output folder + stem),
+    /// so restart recovery downloads the outputs to the same place. Always
+    /// written and removed together with `activeJobIDDefaultsKey`.
+    static let activeJobOutputDefaultsKey = "wispralt.activeJobOutput"
 
     // MARK: - Init
 
@@ -153,115 +187,18 @@ final class MenuBarController: NSObject {
         configureStatusItem()
         configurePopover()
         updateIcon()
-        configureMeetingCapObservers()
+        configureObservers()
         configureDictationCapObserver()
         configureFirstLaunchObserver()
-        configurePendingUploadsDrainTriggers()
     }
 
-    /// Wire up the three automatic drain triggers for `PendingUploadsQueue`:
-    ///   - app foreground (`NSApplication.didBecomeActiveNotification`)
-    ///   - 120s repeating timer
-    ///   (the third trigger is "successful dictation" — fired inline from
-    ///    `dictationStop()` after the inject lands.)
-    ///
-    /// All three coalesce inside `PendingUploadsQueue.drain()` via the
-    /// drain coordinator so concurrent triggers don't stack up.
-    func configurePendingUploadsDrainTriggers() {
-        // Foreground trigger.
-        didBecomeActiveObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task.detached(priority: .utility) {
-                await PendingUploadsQueue.shared.drain()
-            }
-            // Plan A §A8: cloud-fallback dictation queue shares this
-            // foreground trigger so any OpenRouter-served dictations
-            // from offline mode sync to the origin as soon as the user
-            // refocuses the app.
-            Task.detached(priority: .utility) {
-                await DictationFallbackQueue.shared.drain()
-            }
-        }
+    // MARK: - Observers
 
-        // 120s timer trigger. `Timer.scheduledTimer` adds itself to the
-        // current run loop in `.common` mode so it survives event-tracking
-        // (e.g. user holding down a menu).
-        pendingUploadsDrainTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { _ in
-            Task.detached(priority: .utility) {
-                await PendingUploadsQueue.shared.drain()
-            }
-        }
-        if let timer = pendingUploadsDrainTimer {
-            RunLoop.main.add(timer, forMode: .common)
-        }
-    }
-
-    /// Fire the meeting-offline toast, debounced per-kind (10 min cooldown).
-    /// Wording is the brief's locked phrasing.
-    @MainActor
-    func showOfflineMeetingToast() {
-        guard shouldShowToast(.meetingOffline) else { return }
-        AppNotifications.notify(
-            title: "WisprAlt — Server Offline",
-            body: "Meeting will upload when it's back. Recording is saved locally."
-        )
-    }
-
-    /// Fire the dictation-fallback-unavailable toast (Worker also down).
-    @MainActor
-    func showFallbackUnavailableToast() {
-        guard shouldShowToast(.fallbackUnavailable) else { return }
-        AppNotifications.notify(
-            title: "WisprAlt",
-            body: "Transcription temporarily unavailable."
-        )
-    }
-
-    private func shouldShowToast(_ kind: ToastKind) -> Bool {
-        let now = Date()
-        if let last = lastToastShown[kind],
-           now.timeIntervalSince(last) < Self.toastDebounceSec
-        {
-            return false
-        }
-        lastToastShown[kind] = now
-        return true
-    }
-
-    /// Hook reserved for a future menubar `(N pending)` indicator. Currently
-    /// a no-op — the status item uses a transient popover, not a menu, so
-    /// surfacing per-state badges requires a popover-side overhaul outside
-    /// the scope of the offline-fallback feature.
-    func refreshPendingMenu() {}
-
-    // MARK: - C13: Recording cap observers
-
-    func configureMeetingCapObservers() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleMeetingMaxDurationReached),
-            name: .meetingMaxDurationReached,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleMeetingApproachingCap),
-            name: .meetingApproachingCap,
-            object: nil
-        )
+    func configureObservers() {
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleDictationConfigChanged),
             name: .dictationConfigChanged,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleMeetingConfigChanged),
-            name: .meetingConfigChanged,
             object: nil
         )
     }
@@ -281,5 +218,88 @@ final class MenuBarController: NSObject {
     func showToast(_ message: String) {
         Log.warning(message, category: "ui")
         AppNotifications.notify(title: "WisprAlt", body: message)
+    }
+
+    // MARK: - Mode switch / launch
+
+    /// Inputs for `LaunchActions.decide`. The Local key is read only in Local
+    /// mode (Online never needs it).
+    @MainActor var localJobState: LocalJobState {
+        let mode = Settings.shared.mode
+        let hasServerConfig = mode == .local && Settings.shared.serverURL != nil
+            && ((try? KeychainHelper.getAPIKey()) ?? nil)?.isEmpty == false
+        let saved = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey)
+        return LocalJobState(mode: mode, hasServerConfig: hasServerConfig,
+                             hasSavedJobID: saved?.isEmpty == false,
+                             pollerRunning: activeJobTask != nil,
+                             onlineJobRunning: onlineJobTask != nil,
+                             meFetchedThisLaunch: meFetchedThisLaunch)
+    }
+
+    /// True while an invite redeem (`POST /invites/redeem`) is in flight.
+    /// `transcribePickedFile` refuses a Local file job meanwhile: the redeem
+    /// is about to repoint the server URL and key, which would strand it.
+    var inviteRedeemInFlight = false
+
+    /// The one "Local file job active or saved" predicate: converting,
+    /// uploading, polled, or its id saved for resume. While it is true an
+    /// invite is refused and Settings locks the Local server URL and API key
+    /// (either change would point that job at another server and strand it).
+    @MainActor var localFileJobActiveOrSaved: Bool {
+        let saved = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey)
+        return InviteLink.refusedForLocalJob(phase: localUploadPhase, pollerRunning: activeJobTask != nil,
+                                             hasSavedJobID: saved?.isEmpty == false)
+    }
+
+    /// Runs the launch / mode-switch decision. Called by `AppDelegate` at
+    /// launch and by `applyModeSwitch(to:)`.
+    @MainActor func applyModeEvent(_ event: ModeEvent) {
+        let actions = LaunchActions.decide(event, localJobState)
+        if actions.cancelLocalPoll { pauseLocalPoll() }
+        if actions.resumeLocalJob { resumeInFlightJobIfNeeded() }
+        if actions.fetchMe {
+            meFetchedThisLaunch = true
+            Task { @MainActor in await fetchMeAndMaybeAskName() }
+        }
+    }
+
+    /// The popover's mode picker. Refused while a Local upload has no job id
+    /// yet (the picker is disabled then too). Never touches `currentSession`
+    /// or `onlineJobTask`.
+    @MainActor func applyModeSwitch(to mode: TranscriptionMode) {
+        guard Settings.shared.mode != mode, !localUploadPhase.locksModePicker else { return }
+        Settings.shared.mode = mode
+        Log.info("Mode switched to \(mode.rawValue).", category: "app")
+        applyModeEvent(.switched(to: mode))
+    }
+
+    /// Switch to Online: stop watching the Local job without cancelling it on
+    /// the server. The saved `activeJobID` stays, so a switch back (or the
+    /// next launch in Local) resumes polling it.
+    @MainActor func pauseLocalPoll() {
+        pollGeneration += 1
+        activeJobTask?.cancel()
+        activeJobTask = nil
+        recordingState.reset()
+        localUploadPhase = .none
+        localDoneFlash = false
+    }
+
+    /// `GET /me` (Local only, once per launch): mirror `display_name` and
+    /// maybe ask for a name.
+    @MainActor func fetchMeAndMaybeAskName() async {
+        do {
+            let me = try await MeAPI.get()
+            Settings.shared.displayName = me.display_name
+            FirstLaunchCoordinator.shared.maybePresentNameSheet(serverDisplayName: me.display_name)
+        } catch {
+            Log.debug("display_name check skipped: \(ErrorLog.describe(error))", category: "lifecycle")
+        }
+    }
+
+    /// Online FN press with no key: open the popover at the OpenAI key field.
+    @MainActor func openKeyEntry() {
+        recordingState.keyEntryRequested = true
+        if !popover.isShown { showPopover() }
     }
 }

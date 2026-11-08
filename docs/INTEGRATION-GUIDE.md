@@ -12,22 +12,21 @@ two environment variables changed.
 > For the full /v1 surface reference (all response formats, headers, error
 > codes, file formats, key kinds), see [OPENAI-COMPAT.md](OPENAI-COMPAT.md).
 
-For the full WisprAlt-native API (async meetings, /me, admin), see
+For the full WisprAlt-native API (async file jobs, /me, admin), see
 [API.md](API.md).
 
 ---
 
 ## Prerequisites
 
-- WisprAlt server is running and reachable. The default public URL is
-  `https://transcribe.integrateapi.ai` (see [SETUP-SERVER.md](SETUP-SERVER.md)
-  if you need to deploy your own).
+- A WisprAlt host is running and reachable. The examples use
+  `https://wispralt.example.com`; substitute your host's URL (see
+  [SETUP-SERVER.md](SETUP-SERVER.md) to run your own).
 - You have a WisprAlt **integration** API key. Mint one at
-  `https://transcribe.integrateapi.ai/admin/keys/new` (admin only), or ask
+  `https://wispralt.example.com/admin/integrations/new` (admin only), or ask
   your operator to mint one for you (see
   [ADMIN.md → Integration Keys](ADMIN.md#integration-keys)). Integration
-  keys are scoped to `/v1/*` only — they cannot access `/me/*` or
-  `/telemetry/*`. For programs, that's exactly what you want.
+  keys are scoped to `/v1/*` only — they cannot access `/me/*`. For programs, that's exactly what you want.
 
 ---
 
@@ -37,7 +36,7 @@ Set these two environment variables in your project. The env var names follow
 OpenAI conventions so existing libraries auto-pick them up:
 
 ```bash
-export OPENAI_BASE_URL=https://transcribe.integrateapi.ai/v1
+export OPENAI_BASE_URL=https://wispralt.example.com/v1
 export OPENAI_API_KEY=<your-wispralt-token>
 ```
 
@@ -83,7 +82,7 @@ console.log(resp.text);
 ### curl
 
 ```bash
-curl https://transcribe.integrateapi.ai/v1/audio/transcriptions \
+curl https://wispralt.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -F file=@audio.wav \
   -F model=whisper-1 \
@@ -114,7 +113,7 @@ has no Whisper-BPE IDs).
 ### SRT (SubRip) export
 
 ```bash
-curl https://transcribe.integrateapi.ai/v1/audio/transcriptions \
+curl https://wispralt.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -F file=@audio.wav \
   -F response_format=srt \
@@ -127,7 +126,7 @@ into VLC, Premiere, or any subtitle workflow.
 ### VTT (WebVTT) export
 
 ```bash
-curl https://transcribe.integrateapi.ai/v1/audio/transcriptions \
+curl https://wispralt.example.com/v1/audio/transcriptions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -F file=@audio.wav \
   -F response_format=vtt \
@@ -184,8 +183,8 @@ with `code: "unsupported_file_type"`. Pre-convert to wav/mp3 locally.
   `code: "audio_too_long"` over the cap.
 - **Sync only.** This endpoint blocks until transcription completes (typically
   <500ms wall-clock for short clips).
-- **For longer audio (meetings, calls)**, use the native async
-  `/transcribe/meeting` endpoint. See [API.md](API.md).
+- **For longer audio (recorded calls, lectures, video)**, use the native async
+  `/transcribe/file` endpoint (employee keys only). See [API.md](API.md).
 - **Per-token rate limit: 60 requests per 60-second window.** Independent of
   the per-IP bucket on `/transcribe/dictate`. Honor `Retry-After` on 429.
 
@@ -211,56 +210,24 @@ contacting your operator about a failed call.
 
 ---
 
-## Smart formatting (WisprAlt-specific extension)
+## Smart formatting
 
-The WisprAlt macOS client has a "Smart formatting" toggle that calls
-[OpenRouter Mercury 2](https://openrouter.ai/) on the server to add punctuation
-and casing, remove obvious filler words, collapse repeats, and apply light
-list formatting on dictations of at least `SMART_FORMAT_MIN_WORDS` (default
-80) words. Meaning is preserved — no rephrasing, no summarization. **We
-deliberately do NOT apply that on `/v1/audio/transcriptions`** — third-party
-API consumers expect raw model output, not opinionated post-processing. If
-you want cleanup in your own pipeline, do it yourself.
-
-### Need cleanup but not via the WisprAlt client?
-
-Hit the native endpoint directly with the `X-Smart-Format: true` header. Your
-operator must have `SMART_FORMAT_ENABLED=true` and `OPENROUTER_API_KEY` configured server-side for this to
-work; without the key, the header is silently ignored and you get raw output.
-
-```bash
-curl https://transcribe.integrateapi.ai/transcribe/dictate \
-  -H "Authorization: Bearer $WISPRALT_API_KEY" \
-  -H "X-Smart-Format: true" \
-  -F file=@audio.wav
-```
-
-Returns:
-
-```json
-{
-  "text": "Cleaned-up transcript with proper punctuation.",
-  "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
-  "duration_ms": 142.3,
-  "smart_formatted": true
-}
-```
-
-The header accepts `true`, `1`, or `yes` (case-insensitive). Anything else,
-or an absent header, leaves output raw and `smart_formatted: false`. This is a
-WisprAlt-specific extension, **not** part of OpenAI compatibility — do not
-expect upstream OpenAI clients to send it.
+The server never post-processes transcripts: both `/v1/audio/transcriptions`
+and the native `/transcribe/dictate` return raw model output. Server smart
+formatting (OpenRouter Mercury, the `X-Smart-Format` header and the
+`smart_formatted` response key) was removed in Part 4. If you want cleanup in
+your own pipeline, do it yourself.
 
 ---
 
 ## Troubleshooting
 
 - **401 invalid_api_key**: token wrong, expired, or revoked. Mint a fresh one
-  at `https://transcribe.integrateapi.ai/admin/keys/new` (or ask your admin).
+  at `https://wispralt.example.com/admin/integrations/new` (or ask your admin).
 - **413 file_too_large**: clip exceeds 25 MB. Chunk the audio client-side or
   use the native async API.
-- **400 audio_too_long**: clip exceeds 15 minutes. Use `/transcribe/meeting`
-  for longer audio.
+- **400 audio_too_long**: clip exceeds 15 minutes. Use the native async
+  `/transcribe/file` for longer audio.
 - **400 unsupported_file_type**: ffmpeg can't decode the file. Pre-convert
   to wav/mp3 locally.
 - **422 invalid_response_format**: the value you sent isn't a recognized
@@ -277,20 +244,20 @@ For server-side debugging see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 - All 5 response formats supported (`json`, `text`, `verbose_json`, `srt`, `vtt`).
 - We always route to Parakeet TDT 0.6B v2 (English, sub-200ms inference). The
   `model` field is accepted for compatibility against the 5 listed model IDs.
-- No diarization on `/v1/*` (use the native `/transcribe/meeting`).
+- No diarization (speaker labels) anywhere; WisprAlt transcribes one mono stream.
 - No translation (Parakeet is English-only).
 - No SSE streaming (`stream=true` → 400 `streaming_unsupported`). Matches
   real OpenAI's whisper-1 behavior.
 
-For diarization + multi-speaker meetings, use the native `/transcribe/meeting`
-async API, which does mlx-whisper + Pyannote with full speaker attribution.
+For long files, use the native async `/transcribe/file` API (mlx-whisper,
+single speaker, JSON/SRT/VTT/TXT outputs).
 
 ---
 
 ## See also
 
 - [OPENAI-COMPAT.md](OPENAI-COMPAT.md) — full /v1 surface reference (canonical)
-- [API.md](API.md) — full WisprAlt-native API reference (async meeting endpoint, `/me`, admin endpoints)
+- [API.md](API.md) — full WisprAlt-native API reference (async file-job endpoints, `/me`, admin endpoints)
 - [SETUP-SERVER.md](SETUP-SERVER.md) — deploy your own WisprAlt server
 - [SETUP-CLIENT.md](SETUP-CLIENT.md) — install the macOS client
 - [ADMIN.md](ADMIN.md) — minting tokens and managing users (incl. [Integration Keys](ADMIN.md#integration-keys))

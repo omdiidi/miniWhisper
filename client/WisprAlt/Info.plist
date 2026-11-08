@@ -18,8 +18,24 @@
 	<string>0.5.0</string>
 	<key>CFBundleVersion</key>
 	<string>0.5.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>co.wispralt.join</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>wispralt</string>
+			</array>
+		</dict>
+	</array>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAccessibilityUsageDescription</key>
@@ -27,7 +43,7 @@
 	<key>NSAppleEventsUsageDescription</key>
 	<string>WisprAlt sends text to other applications.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>WisprAlt records your voice for dictation and meeting transcription.</string>
+	<string>WisprAlt records your voice for dictation.</string>
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
 	<key>SUEnableAutomaticChecks</key>

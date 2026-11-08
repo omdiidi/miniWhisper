@@ -8,9 +8,9 @@ enum RecordingPhase: Equatable {
     case idle
     /// FN held; mic is actively capturing dictation. `startedAt` used for elapsed display.
     case recording(Date)
-    /// Meeting WAV is being uploaded. `fraction` is in `[0.0, 1.0]`.
+    /// A picked file is being uploaded. `fraction` is in `[0.0, 1.0]`.
     case uploading(Double)
-    /// Server is processing the uploaded meeting. `startedAt` used for elapsed timer.
+    /// Server is processing the uploaded file. `startedAt` used for elapsed timer.
     case processing(Date)
     /// Pipeline finished. Shown briefly before returning to idle.
     case done
@@ -167,50 +167,21 @@ struct RecordingIndicatorView: View {
 }
 
 // MARK: - Preview
-
-#Preview("Idle") {
-    RecordingIndicatorView(phase: .idle)
+#if DEBUG
+// PreviewProvider (not the #Preview macro): the macro needs Xcode's PreviewsMacros
+// plugin, so `swift build` with only the Command Line Tools would fail.
+struct RecordingIndicatorView_Previews: PreviewProvider {
+    static var previews: some View {
+        Group {
+            RecordingIndicatorView(phase: .idle).previewDisplayName("Idle")
+            RecordingIndicatorView(phase: .recording(Date())).previewDisplayName("Recording")
+            RecordingIndicatorView(phase: .uploading(0.43)).previewDisplayName("Uploading 43%")
+            RecordingIndicatorView(phase: .processing(Date())).previewDisplayName("Processing")
+            RecordingIndicatorView(phase: .done).previewDisplayName("Done")
+        }
         .padding()
         .frame(width: 260)
         .environmentObject(RecordingState())
+    }
 }
-
-#Preview("Recording") {
-    RecordingIndicatorView(phase: .recording(Date()))
-        .padding()
-        .frame(width: 260)
-        .environmentObject(RecordingState())
-}
-
-#Preview("Uploading 43%") {
-    RecordingIndicatorView(phase: .uploading(0.43))
-        .padding()
-        .frame(width: 260)
-        .environmentObject(RecordingState())
-}
-
-#Preview("Processing") {
-    RecordingIndicatorView(phase: .processing(Date()))
-        .padding()
-        .frame(width: 260)
-        .environmentObject(RecordingState())
-}
-
-#Preview("Processing — Transcribing chunks") {
-    let state = RecordingState()
-    state.phase = "transcribe"
-    state.phaseLabel = "Transcribing"
-    state.chunkIndex = 7
-    state.totalChunks = 21
-    return RecordingIndicatorView(phase: .processing(Date()))
-        .padding()
-        .frame(width: 260)
-        .environmentObject(state)
-}
-
-#Preview("Done") {
-    RecordingIndicatorView(phase: .done)
-        .padding()
-        .frame(width: 260)
-        .environmentObject(RecordingState())
-}
+#endif

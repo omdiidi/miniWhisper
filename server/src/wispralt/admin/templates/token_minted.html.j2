@@ -1,0 +1,9 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}New key · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head"><h1>New key for user #{{ user_id }}</h1></div>
+  <p class="notice warn"><strong>Copy this key now.</strong> It is shown only once; every older key of this person no longer works.</p>
+  {{ ui.secret_once(plaintext, "token") }}
+  <p><a href="/admin/people/{{ user_id }}">Back to the person</a></p>
+{% endblock %}

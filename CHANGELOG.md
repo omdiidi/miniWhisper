@@ -2,6 +2,289 @@
 
 All notable changes to WisprAlt are documented here.
 
+## [Unreleased] - 2026-11-07 — Part 8: release cleanup
+
+### Changed
+
+- **Updates go through the CLI.** The app's update button no longer runs the retired
+  curl installer: **Copy update command** copies `wispralt update --client`. The
+  releases it polls come from the bundle's `WisprAltReleaseRepo` key, stamped from the
+  clone's GitHub `origin` by `scripts/build-client-local.sh` (no hardcoded owner).
+- **Add employee** shows the clone + `./install.sh --role client --client-mode local`
+  command, the server URL and the key, instead of the retired curl one-liner.
+- **CI:** the client job runs `scripts/test-client.sh` (adds the log-privacy gate);
+  the installer lint also syntax-checks `scripts/*.sh`.
+- **Docs** match the SQLite host, the `wispralt` CLI and `/admin/people`; new concise
+  `README.md` and `AGENTS.md`. Personal names and domains replaced with placeholders.
+- **`wispralt import export|snapshot|files`** runs the history importer against the
+  host's `.env`, stopping and restarting the service around a real import.
+- **One server test runner** (`scripts/test-server.sh`) for local runs and CI.
+
+- **OpenAI spend in the menu**: the popover shows "OpenAI ≈ $X today · $Y this month", estimated on this Mac from audio minutes × each model's price.
+
+### Fixed (found by the end-to-end run on a real Mac)
+
+- `backup`, `restore` and `update` could leave the host unloaded: `launchctl bootout`
+  returns before the job is gone, so the restart kickstarted a dying job. `stop` now
+  waits until launchd no longer lists it.
+- `setup` downloaded Parakeet a second time into `~/.cache/huggingface` (2.3 GB):
+  `HF_HOME` is now pinned before anything imports `huggingface_hub`.
+- The live-model probe streamed at 5× real time, which cut the commit's tail; it now
+  streams in real time and fails on a cut tail. A 10-minute `gpt-live-transcribe`
+  dictation returns complete (2,358/2,360 words), so no shorter live cap is needed.
+
+### Removed
+
+- `server/migrations/` (the Supabase-era Postgres SQL) and stray `.gitkeep` files.
+
+## [Unreleased] - 2026-11-07 — Part 6: modern portal, Data & Insights
+
+### Added
+
+- **Portal shell.** One stylesheet (`admin/static/portal.css`, light/dark, phone
+  layout), shared macros, a role-aware sidebar: Overview · People · Integrations ·
+  Invites · Usage · Records · Data · System · Settings, plus My history / My insights.
+  No build step, no CDN.
+- **First-admin setup in the portal** (`/admin/setup`), unlocked by the one-time
+  `DATA_DIR/setup-code` file written while no admin exists. The CLI bootstrap stays.
+- **People and devices.** Person pages list each device (key) with its own last seen;
+  **Add device** (invite), **Revoke device**, **Rotate key** and **Disable person**.
+- **Invites.** Single-use, 10-minute links `wispralt://join?host=…&invite=…` (stored as
+  a hash, shown once) and the public `POST /invites/redeem`, which answers every
+  failure with the same `400 invite_invalid` and is rate-limited.
+- **System page** (`/admin/system`): uptime/starts, version, CPU, memory, disk and data
+  sizes, models, queue, 5xx rate, failure counters, latency, DB, network, active vs
+  recent clients.
+- **Full-text history search** (SQLite FTS5) on `/me/history` and the admin-only
+  `/admin/records`, with highlighted, escaped snippets. Scope is enforced in SQL.
+- **Measured stats** computed from the database (counts, words, active days, file
+  audio minutes, filler words, time saved as a labelled estimate, latency, error rate,
+  8-week trend, hour of day); every tile opens its records.
+- **AI insights v2.** Every AI item cites the records it came from (validated against
+  what was in the prompt, re-checked at render), with stale and "seen N weeks" notices.
+- **Runs, scheduler and settings.** `insight_runs` with live progress; an hourly due-check
+  for the last full week; rerun and backfill (up to 12 weeks) with a cost estimate shown
+  first; AI is off until an admin accepts the disclosure in Settings; the 30-day cap is
+  checked before every call.
+- Migration `0002_portal.sql` (FTS + triggers, `insight_runs`, `usage_events.key_id`,
+  settings seeds).
+
+### Changed
+
+- `/admin/users*` → `/admin/people*`; `/admin/keys*` (integration keys) →
+  `/admin/integrations*`; `/admin/keys/{key_id}/revoke` now revokes one device.
+- `/me/history` searches with `q` (2+ characters, FTS) instead of `search` (LIKE).
+- Insight timezone defaults to the host zone (else UTC) instead of America/Los_Angeles.
+
+### Removed
+
+- LLM-invented numbers (`pct_time`, `filler_word_count`, `wow_delta`, `tool_mentions`),
+  the substring hallucination scrub, the Sunday-23:00 sleep, the opt-in startup catch-up,
+  `POST /admin/data/insights/run-now`, and the `INSIGHTS_MAX_30D_COST_USD`,
+  `INSIGHTS_SCHEDULE_*` and `INSIGHTS_CATCHUP_ENABLED` settings.
+
+## [Unreleased] - 2026-11-07 — Part 5: the `wispralt` CLI and install
+
+One command now installs, runs and maintains a host and/or client on any
+Apple Silicon Mac: clone, then `./install.sh`.
+
+### Added
+
+- **`wispralt` CLI** (console script in the server package, installed with
+  `uv tool install`): `setup --role host|client|both`, `status`, `doctor`,
+  `start|stop|restart`, `users`, `keys` (incl. `rotate-admin`), `retention`,
+  `backup`, `restore`, `update`, `uninstall`. Non-interactive flags for
+  scripted/agent installs; exit codes 0/1/2/3; `--json` output.
+- **Idempotent setup.** Reruns add only missing `.env` keys, download nothing
+  when the models verify (sha256 against Hugging Face metadata), never create a
+  second admin or rotate a key, and ask the retention question once.
+- **Safe key handoff.** A new key goes only to a terminal or a new 0600
+  `--token-file`; with `--role both` it reaches the app's Keychain through
+  `security -i` on stdin, never a command line.
+- **Offline backup/restore/update** wrapped around the server lock: the service
+  is stopped, proven stopped, and restarted afterwards.
+
+### Changed
+
+- **`install.sh`** is now a thin bootstrap run from a clone (Homebrew, `ffmpeg`,
+  `uv`, then `wispralt setup`). The `curl | bash` release installer and its
+  Keychain seeding are gone; a DMG is installed with `setup --dmg`, verified
+  with `codesign` + `spctl`, and quarantine is never stripped.
+- **Host layout.** Config in `~/.config/wispralt/` (`.env`, `install-state.json`),
+  data in `~/Library/Application Support/WisprAlt/host`, models in
+  `…/WisprAlt/models` (`HF_HOME`), backups in `~/WisprAlt-Backups/`; all
+  re-rooted by `WISPRALT_ROOT`. The LaunchAgent is `co.wispralt.host`; a
+  mini-era `co.wispralt.server` is booted out and its plist moved aside.
+- `python -m wispralt.bootstrap` is a thin shim over the CLI's admin functions.
+- `scripts/setup-cloudflared.sh` (optional tunnel) writes the host config
+  `.env`; `scripts/verify-openai-compat.sh` defaults to the local host.
+
+### Removed
+
+- `scripts/setup-server.sh`, `download-models.sh`, `server-launchd.sh`,
+  `doctor.sh`, `server-uninstall.sh`, `uninstall-client.sh` (folded into the
+  CLI), `deploy-server.sh`, `run-matrix-local.sh`, `setup-local-codesign.sh`,
+  `server/scripts/prefetch-mlx-whisper.sh` and `server/scripts/run-matrix.sh`.
+- The `/setup-server`, `/setup-client`, `/update-models`, `/test-connection`
+  and `/verify-autostart` Claude commands (`wispralt setup|doctor|update`).
+
+### Known gaps
+
+- The app's in-app update button still shells the retired curl installer, and
+  the portal's **Add employee** page still shows a curl install command; both
+  are retargeted in later parts.
+
+## [Unreleased] - 2026-11-07 — Part 3: Online mode (OpenAI direct) + client modernization
+
+### For you (owner-facing)
+
+- **Online is now the default.** Add your key with
+  `security add-generic-password -U -s co.wispralt.openai -a default -w`
+  (works while the app runs) or in Settings → Advanced. Expect one Keychain
+  prompt per new app build. Without a key, FN shows a notice and opens the
+  key field. Use a project-scoped key with a monthly budget cap.
+- Pick the model in Settings → Advanced; prices are shown beside each.
+  Dictation stops at 10 minutes (7 with gpt-realtime-whisper).
+- Live models (gpt-live-transcribe, gpt-realtime-whisper) stream audio while
+  you hold FN and give the text at release, not while you speak. They cost
+  about 3.8× more; measured latency is in docs/TESTING.md. If a live session
+  fails at release, the same audio is re-sent to gpt-transcribe: for a
+  10-minute dictation that can take up to about 8 minutes and is charged a
+  second time.
+- Known limit: with gpt-realtime-whisper, if OpenAI reports no token count, a
+  cut-off transcript cannot be flagged; its 7-minute cap is the protection.
+- In Online mode nothing is sent to your Local server. A running Local file
+  job pauses when you switch to Online; switching back resumes watching it,
+  as after a relaunch (you get a completion notice and re-run it to download
+  the files).
+- If transcription fails, the audio is kept under "Retry" (last 2, for 7
+  days, compact 16 kHz) with Retry, Export… and Discard. If the text could not
+  be confirmed as pasted, it stays on the clipboard and under "Copy last
+  dictation"; no audio is kept. Dictating into a password field types and
+  copies nothing (use "Copy last dictation"). Both rely on FileVault.
+- Online file transcription sends supported files under 25 MB and 10 minutes
+  as is, and splits the rest. It saves TXT and JSON; subtitles need Local.
+  Quitting mid-file loses that job; pick the file again.
+- Not in this part: join link and invites, plain-http LAN hosts (use
+  `tailscale serve`), a history list, text-while-you-speak (live deltas are
+  received but not shown), resuming Online file jobs.
+
+### Added
+
+- **Mode picker** (Online (OpenAI) / Local server) with a status line
+  (`Online · <model> · key saved|key missing` or `Local · <host>`,
+  "transcribing N"). A change applies to the next dictation.
+- **Online dictation**: 16 kHz mono WAV → `POST /v1/audio/transcriptions`,
+  one retry on transient errors, a deadline that cancels the request. Model
+  picker with $/min and retire dates (no diarize model).
+- **Live models over the Realtime API** (`gpt-live-transcribe`,
+  `gpt-realtime-whisper`): the socket opens at FN press, audio streams while
+  FN is held, commit at release; socket / deadline / server errors recover
+  once through `gpt-transcribe`.
+- **Online file jobs** (TXT + JSON): direct upload when possible, else
+  audio extraction, decode and quiet-point chunking (≤ 10 min per chunk,
+  previous chunk's tail as prompt); outputs written all or nothing.
+- **Client-side Mercury smart formatting** (opt-in, both modes, text only to
+  OpenRouter, key `co.wispralt.openrouter`).
+- **Spool + Retry list**, **last-text record** for "Copy last dictation".
+- `WisprAltCore` holds every testable decision; tests moved to Swift Testing
+  (`scripts/test-client.sh`), plus a log-privacy gate and the real-API probe
+  (`scripts/online-assumptions/run-all.sh`: pre-flight P1/P3/P4/P5,
+  `suite-file`, `suite-live`; exit 0 PASS / 1 FAIL / 2 BLOCKED).
+
+### Changed
+
+- Release logs are private; no log carries transcript text, server bodies or
+  reasons, paths, URLs or keys.
+- Local URLs: https, or http only to this Mac (`NSAllowsLocalNetworking`).
+- Every Local dictation request carries `X-Client-Dedup-Id`; the client no
+  longer sends `smart_format` / `X-Smart-Format`.
+- An unverified Cmd+V paste leaves the text on the clipboard (the previous
+  pasteboard is no longer restored).
+
+### Removed
+
+- Local API key export / import / "Copy API Key", the DEBUG `/tmp` WAV dump,
+  and the server call behind "Copy last dictation" (`GET /me/dictations/last`).
+
+## [Unreleased] - 2026-11-07 — Part 2: removals (meetings, cloud fallback, Hugging Face token)
+
+WisprAlt is now dictation plus file transcription. Everything below is a
+removal or a rename; nothing is added except CI.
+
+### Removed
+
+- **Meetings, end to end.** Server: the meeting submit route
+  (`POST /transcribe/meeting`), the `/readyz/meeting` probe, the diarization
+  pipeline, silence/in-person detection, the denoise stub and the compat
+  shims. Client: the meeting recorder (dual-channel system-audio capture),
+  the FN triple-tap toggle, the transcript list/detail views and local
+  speaker rename, and the Screen Recording permission (the wizard is now
+  three steps). `scripts/smoke-meeting.sh` is gone and `doctor.sh` no
+  longer probes meetings.
+- **OpenRouter audio fallback.** When the Mac mini is offline, dictation now
+  retries the origin once and then shows the normal dictation error toast;
+  there is no cloud rung. The client's offline upload queue and the
+  cloud-fallback telemetry queue are gone, as are the server's
+  `/telemetry/cloud-dictation` ingest route and the dev-only fault injection
+  (`dev_faults`, `scripts/check-watcher.sh`). The `co.wispralt.openrouter`
+  Keychain item **stays**: it is reserved for Mercury smart formatting.
+  `docs/FALLBACK.md` was deleted.
+- **Hugging Face token.** Both models (Parakeet, MLX Whisper) are public.
+  `setup-server.sh` no longer prompts for `HF_TOKEN`, and
+  `download-models.sh` fetches only those two models.
+- **Dependencies.** `pyannote.audio`, `torch`/`torchaudio` pins and
+  `matplotlib` dropped from `server/pyproject.toml` (torch now arrives only
+  transitively through `mlx-whisper`); `huggingface_hub` stays on the
+  1.12.x line. Model downloads shrink from ~5.6 GB to ~2.7 GB.
+
+### Changed
+
+- **Package rename.** `server/src/wispralt_server` → `server/src/wispralt`,
+  and `meeting/` → `files/`. Run the server with `uvicorn wispralt.main:app`.
+  `scripts/deploy-server.sh` regenerates an existing LaunchAgent whose plist
+  still names the old module, so in-place upgrades keep booting.
+- **File-job routes moved** to `/transcribe/file/{id}` (poll),
+  `/transcribe/file/{id}/download/{fmt}` and `DELETE /transcribe/file/{id}`,
+  owner-or-admin only (anything else looks missing: 404 / 204). The `mode`
+  field is gone from `/transcribe/file` and chunked init.
+- **Cancel semantics.** `DELETE` returns **202** for a pending or running
+  job (cancel requested) and **204** once removed. A pending job never
+  starts. A running Whisper call finishes before its result is discarded;
+  the job then ends `failed: cancelled by user` with no outputs. The client
+  clears its job state at once, so "Transcribe file…" is never left
+  disabled.
+- **Busy 429s carry a `code`.** `file_job_busy` or `insufficient_memory`;
+  the client maps them once in `ServerClient`. Rate-limit 429s have none.
+- **Transcript JSON.** `model` now lists the ASR model only (no
+  `diarization` / `denoise` keys), every segment is "Speaker 1" with
+  `words: []`, and file audio no longer passes through the denoise stub.
+- **File model lifecycle.** MLX Whisper loads lazily on the first file job
+  and is evicted when idle (`FILE_MODEL_IDLE_EVICTION_SECONDS`, renamed from
+  the meeting-era setting `MEETING_IDLE_EVICTION_SECONDS`, which is now
+  ignored: rename it in an existing `server/.env`).
+- **Update safety.** An update relaunch is refused while the app is busy
+  (dictating, uploading or processing a file job, or a dictation in flight).
+- **Admin portal.** Rows stored with `kind='meeting'` are displayed as
+  "File transcription(s)"; the stored value is unchanged.
+- **CI.** `.github/workflows/ci.yml` runs the server suite on Ubuntu (with
+  `ffmpeg` and MLX stubs, no Hugging Face token) and `swift build && swift
+  test` for the client on macOS. It replaces `test-server.yml`.
+
+### Leftovers you can delete by hand
+
+Nothing deletes user data. On other installs these folders may still exist
+and are no longer read:
+
+- `~/Library/Application Support/co.wispralt/pending-uploads/` (the old
+  offline meeting-upload queue, formerly `PendingUploadsQueue`)
+- `~/Library/Application Support/co.wispralt/cloud-fallback-queue/` (the
+  `DictationFallbackQueue` folder, including its `failed/` subfolder)
+
+Both are absent on the owner's Mac (checked 2026-11-07). Meeting
+transcripts already saved under `~/Documents/WisprAlt/Meetings/` stay where
+they are.
+
 ## [0.1.1] - 2026-05-01
 
 ### Fixed

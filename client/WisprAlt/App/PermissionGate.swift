@@ -1,7 +1,6 @@
 import AppKit
 import AVFoundation
 import CoreGraphics
-import ScreenCaptureKit
 
 // MARK: - PermissionStatus
 
@@ -14,13 +13,12 @@ enum PermissionStatus {
 
 // MARK: - PermissionGate
 
-/// Sequential 4-permission wizard executed at first launch.
+/// Sequential 3-permission wizard executed at first launch.
 ///
 /// Order (mandated by plan):
 ///   1. Accessibility
 ///   2. Input Monitoring
 ///   3. Microphone
-///   4. Screen Recording
 ///
 /// Each step shows an NSAlert with a "Open System Settings" deep-link button when
 /// the permission is not yet granted. For Input Monitoring on macOS 14.4+, after
@@ -34,13 +32,12 @@ enum PermissionGate {
         "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
     private static let microphoneURL =
         "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-    private static let screenRecordingURL =
-        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
 
     // MARK: - Public entry point
 
-    /// Run the sequential 4-step permission check. Must be called on @MainActor.
-    /// Returns a status for each permission in order: [accessibility, inputMonitoring, microphone, screenRecording].
+    /// Run the sequential 3-step permission check. Must be called on @MainActor.
+    /// Returns a status for each permission in order: [accessibility, inputMonitoring, microphone].
+    /// Consumers (AppDelegate's name array, PermissionsView's index map) rely on this order.
     @MainActor
     static func checkAll() async -> [PermissionStatus] {
         var results: [PermissionStatus] = []
@@ -53,9 +50,6 @@ enum PermissionGate {
 
         let mic = await checkMicrophone()
         results.append(mic)
-
-        let sr = await checkScreenRecording()
-        results.append(sr)
 
         return results
     }
@@ -154,40 +148,6 @@ enum PermissionGate {
         @unknown default:
             return .unknown
         }
-    }
-
-    // MARK: - Step 4: Screen Recording
-
-    @MainActor
-    private static func checkScreenRecording() async -> PermissionStatus {
-        if CGPreflightScreenCaptureAccess() {
-            Log.info("Screen Recording: already granted.", category: "permissions")
-            return .granted
-        }
-
-        Log.info("Screen Recording: attempting SCShareableContent to trigger TCC prompt.", category: "permissions")
-        // Calling SCShareableContent.current() triggers the TCC prompt on macOS 14+.
-        do {
-            _ = try await SCShareableContent.current
-            Log.info("Screen Recording: granted after SCShareableContent prompt.", category: "permissions")
-            return .granted
-        } catch {
-            Log.warning("SCShareableContent failed (\(error)); falling back to CGRequestScreenCaptureAccess.", category: "permissions")
-        }
-
-        // Fallback for older OS paths.
-        CGRequestScreenCaptureAccess()
-
-        if CGPreflightScreenCaptureAccess() {
-            return .granted
-        }
-
-        showSettingsAlert(
-            title: "Screen Recording Access Required",
-            message: "WisprAlt needs Screen Recording permission to capture system audio for meeting transcription. Please enable it in System Settings.",
-            settingsURL: screenRecordingURL
-        )
-        return .denied
     }
 
     // MARK: - UI Helpers

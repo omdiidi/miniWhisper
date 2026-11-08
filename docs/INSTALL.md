@@ -1,278 +1,209 @@
 # Install
 
-Canonical install guide for the WisprAlt macOS client.
+WisprAlt installs, runs and is maintained on each Mac with one command,
+`wispralt`. A Mac can take one of three roles:
 
-## 1. The one-liner
+- **host**: runs the local transcription server (Apple Silicon only). It keeps
+  every transcript on this Mac and serves the other Macs in Local mode.
+- **client**: the menubar app. Online mode uses your own OpenAI key; Local mode
+  sends audio to a host.
+- **both**: a host plus the app on the same Mac, already connected to each other.
 
-Open Terminal on the Mac you want to dictate from and paste:
-
-```bash
-curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-  | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
-```
-
-That's it. The script downloads the latest signed build, drops it in
-`/Applications`, writes the API key into the macOS Keychain, writes the server
-URL into UserDefaults, and launches the app.
-
-### History cleanup (recommended)
-
-zsh does **not** ignore leading-space-prefixed commands by default
-(`HIST_IGNORE_SPACE` is OFF unless you've explicitly enabled it), and bash
-behaves the same way. After the install completes, scrub the key from your
-shell history:
+## 1. Quick start
 
 ```bash
-unset WISPRALT_API_KEY
-# zsh 5.3+ and bash:
-history -d $(history | tail -1 | awk '{print $1}')
+git clone <repo-url> wispralt
+cd wispralt
+./install.sh            # asks which role, then sets everything up
 ```
 
-If you want to verify it's gone: `history | grep WISPRALT_API_KEY` should
-return nothing.
+`install.sh` does only what has to happen before Python exists: it installs
+Homebrew if it is missing (that step asks for your password), then `ffmpeg`
+and `uv`, then installs the `wispralt` CLI from this clone with
+`uv tool install`. It then runs `wispralt setup` and passes every argument
+through. It never uses `sudo` and is safe to run again.
 
-### Paranoid pattern (env-file, no shell history exposure)
+If `wispralt` is not on your `PATH` afterwards, run `uv tool update-shell` and
+open a new terminal.
 
-If you'd rather never type the key on a command line at all:
+## 2. Requirements
 
-```bash
-umask 077
-cat > /tmp/wispralt-key <<'EOF'
-export WISPRALT_API_KEY=sk_xxx
-export WISPRALT_SERVER=https://transcribe.integrateapi.ai
-EOF
-chmod 0600 /tmp/wispralt-key
-source /tmp/wispralt-key
-curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
-shred -u /tmp/wispralt-key 2>/dev/null || rm -P /tmp/wispralt-key
-unset WISPRALT_API_KEY WISPRALT_SERVER
-```
-
-(macOS doesn't ship `shred`; the `rm -P` fallback overwrites the file before
-unlinking.)
-
-## 2. Prerequisites
-
-- **macOS 14 (Sonoma) or newer** — earlier versions are not supported.
-- **Apple Silicon** — current builds are arm64-only. Intel Macs are not
-  supported; contact your admin if this is a blocker.
-- **~200 MB free disk space** for the app bundle.
-- **Internet** — anonymous; no GitHub auth needed for the download itself.
-
-No Xcode Command Line Tools, Homebrew, or other developer tooling is required —
-the installer uses only stock macOS utilities.
-
-## 3. The 4 macOS permissions WisprAlt needs
-
-Apple's TCC (Transparency, Consent, and Control) framework will not let any
-script auto-grant these — that's a security boundary, not a bug in the
-installer. The app's PermissionGate UI walks you through each pane on first
-launch.
-
-- **Accessibility** — required to inject transcribed text at the cursor in
-  any app via AXUIElement.
-- **Input Monitoring** — required to detect FN-key holds (the global hotkey
-  that triggers dictation).
-- **Microphone** — required to capture your voice.
-- **Screen Recording** — required for meeting-mode recording, which uses
-  ScreenCaptureKit to capture system audio alongside the mic.
-
-On macOS 14.4+, granting Input Monitoring requires a quit-and-reopen of the
-app before the OS will treat the grant as effective.
-
-## 4. Per-employee install (admin texted you the command)
-
-This is the common case. Your admin generated a token for you and texted
-you a one-liner. Paste it into Terminal exactly as received:
-
-```bash
-curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-  | WISPRALT_API_KEY=sk_yourtoken WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
-```
-
-Then run the [history cleanup](#history-cleanup-recommended) above.
-
-## 5. Self-install (you have the URL but no key)
-
-If you have the server URL but no API key, run the installer with only the
-server env var:
-
-```bash
-WISPRALT_SERVER=https://transcribe.integrateapi.ai \
-  curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
-```
-
-The app will install and launch normally. Open WisprAlt menubar icon →
-Settings → Advanced and paste your API key there. The app stores it in the
-Keychain via the same code path the installer uses.
-
-## 6. Updating
-
-**Re-running the same one-liner is the update path.** `install.sh` is
-idempotent: it downloads the latest signed build, replaces
-`/Applications/WisprAlt.app`, and re-applies your config.
-
-> **⚠️ WARNING — Keychain rotation.**
-> Re-running with a different `WISPRALT_API_KEY` **silently rotates** the
-> stored Keychain entry. This is by design — it's the rotation flow.
-> Useful when your admin issues you a new token; surprising if you
-> didn't mean to.
-
-> **⚠️ WARNING — Server URL overwrite.**
-> Re-running with no `WISPRALT_SERVER` env var **silently overwrites** any
-> custom serverURL back to the default
-> (`https://transcribe.integrateapi.ai`). If you've pointed the client at
-> a staging server via Settings → Advanced, you must re-set it after each
-> install/update, or pass `WISPRALT_SERVER=...` on the install command.
-
-If you only want to update the binary without touching either, run the
-installer with both env vars set to your existing values.
-
-## 7. What gets stored where
-
-Everything the installer writes is user-scoped — nothing goes into
-`/Library/`, nothing requires sudo.
-
-| What | Where | Inspect with |
+| | host | client |
 |---|---|---|
-| App bundle | `/Applications/WisprAlt.app` | `ls -la /Applications/WisprAlt.app` |
-| API key | macOS Keychain (service `co.wispralt`, account `default`) | `security find-generic-password -s co.wispralt -a default -w` |
-| Server URL | UserDefaults (`co.wispralt.WisprAlt`, key `serverURL`) | `defaults read co.wispralt.WisprAlt serverURL` |
-| UserDefaults plist | `~/Library/Preferences/co.wispralt.WisprAlt.plist` | `plutil -p ~/Library/Preferences/co.wispralt.WisprAlt.plist` |
-| Logs | `~/Library/Logs/WisprAlt/` | `ls ~/Library/Logs/WisprAlt/` |
-| Cache | `~/Library/Caches/co.wispralt.WisprAlt/` | `ls ~/Library/Caches/co.wispralt.WisprAlt/` |
+| macOS | 14 (Sonoma) or newer | 14 or newer |
+| Chip | Apple Silicon (MLX) | any |
+| Disk | 6 GB free (models are about 4 GB) | about 200 MB |
+| Tools | Homebrew, `ffmpeg`, `uv` (installed for you) | the same; plus, to build the app, the Command Line Tools (`xcode-select --install`; full Xcode is not needed) and an Apple Development signing identity (create one once in Xcode > Settings > Accounts on any Mac, or at developer.apple.com, and import it). With a signed DMG (`--dmg`) neither is needed. |
 
-The Keychain inspect command will pop a dialog asking you to authenticate
-with your login password — that's the OS, not WisprAlt.
+The host runs as a per-user LaunchAgent, so it runs only while you are logged
+in. `wispralt doctor` says so and checks everything else in this table.
 
-## 8. Rotating the API key
-
-When your admin issues a new token:
-
-- **Either** re-run the install one-liner with the new `WISPRALT_API_KEY`
-  value — the Keychain entry is silently rotated (see [Updating](#6-updating)
-  above);
-- **Or** open WisprAlt menubar icon → Settings → Advanced and paste the new
-  token there. Same Keychain code path either way.
-
-The old token continues to work until your admin revokes it server-side, so
-you don't have to coordinate the rotation tightly.
-
-## 9. Uninstalling
-
-Copy-paste this block into Terminal. It quits the app, removes the bundle,
-clears all four TCC permissions, deletes UserDefaults, removes the Keychain
-entry, deletes logs and caches, and forces `cfprefsd` to forget the plist
-cache:
+## 3. Scripted or agent install (no prompts)
 
 ```bash
-pkill -f /Applications/WisprAlt.app/Contents/MacOS/WisprAlt 2>/dev/null
-rm -rf /Applications/WisprAlt.app
-tccutil reset All co.wispralt.WisprAlt 2>/dev/null
-defaults delete co.wispralt.WisprAlt 2>/dev/null
-security delete-generic-password -s co.wispralt -a default 2>/dev/null
-rm -rf ~/Library/Logs/WisprAlt ~/Library/Caches/co.wispralt.WisprAlt
-killall cfprefsd 2>/dev/null
+./install.sh --role host --non-interactive \
+  --admin-label owner --token-file ~/wispralt-admin.key --no-open
 ```
 
-After this, a fresh install will behave exactly as a first-time install on
-this machine — TCC re-prompts and all.
+- `--non-interactive` never prompts. A missing required answer (only `--role`)
+  exits 2 and names the flag. Retention defaults to 0 (keep forever) and the
+  admin label to `owner`.
+- The first admin key is printed only to a terminal. Without one, pass
+  `--token-file PATH`: a **new** file created 0600 (an existing file is
+  refused; a failed write removes it). Without either, setup stops with exit 2 before it downloads or
+  creates anything. Delete the file once the key is stored.
+- Homebrew's own installer needs a password, so a non-interactive run on a Mac
+  without Homebrew stops (exit 2) and says how to install it.
+- Check the result with `wispralt doctor --json` (exit 0 = healthy, 3 = a check
+  failed; each failing check has a one-line fix).
+- Exit codes everywhere: 0 ok, 1 operation failed, 2 usage error or missing
+  answer, 3 doctor found failures.
 
-## 10. Troubleshooting
+For a throwaway test install, set `WISPRALT_ROOT=/some/dir` (every path below
+moves under it, including the app's `Applications/` folder) and
+`WISPRALT_LABEL=co.wispralt.mytest` (the LaunchAgent label). A re-labelled
+install never touches the real host's agents.
 
-### "I have an old / renamed WisprAlt copy somewhere — will the installer find it?"
+## 4. What `setup` does
 
-Yes. As of v0.5.0 the installer is **bundle-ID-driven**: it uses `mdfind` to
-enumerate every WisprAlt bundle anywhere on the filesystem (including
-`~/Applications/`, renamed copies, or whatever path an earlier install dropped
-it at), not just `/Applications/`. The curl one-liner is idempotent — re-running
-it cleanly removes orphan bundles, gracefully quits running instances via
-AppleScript (with a `pkill -f co.wispralt.WisprAlt` fallback for stragglers),
-and reinstalls to the canonical `/Applications/WisprAlt.app` path. Any
-`~/Library/LaunchAgents/co.wispralt*.plist` files matching the WisprAlt prefix
-are also swept on install so a stale autostart entry from an old install
-location cannot relaunch a deleted binary.
+Host (`--role host` or `both`):
 
-### "macOS says 'Apple cannot check it for malicious software'"
+1. Checks the Mac (not root, Apple Silicon, macOS 14+, 6 GB free, `ffmpeg`, `uv`).
+2. Installs the Apple Silicon inference stack (`wispralt[host]`) if it is
+   missing, then restarts itself in the new code.
+3. Writes `~/.config/wispralt/.env` (0600) with `DATA_DIR`, `SERVER_URL`
+   (default `http://127.0.0.1:8000`) and `SERVER_LOG_PATH`. Only absent keys are
+   added; a value you edited is never overwritten.
+4. Downloads the two models into `~/Library/Application Support/WisprAlt/models`
+   and verifies each weight file's sha256 against Hugging Face. A rerun with a
+   verified cache downloads nothing.
+5. Creates the database and the first admin, and hands you its key once. A rerun
+   never creates a second admin and never rotates a key.
+6. Asks once how long to keep transcripts (0 = forever).
+7. Loads the dictation model once with a test tone (`--skip-warmup` skips it).
+8. Installs the LaunchAgent `co.wispralt.host` (loopback `127.0.0.1:<port>`),
+   waits for `/healthz`, and opens the portal at `/admin` (`--no-open` skips it).
+   A mini-era `co.wispralt.server` agent is booted out and its plist moved to
+   `~/.config/wispralt/legacy/`.
 
-The signed build is notarized, but Gatekeeper occasionally surfaces this
-warning on first launch (especially after a download via curl rather than
-Safari). Right-click `/Applications/WisprAlt.app` in Finder → **Open** →
-**Open Anyway** in the dialog.
+Client (`--role client` or `both`):
 
-If that doesn't clear it, strip the quarantine xattr and re-open:
+1. Installs the app from `--dmg PATH` (checked with `codesign --verify --deep
+   --strict` and `spctl -a -t exec`; the quarantine flag is never removed) or
+   builds it from the clone with `scripts/build-client-local.sh`. A rerun skips
+   the build when the installed version matches (`--rebuild` forces it).
+2. Quits the running app, copies the new one into `/Applications/WisprAlt.app`
+   and opens it.
+3. With `both`, points the app at the host (`serverURL`) and stores the admin key
+   in the Keychain item `co.wispralt` (sent to `security` on stdin, never on a
+   command line).
+4. The app's mode changes only with `--client-mode local|online`; Online stays
+   the default. The OpenAI key is never handled by the CLI: add it in the app's
+   Settings.
 
-```bash
-xattr -cr /Applications/WisprAlt.app && open /Applications/WisprAlt.app
-```
+## 5. The three macOS permissions
 
-### "Test Connection failed"
+macOS will not let any script grant these; the app walks you through each pane
+on first launch.
 
-Verify the local config is what you expect:
+- **Accessibility**: to type the transcript at the cursor in any app.
+- **Input Monitoring**: to detect the FN-key hold that starts dictation. On
+  macOS 14.4+ quit and reopen the app after granting it.
+- **Microphone**: to capture your voice.
 
-```bash
-security find-generic-password -s co.wispralt -a default -w   # API key
-defaults read co.wispralt.WisprAlt serverURL                  # server URL
-```
+## 6. Command reference
 
-If both look right, check the server is reachable:
+Global flags work before or after the command: `--json`, `--non-interactive`,
+`--yes`. `wispralt <command> -h` lists every flag.
 
-```bash
-curl -fsSL https://transcribe.integrateapi.ai/healthz
-```
+| Command | What it does |
+|---|---|
+| `setup [--role host\|client\|both]` | install or repair (safe to rerun). Flags: `--source DIR`, `--data-dir` (new or empty, or an existing WisprAlt data dir with its `wispralt.db`; a folder holding other files is refused), `--backup-dir`, `--server-url`, `--port`, `--admin-label`, `--token-file`, `--retention-days N`, `--no-open`, `--skip-warmup`, `--dmg PATH`, `--client-mode online\|local`, `--rebuild` |
+| `status [--client]` | service state and pid, URL, version, allocated sizes (data, database, outputs, staging, models, backups with count and newest, `*.pre-restore-*` copies), retention and what it would purge now, admin count |
+| `doctor [--warmup] [--client]` | read-only checks with a fix per failure (exit 3 on any failure); `--warmup` also loads the dictation model |
+| `start` / `stop` / `restart` | the host service; `stop` waits until the server has released its data lock; `restart` reloads the plist only if it changed |
+| `users list\|add\|disable\|enable` | accounts (see [ADMIN.md](ADMIN.md#from-the-command-line)) |
+| `keys list\|rotate\|revoke\|rotate-admin` | API keys; `rotate-admin` recovers a lost admin key |
+| `retention show` / `retention set DAYS` | `set` prints what the next purge would delete and asks first (`--yes` in scripts) |
+| `backup [--dest DIR]` / `backup list` | offline backup: the service stops briefly and restarts |
+| `restore BACKUP_DIR` | replaces the host data with a backup; the current data is kept at `<data dir>.pre-restore-<time>` |
+| `update [--no-pull] [--no-backup] [--client]` | `git pull --ff-only` in the clone (refused when it has local changes), backup, reinstall, restart, health check (if the backup or reinstall fails, the old service is started again); `--client` also rebuilds the app |
+| `uninstall [--client] [--purge-data] [--no-backup]` | see section 10 |
 
-A `{"status":"ok"}` response means the server is up; the failure is
-probably the token. Ask your admin to confirm it hasn't been revoked.
+## 7. Where things live
 
-### "GitHub API rate limit"
+| What | Where |
+|---|---|
+| CLI | `uv tool` environment (`uv tool dir`), command in `uv tool dir --bin` |
+| Host config | `~/.config/wispralt/.env` (0600) and `install-state.json` (what setup created) |
+| Host data | `~/Library/Application Support/WisprAlt/host` (0700): `wispralt.db`, `outputs/`, `staging/` |
+| Models | `~/Library/Application Support/WisprAlt/models` (`HF_HOME`) |
+| Logs | `~/Library/Logs/WisprAlt/` (`wispralt.log`; `server.log` / `server.err.log` hold crash output) |
+| Backups | `~/WisprAlt-Backups/` |
+| LaunchAgent | `~/Library/LaunchAgents/co.wispralt.host.plist` (no secrets in it) |
+| App | `/Applications/WisprAlt.app` |
+| App settings | `defaults read co.wispralt.WisprAlt` (`serverURL`, `mode`) |
+| App keys | Keychain items `co.wispralt` (Local), `co.wispralt.openai`, `co.wispralt.openrouter` |
 
-The installer hits the GitHub API to find the latest release. Anonymous
-calls are limited to **60 per hour per IP**. If you hit the limit (multiple
-re-installs, shared NAT, etc.), either wait an hour or set a token:
+## 8. Connecting other Macs
 
-```bash
-GITHUB_TOKEN=ghp_yourtoken WISPRALT_API_KEY=sk_xxx \
-  curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh | bash
-```
+The host listens on `127.0.0.1` only. To reach it from other Macs, publish it
+with `tailscale serve` (or the optional Cloudflare tunnel,
+`scripts/setup-cloudflared.sh`), set `SERVER_URL` in the host `.env` to that
+URL, and run `wispralt restart`. Then on each Mac run `./install.sh --role
+client`, and in the app's Settings enter the server URL and a key made with
+`wispralt users add NAME` (or the portal's **Add employee**).
 
-A no-scope personal access token is fine; it just needs to authenticate the
-rate-limit bucket.
+## 9. Backups, restore and retention
 
-### "Refusing to run as root" / "Refusing to run under sudo"
+- `wispralt backup` stops the service, writes a verified snapshot (database,
+  outputs, staging and a manifest with hashes and row counts) and restarts it.
+- `wispralt restore DIR --yes` checks the backup against its manifest before
+  touching anything, keeps the old data aside and restarts the service. `status`
+  lists the kept copies; delete them yourself once you are sure
+  (`rm -rf "<path>"`). The CLI never deletes a backup or a kept copy.
+- Retention is a database setting: 0 keeps everything forever. A daily purge
+  removes older dictations and finished file jobs; imported history is never
+  purged.
 
-Don't `sudo` the curl pipe. The install is user-scoped by design — the
-Keychain and UserDefaults are per-user, and running the installer as root
-would write everything into the wrong account. The installer aborts on
-purpose to prevent that footgun.
+## 10. Updating and uninstalling
 
-### "Apple Silicon required"
+`wispralt update` is the whole update: it pulls the clone (fast-forward only),
+backs up, reinstalls the CLI, restarts the service and waits for it to be
+healthy. If the new version does not come up healthy it exits 1 and prints the
+`wispralt restore` command for the backup it just took. If a step after the
+reinstall fails (e.g. model verification), it still starts the service and says
+whether it came back. Add `--client` to
+rebuild and reinstall the app. (The app's own **Update** button still points at
+the retired release installer; use `wispralt update --client` until it is
+retargeted.)
 
-Current builds are arm64-only. Intel Macs aren't supported; contact your
-admin.
+`wispralt uninstall` removes only what setup recorded: the LaunchAgent, the
+models and the logs, and finally the CLI itself. Your data, `.env` and backups
+stay.
 
-### "curl: (6) Could not resolve host:" (empty hostname)
+- `--purge-data` also deletes WisprAlt's data (`wispralt.db*`, `outputs/`,
+  `staging/`, `setup-code`) and `.env`, after taking a backup (skip it with
+  `--no-backup`; with no database it copies the files to
+  `wispralt-<ts>-files`). Other files in the data directory are kept, and the
+  directory goes only if it is then empty. Inside `outputs/` and `staging/` it
+  deletes only the files WisprAlt writes there (transcripts and audio named by
+  job or upload id, and its upload chunks); anything else is kept, listed in the
+  output, and keeps its folder. It refuses when there is no
+  `install-state.json` or when the backup directory is inside the data
+  directory.
+- `--client` moves the app to the Trash. It never deletes your transcripts
+  folder or the Keychain items.
 
-A cosmetic line with an **empty** hostname (printed before any `[wispralt]`
-output) is not from the installer — it comes from your shell's `curl` reading a
-malformed `~/.curlrc` (a stray `url`/`proxy` line with no value) or an empty
-proxy variable. It's harmless; the install proceeds. To silence it, inspect and
-clean those up:
+## 11. Troubleshooting
 
-```bash
-cat ~/.curlrc 2>/dev/null     # delete any bare url/proxy line with no value
-env | grep -i proxy           # unset any empty *_proxy / ALL_PROXY var
-```
+Start with `wispralt doctor` (add `--client` on a client). Each failing line
+ends with its fix; [TROUBLESHOOTING.md](TROUBLESHOOTING.md#wispralt-doctor)
+explains every check. Two install-specific cases:
 
-The published one-liner uses `curl -q`, so the installer's own command ignores
-`~/.curlrc` — but a broken config can still surface on other `curl` calls.
-
-### "App opens but the menubar icon doesn't appear"
-
-LSUIElement (menubar-only) cold-start glitch — usually self-resolves on the
-next launch. Force-restart:
-
-```bash
-pkill -9 -f WisprAlt && open /Applications/WisprAlt.app
-```
-
-If it persists, file an issue with `~/Library/Logs/WisprAlt/` attached.
+- **"Apple cannot check it for malicious software"** on a locally built app:
+  right-click `/Applications/WisprAlt.app` in Finder, choose **Open**, then
+  **Open Anyway**.
+- **The menubar icon does not appear**: quit and reopen the app
+  (`pkill -x WisprAlt; open /Applications/WisprAlt.app`). If it persists, attach
+  `~/Library/Logs/WisprAlt/` to an issue.

@@ -1,0 +1,38 @@
+{% extends "base.html.j2" %}
+{% set TAB_LABELS = {'today': 'Today', '7d': '7d', '30d': '30d', '90d': '90d', '1y': '1y', 'all': 'All'} %}
+{% set KIND_LABELS = [('', 'All'), ('dictation', 'Dictations'), ('file', 'File transcriptions')] %}
+{% block title %}My history · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>My history</h1>
+      <p class="muted">Your dictations and file transcriptions. Only you can search your own history here. Deleting a row also leaves it out of future insights.</p>
+    </div>
+  </div>
+  {% if since is none and until is none %}
+  <nav data-active="{{ range }}" x-data="{ active: $el.dataset.active }" @range-changed.window="active = $event.detail" class="tabs" aria-label="Time range">
+    {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
+      <button data-range="{{ r }}" :class="active === $el.dataset.range ? 'active' : ''" @click="active = $el.dataset.range"
+              hx-get="/me/history" hx-vals='{{ {"range": r, "kind": kind or "", "q": q or ""} | tojson }}'
+              hx-target="#history-body" hx-swap="innerHTML" hx-push-url="true">{{ TAB_LABELS[r] }}</button>
+    {% endfor %}
+  </nav>
+  {% else %}
+  <p class="notice">Showing a fixed time window. <a href="/me/history">Show all ranges</a></p>
+  {% endif %}
+  <form class="filters" role="search" hx-get="/me/history" hx-target="#history-body" hx-swap="innerHTML"
+        hx-push-url="true" hx-trigger="input changed delay:300ms from:#history-q, search from:#history-q, change from:#history-kind, submit">
+    <input type="hidden" name="range" value="{{ range }}">
+    {% if since is not none %}<input type="hidden" name="since" value="{{ since }}">{% endif %}
+    {% if until is not none %}<input type="hidden" name="until" value="{{ until }}">{% endif %}
+    <label class="sr-only" for="history-q">Search</label>
+    <input id="history-q" type="search" name="q" placeholder="Search your transcripts…" value="{{ q or '' }}" maxlength="200">
+    <label class="sr-only" for="history-kind">Kind</label>
+    <select id="history-kind" name="kind">
+      {% for opt_value, opt_label in KIND_LABELS %}
+        <option value="{{ opt_value }}" {% if (kind or '') == opt_value %}selected{% endif %}>{{ opt_label }}</option>
+      {% endfor %}
+    </select>
+  </form>
+  <div id="history-body">{% include "_me_history_body.html.j2" %}</div>
+{% endblock %}

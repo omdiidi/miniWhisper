@@ -11,11 +11,11 @@ This page is the canonical reference. For a quick getting-started, see [INTEGRAT
 ## Setup
 
 ```bash
-export OPENAI_BASE_URL=https://transcribe.integrateapi.ai/v1
+export OPENAI_BASE_URL=https://wispralt.example.com/v1
 export OPENAI_API_KEY=<your-integration-key>
 ```
 
-Get a key from the admin UI: <https://transcribe.integrateapi.ai/admin/keys/new>. See [ADMIN.md](ADMIN.md#integration-keys) for the flow.
+Get a key from the admin UI: <https://wispralt.example.com/admin/integrations/new>. See [ADMIN.md](ADMIN.md#integration-keys) for the flow.
 
 ## Auth
 
@@ -36,7 +36,7 @@ Sync transcription. Returns text in one of: json (default), text, verbose_json, 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `file` | file | (required) | Audio bytes. See "File formats" below. ≤25 MB. |
-| `model` | string | `whisper-1` | One of 5 listed models. `gpt-4o-transcribe-diarize` returns 404 — use `/transcribe/meeting` for diarization. Unknown models still route to Parakeet but log a warning. |
+| `model` | string | `whisper-1` | One of the 6 listed models (incl. `gpt-transcribe`). Any other id, including `gpt-4o-transcribe-diarize` (WisprAlt has no diarization), returns 404 `model_not_found` listing the allowed ids, before any inference. |
 | `response_format` | string | `json` | One of: `json`, `text`, `verbose_json`, `srt`, `vtt`. |
 | `language` | string | — | ISO-639-1 (e.g. `en`). Accepted, ignored (Parakeet is English-only). |
 | `prompt` | string | — | Accepted, ignored (no Parakeet equivalent). |
@@ -130,7 +130,7 @@ Content-Type: `text/vtt`. Period decimal separator. `WEBVTT` magic line required
 
 ### `GET /v1/models`
 
-Returns the 5 model IDs WisprAlt advertises. Open WebUI and other clients gate on this endpoint.
+Returns the 6 model IDs WisprAlt advertises. Open WebUI and other clients gate on this endpoint.
 
 ```json
 {
@@ -140,7 +140,8 @@ Returns the 5 model IDs WisprAlt advertises. Open WebUI and other clients gate o
     { "id": "gpt-4o-transcribe", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
     { "id": "gpt-4o-mini-transcribe", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
     { "id": "gpt-4o-mini-transcribe-2025-12-15", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
-    { "id": "gpt-4o-mini-transcribe-2025-03-20", "object": "model", "created": 1677532384, "owned_by": "wispralt" }
+    { "id": "gpt-4o-mini-transcribe-2025-03-20", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
+    { "id": "gpt-transcribe", "object": "model", "created": 1677532384, "owned_by": "wispralt" }
   ]
 }
 ```
@@ -204,7 +205,7 @@ All errors return the OpenAI shape:
 | 400 | `audio_too_long` | Audio > 15 min (after decode) |
 | 400 | `endpoint_not_supported` | Hit `/v1/audio/translations` |
 | 401 | `invalid_api_key` | Missing/invalid Bearer token, or cookie-only on /v1 |
-| 404 | `model_not_found` | Unknown model on `/v1/models/{id}` or `gpt-4o-transcribe-diarize` on transcriptions |
+| 404 | `model_not_found` | Unknown model on `/v1/models/{id}`, or any model id not in `/v1/models` (incl. `gpt-4o-transcribe-diarize`) on transcriptions |
 | 413 | `file_too_large` | File body > 25 MB |
 | 422 | `invalid_response_format` | `response_format` not in {json, text, verbose_json, srt, vtt} |
 | 429 | `rate_limit_exceeded` | 60 req/min/token exceeded |
@@ -257,8 +258,8 @@ Break-glass admin tokens bypass the per-token limit.
 ## Key kinds: employee vs integration
 
 WisprAlt tokens have a `kind` field:
-- **`kind='employee'`** — minted via `/admin/users/new`. For human employees using the macOS client. Has access to `/v1/*`, `/me/*`, `/telemetry/*`, and (if `role='admin'`) `/admin/*`.
-- **`kind='integration'`** — minted via `/admin/keys/new`. For third-party programs. Has access to `/v1/*` ONLY. Blocked from `/me/*` and `/telemetry/*` with a 403 (those surfaces are for humans, not programs).
+- **`kind='employee'`** — minted via `/admin/people/new` (or an invite). For human employees using the macOS client. Has access to `/v1/*`, `/me/*`, and (if `role='admin'`) `/admin/*`.
+- **`kind='integration'`** — minted via `/admin/integrations/new`. For third-party programs. Has access to `/v1/*` ONLY. Blocked from `/me/*` with a 403 (that surface is for humans, not programs).
 
 For drop-in use with `openai-python` or similar, mint a `kind='integration'` key.
 
@@ -281,10 +282,10 @@ The following clients have been verified against WisprAlt's `/v1` (or are expect
 
 | Symptom | Likely cause |
 |---|---|
-| 401 `invalid_api_key` | Token revoked or wrong. Mint a new one via `/admin/keys/new`. |
+| 401 `invalid_api_key` | Token revoked or wrong. Mint a new one via `/admin/integrations/new`. |
 | 401 with valid token | Sending cookie instead of `Authorization: Bearer ...` |
 | 400 `unsupported_file_type` | ffmpeg can't decode the file. Pre-convert to wav/mp3 locally. |
-| 400 `audio_too_long` | Audio > 15 min. Use `/transcribe/meeting` for longer clips. |
+| 400 `audio_too_long` | Audio > 15 min. Use the native async `/transcribe/file` for longer clips. |
 | 429 in rapid succession | Hit the 60/min/token cap. Honor `Retry-After`. |
 | Browser client fails silently with no error | CORS preflight failing. Check browser console for the actual error. |
 | 413 with HTML body (not JSON) | Cloudflare edge rejection on > 100 MB. Size-check locally. |
@@ -294,11 +295,11 @@ The following clients have been verified against WisprAlt's `/v1` (or are expect
 | Feature | Status |
 |---|---|
 | SSE streaming (`stream=true`) | Not supported on any model. Matches real OpenAI's whisper-1 behavior. |
-| Diarization (`response_format=diarized_json`, `model=gpt-4o-transcribe-diarize`) | Use `/transcribe/meeting` (async, native WisprAlt). |
+| Diarization (`response_format=diarized_json`, `model=gpt-4o-transcribe-diarize`) | Not supported. WisprAlt transcribes one mono stream; there are no speaker labels. |
 | Translation (`/v1/audio/translations`) | Parakeet is English-only. |
 | `include[]=logprobs` (returning logprobs) | Silently accepted; not surfaced (Parakeet doesn't produce logprobs). |
 | `language` parameter (forcing a non-English language) | Accepted, ignored. Output is always English-detected. |
 
 ## Getting an API key
 
-See [ADMIN.md](ADMIN.md#integration-keys) for the `/admin/keys/new` flow.
+See [ADMIN.md](ADMIN.md#integration-keys) for the `/admin/integrations/new` flow.

@@ -14,62 +14,23 @@ These commands are defined in `.claude/commands/` and can be run with `/command-
 
 | Command | Purpose |
 |---|---|
-| `/setup-server` | Preflight checks, run `setup-server.sh`, persist printed client config |
-| `/setup-client` | macOS 14+ check, download or build DMG, open each System Settings pane |
-| `/test-connection` | `curl` `/healthz`, both `/readyz/*`, and a tiny-WAV roundtrip on `/transcribe/dictate` |
 | `/docs-check` | Diff the file→doc map against last-edit timestamps to find stale docs |
-| `/update-models` | Re-run `download-models.sh` then reload `co.wispralt.server.plist` via launchctl |
-| `/verify-autostart` | Non-destructive reboot-survival smoke test for server, cloudflared, and client login-launch. |
 
-> Note: employee-facing install is the `install.sh` curl one-liner (see `docs/INSTALL.md`). The legacy `/wispralt-setup` slash command has been removed. The `/wispralt-update` slash command in `~/.claude-dotfiles/commands/` remains as a developer convenience for in-place updates.
+## Operating WisprAlt
 
-## Driving the Mac mini
-
-There are two MCPs in play and they're not interchangeable:
-
-- **chrome-devtools MCP** — lets you *see* the mini (CRD canvas screenshots, console, network on dev-side Chrome tabs). Vision only.
-- **/macmini skill** — lets you *act* on the mini (paste text, click on canvas, route secrets).
-
-**Hard rule: CRD strips the Shift key on every outbound keystroke.** That means `type_text` and `press_key` through chrome-devtools cannot send capital letters, `:` `|` `~` `$` `@` `!` `#` `%` `^` `&` `*` `(` `)` `_` `+` `{` `}` `<` `>` `?` `"`. So:
-
-- Tailing mini logs (`~/Library/Logs/WisprAlt/...`), piping (`|`), URLs (`https://`), env vars (`$HOME`), grep patterns — **none of these can be typed via chrome-devtools `type_text`.** They will arrive corrupted (e.g. `https//gist.com` with no colon, no pipe).
-- For anything with a shifted character, use **`/macmini paste "<text>"`** (gist transport: pushes a gist on the dev side, fetches via lowercase `curl` on the mini side, lands in `pbpaste`, then `Cmd+V` into the target window). This survives capitals, symbols, unicode, multi-line.
-- Pure-lowercase-unshifted commands (`ls`, `pwd`, `cd foo`) are fine via `type_text`.
-- **Never** type or paste credentials via the default `/macmini paste` — GitHub's secret scanner detects gist contents and auto-revokes within minutes (real incident: two OpenRouter keys burned in <10 min). Use `/macmini paste --secure <ENV_VAR_NAME>` for any credential — the value never enters a gist.
-
-Workflow when devtools is connected and you need to run a command on the mini:
-
-1. `list_pages` → find the `remotedesktop.google.com/access/session/<id>` page, `select_page` it.
-2. `take_screenshot` to confirm canvas is live (black screen → `press_key("Shift")` to wake).
-3. If the command is pure-lowercase-unshifted: `type_text("<cmd>", "Enter")`.
-4. Otherwise: `/macmini paste "<cmd>"`, then `Cmd+V` + `Enter` in the target window.
-5. Vision read-back: `take_screenshot` to capture output.
-
-If you just need to read state and the user is sitting at the mini, the fastest path is often to tell the user to type the command themselves — their keyboard isn't shift-stripped.
+Install from a clone with `./install.sh` (it installs the `wispralt` CLI and runs `wispralt setup`); then operate a Mac with `wispralt --help` (`status`, `doctor`, `start`/`stop`/`restart`, `users`, `keys`, `retention`, `backup`, `restore`, `update`, `uninstall`). Scripted and agent installs: `./install.sh --role host|client|both --non-interactive …` (see `docs/INSTALL.md`). For tests and throwaway installs set `WISPRALT_ROOT` and `WISPRALT_LABEL`; never run setup against the real host from a test.
 
 ## Key conventions
 
 - Repository pattern: database queries in repository functions, business logic in services, validation at route boundaries only.
 - No generic `except Exception` — use typed errors.
-- No model loading per dictation request; dictation models are resident at startup. Meeting models load lazily on the first meeting job (async batch — load cost is invisible).
-- No Redis. Meeting jobs/dictation transcripts live in a SQLite job store; users, tokens and usage events live in Postgres (Supabase, via asyncpg).
-- No server-side speaker rename — client-only, atomic local rewrite.
-- Cloudflared tunnel token: stored in `~/.config/wispralt/cloudflare-token` (mode 0600)
-  outside the repo. Read by the cloudflared LaunchAgent via `--token-file`. Never
-  committed, never logged. The legacy `sudo cloudflared service install` flow is
-  abandoned because its plist is broken on macOS 14/15. Rotation: see
-  docs/DEPLOYMENT-NOTES.md.
-- Cloud fallback: when the Mac mini is offline, dictation falls back
-  directly to OpenRouter's `openai/whisper-large-v3-turbo` from the
-  Swift client. No server, no Worker. Each install holds the OpenRouter
-  API key in the Keychain at `co.wispralt.openrouter`. If the key is
-  not set, the client surfaces the existing dictation error toast and
-  the rest of WisprAlt keeps working. Per-spend protection lives in
-  the OpenRouter dashboard's monthly-cap setting. Setup + threat model:
-  [docs/FALLBACK.md](docs/FALLBACK.md). Dev-only `?fault=503` injection
-  lives in `server/src/wispralt_server/routes/dev_faults.py` and is
-  mounted only when `WISPRALT_DEV_FAULTS=1` AND the host is not the
-  configured prod-mini hostname.
-- Secrets: `HF_TOKEN` and `WISPRALT_API_KEY` in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
+- No model loading per dictation request; dictation models are resident at startup. The file model (MLX Whisper) loads lazily on the first file job and is evicted when idle (async batch — load cost is invisible).
+- No Redis and no Postgres: users, keys, usage events, file jobs and transcripts all live in the host's SQLite `DATA_DIR/wispralt.db`.
+- Optional Cloudflare tunnel (`scripts/setup-cloudflared.sh`; `tailscale serve` is the simpler path): its token is stored in `~/.config/wispralt/cloudflare-token` (mode 0600)
+  outside the repo and read by the cloudflared LaunchAgent via `--token-file`. Never
+  committed, never logged. Rotation: see docs/DEPLOYMENT-NOTES.md.
+- Client modes: Online (OpenAI, default) and Local (self-hosted server). Online never contacts the Local host; no OpenAI ↔ Local fallback. Testable client decisions live in `client/WisprAltCore` (Swift Testing, run by `scripts/test-client.sh`); app code only wires them.
+- Client logs: an `Error` reaches a `Log` call only via `ErrorLog.describe`; never log transcript text, response bodies, server reasons, paths, URLs or keys (`scripts/check-log-privacy.py` enforces it).
+- Secrets: the host config is `~/.config/wispralt/.env` (mode 0600; the optional `OPENROUTER_API_KEY` for weekly insights). There is no env admin key: API keys live hashed in `DATA_DIR/wispralt.db`, and a new key is shown once, on a terminal or in a new 0600 `--token-file` (`wispralt setup`, `wispralt keys rotate-admin`). Client keys in the Keychain only: Local `co.wispralt`, OpenAI `co.wispralt.openai`, OpenRouter `co.wispralt.openrouter` (client-side Mercury smart formatting). Never commit any of them.
 
 @CLAUDE.local.md

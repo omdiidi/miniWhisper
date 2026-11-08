@@ -1,0 +1,25 @@
+{# Data → Runs: start a run (estimate first), then watch it. Needs `csrf_token`,
+   `runs`, `running`, `ai_enabled`, `client_ready`, `week_choices`. The form sits outside
+   the polled list, so polling never touches its CSRF token. #}
+{% import "_ui.html.j2" as ui %}
+<section class="card" id="runs" aria-labelledby="runs-h">
+  <div class="card-head"><h3 id="runs-h">AI runs</h3>
+    <a class="small" href="/admin/settings">AI settings</a></div>
+  {% if not ai_enabled %}
+    <p class="muted">AI interpretation is off. <a href="/admin/settings">Read the disclosure and turn it on</a> to run insights.</p>
+  {% elif not client_ready %}
+    <p class="muted">OPENROUTER_API_KEY is not configured on the server, so runs cannot start.</p>
+  {% else %}
+    <form class="row" hx-post="/admin/data/runs" hx-target="#run-confirm" hx-swap="innerHTML">
+      {{ ui.csrf(csrf_token) }}
+      <label for="run-weeks" class="sr-only">Weeks</label>
+      <select id="run-weeks" name="weeks">
+        {% for n in week_choices %}<option value="{{ n }}">{{ "Last full week" if n == 1 else "Last " ~ n ~ " weeks (backfill)" }}</option>{% endfor %}
+      </select>
+      <label class="check"><input type="checkbox" name="force" value="1"> Regenerate existing</label>
+      <button type="submit">Estimate cost</button>
+    </form>
+  {% endif %}
+  <div id="run-confirm" aria-live="polite"></div>
+  {% include "_runs_list.html.j2" %}
+</section>

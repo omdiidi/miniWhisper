@@ -3,10 +3,8 @@
 # Idempotent: re-run any time to refresh from the source.
 #
 # Usage:
-#   ./scripts/build-icon.sh
+#   ./scripts/build-icon.sh path/to/source-1254.png
 #
-# Sources from:
-#   /Users/omidzahrai/.pane/images/43793091-b8c4-4d81-9906-efc05b7914f6_3_1777325113499_yazq1hk.png
 # Outputs to:
 #   client/WisprAlt/Resources/Assets.xcassets/AppIcon.appiconset/
 
@@ -14,7 +12,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SOURCE_PNG="/Users/omidzahrai/.pane/images/43793091-b8c4-4d81-9906-efc05b7914f6_3_1777325113499_yazq1hk.png"
+SOURCE_PNG="${1:-}"
+[[ -n "$SOURCE_PNG" ]] || { echo "usage: $0 path/to/source-1254.png" >&2; exit 2; }
 ICONSET_DIR="$REPO_ROOT/client/WisprAlt/Resources/Assets.xcassets/AppIcon.appiconset"
 
 if [[ ! -f "$SOURCE_PNG" ]]; then

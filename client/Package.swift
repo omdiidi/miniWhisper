@@ -57,10 +57,27 @@ let package = Package(
                 ])
             ]
         ),
+        // Real-API assumption gates (scripts/online-assumptions/run-all.sh).
+        // A developer tool: never bundled (build-client-local.sh copies only
+        // the WisprAlt executable).
+        .executableTarget(
+            name: "WisprAltProbe",
+            dependencies: ["WisprAltCore"],
+            path: "Probe",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
         .testTarget(
             name: "WisprAltCoreTests",
             dependencies: ["WisprAltCore"],
-            path: "Tests/WisprAltCoreTests"
+            path: "Tests/WisprAltCoreTests",
+            resources: [
+                .copy("Fixtures")
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
         )
     ]
 )

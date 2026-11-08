@@ -70,6 +70,25 @@ ditto --norsrc --noextattr "$EXEC_PATH" "$APP_PATH/Contents/MacOS/WisprAlt"
 ditto --norsrc --noextattr "$CLIENT_DIR/WisprAlt/Info.plist" "$APP_PATH/Contents/Info.plist"
 ditto --norsrc --noextattr "$SPARKLE_PATH" "$APP_PATH/Contents/Frameworks/Sparkle.framework"
 
+# The app's update check polls this clone's GitHub releases (owner/name from
+# `origin`, or WISPRALT_RELEASE_REPO). A non-GitHub clone gets no key and skips it.
+RELEASE_REPO="${WISPRALT_RELEASE_REPO:-}"
+if [[ -z "$RELEASE_REPO" ]]; then
+    ORIGIN="$(git -C "$CLIENT_DIR" remote get-url origin 2>/dev/null || true)"
+    RELEASE_REPO="$(printf '%s' "$ORIGIN" | sed -nE 's#^.*github\.com[:/]([^/]+/[^/]+)$#\1#p' | sed 's#\.git$##')"
+fi
+if [[ -n "$RELEASE_REPO" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :WisprAltReleaseRepo string $RELEASE_REPO" \
+        "$APP_PATH/Contents/Info.plist"
+fi
+# The clone commit, so `wispralt setup|update --client` can tell an old build of the
+# same version from this one.
+SOURCE_COMMIT="$(git -C "$CLIENT_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [[ -n "$SOURCE_COMMIT" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :WisprAltSourceCommit string $SOURCE_COMMIT" \
+        "$APP_PATH/Contents/Info.plist"
+fi
+
 # Compile the asset catalog with actool. SPM does NOT auto-run actool on .xcassets
 # resources — it just copies the directory raw. We compile manually so the bundle
 # ships a proper Assets.car.
@@ -80,31 +99,37 @@ if [[ ! -d "$ASSETS_SRC" ]]; then
 fi
 ACTOOL_TMP="$(mktemp -d)"
 trap "rm -rf '$ACTOOL_TMP'" EXIT
-xcrun actool \
-    --compile "$ACTOOL_TMP" \
-    --platform macosx \
-    --minimum-deployment-target 14.0 \
-    --app-icon AppIcon \
-    --output-partial-info-plist "$ACTOOL_TMP/AppIcon-info.plist" \
-    "$ASSETS_SRC" >/dev/null 2>&1 || {
-    echo "ERROR: actool failed to compile $ASSETS_SRC into Assets.car." >&2
+mkdir -p "$APP_PATH/Contents/Resources"
+if xcrun --find actool >/dev/null 2>&1; then
     xcrun actool \
         --compile "$ACTOOL_TMP" \
         --platform macosx \
         --minimum-deployment-target 14.0 \
         --app-icon AppIcon \
         --output-partial-info-plist "$ACTOOL_TMP/AppIcon-info.plist" \
-        "$ASSETS_SRC" >&2 || true
-    exit 1
-}
-if [[ ! -f "$ACTOOL_TMP/Assets.car" ]]; then
-    echo "ERROR: actool ran but did not produce Assets.car." >&2
-    ls -la "$ACTOOL_TMP" >&2
-    exit 1
+        "$ASSETS_SRC" >&2 || { echo "ERROR: actool failed to compile $ASSETS_SRC into Assets.car." >&2; exit 1; }
+    if [[ ! -f "$ACTOOL_TMP/Assets.car" ]]; then
+        echo "ERROR: actool ran but did not produce Assets.car." >&2
+        exit 1
+    fi
+    cp "$ACTOOL_TMP/Assets.car" "$APP_PATH/Contents/Resources/Assets.car"
+    echo "  Compiled + copied Assets.car"
+else
+    # Command Line Tools only (no Xcode, so no actool): the catalog holds just the app
+    # icon, so build AppIcon.icns with iconutil (part of macOS) and name it in Info.plist.
+    ICONSET="$ACTOOL_TMP/AppIcon.iconset"
+    mkdir -p "$ICONSET"
+    for f in "$ASSETS_SRC"/AppIcon.appiconset/icon_*.png; do
+        name="$(basename "$f" .png)"           # icon_16 or icon_16@2x
+        size="${name#icon_}"; size="${size%@2x}"
+        suffix=""; [[ "$name" == *@2x ]] && suffix="@2x"
+        cp "$f" "$ICONSET/icon_${size}x${size}${suffix}.png"
+    done
+    iconutil -c icns "$ICONSET" -o "$APP_PATH/Contents/Resources/AppIcon.icns"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP_PATH/Contents/Info.plist" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$APP_PATH/Contents/Info.plist"
+    echo "  No actool (Command Line Tools only): built AppIcon.icns with iconutil"
 fi
-mkdir -p "$APP_PATH/Contents/Resources"
-cp "$ACTOOL_TMP/Assets.car" "$APP_PATH/Contents/Resources/Assets.car"
-echo "  Compiled + copied Assets.car"
 
 xattr -cr "$APP_PATH"
 
@@ -255,6 +280,6 @@ echo ""
 echo "First launch:"
 echo "  1. Drag $APP_PATH to /Applications/."
 echo "  2. Right-click → Open the first time (Gatekeeper: 'Apple Development' cert, not yet trusted)."
-echo "  3. Grant the four TCC permissions (Accessibility, Input Monitoring, Microphone, Screen Recording)."
+echo "  3. Grant the three TCC permissions (Accessibility, Input Monitoring, Microphone)."
 echo "  4. Open Settings, paste server URL + API key, click Test Connection."
 echo "  5. Toggle 'Launch at login' in Settings to register WisprAlt as a Login Item."

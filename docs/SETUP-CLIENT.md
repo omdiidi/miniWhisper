@@ -4,10 +4,14 @@ title: Client Setup
 
 # Client Setup
 
+Install the app with `./install.sh --role client` from a clone of the repo (or
+`wispralt setup --role client`); [INSTALL.md](INSTALL.md) has the full guide.
+This page covers the app itself.
+
 ## Prerequisites
 
 - macOS 14.0 or later (Apple Silicon or Intel)
-- The WisprAlt server running and reachable (see [SETUP-SERVER.md](SETUP-SERVER.md))
+- Online mode: your own OpenAI API key. Local mode: a WisprAlt host you can reach (see [SETUP-SERVER.md](SETUP-SERVER.md)).
 
 ### Code-signing prerequisite for local builds
 
@@ -28,28 +32,31 @@ SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" bash scripts/build-c
 
 ---
 
-## Install from DMG (Recommended)
+## Install from DMG
 
-1. Download `WisprAlt-<version>.dmg` from the [GitHub Releases](https://github.com/your-org/wisprflowALT/releases) page.
-2. Open the DMG; drag `WisprAlt.app` to `/Applications`.
-3. **Remove the quarantine flag** before first launch (required for Apple Development-signed builds not distributed through the App Store):
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/WisprAlt.app
-   open /Applications/WisprAlt.app
-   ```
-   Alternatively: right-click the app in Finder → **Open** → click **Open** in the Gatekeeper dialog. You only need to do this once per version.
-4. The four-step permission wizard starts automatically (see below).
+```bash
+wispralt setup --role client --dmg ~/Downloads/WisprAlt-<version>.dmg
+```
+
+The CLI mounts the DMG, checks the app with `codesign --verify --deep --strict`
+and `spctl -a -t exec`, copies it into `/Applications` and opens it. It never
+removes the quarantine flag: if Gatekeeper still asks, right-click the app in
+Finder → **Open** → **Open**. You only need to do this once per version. The
+three-step permission wizard then starts (see below).
+
+Without `--dmg`, setup builds the app from the clone instead (see
+[Building from Source](#building-from-source)).
 
 ### Installing on a friend's Mac
 
-Your friend installs only the client — they connect to your existing Mac mini server. They do not need their own server, their own cloudflared, or their own API key.
+Your friend installs only the client — they connect to your existing host. They do not need their own host or their own tunnel.
 
 Send your friend:
-- The `WisprAlt.dmg` download link (or the built `.app` directly).
-- Your server URL (`https://transcribe.yourdomain.com`).
-- Your API key (use Settings → Export API Key to generate a `.wispralt-key` file; see [Backing up your API key](#backing-up-your-api-key)).
+- The DMG (they run `wispralt setup --role client --dmg …`), or have them clone and run `./install.sh --role client`.
+- Your host's URL (your `tailscale serve` or tunnel URL).
+- A join link from the portal (**Invites** → invite them; see [Server Configuration](#server-configuration)), or a key of their own made with `wispralt users add THEIR-NAME` on the host, over a private channel (see [Moving your API key](#moving-your-api-key)), which they paste into Settings → API Key.
 
-Your friend will see the same Gatekeeper warning and the same permission wizard described above. The `xattr -dr` step applies to their machine too.
+Your friend will see the same Gatekeeper prompt and the same permission wizard described above.
 
 ---
 
@@ -66,7 +73,7 @@ Required for AXUIElement text injection (inserting transcribed text at your curs
 
 ### Step 2 — Input Monitoring
 
-Required for CGEventTap FN-key detection (dictation holds and triple-tap for meetings).
+Required for CGEventTap FN-key detection (dictation holds).
 
 - System Settings > Privacy & Security > Input Monitoring
 - Toggle WisprAlt on.
@@ -76,39 +83,56 @@ After granting Input Monitoring on macOS 14.4 or later, the permission does not 
 
 ### Step 3 — Microphone
 
-Required for AVAudioEngine dictation recording and SCStream microphone capture in meeting mode.
+Required for AVAudioEngine dictation recording.
 
 - System Settings > Privacy & Security > Microphone
 - Toggle WisprAlt on (the system prompt appears automatically; click Allow).
 
-### Step 4 — Screen Recording
-
-Required for capturing system audio (channel 2) during meeting recording via SCStream.
-
-- System Settings > Privacy & Security > Screen Recording
-- Toggle WisprAlt on.
-
 ---
+
+## Mode: Online (OpenAI) or Local server
+
+The top of the popover has a **Mode** picker: **Online (OpenAI)** sends dictation audio straight to OpenAI (`gpt-transcribe` by default) using your own OpenAI key; **Local server** uses your self-hosted WisprAlt server (configured below). The default is **Online**, on fresh installs and on upgrade (no probe of a saved server URL); pick Local if you run your own server. A change applies to the next dictation; a dictation already recording finishes on the mode it started in. The picker is locked only while a Local file is converting or uploading ("Finish or cancel the upload first").
+
+Under the picker a status line shows `Online · gpt-transcribe · key saved` (or `key missing`) or `Local · <server host>` with `reachable` / `unreachable` (checked when the popover opens in Local or when you switch to Local), plus `transcribing N` while dictations are still being transcribed. Below it, **OpenAI ≈ $X today · $Y this month** is a running estimate of your Online spend (audio minutes × each model's price, counted on this Mac after every successful request, kept in `~/Library/Application Support/WisprAlt/spend.json`). It is a guide: your OpenAI bill is the exact figure.
+
+**Model.** Show advanced settings → **OpenAI Model** lists every OpenAI transcription model with its price per minute in small text (`≈` marks an estimate for token-billed models) and, for older models, the date OpenAI retires them (e.g. "retires Feb 26, 2027"). The default is `gpt-transcribe` ($0.0045/min). The choice applies to the next dictation; file transcription always uses a file model, and dictation stops at 10 minutes (7 with `gpt-realtime-whisper`). If OpenAI reports the chosen model does not exist, the app switches back to `gpt-transcribe` and tells you.
+
+**Live models.** `gpt-live-transcribe` and `gpt-realtime-whisper` ($0.017/min, about 3.8× `gpt-transcribe`) stream your audio to OpenAI while you hold FN and give the text when you release it; no text appears while you speak. If the live session fails at release (network drop, socket error, timeout or an OpenAI server error), the same audio is re-sent to `gpt-transcribe` automatically: for a 10-minute dictation that can take up to about 8 minutes and is charged a second time. A key, quota or unknown-model error is not re-sent; the audio goes to Retry. Known limit: if `gpt-realtime-whisper` reports no token count, a cut-off transcript cannot be flagged; its 7-minute cap is the protection.
+
+In Online mode nothing is sent to your Local server, and the server-only rows are hidden (Connection / Test Connection, Server URL, API Key and its backup, Your name, Open Portal, Open My Dictations, the job Log button). **Transcribe file…** works in Online too (TXT + JSON only; see below). **Copy last dictation** works in both modes: it copies the last dictation's text, kept on this Mac for 7 days. If a dictation fails, might be cut off, or comes back with no words, its audio is kept under **Retry** in the popover (last 2, 7 days, 16 kHz) with Retry, Export… and Discard. Both rely on FileVault for protection at rest. Switching to Online while a Local file job is being watched stops watching it without cancelling it on the server; switching back resumes watching it.
+
+### OpenAI API key
+
+Enter it in **Show advanced settings → OpenAI API Key** (Save / Remove), or from Terminal (works while the app runs; the next FN press picks it up):
+
+```
+security add-generic-password -U -s co.wispralt.openai -a default -w
+```
+
+The key lives only in the Keychain (service `co.wispralt.openai`, account `default`), in memory, and in the `Authorization: Bearer` header sent to `api.openai.com`. A key created from Terminal trusts Terminal, so each newly signed build asks once for Keychain access; choose **Always Allow**.
+
+Use a **project-scoped** OpenAI key (a project just for WisprAlt) with a **monthly budget cap** set in the OpenAI dashboard, so a lost key or a runaway loop has a ceiling. Online pricing: `gpt-transcribe` is $0.0045 per audio minute. With Online selected and no key, holding FN does not record: a notice appears and the popover opens at the key field.
 
 ## Server Configuration
 
-After the permission wizard, the app is ready for server configuration.
+After the permission wizard, the app is ready for server configuration (Local mode).
 
-1. On your Mac mini, the `setup-server.sh` script prints a one-liner at the end:
-   ```
-   SERVER_URL=https://transcribe.example.com
-   API_KEY=<your-32-byte-hex-key>
-   ```
+**Join link (easiest).** If your admin sent a `wispralt://join?…` link from the portal (**Invites**), click it. WisprAlt asks "Join the WisprAlt server?" and shows the server's address; click **Join**. The app redeems the invite, saves your key in the Keychain (`co.wispralt`), sets the Server URL and switches to Local mode. A link is single use and expires after 10 minutes; an expired or used one says "This invite has expired or was already used". A link whose server is plain `http://` to another machine is refused. While a Local file transcription is running or waiting to resume, the link is refused with "Finish the file transcription first." (joining would point that job at the new server and lose its transcript); let it finish or cancel it, then click the link again. While the link is being redeemed, **Transcribe file…** in Local mode waits ("Joining a Server"); pick the file again a moment later. The token and key are never logged. Otherwise set things up by hand:
+
+1. Get the server URL and a key from the host: `wispralt setup` prints both for the first admin, and `wispralt users add NAME` makes a key for anyone else. On a Mac set up with `--role both`, both are filled in already (the key's Keychain item trusts the installed app, so it reads it without a prompt; a build signed by another identity asks once: choose **Always Allow**).
 2. Click the WisprAlt menubar icon → toggle **Show advanced settings**.
    The advanced section reveals:
-   - **Server URL** — paste the `https://` URL and press Return.
+   - **Server URL** — paste the `https://` URL and press Return. Plain `http://` is accepted only for a server on this Mac (`127.0.0.1`, `::1`, `localhost`); any other host needs https ("Use https://, or http:// only for this Mac"). For a LAN or tailnet server, put https in front of it, e.g. `tailscale serve`. The app's ATS setting is `NSAllowsLocalNetworking` only. A dictation always finishes on the server URL that was set when you pressed FN, even if you change it mid-dictation.
    - **API Key** — paste the bearer token and press Return. Stored in the macOS Keychain under service `co.wispralt` and never written to disk as plain text.
+   - While a Local file transcription is running or waiting to resume, both fields are locked ("Locked while a Local file transcription is running or waiting to resume."): changing them would point that job at another server and lose its transcript. Let it finish or cancel it first.
 3. Collapse advanced settings (you don't need it for daily use). At the top:
    - **Open Portal** — opens `<server>/admin/login` in your browser. Admins land on the global dashboard; employees land on their own usage page. Same button for both roles.
-   - **Open Meetings Folder** — reveals your meeting transcripts directory in Finder.
-4. Click **Test Connection** under the **Connection** section. It calls `/healthz`, `/readyz/dictation`, `/readyz/meeting` in parallel and shows a single status line:
-   - **Green** "Connected — dictation + meeting ready"
-   - **Orange** "Connected — meeting pipeline still loading" (or similar warming variants)
+   - **Open File Transcriptions** — reveals the `Custom Transcriptions` folder (one subfolder per file job) in Finder.
+   - **Open Transcripts Folder** — reveals the transcripts folder chosen in Settings (default `~/Documents/WisprAlt/Transcripts/`; a Mac that already has `~/Documents/WisprAlt/Meetings/` keeps using it. The default is saved on first launch, so the folder never moves).
+4. Click **Test Connection** under the **Connection** section. It calls `/healthz`, `/readyz/dictation` and the authenticated `/me` in parallel and shows a single status line:
+   - **Green** "Connected as <you> — dictation ready."
+   - **Orange** "Connected as <you> — dictation degraded (file job using memory)" or "dictation pipeline still loading"
    - **Red** when the host is unreachable or the API key is rejected
 
 ### Menubar icon states
@@ -117,12 +141,10 @@ After the permission wizard, the app is ready for server configuration.
 |---|---|---|
 | Idle | mic outline | Default |
 | Dictating | mic filled | While holding FN |
-| Meeting recording | red filled dot + bold red **REC** label | Triple-tap FN to start; cannot be missed in a dense menubar |
-| Uploading | upload-cloud | After meeting stops, while uploading |
-| Processing | waveform | While server is transcribing |
+| Converting | circular arrows | Preparing a file for upload |
+| Uploading | upload-cloud | While a file uploads ("Transcribe file…") |
+| Processing | waveform | While the server transcribes a Local file, or while an Online file job runs |
 | Done | checkmark | Briefly, before returning to Idle |
-
-The REC indicator is rendered as a single composite NSImage (NSBezierPath red dot + bold red "REC" attributed text drawn into one bitmap). The earlier image+attributedTitle pair was character-wrapping in cramped menubars (R/E/C stacked vertically); the composite-bitmap approach takes layout decisions away from the menubar layout engine entirely.
 
 ### Picking your input mic
 
@@ -137,45 +159,24 @@ Input Mic
 
 The dropdown lists every input device macOS sees (built-in, AirPods, USB interfaces) plus a "System Default" entry at the top. Selecting a device sets `Settings.preferredInputDeviceUID`.
 
-- **Scope**: this picker affects **dictation only**. Meeting recording always uses the macOS system default input — SCStream has no per-stream mic API, and WisprAlt deliberately does not override the system-wide default (would affect every other app on the system). If you want a specific mic for meetings, set it in System Settings → Sound.
+- **Scope**: this picker affects dictation (the only thing WisprAlt records). WisprAlt deliberately does not override the system-wide default input.
 - **Application**: WisprAlt sets the dictation engine's input via `AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice)` on the AVAudioEngine input node, with no system-wide side effect.
 - **Live changes**: changing the picker mid-idle takes effect on the next dictation. Mid-recording changes don't disturb the active session — the existing audio-device-change abort logic handles legitimate device disconnects (AirPods unplugged etc.).
 - **Permission**: if mic permission is revoked, the dropdown only shows "System Default" with no other options. Re-grant in System Settings → Privacy & Security → Microphone.
 
 Device enumeration lives in `client/WisprAlt/Audio/MicEnumerator.swift` (AVFoundation discovery + CoreAudio HAL property reads).
 
-### Meeting filenames
-
-Saved meetings land in your meetings folder with human-readable names:
-
-```
-Mon Apr 27 2.06pm-2.07pm.wav
-Mon Apr 27 2.06pm-2.07pm.json
-Mon Apr 27 2.06pm-2.07pm.srt
-Mon Apr 27 2.06pm-2.07pm.vtt
-Mon Apr 27 2.06pm-2.07pm.txt
-```
-
-- Format: `EEE MMM d h.mma-h.mma.<ext>` in POSIX (English) locale for stable sorting.
-- Periods instead of colons for filesystem-friendliness across rsync, zip, and Windows.
-- Two meetings ending at the same minute get a `(2)`, `(3)`, etc. suffix.
-- If the rename fails (rare — concurrent file appearance), WisprAlt falls back to the start-only name and logs a warning.
-
-### Copy your API key
-
-In the popover → Show advanced settings → API Key Backup section, the **Copy API Key** button puts your token on the clipboard for one-shot pastes. The clipboard auto-clears after 60 seconds, but only if you haven't copied something else in the meantime (uses `NSPasteboard.changeCount` snapshot — survives Universal Clipboard correctly).
-
 ### Smart formatting
 
-The popover has a **Smart formatting** toggle in the Settings section. When ON, every dictation is sent to the server with the `X-Smart-Format: true` header; for dictations of at least 100 words, the server hands the raw Parakeet output to OpenRouter Mercury 2, which fixes punctuation and casing, removes obvious fillers ("um", "uh", repeated words), and adds bullet-list formatting where you're clearly enumerating items. Meaning is preserved — no rephrasing, no summarization. Below 100 words the call short-circuits and you get raw Parakeet output. The threshold targets long-form dictation (e.g. LLM prompts, notes) where the cleanup is actually visible.
+The popover has a **Smart formatting** toggle in the Quality section. When ON, the app itself (in both Online and Local mode) sends the finished transcript of every dictation of at least 20 words to OpenRouter Mercury 2 (`inception/mercury-2`), which fixes punctuation and casing, removes obvious fillers ("um", "uh", repeated words), and adds bullet-list formatting where you're clearly enumerating items. Meaning is preserved — no rephrasing, no summarization. A length check (cleaned text within 0.70–1.10× of the raw word count) rejects anything that changed too much.
 
-- **Default**: OFF. Raw Parakeet output is what gets injected.
-- **Latency cost**: ~250ms additional wall-clock per dictation when the cleanup runs (the Mercury call is fail-soft — a timeout or HTTP error returns the raw text and the response field `smart_formatted: false`).
-- **Server requirement**: the operator must have set `SMART_FORMAT_ENABLED=true` (default is off) and `OPENROUTER_API_KEY` in `server/.env`. If the key is missing, every dictation comes back as raw text regardless of the toggle — there is no client-visible error, the toggle just silently does nothing. Ask your admin if cleaned output is what you expect but you keep getting raw output.
-- **Pricing**: per-cleanup is roughly $0.0001 against your operator's OpenRouter credit. Negligible for individual employees; visible in OpenRouter usage if you batch-dictate hundreds of clips.
-- **Privacy note**: smart formatting sends your raw transcript to OpenRouter (cloud). If you handle confidential material, leave the toggle OFF.
+- **Default**: OFF. The raw transcript is what gets injected.
+- **Key**: your own OpenRouter key, pasted into the field under the toggle or added from Terminal: `security add-generic-password -U -s co.wispralt.openrouter -a default -w`. It lives only in the Keychain (`co.wispralt.openrouter`). Without it the toggle does nothing and the popover says "OpenRouter key missing".
+- **Latency cost**: at most 2.5 s per dictation (hard deadline). Fail-soft: a timeout, HTTP error or rejected cleanup returns the raw text. The popover shows the last dictation's result ("formatted", "too short", "failed (timeout)", …).
+- **Pricing**: per-cleanup is roughly $0.0001 of OpenRouter credit.
+- **Privacy note**: smart formatting sends the transcript text (never audio) to OpenRouter (cloud). If you handle confidential material, leave the toggle OFF.
 
-The toggle does NOT affect meeting recordings — those run through mlx-whisper server-side and are never routed through Mercury.
+The client no longer asks the server to format (`smart_format` / `X-Smart-Format` are not sent since Part 3). The toggle does NOT affect file transcriptions — they are never routed through Mercury.
 
 ### Your name
 
@@ -194,7 +195,7 @@ WisprAlt now ships with a real icon (dark mic + chat bubble brand mark). You'll 
 - **Launchpad** and **Spotlight** results.
 - The macOS notification banners.
 
-The icon set is generated by `scripts/build-icon.sh` from a master source and lives at `client/WisprAlt/Resources/Assets.xcassets/AppIcon.appiconset/`. If you build from source the script regenerates the 10 required PNG sizes automatically; you should not need to run it manually unless you're customizing the icon.
+The icon set lives at `client/WisprAlt/Resources/Assets.xcassets/AppIcon.appiconset/` and is committed. To change the icon, run `scripts/build-icon.sh path/to/source-1254.png`; it regenerates the 10 required PNG sizes.
 
 ---
 
@@ -211,79 +212,55 @@ If the toggle shows "requires approval" in System Settings, click it to turn it 
 
 ---
 
-## Backing up your API key
+## Moving your API key
 
-Your API key is stored in the macOS Keychain. To move it to another Mac or share it with a friend, use the export/import flow in Settings.
+Your keys live only in the macOS Keychain (`co.wispralt` for the Local server key, `co.wispralt.openai` for OpenAI, `co.wispralt.openrouter` for Smart formatting). WisprAlt has no export, import or "Copy API Key" button: a key never lands in a file or on the clipboard from the app.
 
-**Export:**
-1. Open the WisprAlt settings popover → **Export API Key…**
-2. Save the file to your **Desktop** (the default location).
-3. The file is a plain text `.wispralt-key` file set to mode `0600`.
+To set up another Mac, get the key again from where it was issued (your server operator for the Local key, the OpenAI dashboard for an OpenAI key) and paste it into Settings → Advanced on the new Mac, or add it from Terminal:
 
-**IMPORTANT — treat this file like a password. Never save the export file to:**
-- `~/Documents/` (likely synced to iCloud Drive)
-- iCloud Drive
-- Dropbox
-- Google Drive
-- Any cloud-synced location
+```bash
+security add-generic-password -U -s co.wispralt.openai -a default -w
+```
 
-Once you have moved the file to the destination Mac (e.g. via AirDrop or a USB drive), delete the export file from your Desktop.
-
-**Import:**
-1. On the destination Mac, open Settings → **Import API Key…**
-2. Select the `.wispralt-key` file. The key is written to the Keychain immediately.
-3. Click **Test Connection** to confirm the key works.
-
-### Restoring on a new Mac
-
-1. Export the key from your current Mac (Settings → Export API Key).
-2. Transfer via AirDrop or a USB drive. **Do not email or message it.**
-3. Import on the new Mac (Settings → Import API Key).
-4. Delete the export file from both Macs once the import succeeds.
+(`-w` with no value prompts for the key, so it never appears in your shell history.) Never email or message a key.
 
 ---
 
 ## Dictation Usage
 
 1. Hold the **FN** key (Globe key on M-series Macs). The menubar icon turns to a filled mic.
-2. Speak. Release FN to send audio to the server.
+2. Speak. Release FN to send the audio: in Online to OpenAI (16 kHz mono WAV, one request), in Local to your server (long dictations stream in chunks while you speak).
 3. Transcribed text is injected at the cursor (AXUIElement primary; clipboard + Cmd+V fallback for Electron apps).
-4. Round-trip latency: ~250–400ms p50.
+4. Round-trip latency (Local): ~250–400ms p50. A dictation stops and sends at 10 minutes.
+5. If you press FN while the previous dictation is still being saved, a notice says "Still saving the last dictation — press again".
 
-**Note:** Holding FN while a meeting recording is active is a no-op (with a warning in the log). This is the mic mutual exclusion rule.
-
----
-
-## Meeting Recording Usage
-
-1. Triple-tap the **FN** key within 400ms. The menubar icon changes to a recording circle.
-2. Speak normally. The app captures both your microphone (channel 1) and system audio (channel 2) in a dual-channel 16kHz WAV.
-3. Triple-tap FN again (or click the menubar item) to stop recording.
-4. The UI moves through three explicit states: **Uploading (with %)** → **Processing** → **Done**.
-5. Completed transcripts are saved to `~/Documents/WisprAlt/Meetings/` as `.json`, `.srt`, `.vtt`, and `.txt`.
-
-### Recording Limits
-
-Meeting recording is capped at **90 minutes** by default (configurable via Settings → Max meeting length). At the 60-minute mark, a system notification fires warning that the recording will auto-stop in 30 minutes. After the cap is reached, recording stops automatically and the upload begins immediately. You can change the cap (5–240 minutes) in the WisprAlt settings popover.
-
-### In-Person Mode Auto-Detection
-
-If channel 2 (system audio) is silent for more than 90% of 100ms frames during the recording, the server automatically uses single-channel diarization with "Speaker 1", "Speaker 2", … labels instead of "You" / "Other".
+**Note:** an update relaunch is refused while a dictation (or its in-flight upload) or a file job is running, so an update never kills your work.
 
 ---
 
-## Speaker Rename (Offline-Capable)
+## File Transcription Usage
 
-1. Click the WisprAlt menubar icon and select the transcript from the list.
-2. In the Transcript Detail view, click a speaker name and type the new name.
-3. The app atomically rewrites all four local files (JSON, SRT, VTT, TXT) without any server round-trip. This works entirely offline.
+**Online mode.** Click **Transcribe file…** and pick an audio or video file. Nothing is copied: the file is read where it is.
+
+1. Supported files (mp3, mp4, m4a, wav, webm, ogg, flac, mpeg, mpga) under 25 MB and 10 minutes go to OpenAI as is, in one request. Anything else (longer, larger, mov/caf/aiff/aac, video) is decoded on this Mac: the audio track is extracted from a video, then split at quiet moments into pieces of at most 10 minutes, each sent as 16 kHz mono with the end of the previous piece as context. The popover shows "Chunk i of n".
+2. Only when every piece succeeded, `<name>.txt` and `<name>.json` are saved together in a new `Custom Transcriptions/<name>__<timestamp>/` folder (see [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#online-json)). A failure or Cancel saves nothing. Subtitles (SRT/VTT) need Local mode.
+3. Quitting mid-file loses that job (its temp files are cleaned up at the next launch); pick the file again. A video with no audio track, or a file this Mac cannot decode, says so ("This file type needs Local mode").
+4. Switching modes never stops a running Online file job. If a Local file job was saved and you switch to Local during the Online job, the Local job is watched again once the Online job ends.
+
+**Local mode.**
+
+1. Click the WisprAlt menubar icon → **Transcribe file…** and pick any audio or video file (m4a, mp3, mp4, mov, wav, aac, flac, opus, ogg, webm, m4v, caf, aiff).
+2. The file is copied into its own folder under `Custom Transcriptions` and uploaded as-is (large files go up in chunks). The UI moves through **Uploading (with %)** → **Processing** → **Done**.
+3. The server transcribes it with MLX Whisper (one mono stream, no speaker labels). The model loads on the first file job, so the first one after an idle spell takes longer.
+4. `.json`, `.srt`, `.vtt` and `.txt` are downloaded next to the source file (see [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md)), then the server copy is deleted. **Copy last custom transcription** puts the newest TXT on the clipboard.
+
+**Cancel** stops the client at once and re-enables **Transcribe file…**. If the server was already transcribing, it finishes that Whisper call before discarding the result; a new file submitted in that window gets "previous transcription still finishing".
 
 ---
 
 ## Auto-Updates
 
-**Tier 1.5 distribution** (the current path) uses GitHub Releases via
-the `/wispralt-update` Claude Code slash command. Sparkle is **disabled**
+Updates come from the clone via `wispralt update --client`. Sparkle is **disabled**
 in be720a1 — the framework is bundled but the auto-updater never runs:
 
 - `SUEnableAutomaticChecks=false` in `Info.plist`
@@ -292,15 +269,14 @@ in be720a1 — the framework is bundled but the auto-updater never runs:
 - `didAbortWithError` / `didFinishUpdateCycleFor` only log; no
   user-facing notifications
 
-The previous `Info.plist` had a placeholder `SUFeedURL` pointing at
-`https://omid.example/wispralt/appcast.xml` that triggered "Unable to
-Check For Updates" alerts every few hours. Disabling Sparkle removes the
+The previous `Info.plist` had a placeholder `SUFeedURL` that triggered
+"Unable to Check For Updates" alerts every few hours. Disabling Sparkle removes the
 dialog completely.
 
-**To update:** in Claude Code, run `/wispralt-update`. It diffs the
-installed `CFBundleShortVersionString` against the latest GitHub
-Release tag, downloads + verifies + replaces the app, and runs a
-TCC reset cycle if the cdhash changed.
+**To update:** run `wispralt update --client`: it pulls the clone,
+rebuilds the app and swaps it into place. The app polls the clone's GitHub
+releases and, when one is newer, Settings > Updates offers **Copy update
+command** (see [ARCHITECTURE.md](ARCHITECTURE.md#in-app-updater)).
 
 When we move to Tier 2 distribution (Apple Developer Program +
 notarized builds + signed appcast), flip `SUEnableAutomaticChecks=true`
@@ -309,54 +285,13 @@ and re-enable the user-facing update notifications.
 
 ---
 
-## Employee install (recommended)
+## Employee install
 
-The canonical install path is the curl one-liner — pure bash + native
-macOS tools. **No Claude Code, no Homebrew, no `gh`, no sudo, no auth.**
-Works on a fresh Mac without cloning this repo. See
-[INSTALL.md](INSTALL.md) for the full guide and troubleshooting.
-
-**Prerequisites:**
-- macOS 14.0 or later (Sonoma+).
-- Apple Silicon (current builds are arm64-only).
-- Internet (anonymous; no GitHub auth needed since the repo is public).
-- No developer tooling — the installer uses only stock macOS utilities (no Xcode
-  Command Line Tools, no Homebrew).
-
-**Install:**
-
-```bash
-curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-  | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
-```
-
-What `install.sh` does (full source at the repo root):
-
-1. Refuses to run as root or under sudo (Keychain + UserDefaults are user-scoped).
-2. Verifies macOS ≥ 14 and Apple Silicon; bails clearly otherwise.
-3. Fetches the latest GitHub Release JSON anonymously via the public API.
-4. Downloads the DMG and its `.sha256` sidecar; validates the DMG is real
-   via `hdiutil imageinfo` (catches captive-portal HTML); verifies SHA256.
-5. Mounts the DMG, replaces `/Applications/WisprAlt.app` cleanly (`rm -rf`
-   then `cp -R` — never nests), unmounts, strips `com.apple.quarantine`.
-6. On re-install, runs `tccutil reset All co.wispralt.WisprAlt` to clear
-   stale TCC entries (cdhash changes on every Apple-Development build).
-7. Writes the API key to the Keychain (`security add-generic-password
-   -s co.wispralt -a default -U`) and the server URL to UserDefaults
-   (`defaults write co.wispralt.WisprAlt serverURL ...`). Both are
-   skipped silently if the corresponding env var is unset.
-8. Flushes `cfprefsd` so the app reads the new defaults on first launch.
-9. Opens the app — `PermissionGate.swift` walks four macOS permissions.
-10. Polls (up to 10s) to confirm the app process actually started; warns
-    if it didn't (likely a Gatekeeper dialog needing right-click → Open).
-
-**Update path:** re-run the same curl one-liner. `install.sh` is
-idempotent and pulls the latest release each time. The Claude Code
-`/wispralt-update` slash command remains as a developer convenience for
-teammates who already use Claude Code; it's no longer the primary path.
-
-The build-from-source flow below is for **admin-grade** local builds
-(Omid's MacBook, contributor machines). Employees should not need it.
+Each employee clones the repo and runs `./install.sh --role client` (or installs
+a signed DMG with `wispralt setup --role client --dmg PATH`). Then they open the
+app, choose a mode and paste their key in Settings. See [INSTALL.md](INSTALL.md).
+The old `curl | bash` release installer is retired: there are no releases, and
+setup never strips quarantine or writes keys from environment variables.
 
 ---
 
@@ -368,13 +303,17 @@ See [client/README.md](../client/README.md) for the build/run quickstart.
 
 If you only need WisprAlt on your own Mac and don't plan to distribute it, use the local build flow. You need a **free Apple Development certificate** (see [Code-signing prerequisite for local builds](#code-signing-prerequisite-for-local-builds) above).
 
-**Build:**
+**Build and install:** `wispralt setup --role client` runs the build script and
+swaps the result into `/Applications` (it skips the build when the installed
+version already matches; `--rebuild` forces it). The swap is crash-safe: the
+previous app is kept as `.WisprAlt.app.old` until the new one is in place, and
+a rerun after an interrupted swap restores it first. To build by hand:
 ```bash
 bash scripts/build-client-local.sh
 ```
-Output: `client/build/WisprAlt.app`. Copy it to `/Applications/`, strip the quarantine flag (`xattr -dr com.apple.quarantine /Applications/WisprAlt.app`), and open.
+Output: `client/build/WisprAlt.app`. Copy it to `/Applications/` and open it (right-click → **Open** the first time).
 
-**Per-version TCC re-grant:** Each new build changes the binary's cdhash. macOS sees the new binary as a new app and re-prompts for the four permissions (Accessibility, Input Monitoring, Microphone, Screen Recording). This is Apple-enforced behavior — not a bug. See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for the full explanation and the `tccutil reset` recovery commands.
+**Per-version TCC re-grant:** Each new build changes the binary's cdhash. macOS sees the new binary as a new app and re-prompts for the three permissions (Accessibility, Input Monitoring, Microphone). This is Apple-enforced behavior — not a bug. See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for the full explanation and the `tccutil reset` recovery commands.
 
 **Annual cert renewal:** Free Apple Development certs expire after one year. Xcode auto-renews silently while you stay signed in with your Apple ID, but the renewed cert has a new SHA-1 and a new Designated Requirement. This triggers the same TCC re-grant cycle as a binary rebuild — once a year. Expected behavior; not a bug.
 
@@ -401,4 +340,4 @@ Open the WisprAlt settings popover → **Uninstall…** The in-app flow:
 4. Removes the UserDefaults domain (`co.wispralt.WisprAlt`).
 5. Moves `WisprAlt.app` to Trash.
 
-Alternatively run `./scripts/uninstall-client.sh` from the repo root.
+Alternatively run `wispralt uninstall --client`: it moves the app to the Trash and leaves your transcripts folder and Keychain items alone.

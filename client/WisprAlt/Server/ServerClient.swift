@@ -1,19 +1,23 @@
 import Foundation
+import WisprAltCore
 
 /// Central HTTP client for the WisprAlt server.
 ///
-/// - `session` is used for short dictation requests (low latency, default configuration).
-/// - `backgroundSession` is used for large meeting uploads (resumable, background transfer).
+/// - `session` is used for short requests (dictation, poll, download, delete).
+///   Large file uploads build their own delegate session in `FileJobAPI` /
+///   `ChunkedUploader`.
 ///
 /// Error mapping:
+///   - 410 `{"error":"dictation_deleted"}` / 409 `{"error":"dedup_conflict"}` → terminal `LocalDictationError`
 ///   - 401 → `.unauthorized`
 ///   - 413 → `.uploadTooLarge`
 ///   - 422 → `.uploadTruncated`
-///   - 429 with body "meeting in progress" → `.meetingInProgress`
-///   - other 429 → `.rateLimited(retryAfter:)`
+///   - 429 with `code=file_job_busy` → `.fileJobInProgress`
+///   - 429 with `code=insufficient_memory` → `.server(status: 429, body: <server text>)`
+///   - 429 without `code` (rate-limit middleware) → `.rateLimited(retryAfter:)`
 ///   - other 4xx/5xx → `.server(status:body:)`
 ///   - `URLError.networkConnectionLost` / `.timedOut` → one retry for dictation only.
-///     Meeting uploads (large files) are NEVER retried blindly.
+///     File uploads (large files) are NEVER retried blindly.
 final class ServerClient {
     // MARK: - Singleton
 
@@ -38,9 +42,6 @@ final class ServerClient {
     /// Default session for dictation (small payloads, low latency).
     private let session: URLSession
 
-    /// Background session for meeting uploads (resumable, survives app suspend).
-    let backgroundSession: URLSession
-
     // MARK: - Init
 
     private init() {
@@ -48,30 +49,23 @@ final class ServerClient {
         defaultConfig.timeoutIntervalForRequest = 30
         defaultConfig.timeoutIntervalForResource = 120
         self.session = URLSession(configuration: defaultConfig)
-
-        let bgConfig = URLSessionConfiguration.background(
-            withIdentifier: "co.wispralt.meeting-upload"
-        )
-        bgConfig.isDiscretionary = false
-        bgConfig.sessionSendsLaunchEvents = true
-        self.backgroundSession = URLSession(configuration: bgConfig)
     }
 
     // MARK: - Request builder
 
-    /// Builds a `URLRequest` for the given path, method, and optional body.
-    ///
-    /// Reads `Settings.shared.serverURL` and `KeychainHelper.getAPIKey()`.
-    /// Adds `Authorization: Bearer <key>` header when a key is available.
-    ///
-    /// - Parameters:
-    ///   - path: Server path starting with `/`, e.g. `/healthz`.
-    ///   - method: HTTP method. Defaults to `"GET"`.
-    ///   - body: Optional request body data.
-    ///   - contentType: Value for the `Content-Type` header. Ignored when `body` is nil.
-    ///   - additionalHeaders: Any extra headers to merge in.
+    /// The configured Local server as an endpoint (URL + Local key), read
+    /// per call. The URL must pass `LocalURLPolicy` (https, or http to this Mac).
     /// - Throws: `ServerError.missingConfiguration` if `serverURL` is nil, or
-    ///   `ServerError.invalidServerURL` if the URL cannot be constructed.
+    ///   `ServerError.invalidServerURL` if the policy rejects it.
+    func currentEndpoint() throws -> ServerEndpoint {
+        guard let baseURL = Settings.shared.serverURL else {
+            throw ServerError.missingConfiguration
+        }
+        guard LocalURLPolicy.isAllowed(baseURL) else { throw ServerError.invalidServerURL }
+        return ServerEndpoint(baseURL: baseURL, apiKey: (try? KeychainHelper.getAPIKey()) ?? nil)
+    }
+
+    /// Builds a request against the configured server (`currentEndpoint()`).
     func buildRequest(
         path: String,
         method: String = "GET",
@@ -79,10 +73,34 @@ final class ServerClient {
         contentType: String? = nil,
         additionalHeaders: [String: String] = [:]
     ) throws -> URLRequest {
-        guard let baseURL = Settings.shared.serverURL else {
-            throw ServerError.missingConfiguration
-        }
-        guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
+        try buildRequest(endpoint: currentEndpoint(), path: path, method: method, body: body,
+                         contentType: contentType, additionalHeaders: additionalHeaders)
+    }
+
+    /// Builds a `URLRequest` for `path` on `endpoint`. Adds
+    /// `Authorization: Bearer <key>` when the endpoint has a key, and
+    /// `X-WisprAlt-Client-Version`.
+    ///
+    /// - Parameters:
+    ///   - endpoint: The server to call (Local dictations pass the one captured at FN press).
+    ///   - path: Server path starting with `/`, e.g. `/healthz`.
+    ///   - method: HTTP method. Defaults to `"GET"`.
+    ///   - body: Optional request body data.
+    ///   - contentType: Value for the `Content-Type` header. Ignored when `body` is nil.
+    ///   - additionalHeaders: Any extra headers to merge in.
+    /// - Throws: `ServerError.invalidServerURL` if the endpoint fails
+    ///   `LocalURLPolicy` or the URL cannot be constructed.
+    func buildRequest(
+        endpoint: ServerEndpoint,
+        path: String,
+        method: String = "GET",
+        body: Data? = nil,
+        contentType: String? = nil,
+        additionalHeaders: [String: String] = [:]
+    ) throws -> URLRequest {
+        guard LocalURLPolicy.isAllowed(endpoint.baseURL),
+              let url = LocalURLPolicy.url(endpoint.baseURL, path: path)
+        else {
             throw ServerError.invalidServerURL
         }
 
@@ -90,7 +108,7 @@ final class ServerClient {
         request.httpMethod = method
 
         // Bearer auth — tolerate missing key gracefully (health check doesn't need it).
-        if let apiKey = try? KeychainHelper.getAPIKey() {
+        if let apiKey = endpoint.apiKey {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
@@ -124,9 +142,9 @@ final class ServerClient {
     /// Performs a data task, mapping HTTP errors to `ServerError`.
     ///
     /// Retries once on `URLError.networkConnectionLost` or `.timedOut` when
-    /// `retryOnReset` is true (dictation only — never for meeting uploads).
+    /// `retryOnReset` is true (dictation only — never for file uploads).
     /// Transient URLError codes that warrant a single retry for dictation requests.
-    /// Meeting uploads (large files) are NEVER retried blindly — see submit() in MeetingAPI.
+    /// File uploads (large files) are NEVER retried blindly — see `FileJobAPI.submitFile`.
     private static let retryableURLErrorCodes: Set<URLError.Code> = [
         .networkConnectionLost,
         .timedOut,
@@ -178,6 +196,8 @@ final class ServerClient {
         body: Data
     ) throws {
         guard status >= 400 else { return }
+        // Part 4 dedup contract: 410 dictation_deleted / 409 dedup_conflict are terminal.
+        if let terminal = LocalRequests.terminalError(status: status, body: body) { throw terminal }
 
         let bodyString = String(data: body, encoding: .utf8)
 
@@ -217,11 +237,20 @@ final class ServerClient {
             }
             throw ServerError.uploadTruncated
         case 429:
-            // Distinguish "meeting in progress" from generic rate limit.
-            if let bodyStr = bodyString,
-               bodyStr.lowercased().contains("meeting in progress")
+            // The file-job runner's busy 429s carry a machine `code` field
+            // (`{"error", "retry_after_s", "code"}`); the rate-limit
+            // middleware's 429s do not. Branch on the code, never on text.
+            if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+               let code = json["code"] as? String
             {
-                throw ServerError.meetingInProgress
+                switch code {
+                case "file_job_busy":
+                    throw ServerError.fileJobInProgress
+                case "insufficient_memory":
+                    throw ServerError.server(status: 429, body: json["error"] as? String ?? bodyString)
+                default:
+                    break
+                }
             }
             let retryAfter = response.value(forHTTPHeaderField: "Retry-After")
                 .flatMap { TimeInterval($0) }
@@ -231,7 +260,7 @@ final class ServerClient {
         }
     }
 
-    // MARK: - Offline-signature classifier (shared with fallback path)
+    // MARK: - Offline-signature classifier (shared with the origin retry)
 
     /// First-attempt elapsed-time threshold before a `URLError.timedOut`
     /// counts as "mini is offline" rather than "user is on bad wifi but
@@ -239,7 +268,7 @@ final class ServerClient {
     static let miniHealthWindowSec: TimeInterval = 30
 
     /// Maximum age of the most-recent body-byte ACK (when observable, e.g.
-    /// from `MeetingAPI`'s `UploadSessionDelegate.didSendBodyData`) for a
+    /// from `FileJobAPI`'s `UploadSessionDelegate.didSendBodyData`) for a
     /// `URLError.timedOut` to be treated as "no connectivity" instead of
     /// "throttled but progressing."
     static let byteACKMaxAgeSec: TimeInterval = 5
@@ -319,10 +348,10 @@ final class ServerClient {
 
     /// Calls `/readyz/{endpoint}` and returns the ok flag plus whether dictation is degraded.
     ///
-    /// The `X-Dictation-Degraded: true` response header signals that a meeting job is currently
+    /// The `X-Dictation-Degraded: true` response header signals that a file job (or a model load) is currently
     /// consuming most server memory and dictation latency may be elevated.
     ///
-    /// - Parameter endpoint: `"dictation"` or `"meeting"`.
+    /// - Parameter endpoint: `"dictation"` or `"db"`.
     func readyz(endpoint: String) async throws -> (ok: Bool, degraded: Bool) {
         let request = try buildRequest(path: "/readyz/\(endpoint)")
         let (_, http) = try await execute(request)

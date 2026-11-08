@@ -1,0 +1,35 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Add employee · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>Add employee</h1>
+      <p class="muted">Create a person, issue their first key, and get a ready-to-send install command.</p>
+    </div>
+  </div>
+  {% if error %}<p class="notice bad" role="alert">{{ error }}</p>{% endif %}
+  <form class="form card" method="post" action="/admin/people/new">
+    {{ ui.csrf(csrf_token) }}
+    <label for="label">Label (required)</label>
+    <input id="label" name="label" type="text" required autofocus maxlength="80"
+           value="{{ form_label or '' }}" placeholder="e.g. sam, alex-laptop" aria-describedby="label-hint">
+    <p class="hint" id="label-hint">Internal identifier. 1–80 characters, no control characters.</p>
+
+    <label for="display_name">Display name</label>
+    <input id="display_name" name="display_name" type="text" maxlength="40"
+           value="{{ form_display_name or '' }}" placeholder="e.g. Sarah Chen" aria-describedby="dn-hint">
+    <p class="hint" id="dn-hint">Optional. Leave blank to let the person set it on first launch.</p>
+
+    <label for="role">Role</label>
+    <select id="role" name="role">
+      <option value="employee" {% if form_role != "admin" %}selected{% endif %}>employee</option>
+      <option value="admin" {% if form_role == "admin" %}selected{% endif %}>admin</option>
+    </select>
+
+    <div class="actions">
+      <button type="submit" class="primary">Create and issue key</button>
+      <a href="/admin/people">Cancel</a>
+    </div>
+  </form>
+{% endblock %}

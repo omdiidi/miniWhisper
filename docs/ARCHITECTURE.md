@@ -6,19 +6,19 @@ title: Architecture
 
 ## System Overview
 
-WisprAlt is a two-component system: a native macOS menubar client running on your MacBook and a FastAPI server running on your always-on Mac mini, connected via a Cloudflare Tunnel.
+WisprAlt has two modes. In **Online** mode (the default) the native macOS menubar client sends audio straight to OpenAI with the user's own key (Keychain `co.wispralt.openai`); no server is involved. In **Local** mode the client sends audio to a self-hosted FastAPI host on an always-on Apple Silicon Mac, reached through `tailscale serve` or an optional Cloudflare Tunnel. The diagram below shows Local mode.
 
 ```
-┌─────────────────────────  Client (MacBook Air M4)  ──────────────────────────┐
+┌─────────────────────────  Client (macOS menubar)  ────────────────────────────┐
 │ FNKeyMonitor (CGEventTap, serial queue)                                       │
-│   ├ hold ──▶ DictationRecorder  (AVAudioEngine, NO-OP if MeetingRecorder.on) │
-│   └ 3-tap ▶ MeetingRecorder      (SCStream dual-channel + AlignedRingBuffer) │
-│                ↓ 2-ch WAV                                                     │
+│   └ hold ──▶ DictationRecorder  (AVAudioEngine)                               │
+│ "Transcribe file…" ──▶ source file (any container) ──▶ FileJobAPI             │
+│                ↓                                                              │
 │         ServerClient (URLSession, bearer, streaming multipart, progress)      │
+│         ChunkedUploader (large files, 50 MiB chunks)                          │
 │                ↓                                                              │
 │         TextInjector (AX → clipboard) for dictation                           │
-│         TranscriptStore (download + atomic local rewrites for renames)        │
-│         SparkleController (auto-update via signed appcast)                    │
+│         SparkleController (bundled, auto-update disabled)                     │
 └──────────────────────────────────────┬────────────────────────────────────────┘
                                        │ HTTPS
                           ┌────────────▼────────────┐
@@ -28,25 +28,23 @@ WisprAlt is a two-component system: a native macOS menubar client running on you
                                        │
 ┌────────────────────  Server (Mac mini M4 16GB) ──────────────────────────────┐
 │ uvicorn 1 worker → FastAPI (lifespan: load models, run staging+orphan sweep) │
-│   /healthz  /readyz/dictation  /readyz/meeting  /admin/rotate-key            │
+│   /healthz  /readyz/dictation  /readyz/db                                    │
 │   /me  (GET, PATCH)   ──▶ JSON self-service identity (label, display_name)   │
 │   /v1/audio/transcriptions ──▶ OpenAI-compat shim → ParakeetService          │
-│       (sync, dictate-only, 25 MB cap, never invokes Mercury)                  │
+│       (sync, dictate-only, 25 MB cap)                                        │
 │   /transcribe/dictate ──▶ ParakeetService (warm, single-thread executor)     │
-│       └─ optional X-Smart-Format: true & raw_words ≥ 100 ──▶ Mercury 2       │
-│             (OpenRouter, 1500ms hard timeout, fail-soft → raw on timeout,    │
-│              error, or length-window safety check failure)                   │
-│   /transcribe/meeting ──▶ enqueue → JobStore (SQLite, request_mode=meeting)   │
-│   /transcribe/file?mode={file|meeting} ──▶ ffprobe → ffmpeg → JobStore         │
+│       (raw text; server smart formatting removed in Part 4)                  │
+│   /transcribe/file (+ /chunked/*) ──▶ stage → JobStore (SQLite) → runner     │
 │                          ↓                                                    │
-│                    asyncio.to_thread(run_pipeline)                            │
+│                    FileJobRunner (1 job, dedicated executor)                  │
 │                          ↓                                                    │
-│       MeetingPipeline: mlx-whisper turbo (ANE) → Pyannote (MPS, meeting mode) │
+│       ffprobe → ffmpeg → files.pipeline: mlx-whisper turbo, mono              │
+│                (model lazy-loaded, evicted when idle)                         │
 │                          ↓                                                    │
 │       output.py: JSON+SRT+VTT+TXT atomic write (tempfile in same dir)         │
-│   /transcribe/meeting/{id}             ── poll (includes progress block)      │
-│   /transcribe/meeting/{id}/download/{fmt}  ── stream                          │
-│   /transcribe/meeting/{id}             ── DELETE (sets cancel_requested)      │
+│   /transcribe/file/{id}                ── poll (includes progress block)      │
+│   /transcribe/file/{id}/download/{fmt} ── stream                              │
+│   /transcribe/file/{id}                ── DELETE (202 cancel / 204 remove)    │
 │   /admin/active           ── rich projection of in-flight job                 │
 │   /admin/server-log/{id}  ── 100 lines bracketing the job in server.log       │
 └───────────────────────────────────────────────────────────────────────────────┘
@@ -62,58 +60,88 @@ The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port
 
 | Component | File | Responsibility |
 |---|---|---|
-| **FNKeyMonitor** | `client/WisprAlt/Hotkeys/FNKeyMonitor.swift` | CGEventTap (`kCGSessionEventTap`, `.listenOnly`) on `flagsChanged | keyDown`. Hops to serial private queue immediately. Tracks FN-DOWN time; detects 300ms hold for dictation; detects triple-tap within 400ms window for meeting toggle. Clears `tapTimes` when hold is confirmed to prevent stale taps poisoning future triple-taps. |
-| **DictationRecorder** | `client/WisprAlt/Capture/DictationRecorder.swift` | AVAudioEngine input tap that writes a native-format **Float32 PCM** WAV via `AVAudioFile.write(from:)`. Sample rate, channel count, and PCM format all match the tap's buffer exactly so AVAudioFile performs zero conversion — it streams the float bytes byte-for-byte to disk. Server (`audio.py`) resamples to 16 kHz and downmixes via `np.mean`. AVAudioConverter is intentionally avoided (default channel-mix sums channels rather than averaging, producing peak floats > 3.0). Int16 PCM output is also avoided (AVAudioFile's internal Float→Int16 converter applies a ~140x normalization that rail-clips the signal and destroys ASR accuracy). Tap callback dispatches each write onto a serial `ioQueue` to keep the realtime render thread free. Defensive in-tap clamp to ±0.95 catches any future regression of out-of-range floats. No-op if `MeetingRecorder.isActive == true`. Streaming `chunkBuffer` memory: appended without exact-size `reserveCapacity` (geometric growth), cuts use `removeSubrange`, guarded by `chunkLock` (tap section, `tailFrames()` and a `stop()` fence all serialize on it), capped at ~120 s of pending audio by shipping it as a chunk (pure silence is dropped, speech never is), and released when consumed (`tailFrames()` is consuming) or at `stop()` if streaming never armed. A 600 s hard cap (`maxDictationSeconds`) drops further tap audio and posts `.dictationMaxDurationReached` once (UI should treat it as FN release). |
-| **MeetingRecorder** | `client/WisprAlt/Capture/MeetingRecorder.swift` | SCStream dual-channel capture: `captureMicrophone=true` (ch1) + `capturesAudio=true, excludesCurrentProcessAudio=true` (ch2). Both downsampled to 16kHz Float32 via stateful AVAudioConverter. `startPTS` locked with `os_unfair_lock`; `CMTimeSubtract` used (not float subtraction) to avoid float drift over multi-hour meetings. Feeds `AlignedRingBuffer`. The sink is **AVAssetWriter writing AAC m4a** (16 kHz stereo, 96 kbps; chosen to match AlignedRingBuffer's source rate — server downsamples to 16 kHz anyway, and ~10× smaller than the legacy WAV path). `appendSample` spin-waits on `AVAssetWriterInput.isReadyForMoreMediaData` per Apple's back-pressure contract (1 ms tick, 100 ms warn, 2 s ceiling) — calling `append` while not-ready silently drops samples and was the root cause of the meeting-audio "cutting out" symptom. Instantiates `AudioDeviceListener` before `stream.startCapture()`; posts `.meetingConfigChanged` on input-device change. On abort: tears down the listener, deletes the partial m4a, resets state to idle. |
-| **AudioDeviceListener** | `client/WisprAlt/Capture/AudioDeviceListener.swift` | CoreAudio HAL listener for default-input-device changes (`kAudioHardwarePropertyDefaultInputDevice`). Uses a file-scope C function pointer (required by `AudioObjectAddPropertyListener` — cannot be stored on a Swift class instance). Context is heap-allocated via `Unmanaged.passRetained`; `deinit` calls `release()` exactly once and removes the listener. Posts `.meetingConfigChanged` via `DispatchQueue.main.async` so callers always receive the notification on the main thread. |
-| **AlignedRingBuffer** | `client/WisprAlt/Capture/AlignedRingBuffer.swift` | Sample-position-keyed buffer (dictionary keyed by start-sample integer). `flushAligned()` returns aligned 2-channel chunks when both channels have data; pads lagging channel with silence when gap exceeds `GAP_TOLERANCE_MS` (200ms default). `padMissing(toEnd:)` force-flushes at stop time. Memory bounds: holes up to 4 ms (64 samples) between chunks count as covered (zero-filled), and if either queue runs more than 10 s past the committed cursor the next flush is forced (zero-filling) so a stalled drain cannot accumulate audio unboundedly. `MeetingRecorder` rounds (not truncates) PTS-derived sample offsets to avoid 1-sample holes; `start()` has an `isStarting` re-entrancy guard; `AlignedRingBuffer.append` clamps forward PTS jumps to 5 s past that channel's own position and remembers the per-channel correction so the discontinuity is fixed once (a channel-local baseline keeps a jump shared by both channels from leaving a permanent skew). |
-| **TextInjector** | `client/WisprAlt/Inject/TextInjector.swift` | `@MainActor` strategy combinator. Captures `(FocusContext, AXUIElement?)` once via `captureFocus()` to close the TOCTOU window between security check and AX write. Refuses injection outright (no AX, no clipboard) when `WisprAltCore.shouldRefuseInjection(for:)` returns true (focused element subrole == `AXSecureTextField`); fires a 60-second-debounced local notification including the bundleID. Otherwise calls `AccessibilityInjector.tryInsertWith(element:text:)` and falls through to `ClipboardInjector` if AX cannot prove a value change (iMessages, Pane, every Electron app). |
-| **AccessibilityInjector** | `client/WisprAlt/Inject/AccessibilityInjector.swift` | `tryInsertWith(element:text:)` accepts a pre-captured focused element from `TextInjector` (no internal focus walk → no TOCTOU). Sets a 250 ms `AXUIElementSetMessagingTimeout` to bound stalls on hung target apps, then `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` and reads `kAXValueAttribute` before/after. Returns true ONLY when the read-back proves a change — delegates the decision to the pure `WisprAltCore.didInjectionLand(...)` predicate (regression-pinned by 11 XCTest cases). The "empty before + write succeeded → assume success" heuristic is intentionally absent; that combination is the silent-no-op signature in Electron / custom NSTextView / iMessages compose. |
-| **WisprAltCore** | `client/WisprAltCore/{InjectionPredicate,SecureFieldGate,FocusContext}.swift` | Pure-Swift library: `didInjectionLand(setSucceeded:beforeValue:afterValue:)`, `shouldRefuseInjection(for:)`, and the `Sendable, Equatable` `FocusContext` data type (`bundleID`, `pid`, `role`, `subrole`; `isSecureField` is derived from `subrole == "AXSecureTextField"` so callers can't construct an inconsistent context). No AppKit / ApplicationServices / Sparkle / resource dependencies — `Tests/WisprAltCoreTests` runs via `swift test` without invoking actool or pulling Sparkle into the test runner. |
-| **ClipboardInjector** | `client/WisprAlt/Inject/ClipboardInjector.swift` | Saves all NSPasteboardItem types (skipping `dyn.*`), writes text, synthesizes Cmd+V (virtualKey 0x09, `.maskCommand` on both keyDown and keyUp), then restores clipboard if `changeCount == saved+1`. |
-| **TranscriptStore** | `client/WisprAlt/Storage/TranscriptStore.swift` | File index of `~/Documents/WisprAlt/Meetings/`. Atomic local rewrite using `.{uuid}.tmp` + `replaceItemAt`. Creates `.transcriptWriteInProgress` sentinel before first replace, deletes after last; orphan sentinels on app launch trigger a partial-write revert. |
-| **MenuBarController** | `client/WisprAlt/App/MenuBarController.swift` | State machine: idle → dictating → meeting-recording → uploading → processing → done. Enforces mic mutual exclusion. Renders the meeting-recording state via a custom NSImage composite (NSBezierPath red dot + bold "REC" attributed string) drawn into a single bitmap — a previous image+attributedTitle pair was character-wrapping in cramped menubars (R/E/C stacked vertically). Generates human-readable meeting filenames `EEE MMM d h.mma-h.mma.wav` (POSIX locale, periods not colons, no seconds — collision-suffix `(2)/(3)` if needed). |
+| **FNKeyMonitor** | `client/WisprAlt/Hotkeys/FNKeyMonitor.swift` | CGEventTap (`kCGSessionEventTap`, `.listenOnly`) on `flagsChanged | keyDown`. Hops to serial private queue immediately. Tracks FN-DOWN time; detects the 300ms hold for dictation. (The meeting toggle gesture was removed with meetings.) |
+| **DictationRecorder** | `client/WisprAlt/Capture/DictationRecorder.swift` | AVAudioEngine input tap that writes a native-format **Float32 PCM** CAF to the spool (`~/Library/Application Support/WisprAlt/spool/<id>.caf`; CAF stays readable after a crash) via `AVAudioFile.write(from:)`. Sample rate, channel count, and PCM format all match the tap's buffer exactly so AVAudioFile performs zero conversion — it streams the float bytes byte-for-byte to disk. Server (`audio.py`) resamples to 16 kHz and downmixes via `np.mean`. AVAudioConverter is intentionally avoided (default channel-mix sums channels rather than averaging, producing peak floats > 3.0). Int16 PCM output is also avoided (AVAudioFile's internal Float→Int16 converter applies a ~140x normalization that rail-clips the signal and destroys ASR accuracy). Tap callback dispatches each write onto a serial `ioQueue` to keep the realtime render thread free. Defensive in-tap clamp to ±0.95 catches any future regression of out-of-range floats. Streaming `chunkBuffer` memory: appended without exact-size `reserveCapacity` (geometric growth), cuts use `removeSubrange`, guarded by `chunkLock` (tap section and a `stop()` fence serialize on it), capped at ~120 s of pending audio by shipping it as a chunk (pure silence is dropped, speech never is), and taken (consumed) by `stop()`. `start(dictationId:endpoint:maxSeconds:frameSink:)`: the first line is `guard !slot.isActive else { return false }` (Core `CaptureSlot` replaces `isRecording` and the public `streamSession`); a `DictationStreamSession` is created **only for a Local endpoint** (Online never streams) and captured by the tap closure; nothing in `start()` aborts a session; `slot.begin(session)` is the last step, so every throw leaves the slot free. a live model's `frameSink` gets a per-dictation `MonoResampler` (24 kHz) fed on a serial `frameQueue` (the tap only copies and dispatches). `stop()` fences the tap (new buffers are dropped) and drains `ioQueue` (every already-queued write lands, so the spool holds the same tail the live sink got), `frameQueue` (then flushes the resampler tail to the sink) and `chunkEncodeQueue`, closes the file, copies every per-dictation value into locals, then `slot.end()` (the next `start()` may run from there) and returns `RecorderOutput { recording: Recording, local: LocalCapture? }`; on a throw it aborts the session it took; the spool file is never deleted by the recorder (the dictation's `SpoolDisposition` owns it). A Local capture is re-encoded to native-rate Int16 (`LocalCapture.make`); a failed re-encode throws `.encodeFailed` (no Float32 fallback). The per-dictation cap (`maxSeconds`: 600 s, 420 s for `gpt-realtime-whisper`) drops further tap audio and posts `.dictationMaxDurationReached` once with `userInfo["seconds"]` (the UI runs the FN-up path and names the limit). A device change records `engineStartFailed(NSError -11)`; `stop()` returns what was recorded with `interruptedByDeviceChange` (toast "Audio device changed — transcribed what was recorded"). |
+| **TextInjector** | `client/WisprAlt/Inject/TextInjector.swift` | `@MainActor` strategy combinator. Captures `(FocusContext, AXUIElement?)` once via `captureFocus()` to close the TOCTOU window between security check and AX write. Refuses injection outright (no AX, no clipboard) when `WisprAltCore.shouldRefuseInjection(for:)` returns true (focused element subrole == `AXSecureTextField`); fires a 60-second-debounced local notification including the bundleID. Otherwise calls `AccessibilityInjector.tryInsertWith(element:text:)` and falls through to `ClipboardInjector` if AX cannot prove a value change (iMessages, Pane, every Electron app). Returns Core `InjectOutcome`: `.insertedVerified` (AX; clipboard untouched), `.pastedUnverified` (Cmd+V; the text stays on the clipboard), `.refusedSecureField` (nothing typed or copied), `.noTarget` (no frontmost app; copied only). |
+| **AccessibilityInjector** | `client/WisprAlt/Inject/AccessibilityInjector.swift` | `tryInsertWith(element:text:)` accepts a pre-captured focused element from `TextInjector` (no internal focus walk → no TOCTOU). Sets a 250 ms `AXUIElementSetMessagingTimeout` to bound stalls on hung target apps, then `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` and reads `kAXValueAttribute` before/after. Returns true ONLY when the read-back proves a change — delegates the decision to the pure `WisprAltCore.didInjectionLand(...)` predicate (regression-pinned by 11 Swift Testing cases). The "empty before + write succeeded → assume success" heuristic is intentionally absent; that combination is the silent-no-op signature in Electron / custom NSTextView / iMessages compose. |
+| **WisprAltCore** | `client/WisprAltCore/` (`InjectionPredicate`, `SecureFieldGate`, `FocusContext`, `FileJobContract`, `TranscriptsFolderDefault`, `KeychainItem`, `AppMode`, `OpenAIModels`, `OpenAIErrors`, `OpenAIRequests`, `Errors`, `Deadline`, `Audio/{MonoResampler,Mono16kWAV,ChunkPlanner}`, `Dictation/{DictationProvider,CaptureSlot,LocalFinalizeRoute,OpenAIFileProvider,SpoolDisposition,RetryEntries,LastText}`, `Mercury/{MercuryPolicy,MercuryClient}`) | Pure-Swift library holding every testable decision (see "Online mode" below): `didInjectionLand(setSucceeded:beforeValue:afterValue:)`, `shouldRefuseInjection(for:)`, `FileJobContract.cancelledByUserReason` (the server's cancel reason, a silent end), `TranscriptsFolderDefault.resolve(stored:docs:exists:)` (transcripts-folder default), and the `Sendable, Equatable` `FocusContext` data type (`bundleID`, `pid`, `role`, `subrole`; `isSecureField` is derived from `subrole == "AXSecureTextField"` so callers can't construct an inconsistent context). No AppKit / ApplicationServices / Sparkle / resource dependencies — `Tests/WisprAltCoreTests` (Swift Testing) runs via `scripts/test-client.sh` / `swift test` without invoking actool or pulling Sparkle into the test runner. |
+| **ClipboardInjector** | `client/WisprAlt/Inject/ClipboardInjector.swift` | `injectViaCmdV` writes the text and synthesizes Cmd+V (virtualKey 0x09, `.maskCommand` on both keyDown and keyUp); `copyOnly` writes it only. **Clipboard rule:** the pasteboard is never restored, because a Cmd+V paste cannot be verified and restoring could erase the only copy of a dictation that did not land. |
+| **MenuBarController** | `client/WisprAlt/App/MenuBarController.swift` | Owns the activity state (main thread): `currentSession: DictationSession?` (set only after `recorder.start` returns true; the only "dictation in progress" check), `localUploadPhase` (Core `LocalUploadPhase`: `.none/.converting/.uploading/.polling`, mirrored to `RecordingState`), `localDoneFlash`, `onlineJobTask`, and the `pollGeneration` fence. The icon `mode` is **computed** (`ActivityState.icon(…)`, `Mode` = Core `ActivityIcon`) and never written or branched on. `isBusy` (`currentSession != nil \|\| dictationsInFlight > 0 \|\| fileJobsInFlight > 0`) is the single busy signal: the update relaunch refuses while busy. `beginRun` increments `dictationsInFlight` in the same main-actor turn that clears `currentSession`; the submit Task's `defer` decrements it. Only one file job runs at a time (`transcribePickedFile` ignores a second pick, then branches on the mode: Online → `onlineJobTask`, Local → `activeJobTask`; see "Online file jobs"). `applyModeEvent` / `applyModeSwitch(to:)` run Core `LaunchActions` (see "Online mode"). |
+| **FileJobAPI** | `client/WisprAlt/Server/FileJobAPI.swift` | Poll / download / cancel for `/transcribe/file/{id}`. `cancel` returns the HTTP status; the caller cancels its poll Task, clears `activeJobID` and leaves the processing icon before the request; on 202 or 204 it clears `serverFinishingJobID` only if that still names the cancelled job. A later `failed: cancelled by user` poll result ends silently; any other `failed` clears `activeJobID` and its UserDefaults key (never resumed), while a poll timeout or transport error keeps the key so the next launch resumes. The job's output folder and stem are saved beside the id (`wispralt.activeJobOutput`, Core `SavedJobOutput`; written and removed with it by `saveActiveJob` / `clearSavedActiveJob`). A resumed job that ends `done` downloads its outputs exactly like the normal path (`downloadJobOutputs` with `FileJobContract.formatsToDownload`, into the saved folder, or a new "Recovered transcription" folder for an id saved by an older build), posts "Transcription Recovered", and only then clears the id and deletes the server job; a failed download keeps the id (unless the server answered 404) for the next launch. |
 | **MicEnumerator** | `client/WisprAlt/Audio/MicEnumerator.swift` | Stateless static helper bridging AVFoundation device discovery to CoreAudio HAL property reads. `availableInputs()` uses `[.external, .microphone]` (macOS 15+ — `.builtInMicrophone` is deprecated, subsumed by `.microphone`); dedup by uniqueID. `audioDeviceID(forUID:)` translates an AV `uniqueID` to an `AudioDeviceID` via `kAudioHardwarePropertyTranslateUIDToDevice` (using `withUnsafePointer(to: &cfUID)` and `qualifierSize = MemoryLayout<CFString?>.size`). `systemDefaultInputName()` exposes the current default's localized name for the picker label. Powers the SwiftUI Input Mic picker in `SettingsView`. |
-| **AppDelegate** | `client/WisprAlt/App/AppDelegate.swift` | App lifecycle. Exposes `static weak var shared: AppDelegate?` for cross-controller access. On launch sets `shared`, runs a defensive cleanup of any `pendingMeetingDefaultInputUID` UserDefaults key left over from an earlier build (a previous iteration overrode the macOS system default input for meetings; we backed that out so meetings honor the system default). |
-| **PermissionGate** | `client/WisprAlt/App/PermissionGate.swift` | Sequential 4-permission wizard: Accessibility → Input Monitoring → Microphone → Screen Recording. On macOS 14.4+, posts a blocking "Quit and Reopen Required" sheet after Input Monitoring is granted (`CGRequestListenEventAccess` returns `true` but real grant requires process restart). |
-| **SparkleController** | `client/WisprAlt/Update/SparkleController.swift` | Sparkle 2 wrapper. Defers update sheet if `MeetingRecorder.isActive == true`. Auto-updates intentionally **disabled** in be720a1 — `startingUpdater: false` + `SUEnableAutomaticChecks=false` in Info.plist. Tier 1.5 distribution rides on `install.sh` (curl one-liner; see docs/INSTALL.md) for fresh installs and `/wispralt-update` (Claude Code) for in-place updates. |
+| **AppDelegate** | `client/WisprAlt/App/AppDelegate.swift` | App lifecycle. Exposes `static weak var shared: AppDelegate?` for cross-controller access. Sweeps leftover `wispralt-online-*` temp dirs (`OnlineFileJob.sweepLeftovers`), recovers last session's spool into Retry (`recoverSpoolAtLaunch`; nothing is sent), warms the OpenAI key cache, then runs `menuBarController.applyModeEvent(.launch)`: in Local mode with a server URL + key it resumes a saved Local file job and fetches `/me` once; in Online it contacts neither. **Invite links**: `Info.plist` registers the `wispralt` URL scheme; `application(_:open:)` (a link that arrives before launch finishes is held until then) parses it with Core `InviteLink.parse` (refused unless the `host` passes `LocalURLPolicy`), is refused while a Local file job exists (`InviteLink.refusedForLocalJob`: converting / uploading / polled / id saved for resume, checked before the confirm dialog and again after it via `MenuBarController.localFileJobActiveOrSaved`, because redeeming repoints that job at the new server, which 404s it and strands its transcript; while the redeem is in flight `inviteRedeemInFlight` makes `transcribePickedFile` refuse a Local file job with a "Joining a Server" notice, so none can start mid-redeem; the same predicate locks the Server URL and API Key fields in Settings), shows an NSAlert with the server's host, and on **Join** sends `InviteLink.redeemRequest` (JSON `POST <host>/invites/redeem` with `device_label` = the Mac's name), then `KeychainHelper.setAPIKey(token)` (`co.wispralt`), `Settings.serverURL = host` (the link's host, not the response's) and `applyModeSwitch(to: .local)`. Failures show `InviteError.message`; logs carry only `InviteError.logDescription`, never the token or the key. |
+| **PermissionGate** | `client/WisprAlt/App/PermissionGate.swift` | Sequential 3-permission wizard: Accessibility → Input Monitoring → Microphone. On macOS 14.4+, posts a blocking "Quit and Reopen Required" sheet after Input Monitoring is granted (`CGRequestListenEventAccess` returns `true` but real grant requires process restart). |
+| **SparkleController** | `client/WisprAlt/Update/SparkleController.swift` | Sparkle 2 wrapper. Defers the update sheet while `MenuBarController.isBusy`. Auto-updates intentionally **disabled** in be720a1 — `startingUpdater: false` + `SUEnableAutomaticChecks=false` in Info.plist. Fresh installs: clone + `./install.sh`; updates: `wispralt update --client` (see docs/INSTALL.md). |
+
+### Online mode (OpenAI direct)
+
+Two modes, picked in the popover: **Online (OpenAI)** and **Local server** (`Settings.mode`; absent → `TranscriptionMode.default` = `.online`, on fresh installs and upgrades alike). A change applies to the next dictation.
+
+- **FN press** (`dictationStart`, all synchronous): `DictationSnapshot` freezes `{id (lowercase UUID), mode, kind, model, endpoint}`; `RouteKind.decide(mode:modelKind:keyPresent:)` gives `.openAIFile`, `.openAIRealtime` (a live model), `.local`, or `.needKey` (Online with no key: toast, the popover opens at the OpenAI key field, nothing records). Online reads only the OpenAI key (`OpenAIKey.current()`: memory cache, else a Keychain re-read, so a key added from Terminal works on the next press); Local reads only the Local server. `ProviderFactory.make` builds one fresh `OpenAIFileProvider`, or for a live model an `OpenAIRealtimeProvider` with a `gpt-transcribe` `OpenAIFileProvider` as its recovery (nil for Local). `recorder.start(dictationId:endpoint:maxSeconds:frameSink:)` gets the endpoint only for `.local`, so Online never streams to the Local host, and a `frameSink` only for a live model; right after it returns `true`, `dictationStart` calls `sink.start()`, which opens the Realtime socket. `false` → "Still saving the last dictation — press again".
+- **FN-up / cap / device change** → `beginRun` → `runDictation`: `recorder.stop()` → `DictationSession.route(local:)` → `.openAIFile(p)`: `Mono16kWAV` (16 kHz mono Int16, channels averaged by `MonoResampler`) → one `POST https://api.openai.com/v1/audio/transcriptions` (`audio.wav`, `json`, Bearer key; never `language`), one retry on 429/5xx/URLError, deadline `max(30, 10 + 0.5 × duration)` s via `withDeadline` (the timeout cancels the `URLSessionTask`, it never waits on the work); `.local(capture)`: `LocalServerProvider().finish(capture:)` → `DictationAPI.transcribe(capture:)` (`LocalFinalizeRoute`: stream finalize when a chunk went out, else whole file). Non-empty text is saved to `last.json` (Core `LastText`) **before** delivery, then `TextInjector.inject` returns an `InjectOutcome`, and `SpoolDisposition.decide(outcome, delivery:)` keeps or deletes the audio (see "Spool, Retry and last text"). The log line carries only `chars=`, `model=`, `mode=`, `saved=`, `truncated=`.
+- **Live models (Realtime API)**: `gpt-live-transcribe` (live default) and `gpt-realtime-whisper` ($0.017/min each, about 3.8× `gpt-transcribe`). `start()` opens `wss://api.openai.com/v1/realtime?intent=transcription` (`URLSessionWebSocketTransport`, Bearer key; no `model` query, no `OpenAI-Beta`) and sends `session.update` (`type: transcription`, `audio/pcm` 24 kHz, `transcription.model`, `turn_detection: null`) first. While FN is held the recorder's tap copies each buffer to a serial `frameQueue`, where one `MonoResampler` per dictation makes 24 kHz mono and calls `append`; the provider sends 200 ms `input_audio_buffer.append` messages (clamped PCM16 LE, base64) from one sender task, queued in order until the socket is open (at most 10 s; overflow or a failed open marks `.notConnected`; the spool keeps every frame regardless). `stop()` drains `frameQueue` and flushes the resampler. `finish`: drain (5 s deadline), < 100 ms of audio → `.emptyRecording` (no commit), else wait in the ordered event stream for the `session.updated` ack (an `error` there ends the run with no commit; a socket that closes first is `.notConnected`), then `input_audio_buffer.commit` and wait for that item's `conversation.item.input_audio_transcription.completed` (matched by `item_id`) under `max(15, 5 + 0.25 × duration)` s whose timeout closes the socket. An `error` event (also one answering `session.update`) or `…transcription.failed` throws `ProviderError.realtime(type:)` with the sanitized code. `RealtimeRecovery.shouldRecover`: `.notConnected`, `URLError`, `.deadlineExceeded`, `server_error`, transient HTTP → the same spooled recording goes once through `gpt-transcribe` (`modelUsed = "gpt-transcribe"` in the log line); never for empty audio, a cancel, `invalid_api_key`, `insufficient_quota`, `model_not_found`. The socket is closed on every path. Deltas are decoded but not shown (no text while speaking). Caps: `gpt-realtime-whisper` stops at 420 s (2,000 documented output tokens, A1), `gpt-live-transcribe` at 600 s. Measured latency (P4) is in [TESTING.md](TESTING.md#real-api-assumption-gates-openai).
+- **Spend estimate**: both OpenAI providers take an `onBilled(model, seconds)` hook, called once after each successful request (a recovered live dictation is billed by its `gpt-transcribe` provider, not the live one). The app's `SpendStore.record` turns it into `SpendLedger` (Core; seconds × $/min per local day, 400 days kept) in `spend.json`, shown in the popover as "OpenAI ≈ $X today · $Y this month".
+- **Smart formatting (Mercury, both modes)**: when `Settings.smartFormatting` is on, `MercuryStep.apply` runs after transcription and before the last-text save and delivery (also on a Retry). Core `MercuryClient` POSTs the text (never audio) to `https://openrouter.ai/api/v1/chat/completions` (`inception/mercury-2`, Bearer from Keychain `co.wispralt.openrouter` via `OpenRouterKey`, `X-Title: WisprAlt`) under a 2.5 s `withDeadline` whose timeout cancels the task; `MercuryPolicy` (prompt verbatim from the server, ≥ 20 words, 0.70–1.10 word-count window, `extractText` for every content shape) decides. Fail-soft: `DictationResult.formatting` is `.applied`, `.skipped("short" / "no key")` or `.failed("timeout" / "ratio" / "http" / "network" / "empty")` with the raw text; the popover shows it under the toggle. The client no longer sends `smart_format` / `X-Smart-Format`; server Mercury is removed in Part 4.
+- **Errors**: `ErrorLog.describe` / `ErrorLog.outcome` are the only ways an `Error` reaches a log or a toast. `LogSafeError` conformances: `DictationRecorder.DictationError`, `ServerError` (status / kind only, never the body), `FileJobError` (never the server reason), `ProviderError`, `KeychainItemError`. An empty recording stays silent; `.deviceChanged` toasts "Audio device changed — press FN again".
+- **Mode switch** (`applyModeSwitch(to:)` → `LaunchActions.decide(.switched(to:), state)`): to Online cancels only the Local poll task (`pollGeneration += 1`, `activeJobTask` cancelled; no server DELETE; the saved `wispralt.activeJobID` stays); to Local resumes polling a saved job only when no poller and no Online job runs; `/me` at most once per launch. Neither touches `currentSession`, so a recording finishes on its FN-press route. The picker is disabled while `localUploadPhase` is `.converting` / `.uploading` ("Finish or cancel the upload first").
+- **Poll fence**: `transcribePickedFile` and `resumeInFlightJobIfNeeded` bump `pollGeneration` and pass the captured `gen` down (`handlePickedFile` → `processCustomTranscriptionUpload` → `runFileTranscriptionJob`, and `resumePollingForJob`). Every state write there (phase, done flash, `activeJobID` + defaults, `serverFinishingJobID`, progress fields, notifications, the `defer` that clears `activeJobTask`) runs only if `PollFence.mayWrite(isCancelled:captured:current:)`. `cancelActiveTranscription` bumps the generation first.
+- **Popover status + model picker**: under the Mode picker a status line reads `Online · <model> · key saved|key missing` (Keychain presence only, no network) or `Local · <host> · reachable|unreachable` (`/healthz` runs only when the popover opens in Local or on a switch to Local, never in Online), plus `transcribing N` from `recordingState.dictationsInFlight` (mirrored by `MenuBarController.dictationsInFlight`'s `didSet`; not an icon state). Advanced → **OpenAI Model** lists every `OpenAIModels.all` row with `displayPrice` (`$0.0045/min`; `≈` for token-billed estimates) and `retireTag` (`retires Feb 26, 2027`), the caption "Files always use a file model. Dictation stops at N min for this model.", and the live caption "Live models stream audio while you hold FN and give the text when you release it (no text while speaking). They cost about 3.8× gpt-transcribe."; it writes `Settings.openAIModel`, read at the next FN press. A dictation failing with `FailureKind.modelNotFound` resets the picker to `gpt-transcribe` (`OpenAIModels.defaultFileModelID`, also for a live model) and toasts.
+- **Online hides server-only UI**: connection / Test Connection, Server URL, API key, Identity, Open Portal, Open My Dictations, the job Log button. "Transcribe file…" works in both modes (Online caption: "Online saves TXT + JSON. Subtitles (SRT/VTT) need Local mode."); "Copy last dictation" reads the local `last.json` in both modes.
+
+### Online file jobs
+
+`transcribePickedFile` branches on the mode at pick time, before any task starts, so the Local path's job folder and source copy never happen in Online. Online → `startOnlineFileJob` runs `OnlineFileJob` (`App/OnlineFileJob.swift`) in `onlineJobTask`:
+
+- **Isolation.** Counted in `fileJobsInFlight` (busy signal; one file job at a time). No mode switch cancels it, and it never touches `localUploadPhase`, `activeJobID` or the Local host. Its `defer` (`onlineJobDidEnd`, one main-actor turn) clears `onlineJobTask` and `recordingState.onlineJobID`, then runs `LaunchActions.decide(.onlineJobEnded, state)`, so a saved Local job resumes once the Online job ends if the mode is Local by then. Cancel cancels only the Online task (no fence bump, no server DELETE, `activeJobID` untouched).
+- **Source and temp files.** The pick is read in place (never copied; security scope held for the job). Every temp file lives in one `temporaryDirectory/wispralt-online-<id>/`, removed by `defer`; `AppDelegate` sweeps leftover `wispralt-online-*` dirs at launch. A job interrupted by quit is lost; the user re-picks the file.
+- **Upload plan.** The file model is `OpenAIModels.fileModel(for: Settings.openAIModel)`; its cap is `dictationCapSeconds` (600 s). `OnlineUploadPlan.decide`: mp3 / mp4 / m4a / wav / webm / ogg / flac / mpeg / mpga **and** ≤ 25,000,000 bytes **and** a known duration ≤ the cap → one direct POST with the file's own name and content type. Otherwise a video goes through `AudioExtractor.extract(strict: true)` into the job dir (`AudioExtractPolicy`: no audio track → "This video has no usable audio track"; export failure → "Could not extract audio"; an extraction that is not smaller is still used) and the plan runs again on the extracted file. Still not direct → decode: `Mono16kWAV.rmsProfile` (100 ms windows) → `ChunkPlanner.plan` (each cut at the quietest window in the last 20 s before the cap, never within 1 s of the end) → one 16 kHz mono WAV per chunk via `Mono16kWAV.make(range:)` → `OpenAIFileProvider.transcribe` with `prompt` = the previous chunk's last 200 characters (when the model supports it). A file `AVAudioFile` cannot open (e.g. a passthrough `audio.mp4` with non-AAC audio) → "This file type needs Local mode". Progress goes to `recordingState.chunkIndex` / `totalChunks`.
+- **Output, all or nothing.** Only on success: `<stem>.txt` and `<stem>.json` (`OnlineTranscript`, see TRANSCRIPT-FORMAT.md) are written into `wispralt-online-<id>/out/`, then `FileJobContract.commitOutputs` creates the `Custom Transcriptions/<stem>__<timestamp>/` folder and moves both in; any throw removes the new folder. A failure or cancel leaves nothing in the transcripts folder. Online writes TXT + JSON only (OpenAI returns no timestamps); subtitles need Local.
+
+### Spool, Retry and last text
+
+Files under `~/Library/Application Support/WisprAlt/` (folder 0700, files 0600, at rest protected by FileVault):
+
+- `spool/<id>.caf` + `spool/<id>.json` (`SpoolSidecar {mode, model}`): the sidecar is written synchronously by `SpoolFiles.writeSidecarSync` in `dictationStart` **before** `recorder.start`, so audio on disk always knows its route (a failed write toasts "Could not save audio" and nothing records; a failed start removes it).
+- After FN-up every file operation runs on the `SpoolStore` actor, serially. `SpoolDisposition.decide` (Core, table-tested): empty recording → delete, no toast; empty text from a real recording → keep + "No speech detected. Audio saved under Retry."; text delivered → delete (+ "No app to paste into — the text is on the clipboard" for `.noTarget`; a secure-field refusal adds nothing, `TextInjector` shows its own notice); possibly truncated → keep; a Local 200 with `"saved": false` → the text is delivered **and** the audio kept; a failed `last.json` save (`LastTextStore.save` returns false → `.text(textSaved: false)`) → delivered **and** kept + "Could not save this as the last dictation. Audio saved under Retry." (one keep rule, `SpoolDisposition.keepsAudio(truncated:serverSaved:textSaved:)`, also behind Retry's `RetryEntries.dropAfterRetry`); text that never reached delivery → keep; any failure → keep, except the terminal Local `.rejected` (410 `dictation_deleted` / 409 `dedup_conflict`) → delete, never retried. A cancelled run arrives as `.failed(.other)` (kept).
+- `keep` converts the spool to `retry/<id>.wav` (16 kHz mono via `Mono16kWAV`; the raw `.caf` is moved if conversion fails; if both fail the spool file and sidecar stay in `spool/` for the next launch, never deleted), moves the sidecar (a failed sidecar move leaves it in `spool/`; the next launch's `recover` moves it after its audio) and applies `RetryEntries.plan`: newest 2, 7 days, no 0 s entries, no orphan sidecars; a 3rd entry drops the oldest with "Oldest saved recording discarded".
+- **Launch**: the `spool/` ids are snapshotted in `applicationDidFinishLaunching` (later dictations have new ids); each `.caf` with duration > 0 goes to Retry, a sidecar whose audio is already in `retry/` is moved there, the rest and orphan sidecars are deleted; "N saved recordings from last session — see Retry". Nothing is sent.
+- **Retry N** (popover): per entry "age · duration · mode" and `RetryEntries.actions(sidecar:currentMode:)`: a valid sidecar of the current mode → Retry, Export…, Discard; missing / corrupt → Export…, Discard; the other mode → Export…, Discard + "Switch to Local to retry" (or Online). Retry: Online → `OpenAIFileProvider(fileModel(for: sidecar.model))`; Local → `LocalServerProvider.retry` → `DictationAPI.wholeFile` to the **current** host with `X-Client-Dedup-Id: <id>` (the entry's dictation id). The result goes to `last.json` and the clipboard first; only then `SpoolStore.retryDelivered` deletes the entry (`RetryEntries.dropAfterRetry(_:textSaved:)`): kept when `LastTextStore.save` fails (it returns false; "Could not save it as the last dictation; kept under Retry."), on a Local `saved: false` or an empty transcript ("No speech detected; kept under Retry."). A terminal 410/409 deletes it; any other error keeps it. Export… copies through `AtomicFile.copy` (temp file beside the destination, then `rename`), so a failed export never removes an existing file.
+- **Last text**: `last.json` (`LastText {text, at, mode, modelUsed}`, atomic 0600 write via `PrivateFile.write`) is read by "Copy last dictation" in both modes and expires after 7 days. It replaced the server `GET /me/dictations/last` call (`LastDictationAPI` removed).
 
 ### Server
 
 | Component | File | Responsibility |
 |---|---|---|
-| **FastAPI app** | `server/src/wispralt_server/main.py` | Single uvicorn worker. Lifespan: validates `.env` permissions (warns if not 0600), loads Parakeet, runs `JobStore.recover_orphans()`, sweeps staging, calls `install_compat_shims()` (idempotent torch.load + HF kwarg patches), then `await meeting_runner.reenqueue_pending()` directly. **Meeting models are NOT loaded here** — `bootstrap_models` was removed; mlx-whisper + Pyannote load lazily on the first meeting job via `pipeline._ensure_models_loaded()`. Registers SIGTERM handler, mounts routers. |
-| **ParakeetService** | `server/src/wispralt_server/dictate/parakeet.py` | Warm-resident `mlx-community/parakeet-tdt-0.6b-v2` (float32 — bfloat16 caused a `[matmul] (128,257) vs (514,51)` shape error on first inference). Single `ThreadPoolExecutor(max_workers=1)` serializes all inference (MLX is not thread-safe per model instance). Warmup JIT pass at startup. Defensive return-type handling: checks `hasattr(result, 'text')` vs list of `AlignedToken`. Tracks p50/p95 latency percentiles over last 100 calls. **Audio decode boundary**: `_sync_transcribe` wraps `soundfile.read` in `try/except (LibsndfileError, RuntimeError) → CorruptAudioError` so malformed uploads convert to HTTP 422 (via the route handler) instead of leaking as 500. |
-| **MeetingRunner** | `server/src/wispralt_server/jobs/runner.py` | `asyncio.Semaphore(1)` enforces one meeting at a time. Dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="wispralt-meeting")` isolates meeting CPU work from the default asyncio thread pool. OOM guard: rejects if `psutil.virtual_memory().available < 2 GiB`. Staging WAV always cleaned up in `finally` block. `reenqueue_pending()` called at startup for jobs whose WAVs survived a restart. |
-| **JobStore** | `server/src/wispralt_server/jobs/store.py` | SQLite WAL mode (`PRAGMA journal_mode=WAL; synchronous=NORMAL`). Thread-safe via `threading.Lock`. Job lifecycle: `pending → running → done | failed`. `recover_orphans()`: marks `running` jobs as `failed`; marks `pending` jobs with missing WAV as `failed`; leaves `pending` jobs with existing WAV for `reenqueue_pending()`. |
-| **MeetingPipeline** | `server/src/wispralt_server/meeting/pipeline.py` | Orchestrates: `_ensure_models_loaded()` (lazy first-call load) → load channels → in-person detection (`silence.py`) → denoise no-op (`deepfilter.py` is a stub, see note below) → **mlx-whisper turbo** (`mlx_whisper_loader.py`; `word_timestamps=True` for meeting mode, `False` for file mode) → Pyannote MPS diarization (`diarize.py`, meeting mode only) → merge/label via `merge.assign_speakers_segments` (word-aware splits when word timestamps are present; largest-overlap fallback when not) → atomic output write (`output.py`). Emits `phase_start`/`phase_done` structured logs at every seam; threads `progress_cb`/`cancel_cb` from the runner into the loaders. Returns locked v3 transcript dict.
+| **FastAPI app** | `server/src/wispralt/main.py` | Single uvicorn worker. Lifespan: requires `DATA_DIR`, migrates `wispralt.db`, validates `.env` permissions (warns if not 0600), runs `JobStore.recover_orphans()` BEFORE the staging sweep, loads Parakeet, then `await file_runner.reenqueue_pending()`. On exit it sets `shutting_down` and awaits `file_runner.shutdown()` first, before any loop cancel or store release. **The file model is NOT loaded here** — MLX Whisper loads lazily on the first file job via `files.pipeline._ensure_models_loaded()` and the eviction loop unloads it when idle. Registers SIGTERM handler, mounts routers. |
+| **ParakeetService** | `server/src/wispralt/dictate/parakeet.py` | Warm-resident `mlx-community/parakeet-tdt-0.6b-v2` (float32 — bfloat16 caused a `[matmul] (128,257) vs (514,51)` shape error on first inference). Single `ThreadPoolExecutor(max_workers=1)` serializes all inference (MLX is not thread-safe per model instance). Warmup JIT pass at startup. Defensive return-type handling: checks `hasattr(result, 'text')` vs list of `AlignedToken`. Tracks p50/p95 latency percentiles over last 100 calls. **Audio decode boundary**: `_sync_transcribe` wraps `soundfile.read` in `try/except (LibsndfileError, RuntimeError) → CorruptAudioError` so malformed uploads convert to HTTP 422 (via the route handler) instead of leaking as 500. |
+| **FileJobRunner** | `server/src/wispralt/jobs/runner.py` | `asyncio.Semaphore(1)` serialises execution; admission is decided by the set of spawned-but-unfinished worker tasks (`_workers`), so a second submit is refused even before the first worker has acquired the semaphore. Dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="wispralt-files")` isolates file-job work from the default asyncio thread pool. Busy or low-memory (< 2 GiB) submissions raise `FileJobInProgressError` with `code` `file_job_busy` / `insufficient_memory`, which the routes turn into a coded 429. `_run_source` owns the single `set_running` per attempt and re-checks `cancel_requested` right after the decode (a cancel during the decode ends the job before the model loads); `_fail(jid, reason)` records `cancelled by user` instead of any other reason (phase timeout, watchdog, exception) when a cancel was requested; `set_running` and `set_done` are conditional (`AND cancel_requested=0`), so a cancelled job can neither start nor finish `done` — it ends `failed: cancelled by user` with its outputs removed. The exception path also removes partial outputs. Staging files are cleaned up when the job ends, except when shutdown interrupted it (`CancelledError`, or `shutting_down` and the row still `running`): the input is kept and `requeue_interrupted` puts the row back to `pending` with its attempt refunded. `FileJobRunner(store, app.state)`; `shutdown()` cancels and awaits the workers, then `executor.shutdown(wait=False, cancel_futures=True)`. `reenqueue_pending()` called at startup for jobs whose inputs survived a restart (`MAX_ATTEMPTS = 3`). |
+| **JobStore** | `server/src/wispralt/jobs/store.py` | `JobStore(db, data_dir)` on the one SQLite DB (`Database`: connection per call, `BEGIN IMMEDIATE` writes), so it is safe from any thread. `user_id` is a real FK to `users`; `wav_path` is stored relative to `data_dir` and returned absolute; outputs always live in `DATA_DIR/outputs`. Job lifecycle: `pending → running → done | failed`. `recover_orphans()` — see Failure Handling. |
+| **files.pipeline** | `server/src/wispralt/files/pipeline.py` | `transcribe_file(...)`, holding `_load_lock` for the whole job: `_ensure_models_loaded()` (lazy first-call load, inside the `try` so a failed warmup still stamps the idle clock and releases the cache) → read the canonical WAV and average any channels to mono → resample to 16 kHz → **mlx-whisper turbo** (`mlx_whisper_loader.py`, `word_timestamps=False` hard-coded) → label every segment "Speaker 1" (`segments.py`) → atomic output write (`output.py`). Emits `phase_start`/`phase_done` structured logs at every seam; threads `progress_cb`/`cancel_cb` from the runner into the loader. Returns the v3 transcript dict (`mode="single"`, `model` lists the ASR model only). |
+| **RateLimitMiddleware** | `server/src/wispralt/middleware/rate_limit.py` | In-memory per-IP rolling-window limiter. Two windows: `/transcribe/dictate` 60 req/60s; `/readyz/*` + `/healthz` 120 req/60s. Returns 429 with `Retry-After` header and no `code` field. File jobs are bounded by the runner, not the limiter. |
+| **staging / env_writer** | `server/src/wispralt/ops/` | `staging.py` manages the staging directory; startup sweep removes orphaned WAVs older than 24h. `env_writer.py` atomically rewrites `.env` key-value pairs via tempfile-in-same-dir + `os.replace`, preserving mode 0600. |
 
-**Lazy model load (`_ensure_models_loaded`).** First meeting after server start pays a 5–30s one-time cost while mlx-whisper + Pyannote are loaded into RAM; subsequent meetings are zero-cost (warm). Single-flight is enforced by a module-level `threading.RLock` (`_load_lock`) with double-checked-locking around `_meeting_models_ready`; an `RLock` (not plain `Lock`) prevents deadlock if any future telemetry decorator wraps `load()` and re-enters from the same thread. The lazy loader also re-invokes `install_compat_shims()` (idempotent) to close the long-window race where any module imported between startup and first meeting could bind un-shimmed `torch.load` references. On partial failure (e.g. `_diarize_mod.load()` raises after `_mlx_mod.load()` succeeded) the except block calls `reset()` on each loader to null its module-level singletons, then `gc.collect()` as a hint, before re-raising — this prevents the next retry from double-allocating ~2.5–3 GB of mlx-whisper while the previous instance is still referenced. **Best-effort caveat:** dropping the Python reference does NOT guarantee immediate RAM reclaim — PyTorch holds C-level handles, MLX unified memory caches Metal backing pages, traceback frames retain locals until they unwind, and the OS allocator can keep slabs cached. `pipeline.evict_if_idle` calls `mx.metal.clear_cache()` + `mx.metal.reset_peak_memory()` to force MLX to release cached pages back to the unified pool (post-Phase 10; see `docs/CHANGELOG-2026-05-10.md`). The reset prevents reference accumulation across retries; OS-level reclaim is now bounded by the clear_cache call rather than indefinite. Observability snapshot is exposed via `pipeline.state() -> (warm, loading)` for `/readyz/meeting` and `/admin/metrics`. |
-| **meeting/__init__** | `server/src/wispralt_server/meeting/__init__.py` | Package init that runs **two import-time compat shims** before any submodule loads checkpoints: (1) monkeypatches `torch.load` / `torch.serialization.load` to force `weights_only=False` (required for trusted HF checkpoints since PyTorch 2.6 default flipped to `weights_only=True`, blocking `omegaconf.ListConfig` and other pickled objects in pyannote); (2) intercepts `huggingface_hub.{hf_hub_download, snapshot_download}` to translate the removed `use_auth_token=` kwarg → `token=` (pyannote.audio 3.3.2 still calls the legacy name). |
-| **RateLimitMiddleware** | `server/src/wispralt_server/middleware/rate_limit.py` | In-memory per-IP rolling-window limiter. Two windows: `/transcribe/dictate` 60 req/60s; `POST /transcribe/meeting` 4 req/3600s. Returns 429 with `Retry-After` header. |
-| **staging / env_writer** | `server/src/wispralt_server/ops/` | `staging.py` manages the staging directory; startup sweep removes orphaned WAVs older than 24h. `env_writer.py` atomically rewrites `.env` key-value pairs via tempfile-in-same-dir + `os.replace`, preserving mode 0600. |
+---
+
+**Lazy load and idle eviction.** The first file job after start (or after an eviction) pays a one-time load of MLX Whisper. Single-flight is enforced by a module-level `threading.RLock` (`_load_lock`): `transcribe_file` holds it for the whole job (`_ensure_models_loaded` re-enters it), so `evict_if_idle`'s non-blocking acquire skips while any job runs, and no job can pass the load check and then lose its model. `ops/background.eviction_loop` calls `pipeline.evict_if_idle(settings.file_model_idle_eviction_seconds)` every minute: when the model is warm, no job holds the lock and it has been idle past the threshold, it calls `_mlx_mod.reset()` (clears `mlx_whisper.transcribe.ModelHolder`), `gc.collect()` and `_mlx_mod.release_cache()` (`mx.clear_cache()` + `mx.reset_peak_memory()`; also run after every job), then runs a memory-delta self-check that increments `eviction_failures_total` and logs CRITICAL if the MLX pages did not come back. Observability snapshot: `pipeline.state() -> (warm, loading)` and `idle_seconds()`, surfaced on `/metrics` under the `meeting` key (name kept until a later schema pass).
 
 ---
 
 ## Processing Modes
 
-A single submission can take one of three paths depending on the **endpoint** and an explicit `request_mode` discriminator. Channel count is no longer conflated with intent — the "all Speaker 1" bug on long meeting recordings was caused by deriving `force_single_channel` from channel count rather than from request intent. The fix is one line in `runner._run_source`: `force_single = (request_mode == ProcessingMode.FILE)`.
+There are two paths. Meetings (dual-channel recording + diarization) were removed in Part 2.
 
 | Mode | Endpoint | Channel handling | Diarization | Model | `word_timestamps` |
 |---|---|---|---|---|---|
 | **Dictation** | `POST /transcribe/dictate` | mono (server downmixes) | n/a | Parakeet TDT 0.6B v2 (MLX, resident) | n/a |
-| **Meeting** | `POST /transcribe/file` w/ `mode=meeting`, or legacy `POST /transcribe/meeting` | mono or stereo; ffmpeg→2-ch canonical WAV | yes (Pyannote, MPS) | mlx-whisper large-v3-turbo | **`True`** — needed for word-aware speaker-boundary splits in `merge.assign_speakers_segments` |
-| **File** | `POST /transcribe/file` (default `mode=file`) | any container; ffmpeg-decoded | **no** | mlx-whisper large-v3-turbo | `False` (≈20% faster; no word-level data emitted) |
+| **File** | `POST /transcribe/file` (+ chunked) | any container; ffmpeg-decoded, channels averaged to mono | **no** | mlx-whisper large-v3-turbo (lazy, idle-evicted) | `False` (hard-coded) |
 
-The legacy `POST /transcribe/meeting` route persists `request_mode=meeting` on the row at submit time (`routes/meeting.py`); `routes/transcribe_file.py` takes `mode: ProcessingMode = Form(ProcessingMode.FILE)` and FastAPI auto-validates the enum (invalid → 422). `PendingUploadsQueue.swift` replays queued `.m4a` uploads with `mode=meeting` explicitly so an offline-queued meeting never gets reclassified as a file.
-
-Meeting mode on a mono source still routes through the existing in-person branch in `pipeline.py`: ffmpeg produces a 2-channel canonical WAV with silent ch2, diarization runs on ch1, and `relabel_in_person` produces the final speaker labels.
+There is no `mode` field. The `jobs.request_mode` / `force_single_channel` / `output_dir` columns are gone (Part 4): every job is a file job, and its outputs are in `DATA_DIR/outputs`.
 
 ---
 
 ## MLX Whisper
 
-WhisperX (CTranslate2 CPU int8 + wav2vec2 alignment) was replaced wholesale by [`mlx-community/whisper-large-v3-turbo`](https://huggingface.co/mlx-community/whisper-large-v3-turbo) in `server/src/wispralt_server/meeting/mlx_whisper_loader.py`. The model runs on Apple Neural Engine via MLX unified memory.
+WhisperX (CTranslate2 CPU int8 + wav2vec2 alignment) was replaced wholesale by [`mlx-community/whisper-large-v3-turbo`](https://huggingface.co/mlx-community/whisper-large-v3-turbo) in `server/src/wispralt/files/mlx_whisper_loader.py`. The model runs on Apple Neural Engine via MLX unified memory.
 
 | Item | Value |
 |---|---|
@@ -121,11 +149,12 @@ WhisperX (CTranslate2 CPU int8 + wav2vec2 alignment) was replaced wholesale by [
 | Loader | `mlx_whisper_loader.load()` — one-shot warmup with 1s of silence; idempotent via module-level `_loaded` flag |
 | Inference | `mlx_whisper_loader.transcribe_channel(audio_16k, *, word_timestamps, progress_cb, cancel_cb)` — wraps `mlx_whisper.transcribe` with a `tqdm.auto.tqdm.update` monkeypatch for chunk progress + a 5s wall-clock fallback if tqdm.update never fires |
 | Disk footprint | ~1.6 GB at `~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo/` |
-| Spike result (M4 mini, 16 GB) | 105 min audio (`audio_duration_s=6341.4`) → `transcribe_s=740.26`, **realtime ratio 8.57×**; wall clock 12.3 min including ffmpeg + pyannote |
-| Eviction | `mlx_whisper_loader.reset()` is **effectively a no-op** — MLX unified memory does not return promptly even after dropping references. The real eviction targets in `pipeline.evict_if_idle` remain Pyannote (PyTorch MPS) and DeepFilterNet (currently a no-op stub anyway) |
-| Cancel semantics | `cancel_cb` is honored at chunk boundaries via the tqdm monkeypatch; mlx-whisper has no in-decode interrupt, so cancel mid-transcribe is **advisory** (see Honest Limitations below) |
+| Spike result (M4 mini, 16 GB) | 105 min audio (`audio_duration_s=6341.4`) → `transcribe_s=740.26`, **realtime ratio 8.57×**; wall clock 12.3 min including ffmpeg |
+| Eviction | `mlx_whisper_loader.reset()` clears `mlx_whisper.transcribe.ModelHolder`; `pipeline.evict_if_idle` follows it with `mlx_whisper_loader.release_cache()` so the unified-memory pages return to the OS (see Lazy load and idle eviction above) |
+| Label / imports | `mlx_whisper_loader.MODEL_ID` is the one model label (the transcript `model` block reads it). `mlx`, `mlx_whisper` and `parakeet_mlx` are imported lazily and live in the `[host]` extra (`uv sync --extra host`), so `wispralt.main` imports without them; `ParakeetService(load_fn=…)` lets tests run dictation without MLX |
+| Cancel semantics | Whisper transcribes the whole file in one call with no in-decode interrupt. A cancelled running job keeps the model and the job slot until that call returns; then the result is discarded (see Honest Limitations below) |
 
-The wav2vec2 alignment pass that WhisperX did is **dropped**. For meeting mode, mlx-whisper's own `word_timestamps=True` provides word-level data that `merge.assign_speakers_segments` consumes for speaker-boundary splits (coalesce consecutive same-speaker words; cut on speaker change). File mode skips word timestamps entirely (≈20% perf headroom; SRT/VTT/TXT formatters never accessed `seg["words"]`).
+The wav2vec2 alignment pass that WhisperX did is **dropped**, and file jobs run without word timestamps (≈20% perf headroom; segments carry `words: []`).
 
 **Historical:** through Phase 8 of the swap, `whisperx`, `ctranslate2`, and `faster-whisper` were retained in `pyproject.toml` as a revert-by-`git revert` safety net. Phase 10 (2026-05-10) deleted them along with `meeting/whisperx_loader.py` and `tests/test_whisperx_no_speech.py` after a 24h soak validated the swap. See [CHANGELOG-2026-05-10.md](CHANGELOG-2026-05-10.md) for the full deletion log + MLX RAM-reclaim follow-up patch.
 
@@ -146,17 +175,15 @@ The wav2vec2 alignment pass that WhisperX did is **dropped**. For meeting mode, 
 [<job_id>] phase_done name=transcribe_load duration_ms=4127
 [<job_id>] phase_start name=transcribe
 [<job_id>] phase_done name=transcribe duration_ms=740258
-[<job_id>] phase_start name=diarize_load
-[<job_id>] phase_done name=diarize
-[<job_id>] phase_start name=merge
+[<job_id>] phase_start name=output_write
 [<job_id>] phase_done name=output_write duration_ms=18
 ```
 
-Phase names are the canonical keys used in `runner.PHASE_BUDGETS` / `PHASE_LABELS`: `queued → starting → ffprobe → ffmpeg_decode → transcribe_load → transcribe → diarize_load → diarize → merge → output_write → done|failed`. Diarize phases are skipped in file mode.
+Phase names are the canonical keys used in `runner.PHASE_BUDGETS` / `PHASE_LABELS`: `queued → starting → ffprobe → ffmpeg_decode → transcribe_load → transcribe → output_write → done|failed`. (The diarize and merge phases left with the meeting pipeline.)
 
 ### Job-level progress on the poll response
 
-`GET /transcribe/meeting/{id}` returns a `progress` block (and `serverFinishing: bool` if `cancel_requested=1` AND status is still `running`):
+`GET /transcribe/file/{id}` returns a `progress` block (and `serverFinishing: true` if `cancel_requested=1` AND status is still `running`):
 
 ```json
 {
@@ -168,7 +195,7 @@ Phase names are the canonical keys used in `runner.PHASE_BUDGETS` / `PHASE_LABEL
     "chunk_index": 47,
     "total_chunks": 211
   },
-  "server_finishing": false
+  "serverFinishing": true
 }
 ```
 
@@ -176,16 +203,16 @@ Phase names are the canonical keys used in `runner.PHASE_BUDGETS` / `PHASE_LABEL
 
 ### Admin endpoints
 
-- `GET /admin/active` — rich projection of the currently in-flight job: `id, status, request_mode, mode, phase, phase_label, phase_elapsed_s, chunk_index, total_chunks, started_at, wav_path, audio_duration_s, attempts, cancel_requested, current_rss_mb`. Same auth dependency as `/admin/metrics`.
-- `GET /admin/server-log/{job_id}` — plain-text response: the 100 lines bracketing the job's first and last appearance in `settings.server_log_path` (resolved from settings, NOT hardcoded). Includes intervening lines (ffmpeg stderr, pyannote warnings) for full-context diagnosis. The client's "View server log" sheet polls this every 5s.
+- `GET /admin/active` — rich projection of the currently in-flight job: `id, status, mode, phase, phase_label, phase_elapsed_s, chunk_index, total_chunks, started_at, wav_path, audio_duration_s, attempts, cancel_requested, current_rss_mb`. Same auth dependency as `/metrics`.
+- `GET /admin/server-log/{job_id}` — plain-text response: the 100 lines bracketing the job's first and last appearance in `settings.server_log_path` (resolved from settings, NOT hardcoded). Includes intervening lines (ffmpeg stderr, model warnings) for full-context diagnosis. The client's "View server log" sheet polls this every 5s.
 
 **Role gate (v0.5.0).** `GET /admin/active`, `GET /admin/server-log/{job_id}`,
 and `GET /metrics` are **admin-only** — previously they were behind
 `require_api_key` (any authenticated bearer), which leaked operator-level
 introspection to employee tokens. The dependency was tightened to
 `require_admin` in `routes/admin.py` so employees get a 403 on these surfaces
-and use the per-user `/me/*` routes (`/me`, `/me/insights`, `/me/history`,
-`/me/dictations/last`) for their own data instead. The client's "View server
+and use the per-user `/me/*` routes (`/me`, `/me/insights`, `/me/history`)
+for their own data instead. The client's "View server
 log" sheet handles the 403 with a friendly "Admin-only — ask your
 administrator" message rather than a raw error.
 
@@ -193,47 +220,46 @@ administrator" message rather than a raw error.
 
 ## Honest Limitations
 
-The cancel + per-phase-timeout story has **two real abort surfaces and three advisory ones**. This is documented up front so future debugging doesn't chase a non-existent kill primitive.
+The cancel + per-phase-timeout story has **four real abort surfaces and two deferred ones**. This is documented up front so future debugging doesn't chase a non-existent kill primitive.
 
 | Surface | Behavior |
 |---|---|
 | **`ffprobe` / `ffmpeg_decode` timeouts** | Real abort. Wrapped in `runner._phase` via `asyncio.wait_for` around a `run_in_executor` call. On timeout the executor task is cancelled and `set_failed` runs. |
-| **`transcribe` / `diarize` timeouts** | **Advisory only.** A separate `_phase_watchdog` task reads `phase_started_at` every 5s and calls `set_failed` if elapsed > 2× budget. The executor thread keeps running. The semaphore (`async with self._semaphore:` around `_run_source`) is held by the awaited executor and **is not released until that thread returns naturally.** New submissions get a real `429`. The client UI surfaces this as a "Previous transcription still finishing on server" banner instead of a mysterious error. |
+| **`transcribe` timeout** | **Advisory only.** A separate `_phase_watchdog` task reads `phase_started_at` every 5s and calls `set_failed` if elapsed > 2× budget. The executor thread keeps running. The semaphore (`async with self._semaphore:` around `_run_source`) is held by the awaited executor and **is not released until that thread returns naturally.** New submissions get a real `429` with `code=file_job_busy`, which the client shows as "previous transcription still finishing" instead of a mysterious error. |
 | **Cancel mid-upload** | Real abort. `URLSession.invalidateAndCancel()` on the client. |
-| **Cancel mid-`ffmpeg_decode`** | Real abort. `staging.transcode_to_canonical_wav` runs ffmpeg as a `subprocess.Popen` and polls `jobs.cancel_requested` every 500ms; on True it `SIGTERM`s ffmpeg, cleans the `.partial` file, and raises `staging.StagingCancelled`. `_run_source` catches it, calls `set_failed(jid, "cancelled")`, exits the `async with` → semaphore released. |
-| **Cancel mid-`transcribe`/`diarize`** | **Advisory only.** `cancel_requested=1` is written to the row; the client UI hides the job and shows the "Previous job finishing" banner; the executor thread keeps running until completion. Same semaphore constraint as the advisory timeout. |
+| **Cancel mid-`ffmpeg_decode`** | Real abort. `staging.transcode_to_canonical_wav` runs ffmpeg as a `subprocess.Popen` and polls `jobs.cancel_requested` every 500ms; on True it `SIGTERM`s ffmpeg, cleans the `.partial` file, and raises `staging.StagingCancelled`. `_run_source` catches it, calls `set_failed(jid, "cancelled by user")`, exits the `async with` → semaphore released. |
+| **Cancel while `pending`** | Real abort. `set_running` is conditional (`WHERE status='pending' AND cancel_requested=0`); when it refuses, `_run_source` deletes the staged source and records `failed: cancelled by user`. |
+| **Cancel mid-`transcribe`** | **Deferred.** `DELETE` returns 202 and writes `cancel_requested=1`; the client stops polling and clears its job state at once. Whisper transcribes the whole file in one call, so the executor thread keeps the model and the job slot until that call returns; then the result is discarded. Same semaphore constraint as the advisory timeout. |
 
-When `_run_pipeline_inner`'s executor eventually returns, `set_done` is guarded by a status check — if the watchdog or a cancel has already written `failed`, the executor's result is discarded and a warning is logged.
+When `_run_pipeline_inner`'s executor eventually returns, `set_done` is conditional (`WHERE status='running' AND cancel_requested=0`) and returns whether a row changed. If it refuses (watchdog already wrote `failed`, or a cancel was requested), the outputs are removed, a cancelled job is recorded as `failed: cancelled by user`, and `transcript_text` stays NULL. On the DELETE side the status is re-read after setting the flag, so a job that finished in between has its outputs removed (204) rather than left `done` after a 202; a watchdog-`failed` job whose executor is still running (`runner.active_job_id`) gets 202, not an output removal under the running thread. A finished job's DELETE removes only its outputs and sets `outputs_removed_at`: the row and text stay for `/me/history` and retention, and `/transcribe/file/*` treats it as gone.
 
 ### Networking
 
 The Cloudflare Tunnel maps `transcribe.<user-domain>` → `http://127.0.0.1:8000` on the Mac mini. `cloudflared` runs as a **user-level LaunchAgent** (`~/Library/LaunchAgents/co.wispralt.cloudflared.plist`), not as a system service — the `sudo cloudflared service install` path is broken on macOS 14/15+. The tunnel token is stored at `~/.config/wispralt/cloudflare-token` (mode 0600); the LaunchAgent reads it via `--token-file` on cloudflared ≥ 2025.4.0, or has it inlined in the plist (mode 0600) on older versions. The setup script (`scripts/setup-cloudflared.sh`) reads the token via `read -r -s` and unsets the shell variable immediately after writing the file.
 
-Tunnel latency overhead: ~50–200ms same-region. The Cloudflare free tier has a community-reported body limit of approximately 100 MB; the server enforces `MAX_UPLOAD_BYTES` (default 2 GiB) at the application layer. A 90-minute 2-channel 16kHz Float32 WAV is approximately 460 MB; clients warn the user at 60 minutes.
+Tunnel latency overhead: ~50–200ms same-region. The Cloudflare free tier has a community-reported body limit of approximately 100 MB; the server enforces `MAX_UPLOAD_BYTES` (default 2 GiB) at the application layer. Files over 50 MiB go through the chunked upload path below, so the edge cap never applies to them.
 
-### Cloud Fallback (dictation only)
+### Offline behaviour (no cloud fallback)
 
-When the Mac mini is offline, the Swift client falls back **directly** to OpenRouter's `openai/whisper-large-v3-turbo` (chat-completions audio) using an OpenRouter API key stored in the Keychain at `co.wispralt.openrouter`. No Worker, no proxy, no server-side code in the fallback path. The classifier (`ServerClient.isOfflineSignature`) trips ONLY on connect-refused errors, `URLError.networkConnectionLost`, `dnsLookupFailed`, `cannotFindHost`, or Cloudflare 502/522/523/524 with `CF-Ray` AND no `X-Request-Id`. Origin 5xx (FastAPI sets `X-Request-Id`) never trigger fallback. Meetings are queued locally instead — Whisper-only output cannot replace the mini's Pyannote diarization.
-
-Spend protection lives in the OpenRouter dashboard's monthly cap (set per account, not per employee). If no OpenRouter key is set in the Keychain, the client surfaces the existing 503 dictation error toast — the rest of WisprAlt keeps working. Setup + threat model: [FALLBACK.md](FALLBACK.md).
+There is no cloud fallback for audio. When the Mac mini is offline, dictation retries the origin once (`DictationAPI`: origin, wait, origin; `X-Client-Dedup-Id` keeps a retry from double-persisting), then surfaces the existing dictation error toast. File jobs fail with the usual upload error; nothing is queued for later. `ServerClient.isOfflineSignature` still classifies offline errors for that retry decision. The OpenRouter Keychain item (`co.wispralt.openrouter`) is kept for Mercury smart formatting; it is not used for audio.
 
 ### Custom Transcriptions (menubar file picker)
 
-The menubar QuickActions popover (`UI/SettingsView.swift`) exposes a "Transcribe file…" button that lets the user pick any audio/video container and upload it for transcription. The client copies the source **as-is** (no transcoding) into a per-job folder under `~/Documents/WisprAlt/Custom Transcriptions/`, then POSTs to `/transcribe/file` with `mode=file` via `MeetingAPI.submitFile`. Output JSON/SRT/VTT/TXT lands beside the source. `CustomTranscriptionsStore.swift` manages the per-job folders; `LastTranscriptCaption.swift` powers a "Copy last custom transcription" button with a live mtime caption (folder DispatchSource watcher + 10s timer + `Notification.Name.wisprAltTranscriptWritten` observer; see `Util/TranscriptNotifications.swift`).
+The menubar QuickActions popover (`UI/SettingsView.swift`) exposes a "Transcribe file…" button that lets the user pick any audio/video container and upload it for transcription. This section is the **Local** path; Online is described under "Online file jobs". The client copies the source **as-is** (no transcoding) into a per-job folder under `<transcripts folder>/Custom Transcriptions/` (default `~/Documents/WisprAlt/Transcripts/Custom Transcriptions/`, or `Meetings/` when that folder already existed), then POSTs to `/transcribe/file` via `FileJobAPI.submitFile`. Output JSON/SRT/VTT/TXT lands beside the source. `CustomTranscriptionsStore.swift` manages the per-job folders; `LastTranscriptCaption.swift` powers a "Copy last custom transcription" button with a live mtime caption (folder DispatchSource watcher + 10s timer + `Notification.Name.wisprAltTranscriptWritten` observer; see `Util/TranscriptNotifications.swift`).
 
-`MeetingAPI.swift` uses `URLSessionConfiguration` with `timeoutIntervalForRequest=300` and `request.timeoutInterval=6*60*60` so a 90-min upload over a slow uplink can complete without hitting the default 60s inactivity timeout.
+`FileJobAPI.swift` uses `URLSessionConfiguration` with `timeoutIntervalForRequest=300` and `request.timeoutInterval=6*60*60` so a 90-min upload over a slow uplink can complete without hitting the default 60s inactivity timeout.
 
 ### Large-file uploads (audio extraction + chunked upload)
 
-Cloudflare's free / pro / business plans cap inbound request bodies at **100 MB**. A 1-hour stereo meeting WAV is ~460 MB, and a 3-hour AAC-encoded meeting m4a can easily clear 200 MB — both would 413 at the edge before reaching the origin. Two complementary strategies extend the supported range to 4 GB without touching Cloudflare's plan tier.
+Cloudflare's free / pro / business plans cap inbound request bodies at **100 MB**. A 1-hour stereo WAV is ~460 MB, and a 3-hour AAC m4a can easily clear 200 MB — both would 413 at the edge before reaching the origin. Two complementary strategies extend the supported range to 4 GB without touching Cloudflare's plan tier.
 
 **Step 0 — Audio extraction (`client/WisprAlt/Capture/AudioExtractor.swift`).** Before deciding which upload path to take, the client passes the user-picked URL to `AudioExtractor.extractAudioIfVideo(_:)`. If the asset has BOTH a video and an audio track, it runs `AVAssetExportSession` with `AVAssetExportPresetPassthrough` and writes just the audio track to a temp `.m4a` (or `.mp4` fallback when the source codec isn't AAC-compatible). A 200 MB MP4 typically becomes a ~15 MB audio file — often dropping under the chunking threshold entirely and letting the existing single-shot `/transcribe/file` path serve the request. The extractor never throws: any probe / export failure returns the original URL so the upload still proceeds.
 
-**Step 1 — Chunked upload (`client/WisprAlt/Server/ChunkedUploader.swift` ↔ `server/src/wispralt_server/routes/transcribe_file.py`).** If `uploadSize > 50 MiB`, the client switches from `MeetingAPI.submitFile` (multipart single-shot) to `ChunkedUploader.upload`. The three-step wire protocol is:
+**Step 1 — Chunked upload (`client/WisprAlt/Server/ChunkedUploader.swift` ↔ `server/src/wispralt/routes/transcribe_file.py`).** If `uploadSize > 50 MiB`, the client switches from `FileJobAPI.submitFile` (multipart single-shot) to `ChunkedUploader.upload`. The three-step wire protocol is:
 
-1. `POST /transcribe/file/chunked/init` with JSON `{mode, total_bytes, chunk_count, original_filename}` → server returns `{upload_id, chunk_size}` (22-char `secrets.token_urlsafe(16)`) and creates `staging/chunked/<upload_id>/meta.json` recording the caller's `user.id`.
+1. `POST /transcribe/file/chunked/init` with JSON `{total_bytes, chunk_count, original_filename}` → server returns `{upload_id, chunk_size}` (22-char `secrets.token_urlsafe(16)`) and creates `staging/chunked/<upload_id>/meta.json` recording the caller's `user.id`.
 2. `POST /transcribe/file/chunked/<upload_id>/<chunk_index>` with raw bytes (`application/octet-stream`, NOT multipart) for each 50 MiB chunk. The body is streamed via `request.stream()` to `chunk-NNNN.part.tmp`, then atomically renamed on success. `Content-Length` is mandatory and validated against bytes-written (corrupt chunks → 400). The path declares `{chunk_index:int}` — Starlette's `:int` converter constrains this segment to digits so `/finalize` cannot match the chunk route. Without this constraint, Starlette's registration-order matching sent every `/finalize` request into the wildcard chunk handler with `chunk_index="finalize"`; Pydantic int-coerce then produced a RequestValidationError → 422 with `{"detail":[…]}`, which the client surfaced as the misleading "appears incomplete or corrupted" banner.
-3. `POST /transcribe/file/chunked/<upload_id>/finalize` with an empty body. Server verifies all chunks present + `Σ(part.size) == total_bytes`, concatenates in `run_in_executor` (deletes each `.part` as it copies to halve peak disk), then hands the assembled file to the SAME `MeetingRunner.submit_source_or_429` that the single-shot route uses. Returns `{job_id, status: "pending"}` — from here the existing poll/download/delete loop is unchanged.
+3. `POST /transcribe/file/chunked/<upload_id>/finalize` with an empty body. Server verifies all chunks present + `Σ(part.size) == total_bytes`, concatenates in `run_in_executor`, checks the assembled size, then hands the assembled file to the SAME `FileJobRunner.submit_source_or_429` that the single-shot route uses. The `.part` files are deleted only once the runner has accepted the job: a concat I/O error removes just the partial output and a busy 429 just the assembled copy, so finalize can be retried without re-uploading (the disk gate already requires room for one more copy). Finalize is serialized per upload id (an in-process claim set, taken before the first await; the server is one process): a concurrent second finalize gets 409 instead of racing the first on the same output path. Returns `{job_id, status: "pending"}` — from here the existing poll/download/delete loop is unchanged.
 
 **Resilience properties:**
 
@@ -275,7 +301,7 @@ This whole feature is **off by default** and additive. Every existing dictation 
 
 ### Opt-in surface
 
-The former `Settings.streamingDictation` UserDefaults flag has been removed from the client (it was unused; `DictationRecorder` ignores it). Two further client-side bypasses ensure the streaming path only runs when it can win:
+Streaming runs only for **Local** dictations: the recorder creates a `DictationStreamSession` only when `start` is given a Local endpoint, so an Online dictation never sends chunks. The former `Settings.streamingDictation` UserDefaults flag has been removed from the client (it was unused). Two further client-side bypasses ensure the streaming path only runs when it can win:
 
 - **Speech-length bypass.** If `EnergyVAD` reports cumulative voiced-frame time `< 8 s` at FN release, `DictationRecorder` discards any pending streaming session and uploads the full WAV via the existing `DictationAPI.transcribe` ladder. Short dictations would not amortize the streaming protocol's session-open + chunk-overhead round-trips.
 - **Bootstrap bypass.** If the first chunk has not been emitted by FN release (e.g. the speaker never paused), the recorder falls through to the single-shot path. The streaming session that was opened on FN press but never advanced is left to the server-side sweeper (900 s TTL).
@@ -287,36 +313,41 @@ The former `Settings.streamingDictation` UserDefaults flag has been removed from
 | Energy VAD | `client/WisprAlt/Capture/EnergyVAD.swift` | Pure-Swift RMS-based detector. Hysteresis (separate enter-voice / leave-voice thresholds) prevents flapping; a rolling noise floor (last ~1.5 s of minimum RMS) lets the gate self-calibrate to mic + room. 30 s hard cap on a single voiced run forces a chunk cut even if the speaker never pauses. Minimum-chunk gating drops chunks below `minChunkFrames` or whose average RMS is under `minChunkAverageDB` so silence-only or single-cough chunks never round-trip. |
 | Streaming session actor | `client/WisprAlt/Server/DictationStreamSession.swift` | Owns one session's `UUID` (`sid`), `chunkIndex`, `clientDedupID`, and a long-lived `URLSession`. Mints `sid` lazily on the first chunk POST; chunks POSTed in order to `/transcribe/dictate/stream/{sid}/chunk/{i}`; FN release flushes the tail via `/finalize`. Falls back silently to `DictationAPI.transcribe` on any chunk 4xx/5xx or stream error — the safety buffer (see below) means the full WAV is always available locally. |
 | Recorder integration | `client/WisprAlt/Capture/DictationRecorder.swift` | Streaming-only branch added inside the tap callback. Voiced frames accumulate in a sliding window; on a silence cut the recorder hands the cut WAV (and its starting sample offset) to the active `DictationStreamSession`. The non-streaming branch is unchanged — same `AVAudioEngine`, same Int16 PCM in-memory WAV at FN release. |
-| Safety buffer | `client/WisprAlt/Capture/DictationRecorder.swift` | A **separate full-utterance WAV** is always written in parallel to the chunked stream. If `DictationStreamSession.finalize` fails or times out, the recorder reverts to the existing 3-attempt fallback ladder (origin → retry → OpenRouter cloud-fallback) on the safety WAV. The user-facing failure mode never gets worse than today. |
+| Safety buffer | `client/WisprAlt/Capture/DictationRecorder.swift` | A **separate full-utterance WAV** is always written in parallel to the chunked stream. If `DictationStreamSession.finalize` fails or times out, the recorder reverts to the existing origin → retry ladder on the safety WAV (there is no cloud rung). The user-facing failure mode never gets worse than today. |
 
 ### Server architecture
 
 The server side is intentionally small and lives in two new modules:
 
-- `server/src/wispralt_server/dictate/streaming_session.py` hosts `StreamingSession` (dataclass: `sid`, `api_key_id`, `status ∈ {active, finalizing, done, aborted, expired}`, `partial_texts: list[str | None]`, `pending_tasks: dict[int, asyncio.Task]`, `cumulative_audio_ms`, `last_seen`, `lock: asyncio.Lock`) and `StreamingSessionStore` (the in-process registry).
-- `server/src/wispralt_server/routes/dictate_stream.py` exposes the two HTTP surfaces. See [API.md → `POST /transcribe/dictate/stream/...`](API.md#post-transcribedictatestreamsession_idchunkindex) for wire-level details.
+- `server/src/wispralt/dictate/streaming_session.py` hosts `StreamingSession` (dataclass: `sid`, `api_key_id`, `status ∈ {active, finalizing, done, aborted, expired}`, `partial_texts: list[str | None]`, `pending_tasks: dict[int, asyncio.Task]`, `cumulative_audio_ms`, `last_seen`, `lock: asyncio.Lock`) and `StreamingSessionStore` (the in-process registry).
+- `server/src/wispralt/routes/dictate_stream.py` exposes the two HTTP surfaces. See [API.md → `POST /transcribe/dictate/stream/...`](API.md#post-transcribedictatestreamsession_idchunkindex) for wire-level details.
 
 **Capacity caps (in-process, intentionally tight):**
 
 - **2 active sessions globally.** Returns `503 capacity_exceeded` on the 3rd open. Sized to match the mini's single-Parakeet-executor reality plus one buffer slot.
 - **1 active session per `api_key_id`.** Returns `409 per_user_busy` if the same user opens a second session while their first is still active. Forces clients to either reuse the existing `sid` (idempotent — `open_or_get` returns `existing`) or wait for the prior `finalize` to land.
 - **270 s cumulative voiced audio mid-chunk; 300 s at finalize.** Mid-chunk cap → `413`. Finalize cap → `413`. Keeps any single session inside Parakeet's comfortable VRAM working-set even under HOL contention.
-- **900 s session TTL.** A background sweeper task (`_streaming_sweeper`) reaps any session whose `last_seen` is older than 900 s, regardless of status. On reap, pending chunk tasks are cancelled and the slot is freed.
-- **15 s finalize timeout.** `finalize` waits up to 15 s for all `pending_tasks` to drain before snapshotting `partial_texts`, joining, and running Mercury. Past 15 s the route returns `504 timeout` and the session is marked `aborted`; the client safety buffer kicks in.
+- **900 s session TTL.** A background sweeper task (`_streaming_sweeper`, every 30 s, one `StreamingSessionStore.sweep_once` pass) aborts any `active` session whose `last_seen` is older than 900 s: pending chunk tasks are cancelled and the slot is freed. Finalized and aborted sessions are then evicted from the store 900 s after the sweeper first sees them ended (`ended_at`), so the process-wide store stays bounded; until then a retried finalize can still replay a blank result and a late chunk still gets 410. After eviction the id is unknown (404). Locked and `finalizing` sessions are never touched.
+- **15 s finalize timeout.** `finalize` waits up to 15 s for all `pending_tasks` to drain before snapshotting `partial_texts` and joining. Past 15 s the route returns `504 timeout` and the session is marked `aborted`; the client safety buffer kicks in.
 
 **Single Parakeet executor (no second instance).** Every chunk task is submitted to the same `ParakeetService` `run_in_executor` that `/transcribe/dictate` uses. There is no second model load, no second executor, no second thread pool. This means cross-session head-of-line blocking exists on a shared queue — see Known limitations below. With the 2-session cap, the worst case is 2 chunks contending and is acceptable for the experimental rollout.
 
-**Mercury runs once on joined text.** Each chunk's Parakeet output goes into `partial_texts[index]`. On `finalize` the texts are joined with `" "` separators and Mercury 2 cleanup runs ONCE on the joined string — same Mercury client, same `SMART_FORMAT_MIN_WORDS` threshold, same length-window safety rail as the single-shot path. There is no per-chunk Mercury call: it would (a) cost N× more OpenRouter budget, (b) produce visible seam artifacts because Mercury sometimes capitalizes / repunctuates the first word, and (c) defeat the purpose of streaming since the user's last word lands ~Mercury-RTT after the tail arrives anyway.
+**Joined text is returned raw.** Each chunk's Parakeet output goes into `partial_texts[index]`. On `finalize` the texts are joined with `" "` separators and returned as-is; server smart formatting (Mercury) was removed in Part 4.
 
 ### Idempotency
 
-Both the streaming-finalize path and the fallback path (cloud or local retry) write to the SAME `dictations` row by reusing one `client_dedup_id` UUID v4 per utterance:
+Both the streaming-finalize path and the single-shot fallback path (origin retry) write to the SAME `dictations` row by reusing one `client_dedup_id` UUID v4 per utterance:
 
-- The client mints `clientDedupID` once when `DictationStreamSession` opens.
-- `POST /finalize` sends it as a form field; the route calls `JobStore.insert_dictation(..., client_dedup_id=...)`.
-- If finalize fails and the safety-buffer fallback wins, the same UUID is sent to `POST /transcribe/dictate` via the additive `X-Client-Dedup-Id` header (and into `DictationFallbackQueue` if that path takes cloud-fallback).
-- The `idx_dictations_client_dedup` **partial unique index** (`WHERE client_dedup_id IS NOT NULL`, see `jobs/store.py`) combined with `ON CONFLICT (client_dedup_id) DO NOTHING` guarantees **at most one row per utterance** no matter which path wins.
-- When `X-Client-Dedup-Id` is absent (today's non-streaming clients, and `/v1/audio/transcriptions`), the column stays NULL and the partial index has no effect — backward compatibility is bit-identical.
+- The client's dedup id is the dictation id minted at FN press (`DictationSnapshot.id`, lowercase UUID v4); `DictationStreamSession(endpoint:dictationId:speechStartedAt:)` takes it, so there is no second id.
+- Core `LocalRequests` sends it as `X-Client-Dedup-Id` on **every** chunk, finalize and whole-file request; `POST /finalize` also sends it as the `client_dedup_id` form field.
+- If finalize fails and the safety-buffer fallback wins, the same id goes to `POST /transcribe/dictate`.
+- Every Local request goes to the `ServerEndpoint` captured at FN press (URL + key), never `Settings.serverURL`, so changing the host mid-dictation leaves the in-flight one on its host. `LocalServerProvider` bounds the whole Local finish by `max(30, 10 + 0.5 × duration)`; on timeout it aborts the session and cancels the request.
+- Part 4 contract (server: `dedup.py`; client: `LocalRequests`): a 200 with `"saved": false` is delivered as usual and surfaces as `DictationResult.serverSaved == false` (`SpoolDisposition` keeps that audio and its Retry entry); 410 `{"error":"dictation_deleted"}` and 409 `{"error":"dedup_conflict"}` are terminal (`LocalDictationError`, `FailureKind.rejected`): no whole-file fallback, no retry, and the audio and Retry entry are discarded. A Local Retry reuses the entry's dictation id as `X-Client-Dedup-Id`. A 409/410 with a `detail` body (e.g. session not open) is not terminal.
+- **Server side (Part 4, `dedup.py`).** The header is canonical: RFC-4122 shape, lowercased, 422 if malformed; required on chunk and finalize, optional on `/transcribe/dictate` (third-party callers). Whole-file and finalize hold an in-process **claim** (`DedupLocks`: one refcounted `asyncio.Lock` per id, keyed by the id alone, across users) across replay check → inference → save, so concurrent requests with one id run inference once; one process serves the DB, so an in-process lock suffices.
+- **Replay before work.** `JobStore.find_dictation(id, user)` runs before the session lookup and inference: same user → 200 with the stored text and `"replayed": true` (no usage row: `request.state.dedup_replay`); another user → 409 `{"error":"dedup_conflict"}`; the owner soft-deleted it → 410 `{"error":"dictation_deleted"}` (no inference, no row; re-running would resurrect deleted text). A chunk for a stored id returns 202 `finalized: true` without opening a session. A session remembers its dedup id; a chunk or finalize with another id → 409.
+- **Synchronous save.** `JobStore.insert_dictation` is one `BEGIN IMMEDIATE` select-or-insert (the global `UNIQUE(client_dedup_id)` stays as the collision detector), so at most one row exists per id whichever path wins. A `sqlite3.Error` still returns the text with `"saved": false`, bumps `dictation_save_failures_total` (in `/metrics` and `/readyz/db`) and logs only the error type. The fire-and-forget persist and its shutdown drain are gone.
+- **Blank text.** Neither path stores blank text (nothing to keep; both report `"saved": true`). A retried `/transcribe/dictate` simply re-runs inference on its audio; a streamed session cannot (its partials are consumed), so the session records the blank result (`StreamingSession.blank_text`) and a retried finalize with the same id replays it (`"replayed": true`) rather than hitting 410 `Session is finalized`. In-memory only: a server restart in between gives the retry a 404, which the client's whole-file fallback covers.
+- When `X-Client-Dedup-Id` is absent (third-party callers on `/transcribe/dictate`, and `/v1/audio/transcriptions`, which stores no row) there is no claim or replay and the column stays NULL.
 
 ### Honest fallback latency
 
@@ -324,7 +355,7 @@ The latency story when streaming wins is the §"Latency Budget (Dictation)" tabl
 
 - Up to 15 s waiting on `finalize` to drain pending chunks (the cap).
 - ~50 ms client-side fallback dispatch + safety-buffer reload.
-- The full existing 3-attempt ladder runs as it does today on the safety WAV.
+- The existing origin → retry ladder runs on the safety WAV.
 
 The safety buffer is always written, so a streaming failure costs the user **at worst** their normal single-shot latency + ≤15 s detection time. There is no path where a streaming failure produces a *worse* response than today's offline single-shot does.
 
@@ -339,17 +370,17 @@ The safety buffer is always written, so a streaming failure costs the user **at 
 
 | Concern | File:line landmark |
 |---|---|
-| Endpoint registration | `main.py` lifespan after `parakeet_service.load()`; `include_router(dictate_stream_routes.router)` after `dictate.router` and before `dev_faults.router` |
-| Sweeper lifecycle | `main.py` lifespan creates `_streaming_sweeper` task; shutdown cancels + aborts active sessions before mercury teardown |
+| Endpoint registration | `main.py` lifespan after `parakeet_service.load()`; `include_router(dictate_stream_routes.router)` after `dictate.router` |
+| Sweeper lifecycle | `main.py` lifespan creates `_streaming_sweeper` task; shutdown cancels + aborts active sessions |
 | Per-session lock contract | `streaming_session.py` — every reader/writer of `status / partial_texts / pending_tasks / last_seen / cumulative_audio_ms` acquires `session.lock` before mutating; `finalize` snapshots under lock before releasing for the `asyncio.gather` await |
-| Dedup-id persistence | `jobs/store.py` — `dictations.client_dedup_id` column + `idx_dictations_client_dedup` partial-unique index (added in Plan A, reused here) |
-| Header passthrough on non-streaming | `routes/dictate.py` — additive read of `X-Client-Dedup-Id` (UUID v4 form), forwarded to `insert_dictation(..., client_dedup_id=...)` |
+| Dedup-id persistence | `jobs/store.py` — `dictations.client_dedup_id UNIQUE`; `find_dictation` / `insert_dictation` (atomic select-or-insert) |
+| Dedup contract | `dedup.py` — header parsing, `DedupLocks` claim, `replay_or_none`, `persist`; used by `routes/dictate.py` and `routes/dictate_stream.py` |
 
 ---
 
-### Meeting Upload Latency
+### File Upload Latency
 
-A 1-hour dual-channel 16kHz Float32 WAV is approximately 460 MB. At 100 Mbps symmetric: ~37 seconds upload alone. `RecordingIndicatorView` shows three explicit states with progress: **Uploading (%)** via `URLSession` upload-progress callbacks, then **Processing** (server pipeline), then **Done**.
+A 1-hour stereo 16kHz WAV is approximately 460 MB; compressed sources (m4a, mp3, video with the audio track extracted) are far smaller. At 100 Mbps symmetric a 460 MB file takes ~37 seconds to upload. `RecordingIndicatorView` shows three explicit states with progress: **Uploading (%)** via `URLSession` upload-progress callbacks, then **Processing** (server pipeline), then **Done**.
 
 ---
 
@@ -366,20 +397,19 @@ FastAPI event loop (single thread)
     │                       ParakeetService._sync   ← serialized; MLX not thread-safe
     │                   )
     │
-    └── POST /transcribe/meeting        (legacy; persists request_mode=meeting)
-        POST /transcribe/file            (mode=file|meeting; ffprobe + ffmpeg in worker)
-            └── MeetingRunner.submit_or_429() / submit_source_or_429()
-                    ├── Check Semaphore locked → 429 immediately (non-blocking)
-                    ├── Check available RAM < 2 GiB → 429 immediately
-                    └── asyncio.create_task(_run())
+    └── POST /transcribe/file (+ chunked finalize)   (ffprobe + ffmpeg in worker)
+            └── FileJobRunner.submit_source_or_429()
+                    ├── Check a worker is queued/running (`_workers`) → 429 code=file_job_busy (non-blocking)
+                    ├── Check available RAM < 2 GiB → 429 code=insufficient_memory
+                    └── _spawn(): create_task(_run_source()) tracked in `_workers`
                             └── async with asyncio.Semaphore(1)
                                     └── loop.run_in_executor(
-                                            MeetingRunner._executor,  ← dedicated 1-worker pool
-                                            meeting_pipeline.transcribe_meeting
+                                            FileJobRunner._executor,  ← dedicated 1-worker pool
+                                            files.pipeline.transcribe_file
                                         )
 ```
 
-The FastAPI event loop is never blocked by inference work. When a meeting is active, `app.state.meeting_active_flag` is `True`. `GET /readyz/dictation` adds `X-Dictation-Degraded: true` to signal that dictation inference may be slower due to unified memory pressure.
+The FastAPI event loop is never blocked by inference work. While a file job runs (`file_runner.active`) or the file model is loading (`files.pipeline.is_loading()`), `GET /readyz/dictation` adds `X-Dictation-Degraded: true` to signal that dictation inference may be slower due to unified memory pressure.
 
 ---
 
@@ -388,43 +418,43 @@ The FastAPI event loop is never blocked by inference work. When a meeting is act
 | Component | Resident Memory |
 |---|---|
 | Parakeet TDT 0.6B v2 (MLX float32) | ~3.5–4.0 GB unified (≈2× bf16) |
-| mlx-whisper large-v3-turbo (MLX, ANE/unified memory) | ~2.5–3.0 GB |
-| Pyannote 3.1 (PyTorch, MPS) | ~1.0 GB |
+| mlx-whisper large-v3-turbo (MLX, ANE/unified memory) — only while a file job runs or before idle eviction | ~2.5–3.0 GB |
 | Python / FastAPI process | ~0.5 GB |
-| **Total resident (warm)** | **~7.5–8.5 GB** |
-| **Peak observed across the 12-run matrix** | **< 14 GB** (gate criterion for Phase 10) |
+| **Total resident (file model warm)** | **~6.5–7.5 GB** |
+| **Peak observed across the transcription matrix** | **< 14 GB** (gate criterion for Phase 10, measured with the old meeting rows) |
 
-The Mac mini M4 16 GB configuration leaves ~8.7 GB for the OS and other processes. `MeetingRunner.submit_or_429()` rejects a new meeting job if `psutil.virtual_memory().available < 2 GiB`.
+The Mac mini M4 16 GB configuration leaves ~8.7 GB for the OS and other processes. `FileJobRunner.submit_source_or_429()` rejects a new file job (429 `insufficient_memory`) if `psutil.virtual_memory().available < 2 GiB`; the route boundary returns 503 below 4 GiB before streaming the upload.
 
-**Cold-start footprint:** before any meeting/file job has run, only Parakeet + Python/FastAPI are resident (~4.0–4.5 GB). mlx-whisper + Pyannote are loaded lazily on the first meeting/file job (see `MeetingPipeline._ensure_models_loaded`), reclaiming ~3.5 GB until that point. Once warm, models stay resident for the process lifetime; `pipeline.evict_if_idle` targets Pyannote and DeepFilterNet — `mlx_whisper_loader.reset()` is effectively a no-op because MLX unified memory does not return promptly after dropping references.
+**Cold-start footprint:** before any file job has run, only Parakeet + Python/FastAPI are resident (~4.0–4.5 GB). mlx-whisper is loaded lazily on the first file job (see `files.pipeline._ensure_models_loaded`) and evicted again once idle past `FILE_MODEL_IDLE_EVICTION_SECONDS` (default 60): `pipeline.evict_if_idle` resets the loader and calls `mx.clear_cache()`, and a memory-delta self-check confirms the pages came back.
 
 **Disk guard:** `staging.stream_to_staging()` checks that free disk is at least 1.5x the upload size before accepting a file. `GET /metrics` reports `disk.free_gb` and `disk.staging_count` for monitoring.
 
-**Device matrix:** MLX for Parakeet **and mlx-whisper** (Apple Neural Engine / GPU unified memory). Pyannote supports MPS and runs on `torch.device("mps")` for diarization. The CTranslate2 CPU-int8 path that powered WhisperX has been retired.
-
-**Denoise note:** `meeting/deepfilter.py` is currently a **no-op stub** — `get_df()` returns `None` and `deepfilter()` returns the audio unchanged. DeepFilterNet 3 was removed because it pins `numpy<2.0` while `parakeet-mlx` requires `numpy>=2.2.5`. The stub keeps function signatures stable so callers don't need conditional branches; re-introducing a numpy-2-compatible denoiser is tracked as future work.
+**Device matrix:** MLX for Parakeet **and mlx-whisper** (Apple Neural Engine / GPU unified memory). The CTranslate2 CPU-int8 path that powered WhisperX and the PyTorch MPS diarization path have both been retired.
 
 ---
 
 ## Failure Handling
 
-### SIGTERM Handler
+### SIGTERM and graceful shutdown
 
-Registered in `main.py` lifespan. On SIGTERM:
+The SIGTERM handler (registered in the lifespan when running on the main thread) only sets `app.state.shutting_down = True` and raises SIGINT, which uvicorn's own handler turns into its graceful shutdown; it no longer fails running jobs. The lifespan shutdown then:
 
-1. Sets `app.state.shutting_down = True`.
-2. Calls `job_store.fail_all_running("server shutdown")` to mark in-flight jobs as failed.
-3. Calls `sys.exit(0)` so launchd's `ExitTimeout=15` applies cleanly.
+1. sets `shutting_down` and awaits `file_runner.shutdown()` FIRST, while the DB is open: each worker is cancelled; a job it interrupts keeps its staged input (WAV or source) and `requeue_interrupted` sets the row back to `pending` with the attempt `set_running` took refunded, so a deploy never spends an attempt;
+2. cancels the daemon loops and streaming sessions, closes the insights client;
+3. drops the stores (`app.state.db` etc.);
+4. releases the server lock (`<data_dir>.lock`) last.
 
-The client's `GET /transcribe/meeting/{job_id}` poll sees `status: "failed"` and surfaces the error to the user.
+A worker that finished (`done`/`failed`) during shutdown cleans up its input as usual. The executor thread itself cannot be cancelled: an ffmpeg decode stops at its next cancel poll, an mlx-whisper call runs to its end. `file_runner.shutdown()` waits up to `EXECUTOR_DRAIN_S` (10 s) for it; if the thread is still running, the lifespan calls `ops.backup.pin_until_exit`, which keeps the server lock held until the process really exits (Python joins the thread at exit), so a restore can never swap `DATA_DIR` under it.
+
+A job's staged input (source or WAV) is deleted only once its row reads back `done` / `failed`. If marking it failed hits a DB error, the row stays `running` with its input, and the next start's `recover_orphans` requeues it.
 
 ### Orphan Recovery (`recover_orphans`)
 
-Called once at startup (before the event loop accepts requests). Policy from `jobs/store.py:157`:
+Called once at startup, BEFORE the staging sweep (so a requeued input is never swept):
 
-- `running` → `failed` (server restarted mid-job; job is dead)
-- `pending` + WAV file exists → left as `pending`; `MeetingRunner.reenqueue_pending()` re-submits it
-- `pending` + WAV file missing → `failed` (staging file disappeared between crashes)
+- `running` (the server died mid-job) → `pending` (phase cleared) when its input exists, no cancel was requested and `attempts < 3`; otherwise `failed` with `cancelled by user`, `staging file missing after restart` or `max retries exceeded`. A crash still spends the attempt.
+- `pending` + input missing → `failed`; `pending` + truncated WAV → `failed` and the WAV unlinked.
+- every surviving `pending` row is re-submitted by `FileJobRunner.reenqueue_pending()` on its absolute input path.
 
 ### Staging Sweep
 
@@ -434,144 +464,84 @@ Called once at startup (before the event loop accepts requests). Policy from `jo
 
 ## Authentication
 
-`/healthz`, `/readyz/*`, and `/admin/login` are intentionally **unauthenticated** so Kubernetes-style probes, Cloudflare health checks, external monitoring, and the admin login form can be reached without API credentials. The probes expose only a ready-flag boolean, free RAM in MB, and a `meeting_active` indicator — no user data, no audio, no model output.
+`/healthz`, `/readyz/*`, and `/admin/login` are intentionally **unauthenticated** so Kubernetes-style probes, Cloudflare health checks, external monitoring, and the admin login form can be reached without API credentials. The probes expose only a ready-flag boolean and the `X-Dictation-Degraded` header — no user data, no audio, no model output.
 
-Every other route requires `Authorization: Bearer <token>`. The legacy single-key compare path was replaced in `2026-04-27-team-distribution` by the multi-token flow described next; `secrets.compare_digest` no longer appears on the request hot path.
+Every other route requires `Authorization: Bearer <token>` (or, for browser pages, the session cookie).
 
-### Auth (multi-token)
+### Auth (local SQLite, no cache)
 
 ```
-Bearer <plaintext>
+Bearer <plaintext>  (or wispralt_admin_token cookie; never on /v1)
    │
    ▼
-sha256(plaintext) ─────────────► token_hash (hex)
-   │
-   ▼
-TokenCache.get(token_hash)        ← LRU 256 entries × 60s TTL, in-process
-   │ hit
-   ├──► User(id, label, role) ──► request.state.user
-   │
-   │ miss
-   ▼
-asyncpg pool ─► SELECT id, label, role
-                FROM wispralt.users
-               WHERE token_hash = $1
-                 AND revoked_at IS NULL
-   │
-   │ row found
-   ├──► TokenCache.put → User → request.state.user
-   │
-   │ row missing OR pool=None OR PostgresError
-   ▼
-break-glass branch
-   IF token_hash == app.state.break_glass_token_hash:
-       User(id=-1, label="break-glass-admin", role="admin")
-   ELSE:
-       401 Invalid bearer / 503 Auth temporarily unavailable
+sha256(plaintext) ──► AccountStore.lookup_key(token_hash)      (asyncio.to_thread)
+                        SELECT … FROM api_keys k JOIN users u ON u.id = k.user_id
+                         WHERE k.token_hash = ? AND k.revoked_at IS NULL
+                           AND u.disabled_at IS NULL
+   │ row          → User(id, key_id, label, role, kind) → request.state.user,
+   │                request.state.auth_via = "bearer" | "cookie"
+   │ no row       → 401
+   │ sqlite3.Error → 503 "Auth temporarily unavailable" (there is no fallback admin)
 ```
 
-Source: `server/src/wispralt_server/auth.py` +
-`server/src/wispralt_server/users/{cache.py,store.py}`.
+Source: `server/src/wispralt/auth.py` + `server/src/wispralt/accounts/{store.py,service.py}`.
 
 Key invariants:
 
-- **`request.state.user` is populated for every authenticated request.** The observability middleware reads it to attribute usage events; `routes/admin_ui.py:require_admin` reads it to gate role.
-- **The break-glass branch only fires when Postgres is unreachable** OR when the row genuinely is missing. On first boot the lifespan seeds a real `wispralt.users` row whose `token_hash` matches the env-var hash, so 99% of break-glass calls take the normal Postgres path and produce attributable usage events. The `id=-1` sentinel is reserved for the case where the pool is `None` (Postgres degraded).
-- **Pool watcher (added 2026-05-02).** The lifespan starts a background task that probes `app.state.db_pool` with `SELECT 1` (2s timeout) every 10 seconds. On failure it calls `db.recreate_pool()`, swaps `app.state.db_pool`, and restarts the usage drainer against the fresh pool. Without this, a transient Supabase blip leaves `db_pool=None` forever and every authenticated request returns 503 until a manual `launchctl kickstart` — the failure mode that bit production on 2026-05-02. Recovery latency is bounded by the 10s probe interval plus the asyncpg create_pool round-trip.
-- **Cookie fallback:** `_extract_bearer` falls back to the `wispralt_admin_token` cookie when no `Authorization` header is present. Set by `POST /admin/login` for browser navigation; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. CSRF is mitigated by `SameSite=Strict`.
+- **Lookup on every request.** There is no token cache: one indexed join per request (about the cost of a cache check), so a revoke, disable or rotate, made in this process or by another one (the Part 5 CLI), applies to the very next request.
+- **Identity vs credentials.** `users` holds identity (`role admin|employee`, `kind employee|integration`, `disabled_at`); `api_keys` holds credentials (`token_hash`, `revoked_at`). Rotating a user's key revokes its active keys, inserts one new key and clears `disabled_at` in one transaction (`AccountStore.rotate_user_key`); the portal's Revoke disables the user.
+- **Plaintext tokens exist only in `accounts/service.py`** and the one page or terminal that shows them. Logs carry ids only.
+- **First admin:** `wispralt setup --role host` creates it and hands over the key once (terminal or a new `--token-file`); `wispralt keys rotate-admin` replaces a lost admin key (`python -m wispralt.bootstrap` remains as a TTY-only shim over the same code). There is no env admin key and no break-glass path.
+- **`request.state.user`** is set for every authenticated request; the usage middleware reads it.
+- **Cookie fallback:** `require_api_key` falls back to the `wispralt_admin_token` cookie when no Bearer header is present (`/v1` never does). Set by `POST /admin/login` / `POST /me/login`; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. `auth.cookie_secure(request)` drops `Secure` (session and CSRF cookies) only for plain http to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), so the setup URL `http://127.0.0.1:8000/admin` logs in on Safari; callers that pass no `request` stay Secure.
 
-#### `wispralt.users` columns
+#### `users` and `api_keys` (SQLite, `migrations/0001_initial.sql`)
 
-| Column         | Type        | Notes                                                                                |
-|----------------|-------------|--------------------------------------------------------------------------------------|
-| `id`           | bigserial   | Primary key                                                                          |
-| `label`        | text        | Operator-visible identifier (typically the employee email or canonical handle)        |
-| `display_name` | text NULL   | Self-managed friendly name, edited by the user via `PATCH /me`. 1–40 chars, no control chars (CHECK constraint mirrors `MAX_DISPLAY_NAME_LEN` in `constants.py`). NULL until the user fills in the first-launch sheet. Added by migration `2026-04-27-v2-display-name.sql`. |
-| `role`         | text        | `'admin'` or `'employee'` (CHECK)                                                    |
-| `token_hash`   | text        | sha256(plaintext token), partial-indexed `WHERE revoked_at IS NULL`                   |
-| `created_at`   | timestamptz | Set at mint time                                                                     |
-| `revoked_at`   | timestamptz | NULL while active; set on revoke                                                     |
+| Table | Columns |
+|---|---|
+| `users` | `id`, `label`, `display_name` (self-managed via `PATCH /me`, 1–40 chars, no control chars), `notes`, `role` (`admin`/`employee`), `kind` (`employee`/`integration`), `created_at`, `disabled_at`, `source`/`source_id` (Part 7 import) |
+| `api_keys` | `id`, `user_id` → `users`, `token_hash` (sha256, unique), `label`, `created_at`, `revoked_at` |
 
-The admin UI's user list renders `display_name (label)` when both are populated, falling back to `label` alone when `display_name IS NULL`. See [ADMIN.md](ADMIN.md).
+Timestamps are REAL unix seconds; the repository returns UTC `datetime`s. The admin UI's user list renders `display_name (label)` when both are set. See [ADMIN.md](ADMIN.md).
 
-### Usage event tracking
+### Usage event tracking (in-request, best-effort)
 
-```
-                    request hot path                         background
-                                                             drainer
-┌─ middleware/observability.dispatch ─────────┐    ┌────────────────────────┐
-│ after call_next:                              │    │ usage.writer.drain_loop│
-│   if user.id >= 0 and route in TRACKED_ROUTES │    │  (asyncio task)        │
-│      and method == POST:                      │    │                        │
-│        observability.usage_queue.offer(       │    │  while True:           │
-│          UsageEvent(user_id, ts, kind,        │    │    e = await q.get()   │
-│            status, duration_ms, bytes_in,     │    │    batch.append(e)     │
-│            request_id))                       │    │    if len >= 50 OR     │
-└──────────────────┬───────────────────────────┘    │       1s elapsed:      │
-                   │ asyncio.Queue (maxsize=1000)    │      _flush(pool, batch)
-                   ▼                                  │      batch = []        │
-       UsageEventQueue (bounded)                      └──────────┬─────────────┘
-       full → drop oldest, log WARNING                           │
-                                                                  ▼
-                                                  asyncpg ── INSERT INTO
-                                                            wispralt.usage_events
-                                                            (executemany, in
-                                                             explicit transaction)
+After `call_next`, `_ObservabilityMiddleware` (main.py) writes **one** `usage_events` row with `await asyncio.to_thread(UsageStore.record, event)` (about 1 ms) when:
 
-                                                  on FK violation:
-                                                  filter survivors (user_id>=0)
-                                                  retry in fresh transaction
-```
+- auth resolved a user (`request.state.user`),
+- the route key is tracked and the method is POST (status-poll GETs are excluded), and
+- the request was not a dedup replay (`request.state.dedup_replay`).
 
-Source:
-`server/src/wispralt_server/usage/{events.py,queue.py,writer.py}` +
-`observability.py` (singleton) + `main.py` (drainer task lifecycle).
+Best-effort: a `sqlite3.Error` loses that row, increments `usage_write_failures_total` and logs only the error type; the response is unaffected. The counter is exposed in `/metrics` and in the `/readyz/db` body, so a loss is visible. There is no queue and no background drainer.
 
-Why fire-and-forget:
-
-- The dictation hot path is sub-200ms; a Postgres write per request would
-  add ~10–40ms of unified-memory contention.
-- Bounded queue caps unbounded memory growth if Postgres falls behind:
-  on overflow the oldest event is dropped and a WARNING is logged.
-- FK-violation retry is critical: a `ForeignKeyViolationError` aborts the
-  entire transaction, so we explicitly wrap in `async with conn.transaction():`,
-  filter `user_id >= 0` survivors on retry, and re-execute. Without the
-  explicit transaction the post-error connection would be in an aborted
-  state and the retry would hit `InFailedSQLTransactionError`.
-- Cancelled-on-shutdown: lifespan cancels the drainer task and awaits it;
-  `CancelledError` triggers a final batch flush before the task exits.
-
-Tracked routes: `transcribe/dictate`, `transcribe/meeting`, and
-`v1/audio/transcriptions`, **POST only** — status-poll GETs are
-excluded so a client polling every 5s doesn't multiply the event volume
-by 60. The OpenAI-compat shim records its events with
-`kind = "v1_dictate"` so admins can split native-client traffic from
-third-party API traffic without parsing the `route` column. The current
-admin overview tiles (Dictations 24h/7d/30d) sum across all `kind`
-values; query `usage_events` directly with `WHERE kind = 'v1_dictate'`
-to isolate API traffic.
+Tracked requests are POSTs only, classified by `usage.events.kind_for_path`: `dictate` = one whole dictation (`/transcribe/dictate` or a streamed `…/finalize`), `dictate_chunk` = one streamed chunk, `file` = one file job (`/transcribe/file` or the chunked `…/finalize`), `file_chunk` = chunked init / pieces, `v1_dictate` (`/v1/audio/transcriptions`), `v1_translations`. So `dictate` latency and error rates are per dictation; the measured stats (`insights/measured.py`) count only the whole-request kinds (`WHOLE_REQUEST_KINDS`). The admin overview's Dictations 24h/7d/30d tiles count `dictations` rows (`JobStore.dictation_counts`), not requests; the person page's tiles still count that user's `usage_events` requests. Since Part 6 each row also records the authenticating `key_id`, which gives every device its own "last seen" and drives the active/recent client list on `/admin/system`.
 
 ### Admin UI
 
 ```
 ┌────── /admin (FastAPI APIRouter) ─────────────────┐
 │                                                     │
-│  public_router  ─► /admin/login (GET, POST)        │  no auth
+│  public_router  ─► /admin/login, /admin/setup      │  no auth (setup gated)
 │                                                     │
-│  me_router      ─► /admin/me                       │  Depends=[require_api_key,
-│                                                     │           _require_db_pool]
+│  me_router      ─► /admin/me                       │  Depends=[require_api_key]
 │                                                     │  any role — admin or employee
 │                                                     │
-│  authed_router  ─► everything else                  │  Depends=[require_admin,
-│      /admin/                                        │           _require_db_pool]
-│      /admin/users  /admin/users/{id}               │
-│      /admin/users/{id}/mint  …/revoke              │
+│  authed_router  ─► everything else                  │  Depends=[require_admin]
+│      /admin/  /admin/people[/new|/{id}]             │
+│      /admin/people/{id}/rotate …/disable           │
+│      /admin/keys/{key_id}/revoke   (one device)     │
+│      /admin/integrations[/new|/{id}/rotate|revoke]  │
 │      /admin/usage  /admin/usage.csv                 │
+│  admin_invites ─► /admin/invites[/{id}/revoke]      │  require_admin
+│  admin_system  ─► /admin/system[/snapshot]          │  require_admin
+│  admin_data    ─► /admin/data[/runs…] /records      │  require_admin per route
+│                   /admin/settings                   │
 └─────────────────────────────────────────────────────┘
+   public: POST /invites/redeem (admin_invites.public_router)
 ```
 
-Source: `server/src/wispralt_server/routes/admin_ui.py` +
-`server/src/wispralt_server/admin/templates/*.html.j2`.
+Source: `server/src/wispralt/routes/{admin_ui,admin_invites,admin_system,admin_data}.py`
++ `server/src/wispralt/admin/templates/*.html.j2` + `admin/static/portal.css`.
 
 Three-router pattern (be720a1 split out `me_router`):
 
@@ -582,20 +552,32 @@ Three-router pattern (be720a1 split out `me_router`):
   → `/admin/`, employee → `/admin/me`.
 - **`me_router`** carries `/admin/me`, gated by `require_api_key` (NOT
   `require_admin`). Admins are 303'd to `/admin/`. Employees see their
-  own `user_detail` page; admin nav (Overview/Users/Usage) is hidden by
-  `base.html.j2` for non-admin sessions and replaced with a single "My
-  Usage" link. Header title flips to "Wispralt Portal".
-- **`authed_router`** has `dependencies=[Depends(require_admin),
-  Depends(_require_db_pool)]`, so a browser hitting `/admin/` without a
-  valid admin token gets 401/403, and a request hitting it while
-  Postgres is degraded gets 503 — never an `AttributeError` on
-  `app.state.db_pool`.
+  own person page without admin actions; `base.html.j2` shows the Admin nav
+  group only for admins (employees get My history / My insights / My usage).
+- **`authed_router`** has `dependencies=[Depends(require_admin)]`, so a
+  browser hitting `/admin/` without a valid admin token gets 401/403.
+  Every page reads `AccountStore` / `UsageStore` in a worker thread.
 
 Auth model: `Authorization: Bearer ...` (curl/Postman) or
 `wispralt_admin_token` cookie (browser, set by `POST /admin/login`).
-`auth._extract_bearer` falls back to the cookie when the header is
-absent. CSRF is mitigated by `SameSite=Strict` on the cookie — browsers
-refuse to attach it to cross-site POSTs.
+`auth._extract_bearer` falls back to the cookie when there is no Bearer
+header. Cookie-authenticated mutations are guarded by `auth.require_csrf`,
+a dependency that declares `require_api_key` as its own sub-dependency (so
+auth always resolves first and records `request.state.auth_via`) and skips
+the token only when `auth_via == "bearer"`; otherwise the `X-CSRF-Token`
+header or `csrf_token` form field must pass `auth.verify_csrf`, or 403. The
+token is **bound to the session**: `auth.session_csrf_token(session)` =
+HMAC-SHA256 keyed by the (HttpOnly, secret) session token, so a sibling
+same-site origin that plants a parent-domain `wispralt_csrf` cookie still
+cannot forge it (an unsigned double-submit cookie could simply be
+overwritten). This works over loopback http, where a `__Host-` cookie would
+not (it needs Secure). With no session cookie (the login and setup forms
+only) the token must equal the `wispralt_csrf` cookie (double-submit). Every admin mutation takes it as a parameter through
+`require_admin_csrf`; `PATCH /me` and the `/me/history` mutations through
+`require_csrf` beside `forbid_integration_kind`. Pages that render those
+forms embed `auth.csrf_token_for(request)` (`admin_ui._form_page`): stable
+for the session, so full pages and partials agree and nothing rotates. `SameSite=Strict` stays as a
+second layer.
 
 The macOS client's menubar **Open Portal** button opens
 `<server>/admin/login` for everyone — the same install ships to admins
@@ -607,116 +589,303 @@ does **not** include this extension; `select_autoescape(enabled_extensions=("htm
 is set explicitly so user-supplied fields (label, notes, error_class)
 render escaped, closing the stored-XSS hole on the admin UI.
 
-### Legacy single-key shim
+Escaping does not protect a value inside an inline handler or an Alpine/HTMX
+expression (`onsubmit`, `x-data`, `@click`, `:class`, `hx-on`): the browser decodes
+`&#39;` back to `'` before evaluating it. So no template interpolates `{{ … }}` into
+such an attribute; values go in a `data-*` attribute and the expression reads
+`$el.dataset.*` / `this.dataset.*`. The routes also validate `range` with
+`timewindow.normalize_range` (unknown → the page default). `test_portal_render.py`
+fails on any template that breaks this rule.
 
-`auth.current_key()` and `auth.set_current_key()` are retained as thin
-shims for `routes/admin.py:rotate_key`, the last-resort tool for
-rotating the env-var token while Postgres is unreachable. Once all
-rotation moves through the admin UI's mint flow, this endpoint can be
-removed.
-
-### Memory budget impact
-
-The asyncpg pool adds ~1 MB per resident connection. Pool sized
-`min_size=1, max_size=10`, so the steady-state footprint is ~1–10 MB
-on top of the existing ~6.5–7.0 GB resident model memory. The drainer
-holds at most one connection during the `executemany` window; auth
-lookups and admin UI requests compete for the other nine. Comfortable
-headroom for ≤10 employees.
-
----
-
-## Speaker Rename
-
-Speaker rename is **client-side only**. There is no server `PATCH /speakers` endpoint. The client (`TranscriptDocument.swift`):
-
-1. Loads the local `.json` file.
-2. Calls `renameSpeaker(raw:to:)`: updates `display_name` in the `speakers` table and rewrites the `speaker` field in every matching segment. Throws `.speakerNameConflict` if the new name collides with an existing speaker's `display_name`.
-3. Writes all four formats atomically: each file is written to a `.{uuid}.tmp` file in the same directory, then `replaceItemAt` replaces the original.
-4. A `.transcriptWriteInProgress` sentinel file is created before the first replace and deleted after the last. On app launch, orphan sentinels trigger a revert (delete partial outputs, keep originals).
-
-This is fully offline-capable and requires no network connectivity.
+**Part 6 portal rules.** One stylesheet (`admin/static/portal.css`: CSS variables,
+light/dark via `prefers-color-scheme`, sidebar → top strip under 768 px, tables scroll
+inside `.table-wrap`) and the `_ui.html.j2` macros; no `<style>` blocks, no build
+step, no CDN. Every page that shows a secret (a new key, an invite, the first-admin
+key) sends `Cache-Control: no-store` and renders it through `secret_once`. HTMX
+partials that poll or swap (`/admin/system/snapshot`, `/admin/data/runs/current`,
+range tabs) never mint or rotate the CSRF cookie, so forms already on the page keep
+working. **First-admin setup**: while no enabled admin exists the lifespan writes
+`data_dir/setup-code` (0600, 128-bit) and logs its path; `/admin/setup` needs CSRF and
+that content (constant-time compare), then calls `bootstrap_first_admin` (race-safe:
+`AlreadyBootstrapped` → 404) and deletes the file. `request.client.host` is loopback
+for every tunnelled request, so it is never used as an auth signal. **Invites**: a
+`secrets.token_urlsafe(32)` token stored as sha256 with a 10-minute TTL;
+`POST /invites/redeem` validates and redeems in one `BEGIN IMMEDIATE` (so concurrent
+redeems issue one key), answers every failure with the same `400 invite_invalid`, and
+is rate-limited per client IP.
 
 ---
+
+## Operating the host (`wispralt` CLI)
+
+`wispralt` (console script `wispralt.cli.main:main`, installed by `uv tool install <clone>/server`) installs, runs and maintains a host and/or client; [INSTALL.md](INSTALL.md) is the command reference. It wraps the server's own functions (accounts, retention, `ops.backup`) and never re-implements them.
+
+- **Layout.** `cli/main.py` (argparse + dispatch), `paths.py` (`Paths`, `InstallState`, `Ctx`, `.env` merge), `system.py` (`Runner`, `http_get`, `Deps` — the only `subprocess`/`execv` seam), `launchd.py`, `host.py`, `client.py`, `ops.py`.
+- **Paths.** `WISPRALT_ROOT` (default `$HOME`) re-roots the config dir `~/.config/wispralt/` (`.env` and `install-state.json`, both 0600), the data dir `~/Library/Application Support/WisprAlt/host`, `HF_HOME` `…/WisprAlt/models`, logs `~/Library/Logs/WisprAlt/` and backups `~/WisprAlt-Backups/`. `--data-dir`/`--backup-dir` override and are recorded. The LaunchAgent plist always goes in `$HOME/Library/LaunchAgents`; `WISPRALT_LABEL` overrides its label (tests, Part 8 E2E).
+- **State.** `install-state.json` records `{version, source_dir, role, label, port, paths, models, artifacts, data, retention_prompted, last_run}`, written atomically. `artifacts` are what a plain `uninstall` removes; `data` only goes with `--purge-data`; backups are never removed by the CLI.
+- **Setup is idempotent.** `setup` adds only absent `.env` keys, re-verifies the models (sha256 of the LFS files against the Hub's metadata at the resolved commit; nothing is downloaded when the cache matches), never creates a second admin or rotates a key, and asks the retention question once. A missing `[host]` extra is installed with `uv tool install --force` and the CLI `execv`s the fresh entry point, so new code is never half-imported. The first admin's key is handed over right after it is minted (terminal or `--token-file`), before the warm-up and health wait.
+- **Service.** A per-user LaunchAgent `co.wispralt.host` (`gui/$UID`) runs uvicorn from the tool venv on `127.0.0.1:<port>` with the config dir as its working directory; remote access goes through `tailscale serve` or the optional tunnel. `stop` is proven by taking `server_lock` (bootout returns before teardown ends); `restart` reloads only when the rendered plist changed. A mini-era `co.wispralt.server` agent is booted out and its plist moved to `config/legacy/`.
+- **Status and doctor.** `status` reports allocated sizes (`st_blocks`, so APFS clones are not double-counted), backups, `*.pre-restore-*` copies and retention. `doctor` is read-only (`mode=ro` integrity check, Keychain presence without reading secrets); only `--warmup` loads the dictation model, so a running host never pays its RAM twice.
+- **Offline operations.** `backup`, `restore` and `update` run inside `service_stopped` (one helper for all three): note whether the agent is loaded, then, inside the guard, boot it out, prove it stopped by taking `server_lock` and run the Part 4 function (`ops.backup.backup` / `restore`). Any failure, including the lock wait timing out after the bootout, starts the agent again if it had been loaded and says whether it came back; on success `backup`/`restore` start it again, while `update` leaves that to its phase 2. `restore` keeps the old tree at `<data_dir>.pre-restore-<ts>`; the CLI never deletes those or any backup.
+- **Update and uninstall.** `update` pulls (`--ff-only`, refusing a dirty clone), stops the service, backs up, reinstalls the tool, smoke-runs the new `wispralt --version` and `execv`s its second phase in the new code, which re-verifies models, restarts the agent and waits for `/healthz` + `/readyz/db` (migrations run in the lifespan). `uninstall` removes only the recorded `artifacts` (and only those that resolve under the install root or LaunchAgents: `..` and symlinked parents are resolved on both sides, and a symlink artifact is unlinked, never followed), with `uv tool uninstall` last; `--purge-data` backs up first (a files-only copy when there is no DB) and then deletes only what WisprAlt owns in the data dir (`wispralt.db*`, `setup-code`, and inside `outputs/` and `staging/` only the file names WisprAlt writes, each folder only if then empty; anything else is kept and listed; the data dir only if then empty). `outputs/` and `staging/` go whole because setup (`host.check_data_dir`) refuses a data dir that already holds other files and no `wispralt.db`: a data dir is WisprAlt's own, never a shared folder such as `~/Work`. Every phase-1 failure restarts a service that was loaded: the stop itself sits inside that guard (a bootout whose lock wait then times out still re-bootstraps), and so do a failed smoke run and a failed `execv`. A phase-2 failure still tries to start the service. Explicit `--server-url` / `--port` on a setup rerun update `SERVER_URL` (`paths.set_values`); defaults never clobber.
+- **Exit codes.** 0 ok, 1 failed, 2 usage error or missing non-interactive answer, 3 doctor failures. `--non-interactive` never prompts; `--json` is machine output.
+- The CLI never imports `wispralt.config` (its module-level `Settings()` needs a `.env`): it takes the data dir from `install-state.json`, and the service reads the config `.env` from its launchd `WorkingDirectory`.
 
 ## Background maintenance and logging
 
-`ops/background.py` hosts the lifespan's daemon loops. `daily_sweep_loop` runs every 24 h (in a worker thread): stale staging WAVs (>24 h, excluding WAVs of active jobs), stale chunked-upload dirs (>1 h), stale meeting-output `.tmp` files, `sweep_transcripts` (below), and meeting retention — finished (`done`/`failed`) job rows plus their `<id>.{txt,srt,vtt,json}` files older than `MEETING_JOB_RETENTION_DAYS` (default 90, 0 disables; pending/running and any job the runner still tracks as active are never touched; files are removed from each job's persisted `output_dir`, which must resolve inside `MEETING_OUTPUT_DIR`, and a job whose files fail to delete keeps its row for the next sweep). The same staging sweeps also run once at startup. `db_watcher_loop` logs repeated identical failures once in full and then a summary every 5 minutes (`RepeatedFailureLogger`), while still retrying every 10 s.
+`ops/background.py` hosts the lifespan's daemon loops. `daily_sweep_loop` runs every 24 h (in a worker thread): stale staging WAVs (>24 h, excluding WAVs of active jobs), stale chunked-upload dirs (>1 h), stale file-job output `.tmp` files, and `run_retention` (see "Retention" below). The staging sweeps and `run_retention` also run once at startup.
 
 Logging: launchd cannot rotate `server.log` / `server.err.log` without sudo, so `ops/logging_setup.configure_file_logging` sends root and uvicorn loggers to a `RotatingFileHandler` at `settings.server_log_path` (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). The launchd files now only capture crash output and the one-off `NEW_API_KEY=` print on key rotation. `/admin/server-log/{job_id}` reads `wispralt.log` plus its rotated backups (`.1`-`.5`).
+
+## Local database (`wispralt.db`)
+
+Part 4 moves the Local-mode host onto **one SQLite file**, `data_dir/wispralt.db`
+(`DATA_DIR` in `.env`, an absolute path; `outputs/` and `staging/` live beside it).
+`wispralt.database.Database` is the only way in:
+
+- a short-lived connection per call with `foreign_keys=ON`, `busy_timeout=5000`
+  and `synchronous=NORMAL`; WAL is set once by `migrate()`;
+- `read()` opens a `BEGIN` snapshot, `write()` a `BEGIN IMMEDIATE` transaction that
+  commits on exit and rolls back if the body raises; no transaction spans inference,
+  and async callers use `asyncio.to_thread`;
+- `migrate()` creates the file at mode 0600 before the first connect, then applies
+  `migrations/NNNN_*.sql` one statement at a time inside a single transaction
+  (never `executescript`, which commits implicitly) and records each file's sha256
+  in `schema_migrations`. An edited or missing applied file, or a DB newer than the
+  code, raises `MigrationError` before anything is applied;
+- `check()` backs readiness: `None`, `"db_error"` (any `sqlite3.Error`) or
+  `"schema_outdated"`.
+
+`0001_initial.sql` holds the full schema (users, api_keys, invites, usage_events,
+dictations, jobs, weekly_insights, settings). `0002_portal.sql` (Part 6) adds the
+full-text indexes, `insight_runs`, `usage_events.key_id` and the AI settings seeds;
+`0003_import_runs.sql` (Part 7) adds `import_runs`. The runner applies files in sorted
+order, so numbers may arrive out of merge order.
+
+**Full-text search (Part 6, `0002_portal.sql`).** `dictations_fts` is an
+*external-content* FTS5 table over `dictations.text` (`content_rowid='id'`, a stable
+`INTEGER PRIMARY KEY`). `jobs_fts(text, job_id UNINDEXED)` is a *regular* FTS5 table:
+`jobs.id` is TEXT, and implicit rowids can change under `VACUUM` / `VACUUM INTO` (the
+backup path), so the job id is stored as a column. Tokenizer `unicode61
+remove_diacritics 2` (`cafe` finds `café`). Six triggers keep both exact for every
+writer (routes, retention purge, the Part 7 importer, restore): insert; update of the
+text column guarded by `WHEN old IS NOT new` (jobs get `transcript_text` late, NULL →
+text, and may go back to NULL); delete. An external-content delete must pass the
+**old** text (`INSERT INTO dictations_fts(dictations_fts, rowid, text)
+VALUES('delete', old.id, old.text)`) or the index is corrupted; the tests run
+`'integrity-check'` after every kind of mutation. Soft delete leaves the index entry:
+every query joins back to the source row and filters `deleted_at IS NULL`, so restore
+needs no reindex. Deleting from `jobs_fts` by the UNINDEXED `job_id` scans `jobs_fts`;
+at file-job volume (thousands of rows) that is fine, and a retention purge of N jobs
+costs N such scans offline. Queries never pass user input raw to `MATCH`
+(`jobs.store.fts_query`: each token quoted, ANDed, last token a prefix, 200 chars / 12
+tokens). The owner is bound in SQL: `search_history(user_id, q)` for `/me`, a separate
+admin-only `search_history_team` — there is no "all users" wildcard. Snippets come back
+raw with `\x02…\x03` sentinels and are rendered by `web.templates_env.highlight`
+(escape first, then `<mark>`). A SQLite build without FTS5 fails the migration with
+`MigrationError("SQLite lacks FTS5")`.
+
+**Server lock.** The lifespan takes `fcntl.flock(LOCK_EX | LOCK_NB)` on the
+sibling `<data_dir>.lock` (`ops.backup.server_lock`) before it opens the DB and
+releases it last; a second server on the same `DATA_DIR` refuses to start
+(`ServerRunning`). The lock lives beside, not inside, `DATA_DIR`, so a restore's
+directory swap never moves it. `lock_path` resolves `DATA_DIR` first, so a
+symlinked `DATA_DIR` and its target share one lock. (In WAL mode an idle server holds no SQLite lock,
+so no SQLite probe can prove the server is stopped; only this flock can.)
+
+**Offline backup and restore** (`ops/backup.py`; the Part 5 CLI stops the service,
+runs them, and restarts it). Both take the server lock non-blocking and raise
+`ServerRunning` while a server runs, and both preflight disk first: the estimated
+bytes × 1.1 must fit in the target parent's free space, else `InsufficientSpace("need
+X GB, have Y GB")` before anything is written.
+
+- `backup(data_dir, dest)` refuses a `dest` that exists or overlaps `DATA_DIR`
+  (`BackupRefused`); takes a `VACUUM INTO` snapshot and switches it to
+  `journal_mode=DELETE` (so no `-wal`/`-shm` appears beside it); copies `outputs/`
+  and `staging/` (regular files only); writes `manifest.json` (relative POSIX paths,
+  sha256, bytes, per-table counts, `schema_version`). Dirs 0700, files 0600,
+  whatever the umask.
+- `restore(backup_dir, data_dir)` refuses (`RestoreRefused`, nothing changed) a
+  backup inside `DATA_DIR`, a symlink anywhere in it, a manifest path that is
+  absolute, has `..` or leaves the backup, any file not in the manifest (e.g. a
+  stray `wispralt.db-wal`), a missing database entry, a hash or size mismatch, or a
+  failed `integrity_check` (run on the staged copy opened `?mode=ro&immutable=1`, so
+  the backup is never written). Files are copied into a sibling `.restore-<ts>`
+  (0700/0600), `DATA_DIR` is moved aside to `.pre-restore-<ts>` and the staged tree
+  takes its place; a failed swap puts the original back. It returns the aside path,
+  which is never deleted (a refusal removes only its staged copy).
+
+**Repositories** are classes over `Database`, one transaction per method:
+
+- `accounts.store.AccountStore` splits identity from credentials: `users`
+  (`role`, `kind`, `disabled_at`) and `api_keys` (`token_hash`, `revoked_at`).
+  A key authenticates only while it is not revoked and its user is not disabled
+  (`lookup_key`, one indexed join). `rotate_user_key` revokes the user's active
+  keys, inserts one new key and clears `disabled_at` in a single transaction, so a
+  failure leaves the old key valid. `create_first_admin` refuses
+  (`AlreadyBootstrapped`) while an enabled admin exists.
+- `accounts.service` is the only code that sees plaintext tokens: it generates a
+  64-hex token, stores its sha256 and returns the plaintext once; it logs ids only.
+- `usage.store.UsageStore` writes one `usage_events` row per `record` and serves
+  the portal reads (overview tiles, top users, 14 UTC-day buckets, user totals,
+  drilldown and CSV). The p50 is the median of the window's `duration_ms` values,
+  computed in Python.
+
+### History import writer (Part 7)
+
+`0003_import_runs.sql` adds `import_runs` (one row per source per run: `status`
+running/done/failed/blocked, `checkpoint`, `counts_json`). Numbering skips `0002`,
+which Part 6 owns: `migrate()` applies pending files in sorted order and does not
+need contiguous numbers (a DB that got `0003` first simply applies `0002` later).
+
+`wispralt.imports` is the one generic writer for imported history.
+`insert_rows(con, table, rows, source)` runs inside the caller's `write()` (so a
+batch and its `import_runs` checkpoint commit together); `import_rows(db, …)` wraps
+it in its own transaction. Tables and columns come from a fixed allowlist
+(`users`, `usage_events`, `dictations`, `jobs`; never `api_keys`/`invites`), every
+row needs a `source_id`, and bad input raises `ValueError` before anything is
+written. Each row runs in its own SAVEPOINT with
+`ON CONFLICT(source, source_id) WHERE source IS NOT NULL DO NOTHING RETURNING id`:
+it is inserted, a duplicate (its existing id is read in the same transaction), or
+a `RowError` naming the `source_id` and the failed constraint, while the rest of
+the batch commits. `link_existing` stamps an existing row (the owner's local admin)
+with a `(source, source_id)` once, idempotently. A real import holds the offline
+`<data_dir>.lock` via `ops.backup.server_lock` (through `importer/lock.py`'s
+re-entrant `offline`), so it refuses while the server runs; `python -m
+wispralt.importer` takes it *before* migrating and holds it through the import, and
+a dry run never migrates.
+
+**Supabase export (read-only).** `importer/supabase_export.py` copies the old
+Postgres history (`users` without `token_hash`, `usage_events`, `fallback_events`)
+into `~/WisprAlt-Backups/supabase-snapshot-YYYY-MM-DD[-N]/` (dir 0700, files 0600):
+one canonical-JSON line per row in `<table>.jsonl`, plus `counts.json` per table
+(`source_count`, `exported`, `columns`, `max_id`, `sha256` of the JSONL bytes,
+`exported_at`). Supabase is never written: `PsqlSource` only sends allowlisted SELECTs through
+`psql -X -q -At -v ON_ERROR_STOP=1` with `PGOPTIONS=-c default_transaction_read_only=on`;
+table names are fixed, columns come from `information_schema` and are
+identifier-checked, and `_check` refuses any statement with a write verb. Column
+discovery is a catalog read (`BEGIN TRANSACTION READ ONLY; <SELECT>; COMMIT;`); all
+**data** then comes from ONE psql session in ONE `BEGIN TRANSACTION ISOLATION LEVEL
+REPEATABLE READ READ ONLY` transaction, so every table is the same consistent
+snapshot. The
+connection string (env `WISPRALT_IMPORT_PG_URL`, else Keychain item
+`co.wispralt.import-pg`) reaches `psql` only as `PG*` env vars. Per table that session prints a
+`count(*)`/`max(id)` header line, then one `row_to_json` line per row; the parser
+demands exactly that shape and the rows must match the header, else
+`ImportIntegrityError` (no retry: a snapshot cannot drift). The output is held in
+memory, fine for this history's size. A fresh snapshot dir is created per run
+(`-2`, `-3`, … on the same day); files are created with `O_EXCL`, a failed write's
+`.part` file is kept, and nothing is ever deleted or overwritten. An unreachable or paused project raises `ExportBlocked`
+and leaves `BLOCKED.json`; nothing ever calls a Supabase management API or
+unpauses it. `JsonPagesSource(dir)` reads `<table>.json` arrays saved by hand from
+the same SELECTs (read-only MCP fallback). Every table needs its file: a missing,
+unparseable or non-array file raises `ImportIntegrityError`, so an incomplete
+manual export never passes as empty tables; an empty table is saved as `[]`.
+
+**Snapshot import.** `importer/supabase_import.py` verifies every `<table>.jsonl`
+against `counts.json` (sha256 and line count) before anything is written, then maps
+each row into exactly one bucket — new, duplicate, linked, malformed or unmatched —
+and checks `source_count` equals their sum per table (fail closed). Users get new
+local ids (`source='supabase.users'`, `source_id` = the Postgres id), `revoked_at`
+becomes `disabled_at`, and no `api_keys` are created (people rejoin by invite);
+`last_seen_at` and the fallback `provider`/`provider_request_id`/`cost_micro_usd`
+stay in the snapshot only. The **owner** — the one enabled Supabase admin — is
+*linked* to the one enabled local admin (`link_existing`) instead of inserted; the
+mapping must be confirmed (`--yes` only when unambiguous, or `--owner-map PG=LOCAL`),
+an earlier link counts as confirmed, and with no local admin the import refuses
+until `wispralt setup --role host` has created one. `usage_events` keep their kind
+(`meeting` → `file`), `fallback_events` land in `usage_events` as `fallback_<kind>`,
+and `user_id` is remapped through the imported users (unknown → unmatched). Rows go
+in batches of 500, each committed with its `import_runs` checkpoint, so a crashed
+run resumes the same run row; a first run with any duplicate, or a write that does
+not account for every planned row, marks the run `failed`. A dry run only reads and
+prints the counts and the owner proposal.
+
+**Transcript files.** `importer/files.py` imports TXT/JSON/SRT/VTT transcripts as
+`jobs` rows (`source='files'`, `status='done'`, `mode='file'`, `wav_path=''`, with
+`estimated=1` when the time is a file mtime); see
+[TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#importing-old-transcript-files-part-7).
+Each group's files are copied to `.import-<id><ext>.part` temps in `outputs/` (each tracked
+before its copy starts, so a copy that fails midway leaves no `.part`) and
+renamed to `<id><ext>` (fresh uuid names) *before* the batch and its checkpoint
+commit, so a committed row always has its outputs; a duplicate, a row error, a
+failed rename or an uncommitted batch removes only those copies. A crash between
+rename and commit leaves unreferenced `<uuid>.*` copies; the retry makes new ones. The first-run
+duplicate abort does not apply here: the same file in two folders is an expected
+duplicate.
+
+**Entry point.** `wispralt.importer` exports `run_export`, `run_snapshot_import` and
+`run_file_import` (what the Part 5 `wispralt import …` CLI will wrap);
+`wispralt import export | snapshot DIR | files PATH… --owner ID` (the CLI wrapper over `python -m wispralt.importer`) is the
+interim operator command (`--dry-run`, `--yes`, `--owner-map PG=LOCAL`; exit codes
+0 ok, 1 error, 2 refused, 3 BLOCKED, 4 integrity). A real import needs `--yes` or an
+interactive confirmation after the dry-run report. Runbook:
+[ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files).
 
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output
-(dictation + meeting + file) is persisted to the mini's SQLite so the future
+(dictation + file job) is persisted to the mini's SQLite so the future
 weekly-insights cron has data to summarize. Capture is **unconditional and
 transparent** — there is no client-visible toggle and no admin UI redaction.
 Zero behavior change for end users.
 
 ### Where the data lives
 
-- **Meeting + file transcripts** are stored on the existing `jobs` row.
-  Four new columns added by an idempotent `ALTER TABLE` in `JobStore.__init__`:
-  `transcript_text`, `word_count`, `client_app_version`, `api_key_id`. The
-  derivation happens inside `MeetingRunner._run_pipeline_inner` right before
-  `set_done`: joins `transcript["segments"][*].text`; falls back to reading
-  `<output_dir>/<job_id>.txt` if the joined string is empty.
-- **Dictation transcripts** live in a separate `dictations` table created in
-  the same `__init__`. Dictation is request-response (no job row), so the
-  route's normal success path fires-and-forgets an `asyncio.create_task` that
-  calls `JobStore.insert_dictation` via `asyncio.to_thread` (the `_exec`
-  lock is sync, so we must hop off the event loop). Tasks are held in
-  `app.state.pending_persists` to defeat the documented `asyncio.create_task`
-  GC race, and drained with a 2-second budget at shutdown.
+Both tables live in `DATA_DIR/wispralt.db` (`migrations/0001_initial.sql`).
 
-Both tables carry `api_key_id`, the existing per-user FK to `wispralt.users`.
-This makes the Phase 2 per-employee filter trivial: `/me/insights` will filter
-to one `api_key_id`; `/admin/data` will union all of them.
+- **File-job transcripts** are stored on the `jobs` row: `transcript_text`,
+  `word_count`, `client_app_version`, `user_id`. The derivation happens inside
+  `FileJobRunner._run_pipeline_inner` right before `set_done`: joins
+  `transcript["segments"][*].text`; falls back to reading
+  `DATA_DIR/outputs/<job_id>.txt` if the joined string is empty.
+- **Dictation transcripts** live in the `dictations` table. Dictation is
+  request-response (no job row); the route saves the row synchronously
+  (`dedup.persist` → `JobStore.insert_dictation` in a thread) before it
+  responds, and the response says `"saved": true|false` (see Idempotency).
+
+Both tables carry `user_id`, a real FK to `users`, so `/me/*` filters to one
+user and `/admin/data` groups by it (`JobStore.stats_by_user`, one query).
 
 ### Privacy posture
 
 - **No opt-in flag.** Deliberate product decision; do not re-introduce
   gating "to be safe."
-- **90-day retention.** `JobStore.sweep_transcripts(days)` zeros
-  `jobs.transcript_text` and deletes `dictations` rows older than
-  `transcript_retention_days` (default 90). TTL is measured from
-  `COALESCE(finished_at, created_at)` on jobs (the moment the transcript
-  actually existed, not job submission) and from `created_at` on dictations.
-  Sweep runs once at startup (`main.lifespan`) and on a daily 24 h asyncio
-  timer task (`_daily_transcript_sweep`) so a long-uptime server eventually
-  reaps.
-- **Asymmetric word-count survival.** `jobs.word_count` survives past sweep
-  because the row stays as audit history; `dictations` rows are deleted
-  entirely. This is intentional.
-- **File permissions.** `jobs.db`, `jobs.db-wal`, and `jobs.db-shm` are
-  `chmod 0600` on every startup so a restored backup is auto-tightened.
-  When the mode actually changes, the new mode is logged at INFO.
-- **Break-glass admin (user.id < 0) is skipped everywhere.** No orphaned
-  `-1` rows ever appear in either table.
+- **Retention: keep forever by default.** One DB setting, `settings.retention_days`
+  (seeded `'0'` by `0001`; a missing row also reads 0 = forever; DESIGN §2.1).
+  `JobStore.retention_days()` / `set_retention_days(n)` / `retention_preview(n) →
+  {"dictations", "jobs"}` (what a purge would delete now; the Part 5 CLI shows it
+  before setting). When `n > 0`, `background.run_retention` (startup + daily)
+  calls `purge_dictations(n)` (by `created_at`) and `purge_expired_jobs`: finished
+  (`done`/`failed`) job rows older than `n` days by `COALESCE(finished_at,
+  created_at)` plus their `<id>.{txt,srt,vtt,json}` in `outputs/`. Pending/running
+  jobs and any job the runner still tracks as active are never touched; an id whose
+  output path would leave `outputs/` is skipped (files untouched), and a job whose
+  files fail to delete keeps its row for the next run. Imported rows (`source IS NOT
+  NULL`) and `usage_events` are never purged.
+- **File permissions.** `wispralt.db` is created 0600 (its `-wal`/`-shm`
+  inherit the mode) and re-chmodded by every `migrate()`.
 - **Empty / whitespace-only dictations are skipped.** Avoids polluting
   Phase 2 word counts with silence-only audio.
 - **All transcripts stay on the mini.** Nothing is sent to OpenRouter
   except via the future weekly insights cron (Phase 2).
 
-### Cloud-fallback dictations (closed in Plan A)
+### Cloud-fallback dictations (removed in Part 2)
 
-Phase 1 originally had no capture path for the dictations that go through
-the OpenRouter cloud-fallback while the mini is unreachable. Plan A
-closes that gap end-to-end: a disk-backed Swift queue
-(`DictationFallbackQueue`) records each fallback dictation with a UUIDv4
-`client_dedup_id`, then drains to `POST /telemetry/cloud-dictation` on
-the next app-foreground OR successful online dictation. Rows land in the
-same `dictations` table with `source='cloud_fallback'`. Full design lives
-in [Cloud-fallback telemetry sync](#cloud-fallback-telemetry-sync) below.
+Plan A once captured dictations that went through the client's OpenRouter
+audio fallback (a disk queue draining to a `/telemetry/*` ingest route).
+The audio fallback, the queue and the ingest route were removed in Part 2.
+Rows written back then keep `source='cloud_fallback'` and still render in
+`/me/history`; no new ones are created.
 
 ### Client app version (`X-WisprAlt-Client-Version`)
 
 The Swift client sets this header on every server-bound request
-(`MeetingAPI.submit`, `MeetingAPI.submitFile`, `ChunkedUploader.postJSON` +
+(`FileJobAPI.submitFile`, `ChunkedUploader.postJSON` +
 `uploadOneChunk`, and `ServerClient.buildRequest` for `DictationAPI`).
 Format: `"<CFBundleShortVersionString>+<CFBundleVersion>"`. The server reads
 it at submit time and persists it on the row via `JobStore.create` (single-shot
-file + legacy meeting) or on `meta.json` (chunked init) so it survives both
+file) or on `meta.json` (chunked init) so it survives both
 worker crashes and mid-upload client upgrades. Missing → stored as NULL.
 
 ### What's deferred to Phase 2
@@ -730,253 +899,213 @@ worker crashes and mid-upload client upgrades. Missing → stored as NULL.
 
 ## Weekly insights
 
-Phase 2 of the portal effort. The capture loop (transcript persistence above)
-runs continuously; the **analysis loop** here turns the previous week's
-captured transcripts into per-employee + team summaries every Sunday night.
-The render loop (`Data portal` below) is what employees and admins see in the
-browser.
+The analysis loop: it turns a week of captured transcripts into per-person and team
+summaries. Since Part 6 it is **opt-in** and every AI claim is tied to the records it
+came from; the numbers people see are **measured** from the database, never asked of
+the model.
 
-Source: `server/src/wispralt_server/insights/{__init__.py, client.py, prompts.py, cron.py}`
-and the `weekly_insights` table + 5 helpers in `jobs/store.py`.
+Source: `server/src/wispralt/insights/{client,prompts,sources,measured,settings,cron,timewindow}.py`
+and `jobs/store.py` (`weekly_insights`, `insight_runs`, refs, measured reads).
 
-### Schedule
+### Measured vs AI
 
-The cron fires at **23:00 in `settings.insights_timezone`** (default
-`America/Los_Angeles`) every Sunday. It's an **in-process asyncio task**
-launched from the FastAPI lifespan — not a separate launchd plist. The
-trade-off: in-process loses the process-isolation that a separate plist would
-buy (a runaway insights pass could in principle starve the dictation loop)
-but gains a warm OpenRouter client + reuse of the existing SQLite/`JobStore`
-connection. The startup-catchup branch (next section) covers the
-reboot-during-fire case, so the in-process path is effectively reliable in
-practice; we accepted the trade.
+| | Measured (`insights/measured.py`) | AI interpretation (`insights/cron.py` + `sources.py`) |
+|---|---|---|
+| Source | DB rows: `dictations`, `jobs`, `usage_events` | OpenRouter, only when enabled |
+| When | Every page view, any range | Weekly (scheduled) or a run/backfill from the portal |
+| What | counts, words, active days, file audio minutes, filler words (regex `um/uh/like/you know`), time saved (**estimate**, 40 wpm), dictation latency p50/p95, error rate, 8-week trend, hour of day | digest, action items, decisions, blockers, projects, topics, quotable line; team: themes, action items, blockers, decisions, knowledge gaps |
+| Numbers | yes | **none**: `pct_time`, `filler_word_count`, `wow_delta`, `tool_mentions` were removed |
 
-`_seconds_until_next_fire(tz, *, iso_weekday, hour)` in `insights/cron.py`
-computes the sleep interval via `datetime.now(ZoneInfo(...))` arithmetic,
-which is DST-correct (`zoneinfo` handles the spring-forward / fall-back
-delta automatically) — verified by hand against both the 2026 PST→PDT
-and PDT→PST transitions. The parameterized form lets ops dry-runs and
-the catchup path retarget specific weekdays/hours without code edits;
-the back-compat alias `_seconds_until_sunday_23_local(tz)` is retained
-for one release. The lifespan installs an `asyncio.Lock` on
-`app.state.weekly_insights_lock`; `run_weekly_insights` short-circuits
-with a warning if the lock is already held (catchup overlap → no
-double-bill).
+Measured counts come from `dictations` rows (a streamed dictation is one row however
+many chunk requests it took); `usage_events` only feeds latency and error rates.
+`dictations.duration_ms` is inference time, so audio minutes cover file jobs
+(`jobs.audio_duration_s`) only. Weeks, trend buckets and the hour chart use the
+insights timezone (DB setting, else `INSIGHTS_TIMEZONE`, else the host zone from
+`/etc/localtime`, else UTC).
 
-### Startup catchup
+### Source refs (insight schema v2)
 
-Gated behind `settings.insights_catchup_enabled` (defaults **False** — opt-in
-only). When True, on lifespan startup the cron checks whether the most-recent
-completed ISO week has a row in `weekly_insights` for any user **and** ended
-less than 72 hours ago; if both conditions hold, it runs the insights pass
-immediately rather than waiting for the next Sunday. The operator opts in via
-`.env` only after verifying OpenRouter model availability + pricing — leaving
-it False on a fresh deploy prevents an accidental Wednesday-after-deploy
-charge.
+1. **Assemble.** Each record goes into the prompt behind a bracketed ref: `[d:12]`
+   (dictation 12) or `[f:<job id>]`, newest first, capped at `insights_input_word_cap`
+   words. `sources.assemble` returns the set of refs actually placed in the prompt.
+2. **Parse.** The reply is parsed with pydantic models (`extra='ignore'`). A wrong
+   shape (`sources` not a list, a non-object) is an `InsightShapeError` and counts as
+   a person failure; bad JSON likewise.
+3. **Validate.** Each item keeps only refs from the prompt set and is dropped when none
+   remain, so an invented ref, or another person's record (it was never in this
+   person's prompt), can never survive. `quotable_line` is kept only when its text is an
+   exact substring of the record it cites. The team pass receives the validated person
+   insights of the week (saved earlier or new in this run) and its items may cite only
+   refs those insights cite. A reply left with nothing usable (`{}` parses, since every
+   field defaults to empty; a person reply also needs no surviving quote) is an
+   `InsightShapeError` too, through one shared check (`_require_usable`): a person reply
+   counts as a `schema` failure (the run ends `failed`, so it is retried), and a team
+   reply is retried once, then the run ends `team_unusable`. An empty insight is never
+   saved.
+4. **Render.** `sources.build_view` re-checks refs at view time
+   (`JobStore.refs_exist(refs, viewer, is_admin)`): refs to deleted records, or to
+   records the viewer may not open, are hidden, and an item left with none is hidden.
+   Each ref links to `/me/history/{kind}/{id}` (own) or `/admin/records/{kind}/{id}`
+   (admin). A **stale** notice appears when records of that week were created after
+   `generated_at` (`count_records_after`); a topic also present in the previous 4 weeks'
+   stored insights shows "seen N weeks" (`recent_topic_labels`, computed, not asked).
+   Rows without `schema_version: 2` render a "regenerate" notice (no converter: the old
+   host was wiped and Part 7 imports no insights).
+
+The prompts carry no ids beyond the refs (no `user_id`, no `api_key_id`). Logs carry
+ids, error classes and lengths, never transcript or response text.
+
+### Enablement, scheduler and runs
+
+AI settings live in the DB `settings` table (`insights/settings.py`): `insights_enabled`
+(effective only together with `insights_disclosure_ack_at`), `insights_model`,
+`insights_cap_30d_usd` (default 8), `insights_timezone`. They are edited at
+`/admin/settings`; enabling requires acknowledging the disclosure that transcript text
+will be sent to OpenRouter. The OpenRouter key comes only from the host `.env` (`~/.config/wispralt/.env`). Readers
+fail closed (no store or a DB error = off).
+
+`scheduler_loop` (an in-process asyncio task from the lifespan) checks once an hour
+(first after 60 s) whether the **last full ISO week** is due: AI enabled, a client
+present, no `done` scheduled run for that week, and no scheduled attempt in the last 6
+hours. This replaces the old Sunday-23:00 sleep and the opt-in startup catch-up: a
+missed week self-heals at the next tick, and sleep or DST cannot skip it. Older weeks
+run only by an explicit backfill.
+
+`run_weeks(app, weeks, trigger, force)` runs weeks one after another under
+`app.state.weekly_insights_lock` (a held lock → the call returns None; nothing
+overlaps or double-bills). That lock is per process, so the run row is also the
+**DB run lock**: `JobStore.start_insight_run` checks for another `running` row and
+inserts its own in one `BEGIN IMMEDIATE` transaction, and returns None while one exists
+(`run_weeks` → None), so the server and a CLI run never both spend the same remaining
+budget. The lock is a heartbeat, not a start time: every progress step (before and after
+each person call, and before each team call) sets the row's `heartbeat_at`
+(migration 0004), and only a `running` row whose heartbeat is older than
+`cron.RUN_LOCK_STALE_S` (10 min, far above one call's 30 s timeout) is a crashed run and no
+longer counts, so a long live run never loses its lock to a CLI run; a cancelled run (shutdown) closes its row `aborted` / `cancelled`. Each
+week writes an `insight_runs` row:
+
+```sql
+CREATE TABLE insight_runs(
+  id INTEGER PRIMARY KEY, trigger TEXT NOT NULL CHECK (trigger IN ('scheduled','manual','backfill')),
+  iso_year INTEGER NOT NULL, iso_week INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running','done','failed','aborted','skipped')),
+  people_total INTEGER NOT NULL DEFAULT 0, people_done INTEGER NOT NULL DEFAULT 0,
+  failures_json TEXT NOT NULL DEFAULT '[]',   -- [{user_id, error_class}] only
+  estimated_usd REAL, cost_usd REAL NOT NULL DEFAULT 0, error_class TEXT,
+  started_at REAL NOT NULL, finished_at REAL);
+-- 0004: the run lock's heartbeat, touched on every progress step
+ALTER TABLE insight_runs ADD COLUMN heartbeat_at REAL;
+```
+
+Progress is updated after every person; the portal polls it every 2 s. A run ends
+`done`; `failed` (`all_people_failed`; `some_people_failed`, when any person call failed:
+the team pass is then skipped, since a team insight missing someone would be saved as
+complete and never revisited; `team_openrouter_error` / `team_unusable` when the team
+call errors or is unusable twice; or a crash with its exception class); `aborted`
+(`budget`, `rate_limit` or `cancelled`); or `skipped` (`ai_disabled`, `no_client`). A
+failed or aborted scheduled run is not `done`, so the scheduler retries it. Without
+`force` a week is restart-safe (people who already have a row are skipped, so nobody is
+paid for twice) but their saved insights still go into the team prompt; the team pass
+runs when the week has no team row, anyone new was analysed, or with `force`, and no
+person failed. `force` regenerates everyone.
 
 ### Cost control
 
-A hard 30-day rolling cap (`settings.insights_max_30d_cost_usd`, default
-**$8**) gates the cron at two seams:
-
-1. **Pre-call check.** Before issuing any OpenRouter call, the cron reads
-   `JobStore.rolling_insights_cost_usd(days=30)` and skips the entire run if
-   the figure is already at or above the cap.
-2. **Mid-run check.** Inside the per-user loop, an `accumulated_run_cost`
-   counter tracks spend for the current invocation. After each call the cron
-   re-checks `baseline_30d_cost + accumulated_run_cost ≥ BUDGET` and stops
-   mid-run rather than blowing through the cap on the last few employees.
-
-Cost is extracted from the OpenRouter response body's `usage.cost` field
-(verified to exist on `x-ai/grok-4.3` responses on 2026-05-14 via Task 0).
-If a future model strips the field, `InsightsClient` falls back to a
-hardcoded `INSIGHTS_PRICING_PER_1K` rate-card keyed by model id; the
-`_default` entry is intentionally set high so the fallback fails closed (we'd
-rather skip a run than under-bill against a missing rate).
-
-The OpenRouter 429 rate-limit response is surfaced as `RateLimitedError`
-which aborts the entire current run; the next scheduled Sunday fire will
-retry. We don't sleep-and-retry inside the loop — Sunday-to-Sunday cadence
-gives more than enough recovery time.
+- The **30-day cap** is checked before **every** OpenRouter call (person and team),
+  against the 30-day spend at the start of the run plus this run's spend **plus that
+  call's reserved worst case** (`cron.call_reserve_usd`: prompt tokens counted
+  generously, the larger of 1.35/word and 1 per 3 chars, plus a full `max_tokens`
+  reply, at the rate card via `client.worst_case_cost_usd`). A call that could cross
+  the cap is never made.
+  `rolling_insights_cost_usd` takes the larger of the stored insights' cost and the
+  runs' recorded spend (a forced rerun overwrites a row's cost; runs also count replies
+  that were billed but unusable).
+- Cost comes from the response's `usage.cost`, else the `INSIGHTS_PRICING_PER_1K` rate
+  card (`_default` is deliberately high, so an unknown model fails closed).
+- A 429 (`RateLimitedError`) aborts the run; the next due tick (after 6 h) retries.
+- Before any portal-started run the admin sees an **estimate**: words actually sent
+  (per qualifying person, capped) × 1.35 tokens/word ÷ 1000 × the model's input rate.
 
 ### Data shapes
 
-```sql
-CREATE TABLE weekly_insights (
-    iso_year     INTEGER NOT NULL,
-    iso_week     INTEGER NOT NULL,
-    scope        TEXT NOT NULL,         -- 'person' or 'team'
-    api_key_id   INTEGER,                -- NULL for team scope
-    insight_json TEXT NOT NULL,
-    input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    cost_usd     REAL NOT NULL,
-    model        TEXT NOT NULL,         -- e.g. 'x-ai/grok-4.3'
-    generated_at REAL NOT NULL,
-    PRIMARY KEY (iso_year, iso_week, scope, api_key_id)
-);
-CREATE INDEX idx_weekly_insights_generated ON weekly_insights(generated_at);
-```
-
-`upsert_weekly_insight` uses `ON CONFLICT (iso_year, iso_week, scope, api_key_id)
-DO UPDATE` so a re-run for the same week overwrites the previous row
-idempotently — useful for catchup, manual re-runs via the
-`python -m wispralt_server.insights.cron --manual` entrypoint, and prompt
-iteration during development.
-
-Per-person `insight_json` schema:
+`weekly_insights` keeps one row per `(iso_year, iso_week, scope_key)` (`'team'` or
+`'user:<id>'`; `upsert_weekly_insight` overwrites). Person `insight_json` (v2):
 
 ```json
 {
-  "digest": ["3-bullet summary of the employee's week"],
-  "action_items": [{"text": "ship migration", "owner": "Sarah", "eta": "Fri"}],
-  "projects": [{"name": "Acme proposal", "pct_time": 0.40}],
-  "decisions": ["we decided to..."],
-  "blockers": ["mercury timeouts mentioned 6x"],
-  "topics": [{"label": "billing", "weight": 0.3}],
-  "filler_word_count": 47,
-  "quotable_line": "the migration WILL ship on Friday"
+  "schema_version": 2,
+  "digest": [{"text": "Planned the Q4 launch", "sources": ["d:12"]}],
+  "action_items": [{"text": "ship the migration", "owner": "self", "sources": ["f:3f2a…"]}],
+  "decisions": [{"text": "go with vendor B", "sources": ["d:14"]}],
+  "blockers": [{"text": "waiting on legal", "sources": ["d:13"]}],
+  "projects": [{"name": "Acme proposal", "sources": ["d:12", "d:15"]}],
+  "topics": [{"label": "billing", "sources": ["d:12"]}],
+  "quotable_line": {"text": "the migration ships on Friday", "source": "d:12"}
 }
 ```
 
-Team `insight_json` schema:
-
-```json
-{
-  "themes": [{"label": "client onboarding", "rank": 1, "wow_delta": "+2"}],
-  "team_action_items": [...],
-  "team_blockers": [...],
-  "tool_mentions": {"Mercury": 6, "Cloudflare": 4},
-  "knowledge_gaps": ["questions raised without follow-up"]
-}
-```
-
-### Hallucination guard
-
-`_scrub_hallucinations` in `insights/cron.py` is **two-tier**:
-
-- **`quotable_line` — strict exact substring (case-insensitive).** Must appear
-  verbatim in the week's transcript blob for that user, because the UI
-  renders this field as a literal quote. If absent, the field is replaced
-  with `null` rather than risk attributing made-up words to the employee.
-- **`action_items` / `decisions` / `blockers` — 8-character sliding window.**
-  Each item must share an 8-char substring with the transcript blob. This is
-  paraphrase-tolerant (the LLM legitimately summarizes "we decided X" without
-  copying the exact words) at the cost of false-positives on common phrases.
-  The UI surfaces an **"AI-generated, may be inaccurate"** disclaimer on
-  every card to set user expectations accordingly.
+Team: `{schema_version: 2, themes: [{label, sources}], team_action_items: [{text, owner,
+sources}], team_blockers, decisions, knowledge_gaps: [{text, sources}]}`.
 
 ### Scope semantics
 
-- **`scope = 'person'`** rows are emitted per employee that hit the
-  data-floor gate: at least **5 dictations OR at least 1 meeting/file** in
-  the week. Users below the floor are skipped silently (no row written) to
-  avoid charging for thin-data summaries.
-- **`scope = 'team'`** is one row per week with `api_key_id = NULL`. It's
-  written **only when at least 2 employees had successful person-scope
-  insights** — a one-person team aggregate would just be a re-rendering of
-  that person's row.
+- A person row is written for each active person with at least **5 dictations or 1 file
+  transcription** that week; below that they are skipped (no call, no charge).
+- The team row is written when at least one person insight succeeded in the run.
 
 ---
 
 ## Data portal
 
-The render loop. All three surfaces share the same base template + vendored
-JS so a single design language covers admin + employee views.
-
-Source: `server/src/wispralt_server/routes/{me.py, admin_data.py}` +
-`server/src/wispralt_server/admin/templates/{me_login, me_insights, data,
-_insight_cards, _stats_grid_partial}.html.j2`.
+The render loop: one shell (`base.html.j2` + `portal.css` + `_ui.html.j2`) for admins
+and employees.
 
 ### Surfaces
 
-- **Admin Data tab — `GET /admin/data`.** Admin-only (router-level
-  `require_admin` + `_require_db_pool` deps). Renders the team `weekly_insights`
-  card stack on top + a per-user leaderboard underneath. The optional
-  `?user_id=N` query param drills into one employee using the same
-  `_insight_cards.html.j2` macro layout the employee self-view renders, so
-  the admin sees exactly what the employee sees.
-- **Employee self-view — `GET /me/insights`.** Authenticated user only.
-  Shows that user's `'person'`-scope insight (most recent week) plus a
-  time-range stats grid (Today / 7d / 30d / 90d / 1y / All). Break-glass
-  admin (`user.id < 0`) is 303'd to `/admin/data` because break-glass
-  identities have no per-user transcript history to summarize.
-- **Employee login — `GET /me/login` / `POST /me/login`.** Token-paste form
-  mirroring the admin login flow. On success it sets the **same**
-  `wispralt_admin_token` cookie that admin login sets, but with `path="/"`
-  so a single cookie scopes across both `/admin/*` and `/me/*` surfaces
-  (the admin login handler was simultaneously broadened to `path="/"` so
-  the cookie is interchangeable in both directions). Break-glass tokens are
-  rejected at this surface with an explanatory error — the break-glass
-  identity is intended for emergency admin access, not employee self-view.
+- **Admin Data — `GET /admin/data`.** Measured (team, or `?user_id=N`), the AI panel,
+  the per-person table and the AI runs panel. Admin-only.
+- **My insights — `GET /me/insights`.** The caller's Measured stats and their AI panel.
+- **Records — `GET /admin/records`** (admin) and **My history — `GET /me/history`**
+  (own rows only): see "Personal history" below.
+- **Login — `/admin/login`, `/me/login`.** Both set the same `wispralt_admin_token`
+  cookie with `path="/"`, so one sign-in covers `/admin/*` and `/me/*`.
 
 ### HTMX partial swaps
 
-The time-range tabs are wired through HTMX. Each surface route inspects the
-`HX-Request: true` header (via the shared `web.htmx.is_htmx` dep): when
-present, the handler returns a *body partial* — `_me_insights_body.html.j2`
-for `/me/insights`, `_admin_data_body.html.j2` for `/admin/data` — which
-includes BOTH the stats grid AND the insight cards. Each partial is
-swapped into the page's `#insights-body` wrapper without a full reload, so
-one range-tab click refreshes both the stats grid AND the insight cards
-in a single round-trip. The Alpine `<nav>` tabs sit outside the swap
-target so their `active` state survives the swap; an `htmx:historyRestore`
-handler in `base.html.j2` dispatches a `range-changed` custom event so the
-Alpine tabs re-sync from the URL on browser back/forward.
+Range tabs swap `#insights-body` with `_me_insights_body.html.j2` or
+`_admin_data_body.html.j2` (Measured + AI panel) when `HX-Request: true`; the partial
+branch never mints a CSRF cookie. The Alpine tabs sit outside the swap target; an
+`htmx:historyRestore` handler in `base.html.j2` re-syncs them on back/forward. The runs
+list (`_runs_list.html.j2`) re-polls itself every 2 s only while a run is going.
 
 ### Shared helpers
 
-`web/templates_env.py` exports a single `Jinja2Templates` singleton (with
-`select_autoescape` on `*.html.j2` / `*.html` / `*.j2`) used by
-`routes/admin_ui.py`, `routes/admin_data.py`, and `routes/me.py` so the
-escape policy + template dir stay in sync. `web/htmx.py` exports
-`is_htmx(request)`. `insights/timewindow.py` exports
-`last_full_iso_week` / `iso_week_epoch_bounds` / `epoch_for_range` —
-the cron + both routes share one source of truth for week boundaries
-and the Today/7d/30d/90d/1y/All range tabs. `auth.set_session_cookie`
-/ `clear_session_cookie` / `set_csrf_cookie` / `verify_csrf` centralize
-the `wispralt_admin_token` cookie issuance (path="/", samesite=strict,
-secure, httponly, 8 h) AND the double-submit CSRF token used by both
-`/admin/login` and `/me/login` forms (constant-time compare via
-`hmac.compare_digest`). `JobStore.has_any_insight_for_week`,
-`list_filler_counts_for_week`, and `compute_user_stats` are the public
-read paths the routes use instead of reaching into the private `_exec`.
-
-### CSS scoping
-
-The frosted-glass card rules added to `base.html.j2` are scoped under the
-`.data-page` class so the new visual treatment applies only to
-`me_insights.html.j2` and `data.html.j2`. Existing admin pages (`/admin/`,
-`/admin/users`, `/admin/usage`) inherit the old flat styling unchanged —
-the scoping is a defensive choice so a regression in the new CSS can't
-visually break the existing admin surfaces.
+`web/templates_env.py` (one `Jinja2Templates`, autoescape on `.html.j2`, the `highlight`
+and `ts` filters), `web/htmx.py` (`is_htmx`), `web/records.py` (time window, row
+decoration), `insights/timewindow.py` (ISO weeks, range tabs, `host_timezone`), `auth`
+cookie + CSRF helpers.
 
 ### Vendored JS
 
-HTMX 2.0.4 (`/admin/static/htmx.min.js`, ~50 KB) and Alpine 3.14.8
-(`/admin/static/alpine.min.js`, ~44 KB) are checked in to the repo and
-served by FastAPI's `StaticFiles` mount at `/admin/static`. CDN delivery
-was rejected for two reasons: (1) it would force a CSP carve-out for
-`unpkg.com` (or similar), expanding the supply-chain surface; (2) the
-mini's network egress isn't guaranteed — vendoring locally keeps the
-portal functional during an internet outage at the office. Refresh
-procedure (out-of-band): `curl -fsSL -o ...` from the upstream CDN,
-verify SHA-256 against the published release, commit.
+HTMX 2.0.4 (`/admin/static/htmx.min.js`) and Alpine 3.14.8 (`/admin/static/alpine.min.js`)
+are checked in and served by the `/admin/static` `StaticFiles` mount with SRI hashes.
+CDN delivery was rejected: it would widen the supply-chain surface and the portal must
+work during an internet outage. Refresh out-of-band: download, verify the SHA-256
+against the release, commit.
 
 ---
 
 ## Personal history (`/me/history`)
 
 Plan A's headline employee surface. Every authenticated employee can browse
-their own dictations + meetings + custom file transcriptions in one
-chronological list, filter by range / kind / search term, expand any row to
+their own dictations + file transcriptions (including legacy meeting rows) in one
+chronological list, filter by range / kind, full-text search it (Part 6), expand any row to
 see the full transcript text, soft-delete with a one-click undo path, and
 download an individual transcript as `.txt` or `.json`. Sits in the same
-sidebar as `/me/insights` and inherits the data-portal frosted-glass
-treatment.
+sidebar as `/me/insights`.
 
-Source: `server/src/wispralt_server/routes/me.py` (handlers) +
-`server/src/wispralt_server/admin/templates/{me_history, _me_history_body,
+Source: `server/src/wispralt/routes/me.py` (handlers) +
+`server/src/wispralt/admin/templates/{me_history, _me_history_body,
 _me_history_page, _me_history_row, _me_history_row_expanded}.html.j2`
 (render). Design lineage:
 `tmp/ready-plans/2026-05-15-plan-a-me-history-and-cloud-telemetry.md`.
@@ -984,10 +1113,10 @@ _me_history_page, _me_history_row, _me_history_row_expanded}.html.j2`
 ### Two-leg union
 
 A "history row" is either a dictation (from the `dictations` table) or a
-job-style transcript (from the `jobs` table — meeting OR file). Both legs
-carry `api_key_id` already, so per-user scoping is free. `JobStore.transcripts_in_range_filtered`
+file transcript (from the `jobs` table). Both legs carry `user_id`, so
+per-user scoping is free. `JobStore.transcripts_in_range_filtered`
 runs two parameterized SQL queries — one per leg — applies the range +
-optional kind + optional `LIKE` search filter, ORDERs each by
+optional kind filter, ORDERs each by
 `(created_at DESC, row_id DESC)`, then merge-sorts the two streams in
 Python.
 
@@ -996,19 +1125,27 @@ Filters live entirely server-side:
 - `range` (default `30d`) — one of `today`, `7d`, `30d`, `90d`, `1y`, `all`,
   reusing `insights/timewindow.epoch_for_range` so the history page and the
   insights page agree on what "30d" means.
-- `kind` (optional) — `dictation` or `meeting`. Empty string from the
+- `kind` (optional) — `dictation` or `file` (every `jobs` row; displayed as "File transcriptions"). `meeting` URLs from before Part 4 404. Empty string from the
   `<select>` element is normalized to None at the handler.
-- `search` (optional) — minimum **3 characters** after `.strip()`; shorter
-  strings are silently dropped to keep the `LIKE '%…%'` scan bounded.
+- `q` (optional, Part 6) — 2+ characters after `.strip()` switch the page to
+  **full-text search**: `JobStore.search_history(user_id, q, since, until, kind,
+  limit, offset)` over the FTS5 indexes (see "Local database → Full-text search"),
+  newest first, offset paging, snippets highlighted via `|highlight`. Shorter input
+  shows the plain list. The old `LIKE` filter is gone.
+- `since` / `until` (optional, unix seconds) — override the range tab; the Measured
+  tiles link here with them.
 
 ### Per-leg cursor pagination
 
 Each leg has its own opaque cursor (`dict_cursor`, `jobs_cursor`) so a page
-that's heavy on dictations doesn't starve meetings off the next page (and
+that's heavy on dictations doesn't starve file transcriptions off the next page (and
 vice versa). Cursors are `(created_at, row_id)` tuples base64-urlsafe-encoded
 in the URL; malformed cursors decode to None and silently restart pagination.
 The "Load more" HTMX button posts back both cursors and the server appends
-the next 50 rows. Page size lives in `settings.history_page_size`
+the next 50 rows. Each leg fetches `limit + 1` rows and the two are merged in
+order; a leg's next cursor is the last row of that leg actually shown (its
+incoming cursor if it showed none), so a row the page limit cut appears on the
+next page. Both cursors are empty once nothing is left. Page size lives in `settings.history_page_size`
 (default **50**).
 
 `row_id` is included as a tie-breaker because two transcripts captured in
@@ -1018,15 +1155,13 @@ covers this.
 
 ### Soft delete
 
-`dictations.deleted_at` and `jobs.deleted_at` (REAL, NULL = live) were
-added by idempotent `ALTER TABLE` calls in `JobStore.__init__`. Two new
-partial indexes (`idx_dictations_api_key_active`,
-`idx_jobs_api_key_active`) keep the live-row scan fast:
+`dictations.deleted_at` and `jobs.deleted_at` (REAL, NULL = live). Two
+partial indexes keep the live-row scan fast:
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_dictations_api_key_active
-  ON dictations(api_key_id, created_at DESC)
-  WHERE deleted_at IS NULL;
+CREATE INDEX dictations_user_created ON dictations(user_id, created_at) WHERE deleted_at IS NULL;
+CREATE INDEX jobs_user_active ON jobs(user_id, created_at)
+  WHERE deleted_at IS NULL AND transcript_text IS NOT NULL;
 ```
 
 `DELETE /me/history/{kind}/{row_id}` flips `deleted_at = NOW()`; the row
@@ -1044,15 +1179,16 @@ existed".
 
 ### CSRF + ownership
 
-Both mutating routes (`DELETE`, `POST /restore`) accept the standard form
-`csrf_token` field validated through the shared
-`auth.verify_csrf`/`set_csrf_cookie` helpers (same double-submit pattern
-as `/admin/login` and `/me/login`). Every read AND mutation re-checks
-ownership: `get_history_row(api_key_id, kind, row_id)` filters on
-`api_key_id` so a malicious or stale row_id from another user uniformly
-returns **404** — we never leak existence to non-owners. Break-glass
-admin (`user.id < 0`) is rejected from every history route (no person
-row to scope to).
+Both mutating routes (`DELETE`, `POST /restore`) take the
+`auth.require_csrf` dependency: the `csrf_token` form field (or
+`X-CSRF-Token` header) must pass `auth.verify_csrf` (the session-bound token the page render
+embedded, see Auth above); a Bearer-authenticated
+request needs no token. Every read AND mutation re-checks
+ownership: `get_history_row(user_id, kind, row_id)` (=
+`get_record_scoped(kind, row_id, viewer_id, is_admin=False)`) filters on
+`user_id` in SQL, so a malicious or stale row_id from another user uniformly
+returns **404** — we never leak existence to non-owners. Admins read any record only
+through `/admin/records/{kind}/{id}` (`is_admin=True`).
 
 ### HTMX render contract
 
@@ -1062,7 +1198,8 @@ Three template shapes, picked at the handler based on request kind:
 |---|---|---|
 | Fresh page load | `me_history.html.j2` | Full chrome (nav, filter bar, table shell + first page). |
 | HTMX nav (range/kind/search change) | `_me_history_body.html.j2` | Body fragment swapped into `#history-body`. |
-| HTMX Load-more | `_me_history_page.html.j2` | Just the next batch of `<tr>` rows + the updated Load-more button. |
+| HTMX Load-more | `_me_history_page.html.j2` | Just the next batch of `<tr>` rows + the updated Load-more button (`_load_more.html.j2`: cursors, or `offset` in search mode; `hx-vals` via `|tojson`). |
+| Record link (no `HX-Request`) | `record_detail.html.j2` | Full page for one record; the target of AI source links. |
 | Row expand | `_me_history_row_expanded.html.j2` | Swaps the compact row in place; transcript text + per-row Delete/Download buttons. |
 | Row collapse / restore | `_me_history_row.html.j2` | Compact row partial. |
 
@@ -1090,131 +1227,24 @@ me.py:me_history ──▶ JobStore.transcripts_in_range_filtered
 
 ---
 
-## Cloud-fallback telemetry sync
+## Cloud-fallback telemetry sync (removed)
 
-Plan A's other half: closes the gap noted in the "Known gap:
-cloud-fallback dictations" subsection above. When the Mac mini is offline,
-the Swift client transcribes via OpenRouter directly (see [Cloud Fallback
-(dictation only)](#cloud-fallback-dictation-only) and [docs/FALLBACK.md](FALLBACK.md));
-those transcripts used to be invisible to the origin and never appeared in
-`/me/history` or the weekly insights cron. Plan A adds an idempotent
-client-side queue + a server ingest endpoint so cloud-fallback dictations
-eventually land in the same `dictations` table as origin-served ones.
-
-Source: `client/WisprAlt/Storage/DictationFallbackQueue.swift` (queue +
-drain) + `client/WisprAlt/Server/DictationAPI.swift` (enqueue at the
-OpenRouter success site) + `client/WisprAlt/App/MenuBarController.swift`
-(drain triggers) on the client side;
-`server/src/wispralt_server/routes/telemetry.py` (ingest) +
-`JobStore.insert_cloud_fallback_dictation` on the server side.
-
-### Data lineage
-
-```
-  offline dictation
-   │  (mini unreachable; classifier in ServerClient::isOfflineSignature trips)
-   ▼
- DictationAPI.callOpenRouter ──── inject text into focused app ────► user sees result
-   │
-   │  (try?) DictationFallbackQueue.shared.enqueue(...)
-   ▼
- ~/Library/Application Support/co.wispralt/cloud-fallback-queue/<dedup>.json
-   │
-   │  drain triggers: app didBecomeActive  +  next successful online dictation
-   ▼
- POST https://transcribe.integrateapi.ai/telemetry/cloud-dictation
-   │   { dictations: [ { client_dedup_id, text, dictated_at, word_count,
-   │                     client_app_version }, … up to 200 per batch ] }
-   ▼
- routes/telemetry.py ──▶ JobStore.insert_cloud_fallback_dictation
-   │                       (ON CONFLICT DO NOTHING via partial unique
-   │                        index on client_dedup_id IS NOT NULL)
-   ▼
- dictations table (source='cloud_fallback')  →  /me/history  +  future cron inputs
-```
-
-### Queue design (client)
-
-The queue is a singleton actor wrapper around a disk directory. Each
-queued dictation is a single JSON file named `<client_dedup_id>.json`
-(`client_dedup_id` is a freshly-minted UUIDv4 per dictation). Writes are
-atomic in the same style as `PendingUploadsQueue`: write `.tmp` → fsync
-file → rename → fsync parent directory. Concurrent drain calls are
-coalesced into one in-flight task by `DictationFallbackDrainCoordinator`
-so a foreground notification arriving mid-drain doesn't double-POST.
-
-Lifecycle:
-
-- **Enqueue** — `DictationAPI.callOpenRouter` enqueues on the success
-  path immediately after the parse, wrapped in `try?` so any queue write
-  failure is logged but never breaks the dictation user experience.
-- **Drain** — fires on `NSApplication.didBecomeActiveNotification` and
-  immediately after any successful online dictation. Each invocation
-  reads up to 200 files, builds one batch, POSTs, then handles the
-  response per the status policy below.
-- **Retry / TTL** — a `retry_count` field is bumped on transient
-  failure. Items that hit `maxAttempts = 5` or exceed the 7-day age
-  ceiling move to a `failed/` sibling directory rather than retry
-  forever (matches the same pattern in `PendingUploadsQueue`). Local
-  bookkeeping fields (`created_at`, `retry_count`, `last_attempt_at`)
-  are stripped before the POST body is built so the server only sees
-  the fields it validates.
-
-Status policy on the drain POST:
-
-| Server status | Client action |
-|---|---|
-| 2xx | Delete the batch's files. Done. |
-| 401 | Log + abort drain. User likely needs to re-paste a token. |
-| 4xx non-401 | Bump `retry_count` on every file in the batch. Will retry next trigger. |
-| 5xx / transport error | Leave files in place. Retry next trigger. |
-
-### Endpoint design (server)
-
-`POST /telemetry/cloud-dictation` is **Bearer-only**: a cookie-only
-request with no `Authorization` header is rejected with 401 even if the
-shared session cookie would normally satisfy auth. This stops a malicious
-site that holds a `wispralt_admin_token` cookie (set when the user logged
-into `/me/login`) from triggering ingest from a logged-in browser session
-the user didn't initiate. Pydantic validates the batch shape (`client_dedup_id`
-is a UUID-shaped string, `text` is 1–200_000 chars, batch size 1–200);
-the handler then bounds `dictated_at` to `[now − 365d, now + 5min]` so a
-clock-skew or replay attack can't backfill the cron's input.
-
-Idempotency lives in the schema: a partial unique index
-`idx_dictations_client_dedup` on `client_dedup_id WHERE client_dedup_id
-IS NOT NULL` plus `INSERT … ON CONFLICT (client_dedup_id) DO NOTHING` in
-`insert_cloud_fallback_dictation` means a retried batch with the same
-`client_dedup_id`s lands exactly once. The handler returns `{inserted,
-received}` so the client can distinguish "all new" from "all duplicates"
-in OSLog.
-
-Rate-limited at 10 batches per minute per IP through the same
-`middleware/rate_limit.py` that gates `/transcribe/*` (new
-`telemetry_per_min` kwarg + `/telemetry/*` branch in dispatch); each
-batch can carry up to 200 dictations, so 2000 dictations/minute is the
-ceiling — more than enough for a 10-person team's worst-case
-offline-then-online surge.
-
-### Provenance
-
-Cloud-fallback rows carry `source='cloud_fallback'` (server-set in
-`insert_cloud_fallback_dictation`). Origin-served dictations carry
-`source='server'` (NULL coalesces to `'server'` for the migration's
-existing rows; the column was added by an idempotent `ALTER TABLE` in
-`JobStore.__init__`). `/me/history` renders the source as a small
-icon/label so users can tell at a glance which dictations went through
-the cloud-fallback path.
+The client-side dictation fallback queue, the `/telemetry/*`
+ingest route and `JobStore.insert_cloud_fallback_dictation` were removed in
+Part 2 together with the OpenRouter audio fallback they served. The queue's
+folder (`~/Library/Application Support/co.wispralt/cloud-fallback-queue/`)
+is no longer read; see the root `CHANGELOG.md` for leftover cleanup. Rows
+already ingested keep `source='cloud_fallback'`, and `/me/history` still
+labels them so users can tell which dictations went through the old path.
 
 ---
 
-## In-app updater (v0.5.0)
+## In-app updater
 
 A lightweight in-app update checker runs alongside the still-disabled Sparkle
-wrapper. The new module lives at
-`client/WisprAlt/Update/UpdateChecker.swift` and is **deliberately not Sparkle**
-— it reuses `install.sh` (the curl one-liner) as the canonical install path so
-there is exactly one update mechanism to reason about.
+wrapper. It lives at `client/WisprAlt/Update/UpdateChecker.swift` and is
+**deliberately not Sparkle**: it only notices a release; installing is
+`wispralt update --client`.
 
 - **Polling.** The checker fires 60 s after launch and then every 6 h,
   debounced via `Settings.shared.lastUpdateCheck` so a wake-from-sleep doesn't
@@ -1222,18 +1252,16 @@ there is exactly one update mechanism to reason about.
   `https://api.github.com/repos/<owner>/<repo>/releases/latest` and compares the
   `tag_name` (minus the leading `v`) against the bundled
   `CFBundleShortVersionString` via a SemVer-aware numeric compare.
-- **Badge.** When a newer release is found, the checker flips
+  `<owner>/<repo>` is the bundle's `WisprAltReleaseRepo` key, which
+  `scripts/build-client-local.sh` stamps from the clone's GitHub `origin`
+  (`WISPRALT_RELEASE_REPO` overrides it). Without the key the check is skipped.
+- **Badge.** When a newer release is found, the checker sets
   `Settings.shared.updateAvailable` (UserDefaults-backed) and calls
-  `MenuBarController.shared.setUpdateBadge(visible: true)` — the latter
-  composites a subtle orange dot onto the menubar mic icon. The badge is only
-  rendered when `Settings.shared.serverURL != nil` so a half-configured install
-  doesn't show a misleading update prompt.
-- **Install now.** Settings → Advanced → Updates shows the current version, the
-  latest tag, and an "Install now…" button. The button shells out to
-  `Terminal.app` via `NSAppleScript` with the canonical curl install one-liner
-  pre-typed; if Automation TCC is denied (no Terminal scripting permission)
-  the command is dropped onto the clipboard with a "Paste this into Terminal"
-  toast as a fallback so the user is never stuck.
+  `MenuBarController.shared.setUpdateBadge(visible: true)`, which composites a
+  subtle orange dot onto the menubar mic icon.
+- **Update.** Settings → Advanced → Updates shows the new version and a
+  **Copy update command** button that puts `wispralt update --client` on the
+  clipboard, to paste into Terminal (the app quits while it is reinstalled).
 
 Source: `client/WisprAlt/Update/UpdateChecker.swift` +
 `client/WisprAlt/Storage/Settings.swift` (`updateAvailable`,
@@ -1247,12 +1275,10 @@ Source: `client/WisprAlt/Update/UpdateChecker.swift` +
 Two menubar-popover additions surface the existing portal more clearly to
 employees.
 
-- **"Copy last dictation"** — pinned at the very top of the popover. Calls
-  `LastDictationAPI.fetch()` which hits the new `GET /me/dictations/last`
-  JSON endpoint (see [API.md → `GET /me/dictations/last`](API.md)) and copies
-  the returned `text` to the clipboard with a 60 s-debounced "Copied" toast.
-  Surfaces a friendly "No dictations yet" message on 404 and the standard
-  network error toast on 5xx / offline.
+- **"Copy last dictation"** — pinned at the very top of the popover. Since
+  Part 3 it reads the client's own `last.json` (see "Spool, Retry and last
+  text"), in both modes; the client no longer calls
+  `GET /me/dictations/last` (the server route was removed in Part 4).
 - **"Open My Dictations"** — opens
   `<serverURL>/me/login?next=/me/history` in the default browser. The
   `?next=` parameter (server-side open-redirect-guarded to relative paths
@@ -1260,7 +1286,7 @@ employees.
   history page after token-paste instead of the default `/me/insights`
   landing — which was the discoverability gap raised against v0.4.x.
 
-The other QuickActions buttons (Transcribe file…, Copy last meeting / custom
+The other QuickActions buttons (Transcribe file…, Copy last custom
 transcription, etc.) are unchanged from the v0.4.6 layout.
 
 ---
@@ -1270,14 +1296,15 @@ transcription, etc.) are unchanged from the v0.4.6 layout.
 Three launchd entries keep both sides of WisprAlt alive across reboots, crashes, and logins.
 
 ```
-Mac mini — launchd gui/<UID>
+Host — launchd gui/<UID>
   │
-  ├── co.wispralt.server  (~/Library/LaunchAgents/co.wispralt.server.plist)
+  ├── co.wispralt.host  (~/Library/LaunchAgents/co.wispralt.host.plist; written by `wispralt setup`)
   │     RunAtLoad: true
-  │     KeepAlive: true
-  │     → uvicorn on 127.0.0.1:8000
+  │     KeepAlive: {SuccessfulExit: false}
+  │     ThrottleInterval: 30
+  │     → uvicorn on 127.0.0.1:<port> (default 8000), cwd ~/.config/wispralt
   │
-  └── co.wispralt.cloudflared  (~/Library/LaunchAgents/co.wispralt.cloudflared.plist)
+  └── co.wispralt.cloudflared  (optional; ~/Library/LaunchAgents/co.wispralt.cloudflared.plist)
         RunAtLoad: true
         KeepAlive: {SuccessfulExit: false, NetworkState: true}
         ThrottleInterval: 10
@@ -1292,6 +1319,6 @@ Client Mac — SMAppService (registered by AppDelegate at first launch)
         Configurable via in-app Settings → Launch at login toggle
 ```
 
-Both Mac mini LaunchAgents run at user level (`gui/$UID`) — not system level — so they have access to the user's Keychain, home directory, and environment without requiring sudo. `EnvironmentVariables/PATH` is set explicitly in each plist because launchd provides a minimal PATH that may not include Homebrew.
+Both host LaunchAgents run at user level (`gui/$UID`) — not system level — so they have access to the user's Keychain, home directory, and environment without requiring sudo. `EnvironmentVariables/PATH` is set explicitly in each plist because launchd provides a minimal PATH that may not include Homebrew.
 
 The SMAppService entry on the client is registered via `SMAppService.mainApp.register()` and requires an Apple-issued code-signing identity (Apple Development or Developer ID). Ad-hoc signed builds cannot use SMAppService.

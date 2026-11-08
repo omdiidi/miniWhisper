@@ -14,7 +14,7 @@ FastAPI app composed of:
   - the OpenAI exception handlers installed via ``openai_errors.install``
     so 401/403/etc. ride the OpenAI envelope shape (matching production).
 
-Auth is handled by overriding ``require_api_key_v1`` via FastAPI's
+Auth is handled by overriding ``require_bearer`` via FastAPI's
 ``dependency_overrides`` — we don't go through Postgres.
 """
 from __future__ import annotations
@@ -25,13 +25,8 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
-# wispralt_server import so the tests work on a bare dev box without a .env.
-os.environ.setdefault("HF_TOKEN", "stub")
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
+# wispralt import so the tests work on a bare dev box without a .env.
 os.environ.setdefault("SERVER_URL", "http://test.local")
-os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
-os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
-os.environ.setdefault("STAGING_DIR", "/tmp/wispralt-test-staging")
 
 from typing import TYPE_CHECKING
 
@@ -39,18 +34,18 @@ from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.testclient import TestClient
 
-from wispralt_server._errors import (
+from wispralt._errors import (
     AudioTooLongError,
     CorruptAudioError,
 )
-from wispralt_server.auth import require_api_key_v1
-from wispralt_server.middleware import openai_errors
-from wispralt_server.middleware.cors import install_cors
-from wispralt_server.ratelimit_per_token import (
+from wispralt.auth import require_bearer
+from wispralt.middleware import openai_errors
+from wispralt.middleware.cors import install_cors
+from wispralt.ratelimit_per_token import (
     init_rate_limit_state,
 )
-from wispralt_server.routes.v1_transcriptions import router as v1_router
-from wispralt_server.users.store import User
+from wispralt.routes.v1_transcriptions import router as v1_router
+from wispralt.accounts.store import User
 
 if TYPE_CHECKING:
     import pytest
@@ -113,21 +108,21 @@ class _StubParakeet:
 
 
 def _override_auth(app: FastAPI, *, user: User | None = None) -> User:
-    """Install a dependency override for ``require_api_key_v1`` that returns
+    """Install a dependency override for ``require_bearer`` that returns
     the supplied User (or a sensible default integration-kind one).
 
     NOTE: ``rate_limit_v1_per_token`` depends transitively on
-    ``require_api_key_v1`` — overriding the inner dep is enough to satisfy
+    ``require_bearer`` — overriding the inner dep is enough to satisfy
     both because FastAPI's dependency cache resolves each unique callable
     once per request.
     """
     if user is None:
-        user = User(id=42, label="key-test-app", role="employee", kind="integration")
+        user = User(id=42, key_id=None, label="key-test-app", role="employee", kind="integration")
 
     async def _fake(_request: Any = None) -> User:
         return user
 
-    app.dependency_overrides[require_api_key_v1] = _fake
+    app.dependency_overrides[require_bearer] = _fake
     return user
 
 
@@ -306,6 +301,34 @@ class TestValidationErrors:
         body = resp.json()
         assert body["error"]["code"] == "model_not_found"
 
+    def test_post_gpt_transcribe_is_known(self) -> None:
+        app = _build_app()
+        with _client(app) as client:
+            resp = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("tiny.wav", _tiny_wav(), "audio/wav")},
+                data={"model": "gpt-transcribe"},
+                headers={"Authorization": "Bearer test"},
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["text"] == "hello world."
+
+    def test_post_unknown_model_is_404_without_inference(self) -> None:
+        app = _build_app()
+        with _client(app) as client:
+            resp = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("tiny.wav", _tiny_wav(), "audio/wav")},
+                data={"model": "foo"},
+                headers={"Authorization": "Bearer test"},
+            )
+        assert resp.status_code == 404, resp.text
+        error = resp.json()["error"]
+        assert error["code"] == "model_not_found"
+        assert error["type"] == "invalid_request_error"
+        assert "gpt-transcribe" in error["message"] and "whisper-1" in error["message"]
+        app.state.parakeet_service.transcribe_with_alignment.assert_not_called()
+
     def test_post_temperature_out_of_range(self) -> None:
         app = _build_app()
         with _client(app) as client:
@@ -451,7 +474,7 @@ class TestPayloadAndDecodeFailures:
         # Force the decode helper to raise CorruptAudioError. Patch the
         # `decode_to_pcm` symbol imported into the route module (not the
         # source module) — `from X import Y` rebinds Y locally.
-        from wispralt_server.routes import v1_transcriptions as v1_route_mod
+        from wispralt.routes import v1_transcriptions as v1_route_mod
 
         def _raise(_b: bytes) -> Any:
             raise CorruptAudioError("Cannot decode audio: garbage")
@@ -476,7 +499,7 @@ class TestPayloadAndDecodeFailures:
 
 class TestAuth:
     def test_no_bearer_returns_401_envelope(self) -> None:
-        # Don't override auth — let the real require_api_key_v1 run.
+        # Don't override auth — let the real require_bearer run.
         app = _build_app(override_auth=False)
         with _client(app) as client:
             resp = client.post(
@@ -492,7 +515,7 @@ class TestAuth:
 
     def test_cookie_only_auth_rejected_on_v1(self) -> None:
         # Setting the admin session cookie WITHOUT a Bearer header MUST 401 on
-        # /v1 — cookie auth is intentionally not consulted by require_api_key_v1.
+        # /v1 — cookie auth is intentionally not consulted by require_bearer.
         app = _build_app(override_auth=False)
         with _client(app) as client:
             resp = client.post(
@@ -555,7 +578,7 @@ class TestTranslationsStub:
                 headers={"Authorization": "Bearer test"},
             )
         # Stub returns 400 / endpoint_not_supported. Auth dep
-        # (rate_limit_v1_per_token -> require_api_key_v1) is resolved via
+        # (rate_limit_v1_per_token -> require_bearer) is resolved via
         # the override installed by _build_app().
         assert resp.status_code == 400, resp.text
         body = resp.json()

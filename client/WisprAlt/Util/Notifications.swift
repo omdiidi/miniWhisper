@@ -1,17 +1,6 @@
 import Foundation
 import UserNotifications
-
-// MARK: - Notification names (NSNotification.Name extensions)
-
-extension Notification.Name {
-    /// Posted by MeetingRecorder when the 90-minute recording cap is reached.
-    /// Observer (MenuBarController) should stop and upload immediately.
-    static let meetingMaxDurationReached = Notification.Name("co.wispralt.meetingMaxDurationReached")
-
-    /// Posted by MeetingRecorder at 60 minutes as an advance warning that the
-    /// 90-minute cap is approaching.
-    static let meetingApproachingCap = Notification.Name("co.wispralt.meetingApproachingCap")
-}
+import WisprAltCore
 
 /// App-level notification helpers.
 ///
@@ -31,7 +20,7 @@ enum AppNotifications {
             options: [.alert, .sound]
         ) { granted, error in
             if let error {
-                Log.error("Notification authorization error: \(error.localizedDescription)", category: "notifications")
+                Log.error("Notification authorization error: \(ErrorLog.describe(error))", category: "notifications")
                 return
             }
             if granted {
@@ -70,7 +59,7 @@ enum AppNotifications {
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
                 Log.error(
-                    "Failed to post notification '\(title)': \(error.localizedDescription)",
+                    "Failed to post notification: \(ErrorLog.describe(error))",
                     category: "notifications"
                 )
             }

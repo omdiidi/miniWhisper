@@ -31,7 +31,7 @@ If pyannote ever bumps to use `token=` instead of `use_auth_token=`, the upper b
 ## Server-side file map (new and modified)
 
 ```
-server/src/wispralt_server/
+server/src/wispralt/
 ├── meeting/
 │   ├── mlx_whisper_loader.py        ← NEW (replaces whisperx_loader.py — deleted in Phase 10)
 │   │                                   one-shot transcribe with tqdm.auto monkey-patch
@@ -272,7 +272,7 @@ Follow-up patch after a 24h soak of the MLX-Whisper swap.
 
 ### Part A — WhisperX deletion
 
-- Deleted `server/src/wispralt_server/meeting/whisperx_loader.py`.
+- Deleted `server/src/wispralt/meeting/whisperx_loader.py`.
 - Deleted `server/tests/test_whisperx_no_speech.py` (orphan after the swap).
 - Removed `whisperx==3.4.0` from `server/pyproject.toml`. `ctranslate2` and `faster-whisper` were transitive only — they prune automatically on next `pip install -e .`.
 - KEPT `huggingface_hub>=1.12.0,<1.13` pin. Pyannote-3.1 still calls `hf_hub_download(use_auth_token=...)` which was removed in 1.13. The compat shim in `meeting/__init__.py` translates the kwarg.
@@ -283,7 +283,7 @@ Follow-up patch after a 24h soak of the MLX-Whisper swap.
 
 Why: idle RSS sat at 6.5–9 GB after a meeting job because `_mlx_mod.reset()` only drops the Python ref. Apple's unified-memory pool keeps the MLX backing pages cached for the next load. Without an explicit `mx.metal.clear_cache()` call, those pages stay resident.
 
-Fix: two new calls in `server/src/wispralt_server/meeting/pipeline.py`:
+Fix: two new calls in `server/src/wispralt/meeting/pipeline.py`:
 
 1. **`evict_if_idle()`** — after `_mlx_mod.reset()` + `_diarize_mod.reset()` + `gc.collect()`, call `mx.metal.clear_cache()` + `mx.metal.reset_peak_memory()`. The reset_peak call gives `/metrics` a clean high-water mark per idle cycle.
 2. **`transcribe_meeting()` finally:** — call `mx.metal.clear_cache()` (no reset_peak) at the end of every job so back-to-back jobs don't compound activation cache.
@@ -310,6 +310,6 @@ First chunk of the NEXT job after a cache clear is ~2-3s slower (Metal kernel re
 ### Validation pending (on the mini, post-deploy)
 
 - `python -c "import mlx.core as mx; mx.metal.clear_cache(); mx.metal.reset_peak_memory(); print('ok')"` from the venv.
-- `python -c "from wispralt_server.meeting import pipeline; print('ok')"` from the venv.
+- `python -c "from wispralt.meeting import pipeline; print('ok')"` from the venv.
 - Smoke: `SKIP_ROWS="2,3,5,6,7,8,9,10,11,12" ./scripts/run-matrix-local.sh` from MacBook — rows 1 (30s file) + 4 (5m file) must complete green.
 - RAM measurement before/after job — capture `ps -o rss=` numbers and append to this changelog.

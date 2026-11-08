@@ -1,125 +1,80 @@
 # WisprAlt
 
-A self-hosted, privacy-first replacement for Wispr Flow. Sub-400ms dictation and speaker-diarized meeting transcription running entirely on hardware you own — no cloud subscription, no audio leaving your network. Powered by Parakeet TDT 0.6B v2 (MLX) for dictation and mlx-whisper large-v3-turbo + Pyannote 3.1 for meetings.
+Hold-to-talk dictation and audio/video file transcription for macOS: hold FN, speak,
+release, and the text appears at the cursor. A menubar app, plus an optional
+self-hosted transcription server for teams that want audio to stay on their own hardware.
 
-**OpenAI-compatible**: point any Whisper-API client at `https://transcribe.integrateapi.ai/v1`. See [docs/OPENAI-COMPAT.md](docs/OPENAI-COMPAT.md).
+## Two modes
 
-**v0.4.0 (May 2026)** adds opt-in **streaming dictation** — long dictations transcribe audio chunks in parallel with recording so only a short tail remains on FN release. Off by default; enable via Settings → "Streaming dictation (experimental — faster for long dictations)". Falls back to the standard path on any failure. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#streaming-dictation-opt-in-experimental).
+The app's popover has a **Mode** picker:
 
-![Demo](docs/demo.gif)
+- **Online (OpenAI)**, the default: audio goes straight from your Mac to OpenAI
+  (`gpt-transcribe` by default; other models and prices under Advanced) with your own
+  API key. No server needed. File transcripts are saved as TXT + JSON.
+- **Local (self-hosted)**: audio goes to a WisprAlt host you run on an Apple Silicon
+  Mac: Parakeet TDT 0.6B (MLX) for dictation, mlx-whisper large-v3-turbo for files,
+  a SQLite database, a web portal for people, keys, usage and history, and an
+  [OpenAI-compatible `/v1` API](docs/OPENAI-COMPAT.md). Audio never leaves your
+  network. File transcripts are saved as JSON, SRT, VTT and TXT.
 
-## What it is
+Optional smart formatting (Mercury via OpenRouter) runs in the app in either mode and
+sends text only.
 
-WisprAlt is a two-component system:
+## Install
 
-- **Server** (`server/`): A FastAPI service you run on your always-on Mac mini. It exposes two transcription endpoints: a low-latency dictation endpoint powered by Parakeet TDT 0.6B v2 (MLX, ~80–200ms warm inference) and a meeting transcription endpoint that runs mlx-whisper large-v3-turbo (Apple Silicon GPU) and Pyannote 3.1 speaker diarization. The server is reachable from anywhere via a Cloudflare Tunnel — no port forwarding, no inbound firewall rules, no cloud subscription. See [docs/CHANGELOG-2026-05-10.md](docs/CHANGELOG-2026-05-10.md) for the WhisperX → mlx-whisper swap history.
-
-- **Client** (`client/`): A native macOS menubar app (signed, notarized) that listens for your FN key. Hold FN to dictate; release to inject the transcribed text at the cursor. Triple-tap FN within 400ms to start or stop a dual-channel meeting recording that captures both your microphone and system audio. Speaker rename happens entirely on-device — no server round-trip, works offline.
-
-Your audio never leaves your own infrastructure. The server runs on hardware you own; the Cloudflare Tunnel is an outbound-only connection.
-
-## Architecture
-
-```
-MacBook (client) ──FN hold──▶ Dictation Recorder ──WAV──▶ /transcribe/dictate
-                                                                    │
-                                                            Parakeet TDT 0.6B (MLX)
-                                                                    │
-                                                            text ──▶ AX inject / clipboard
-
-MacBook (client) ──FN 3-tap─▶ Meeting Recorder (SCStream dual-channel)
-                                        │ 2-ch 16kHz WAV
-                               /transcribe/meeting ──▶ JobStore (SQLite)
-                                        │
-                              ffmpeg → mlx-whisper turbo (MLX) → Pyannote (MPS)
-                                        │
-                              JSON + SRT + VTT + TXT ──▶ client download + local rename
-```
-
-The server runs a single uvicorn worker process. All models are resident in memory (~7.3 GB combined). Dictation is serialized through a single-thread executor (MLX is not thread-safe). Meeting jobs are limited to one concurrent job via an asyncio semaphore.
-
-For the full architecture diagram and latency budget, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Features
-
-- **Sub-400ms dictation** — hold FN, speak, release; text injected at cursor
-- **Dual-channel meeting recording** — triple-tap FN to capture mic + system audio simultaneously via SCStream
-- **Speaker diarization** — Pyannote 3.1 with mlx-whisper word timestamps; "You" / "Other" labels in remote mode; "Speaker N" labels in in-person mode
-- **In-person mode auto-detection** — frame-based RMS silence check on system audio channel
-- **Offline speaker rename** — rename speakers locally without any server round-trip; atomic file rewrite
-- **Four output formats** — JSON (with word-level timestamps), SRT, VTT, TXT
-- **Privacy-first** — your audio goes to your own Mac mini, not a cloud API
-- **Free** — all models are open-source; no per-minute API fees
-- **Auto-updates** — Sparkle 2 EdDSA-signed appcast; never during an active meeting
-- **Cloudflare Tunnel** — access your Mac mini from anywhere; outbound-only, no port forwarding
-
-## Comparison
-
-| Feature | WisprAlt | Wispr Flow |
-|---|---|---|
-| **Privacy** | Audio stays on your hardware | Audio sent to cloud |
-| **Cost** | Free (after hardware) | $15/month |
-| **Dictation latency** | ~250–400ms p50 | ~200–500ms (varies) |
-| **Meeting recording** | Yes — dual-channel, diarized | No |
-| **Speaker rename** | Yes — offline, atomic | N/A |
-| **Platforms** | macOS 14+ | macOS, iOS, Windows |
-| **Setup** | ~20 minutes (one script) | Instant (SaaS) |
-
-## Status
-
-**Alpha** — core dictation and meeting transcription are implemented and functional. This is a polished GitHub showcase project; production use is at your own discretion. Issues and pull requests welcome.
-
-## Quickstart — Server
-
-> Prerequisites: macOS 13+, Python 3.11, ~8 GB free disk, Homebrew, a HuggingFace account with gated-model access accepted for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`.
+macOS 14+. A host also needs Apple Silicon and about 6 GB of free disk.
 
 ```bash
-git clone https://github.com/yourusername/wisprflowALT.git
-cd wisprflowALT
-./scripts/setup-server.sh
+git clone <repo-url> wispralt
+cd wispralt
+./install.sh                      # asks for the role, or:
+./install.sh --role client        # the menubar app only (Online by default)
+./install.sh --role host          # the Local server
+./install.sh --role both          # a host plus the app, already connected
 ```
 
-The script handles everything: Python venv, model downloads (~5.6 GB), API key generation, Cloudflare Tunnel setup (token read from stdin — never written to disk), and launchd registration. When it finishes it prints a one-liner you paste into the client.
+`install.sh` installs Homebrew (if missing), `ffmpeg`, `uv` and the `wispralt` CLI,
+then runs `wispralt setup --role …`. It never uses `sudo` and is safe to rerun.
+Afterwards `wispralt status`, `doctor`, `backup`, `update` and `uninstall` manage the
+Mac; `wispralt --help` lists everything. Full guide: [docs/INSTALL.md](docs/INSTALL.md).
 
-Full walkthrough: [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md)
+The app walks you through three macOS permissions (Accessibility, Input Monitoring,
+Microphone).
 
-## Quickstart — Client (employees)
+### OpenAI key (Online mode)
 
-Open Terminal on the Mac you want to dictate from, paste this, hit enter:
+The key lives only in the macOS Keychain. Paste it in the app's Settings > Advanced,
+or add it from Terminal (it prompts for the key):
 
 ```bash
-curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-  | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
+security add-generic-password -U -s co.wispralt.openai -a default -w
 ```
 
-The app opens, walks you through 4 macOS permissions (Accessibility, Input Monitoring, Microphone, Screen Recording), and you're ready to dictate.
-
-Hold FN to dictate. Release to inject text at the cursor. Triple-tap FN quickly to start a meeting recording.
-
-See [docs/INSTALL.md](docs/INSTALL.md) for the full install guide and troubleshooting.
-
-Building from source (developers only): [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md).
+Use a project-scoped key with a monthly budget cap. See
+[docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md#mode-online-openai-or-local-server).
 
 ## Docs
 
 | Document | Description |
 |---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Install and the `wispralt` command reference |
+| [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md) | The app: modes, keys, permissions, building from source |
+| [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md) | Host details: models, remote access, `.env` |
+| [docs/ADMIN.md](docs/ADMIN.md) | The portal: people, invites, integrations, insights, importing history |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, latency budget, model residency |
-| [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md) | Full server setup walkthrough |
-| [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md) | Client install, permissions, and config |
 | [docs/API.md](docs/API.md) | HTTP endpoint reference |
-| [docs/OPENAI-COMPAT.md](docs/OPENAI-COMPAT.md) | OpenAI Whisper API drop-in (`/v1/*`) — canonical reference |
-| [docs/INTEGRATION-GUIDE.md](docs/INTEGRATION-GUIDE.md) | Third-party integration quickstart (Python / Node / curl) |
-| [docs/TRANSCRIPT-FORMAT.md](docs/TRANSCRIPT-FORMAT.md) | Transcript JSON schema, SRT/VTT/TXT formats |
-| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common issues and fixes |
-| [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | CI secrets, Sparkle key management, PR workflow |
+| [docs/OPENAI-COMPAT.md](docs/OPENAI-COMPAT.md) | OpenAI Whisper API drop-in (`/v1/*`) |
+| [docs/INTEGRATION-GUIDE.md](docs/INTEGRATION-GUIDE.md) | Third-party integration quickstart |
+| [docs/TRANSCRIPT-FORMAT.md](docs/TRANSCRIPT-FORMAT.md) | Transcript JSON schema, SRT/VTT/TXT |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | `wispralt doctor` checks and common fixes |
+| [docs/TESTING.md](docs/TESTING.md) | Running the test suites |
+| [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | PR workflow, CI secrets |
+| [docs/OVERVIEW.md](docs/OVERVIEW.md) | Codebase map: which doc covers each file |
+
+## Status
+
+Alpha. Issues and pull requests welcome.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## Links
-
-- [Documentation](docs/)
-- [Issues](../../issues)
-- [Contributing](docs/CONTRIBUTING.md)
+MIT; see [LICENSE](LICENSE).

@@ -1,0 +1,54 @@
+{# AI insight cards (schema v2). Every item comes from insights.sources.build_view and
+   carries `links` to the records it cites; items whose records are all gone were
+   already dropped there. #}
+{% import "_ui.html.j2" as ui %}
+
+{% macro chips(item) -%}
+<span class="chips">{% for l in item.links %}<a class="chip" href="{{ l.href }}" title="Open the source record">{{ l.label }}</a>{% endfor %}</span>
+{%- endmacro %}
+
+{% macro item_card(title, items, empty, field="text") -%}
+<section class="card">
+  <h3>{{ title }}</h3>
+  {% if items %}
+    <ul class="list">
+      {% for it in items %}
+        <li>{% if it.owner %}<strong>{{ it.owner }}</strong>: {% endif %}{{ it[field] }}
+          {%- if it.seen_weeks %} {{ ui.badge("seen " ~ it.seen_weeks ~ " weeks") }}{% endif %} {{ chips(it) }}</li>
+      {% endfor %}
+    </ul>
+  {% else %}<p class="empty">{{ empty }}</p>{% endif %}
+</section>
+{%- endmacro %}
+
+{% macro quote_card(q) -%}
+{% if q %}
+<section class="card">
+  <h3>Quotable line</h3>
+  <blockquote>“{{ q.text }}”</blockquote>
+  <p class="small"><a class="chip" href="{{ q.link.href }}">{{ q.link.label }}</a></p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+{% macro person_cards(ai) -%}
+<div class="grid">
+  {{ item_card("Digest", ai.digest, "Not enough to summarise this week.") }}
+  {{ item_card("Action items", ai.action_items, "No commitments captured.") }}
+  {{ item_card("Decisions", ai.decisions, "No decisions captured.") }}
+  {{ item_card("Blockers", ai.blockers, "No blockers named.") }}
+  {{ item_card("Projects", ai.projects, "No projects named.", field="name") }}
+  {{ item_card("Topics", ai.topics, "No topics.", field="label") }}
+</div>
+{{ quote_card(ai.quotable_line) }}
+{%- endmacro %}
+
+{% macro team_cards(ai) -%}
+<div class="grid">
+  {{ item_card("Themes", ai.themes, "No themes.", field="label") }}
+  {{ item_card("Team action items", ai.team_action_items, "No team action items.") }}
+  {{ item_card("Blockers", ai.team_blockers, "No blockers named.") }}
+  {{ item_card("Decisions", ai.decisions, "No decisions captured.") }}
+  {{ item_card("Knowledge gaps", ai.knowledge_gaps, "No open questions.") }}
+</div>
+{%- endmacro %}

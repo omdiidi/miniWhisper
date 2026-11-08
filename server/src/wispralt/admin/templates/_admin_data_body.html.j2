@@ -1,0 +1,32 @@
+{# HTMX swap target for /admin/data: measured stats, the separate AI panel, then (team
+   view) the per-person table. #}
+{% include "_measured.html.j2" %}
+{% include "_ai_panel.html.j2" %}
+
+{% if user_id %}
+  <p><a href="/admin/data?range={{ range }}">Back to team</a></p>
+{% else %}
+  <h2>People ({{ range }})</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Person</th><th class="num">Dictations</th><th class="num">Files</th><th class="num">Words</th><th class="num">Filler words</th><th class="num">Time saved (hrs, est.)</th><th><span class="sr-only">Open</span></th></tr>
+      </thead>
+      <tbody>
+        {% for r in leaderboard %}
+          <tr>
+            <td>{{ r.name }}</td>
+            <td class="num">{{ r.dictations }}</td>
+            <td class="num">{{ r.files }}</td>
+            <td class="num">{{ "{:,}".format(r.words) }}</td>
+            <td class="num">{{ r.fillers }}</td>
+            <td class="num">{{ r.time_saved_hours }}</td>
+            <td><a href="/admin/data?range={{ range }}&user_id={{ r.id }}">Open</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="7"><p class="empty">No people yet.</p></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}

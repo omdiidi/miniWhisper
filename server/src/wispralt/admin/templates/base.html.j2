@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}WisprAlt{% endblock %}</title>
+  <link rel="stylesheet" href="/admin/static/portal.css">
+  <script src="/admin/static/htmx.min.js" defer
+          integrity="sha256-4gndpcgjVHnzFm3vx3UOHbzVpcGAi3eS/C5nM3aPtEc="
+          crossorigin="anonymous"></script>
+  <script src="/admin/static/alpine.min.js" defer
+          integrity="sha256-tgDjY9mdlURNtUrL+y3v/smueSqpmgkim82geOW1VkM="
+          crossorigin="anonymous"></script>
+  <script defer>
+    // HTMX restores history without re-initialising Alpine, so the range tabs
+    // can show a stale active tab after back/forward. Re-sync them from the URL.
+    document.addEventListener("htmx:historyRestore", () => {
+      const range = new URLSearchParams(window.location.search).get("range") || "7d";
+      setTimeout(() => {
+        document.querySelectorAll(".tabs button.active").forEach((b) => b.classList.remove("active"));
+        window.dispatchEvent(new CustomEvent("range-changed", { detail: range }));
+      }, 0);
+    });
+  </script>
+</head>
+<body>
+{% if not hide_chrome %}
+  {% set _user = request.state.user if request.state.user is defined and request.state.user else None %}
+  {% set _is_admin = _user is not none and _user.role == "admin" %}
+  {% set _path = request.url.path %}
+  {% set admin_nav = [
+       ("/admin/", "Overview"),
+       ("/admin/people", "People"),
+       ("/admin/integrations", "Integrations"),
+       ("/admin/invites", "Invites"),
+       ("/admin/usage", "Usage"),
+       ("/admin/records", "Records"),
+       ("/admin/data", "Data"),
+       ("/admin/system", "System"),
+       ("/admin/settings", "Settings"),
+     ] %}
+  {% set self_nav = [("/me/history", "My history"), ("/me/insights", "My insights")]
+       + ([] if _is_admin else [("/admin/me", "My usage")]) %}
+  <div class="shell">
+    <nav class="sidebar" aria-label="Portal">
+      <div class="brand">WisprAlt{% if _user %}<small>{{ _user.label }} · {{ _user.role }}</small>{% endif %}</div>
+      {% if _is_admin %}
+      <div class="nav-group">
+        <span>Admin</span>
+        {% for href, label in admin_nav %}
+          <a href="{{ href }}"{% if _path == href or (href != "/admin/" and _path.startswith(href)) %} aria-current="page"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if _user %}
+      <div class="nav-group">
+        <span>Me</span>
+        {% for href, label in self_nav %}
+          <a href="{{ href }}"{% if _path.startswith(href) %} aria-current="page"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </nav>
+    <main class="content" id="main">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+{% else %}
+  {% block bare_content %}{% endblock %}
+{% endif %}
+</body>
+</html>

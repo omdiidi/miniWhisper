@@ -1,0 +1,40 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Integrations · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>Integrations</h1>
+      <p class="muted">Keys for third-party programs that call <code>/v1/audio/transcriptions</code>. They cannot open <code>/me</code>.</p>
+    </div>
+    <a class="btn primary" href="/admin/integrations/new">Add API key</a>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Program</th><th>Label</th><th>Created</th><th>Last seen</th><th>Actions</th></tr></thead>
+      <tbody>
+        {% for key in keys %}
+          <tr>
+            <td>{{ key.display_name or "(unnamed)" }}</td>
+            <td><code>{{ key.label }}</code></td>
+            <td>{{ key.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+            <td>{{ key.last_seen_at.strftime("%Y-%m-%d %H:%M") if key.last_seen_at else "—" }}</td>
+            <td class="row">
+              <form class="inline" method="post" action="/admin/integrations/{{ key.id }}/rotate">
+                {{ ui.csrf(csrf_token) }}
+                <button type="submit">Rotate</button>
+              </form>
+              <form class="inline" method="post" action="/admin/integrations/{{ key.id }}/revoke"
+                    onsubmit="return confirm('Revoke this key? Programs using it fail immediately.')">
+                {{ ui.csrf(csrf_token) }}
+                <button type="submit" class="danger">Revoke</button>
+              </form>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5">{{ ui.empty_state("No integration keys yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

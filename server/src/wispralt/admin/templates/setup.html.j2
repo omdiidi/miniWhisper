@@ -1,0 +1,29 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}First-time setup · WisprAlt{% endblock %}
+{% block bare_content %}
+  <main class="login">
+    <div class="card">
+    {% if created %}
+      <h1>Admin created: {{ created.label }}</h1>
+      <p class="notice warn"><strong>Copy this key now.</strong> It is shown only once and is your admin sign-in.</p>
+      {{ ui.secret_once(plaintext, "token") }}
+      <p class="muted small">Server URL for the WisprAlt app: <code>{{ server_url }}</code></p>
+      <p><a class="btn primary" href="/admin/">Open the portal</a></p>
+    {% else %}
+      <h1>First-time setup</h1>
+      <p class="muted">No admin exists yet. Paste the setup code from the server's data folder to create one.</p>
+      <p class="muted small">It is the file <code>{{ code_file }}</code> in the server's <code>DATA_DIR</code> (the server logs its location at startup).</p>
+      {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+      <form method="post" action="/admin/setup">
+        {{ ui.csrf(csrf_token) }}
+        <label for="code">Setup code</label>
+        <input id="code" name="code" type="password" autocomplete="off" autofocus required>
+        <label for="label">Your label</label>
+        <input id="label" name="label" type="text" maxlength="80" required value="{{ form_label or 'owner' }}">
+        <button type="submit" class="primary">Create admin</button>
+      </form>
+    {% endif %}
+    </div>
+  </main>
+{% endblock %}

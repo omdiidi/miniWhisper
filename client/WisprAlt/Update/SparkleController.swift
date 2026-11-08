@@ -1,12 +1,13 @@
 import AppKit
 import Sparkle
+import WisprAltCore
 
 /// Manages Sparkle 2 auto-update lifecycle.
 ///
 /// v3 delta requirements:
-///  - Update prompts are gated on `MeetingRecorder.isActive == false`.
-///    SparkleController observes the `isMeetingActive` flag from MenuBarController;
-///    if a meeting is recording the update sheet is deferred until `stop()` completes.
+///  - Update relaunches are gated on `MenuBarController.isBusy == false`
+///    (no dictation recording/transcribing, no file upload or job in flight).
+///    Sparkle is not started today (see `init`), so this guard is dormant.
 ///  - `SUAutomaticallyUpdate = NO` in Info.plist ensures the user must explicitly click
 ///    "Restart Now" — the app never relaunches silently.
 final class SparkleController: NSObject, SPUUpdaterDelegate {
@@ -14,17 +15,16 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
 
     private var updaterController: SPUStandardUpdaterController
 
-    // MARK: - Meeting guard
+    // MARK: - Busy guard
     // Set by AppDelegate after MenuBarController is ready.
     weak var menuBarController: MenuBarController?
 
     // MARK: - Init
 
     override init() {
-        // We construct the controller but DO NOT start the updater. The Tier 1.5
-        // distribution path uses GitHub Releases via the /wispralt-update slash
-        // command (see scripts/release-client.sh + ~/.claude-dotfiles/commands/
-        // wispralt-update.md). Sparkle's appcast feed is a placeholder URL and
+        // We construct the controller but DO NOT start the updater. Updates come
+        // from `wispralt update --client` (UpdateChecker only notices a release;
+        // see scripts/release-client.sh). Sparkle's appcast feed is a placeholder URL and
         // SUPublicEDKey is unset — starting the updater would background-check
         // a bogus URL and surface "Unable to Check For Updates" dialogs to the
         // user every few hours. When we move to Tier 2 distribution (Apple
@@ -45,33 +45,23 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
         updaterController.checkForUpdates(sender)
     }
 
-    /// Call from MenuBarController when meeting recording starts/stops so Sparkle
-    /// knows whether it may present the update sheet.
-    func meetingStateChanged(isActive: Bool) {
-        if !isActive {
-            // Meeting finished; if a deferred update is pending, Sparkle will retry
-            // on the next scheduled check. No explicit trigger needed.
-            Log.info("Meeting ended — Sparkle updates re-enabled.", category: "update")
-        }
-    }
-
     // MARK: - SPUUpdaterDelegate
 
-    /// Gate update checks: disallow while a meeting is in progress.
+    /// Gate update relaunches: disallow while the app is busy (`isBusy`).
     func updater(
         _ updater: SPUUpdater,
         shouldPostponeRelaunchForUpdate item: SUAppcastItem,
         untilInvokingBlock installHandler: @escaping () -> Void
     ) -> Bool {
-        guard let mbc = menuBarController, mbc.isMeetingActive else {
-            // No meeting active; install immediately.
+        guard let mbc = menuBarController, mbc.isBusy else {
+            // Not busy; install immediately.
             installHandler()
             return false
         }
-        // Meeting active: defer the relaunch. Sparkle will prompt the user again
-        // after the next launch. We do NOT auto-install during an active meeting.
+        // Busy: defer the relaunch. Sparkle will prompt the user again after
+        // the next launch. We do NOT relaunch over a dictation or file job.
         Log.info(
-            "Sparkle update install deferred — meeting recording is active.",
+            "Sparkle update install deferred — dictation or file job in progress.",
             category: "update"
         )
         return true  // true = we take ownership; we intentionally do NOT call installHandler here
@@ -88,7 +78,7 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     /// notification, since the only way this fires today is if someone manually
     /// invokes Sparkle while the appcast is still a placeholder.
     func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
-        Log.error("Sparkle update aborted: \(error.localizedDescription)", category: "update")
+        Log.error("Sparkle update aborted: \(ErrorLog.describe(error))", category: "update")
         menuBarController?.lastUpdateError = error.localizedDescription
     }
 
@@ -106,7 +96,7 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
         error: Error?
     ) {
         if let error {
-            Log.error("Sparkle update cycle finished with error: \(error.localizedDescription)", category: "update")
+            Log.error("Sparkle update cycle finished with error: \(ErrorLog.describe(error))", category: "update")
         }
     }
 }

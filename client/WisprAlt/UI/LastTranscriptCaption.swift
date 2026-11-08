@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import SwiftUI
+import WisprAltCore
 
 /// Observable view-model that watches a folder for filesystem changes and
 /// publishes a relative-time caption (e.g. "just now", "12s ago", "3m ago")
@@ -48,7 +49,7 @@ final class LastTranscriptCaptionViewModel: ObservableObject {
         fd = open(folderURL.path, O_EVTONLY)
         guard fd >= 0 else {
             Log.warning(
-                "LastTranscriptCaptionViewModel: open() failed for \(folderURL.path)",
+                "LastTranscriptCaptionViewModel: open() failed for transcripts folder",
                 category: "captions"
             )
             refresh()
@@ -148,5 +149,30 @@ struct LastTranscriptCaption: View {
         Text(viewModel.captionText)
             .font(.caption)
             .foregroundStyle(.secondary)
+    }
+}
+
+// MARK: - Smart formatting status
+
+extension LastTranscriptCaption {
+    /// Short, fixed label for a Mercury outcome (safe to log: never text).
+    static func formattingLabel(_ f: Formatting) -> String {
+        switch f {
+        case .off: return "off"
+        case .applied: return "applied"
+        case .skipped(let why): return "skipped(\(why))"
+        case .failed(let why): return "failed(\(why))"
+        }
+    }
+
+    /// The caption under the Smart formatting toggle for the last dictation.
+    static func formattingStatus(_ f: Formatting?) -> String? {
+        switch f {
+        case nil, .off?: return nil
+        case .applied?: return "Last dictation: formatted."
+        case .skipped("short")?: return "Last dictation: too short to format (under \(MercuryPolicy.minWords) words)."
+        case .skipped?: return "Last dictation: not formatted — add your OpenRouter key."
+        case .failed(let why)?: return "Last dictation: formatting \(why == "ratio" ? "rejected (changed too much)" : "failed (\(why))"); raw text used."
+        }
     }
 }

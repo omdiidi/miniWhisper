@@ -54,26 +54,6 @@ enum CustomTranscriptionsStore {
 
     // MARK: - Newest-transcript lookup
 
-    /// Newest `.txt` directly under `<meetingsPath>` (non-recursive).
-    /// Excludes directory entries defensively so a future subdirectory promotion
-    /// can't poison the lookup.
-    static func newestMeetingTranscript() -> URL? {
-        let meetingsRoot = Settings.shared.meetingsPath
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: meetingsRoot,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-        let txts = entries.filter {
-            !$0.hasDirectoryPath && $0.pathExtension.lowercased() == "txt"
-        }
-        return txts.max { lhs, rhs in
-            mtime(lhs) < mtime(rhs)
-        }
-    }
-
     /// Newest `.txt` across all per-job subfolders inside `Custom Transcriptions/`.
     static func newestCustomTranscript() -> URL? {
         let root = directoryURL

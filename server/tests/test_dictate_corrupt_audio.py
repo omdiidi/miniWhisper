@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import pytest
 
-from wispralt_server._errors import CorruptAudioError
-from wispralt_server.dictate.parakeet import ParakeetService
+from wispralt._errors import CorruptAudioError
+from wispralt.dictate.parakeet import ParakeetService
 
 
 class TestSyncTranscribeDecodeBoundary:

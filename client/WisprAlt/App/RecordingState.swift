@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import WisprAltCore
 
 // MARK: - RecordingState
 
@@ -23,7 +24,7 @@ final class RecordingState: ObservableObject {
 
     // MARK: - Per-phase progress (server-driven)
 
-    /// Raw phase name from the server (`ffprobe`, `transcribe`, `diarize`, …).
+    /// Raw phase name from the server (`ffprobe`, `ffmpeg_decode`, `transcribe`, `output_write`).
     @Published var phase: String? = nil
     /// Friendly phase label sent by the server (`"Transcribing"`, …). Falls
     /// back to the local map via `phaseLabelDisplay` when absent.
@@ -39,6 +40,9 @@ final class RecordingState: ObservableObject {
     /// Currently-active server job id. Persisted to UserDefaults so a process
     /// restart can resume polling. Nil when no job is in flight.
     @Published var activeJobID: String? = nil
+    /// The running Online file job (never persisted: a quit loses it). Shows
+    /// the in-flight card with Cancel; never touches the Local job fields.
+    @Published var onlineJobID: String? = nil
     /// Set when the user cancelled but the server-side executor is still
     /// running an in-pipeline phase. The popover shows a "Previous job
     /// finishing" banner and blocks new submissions while this is non-nil.
@@ -49,6 +53,28 @@ final class RecordingState: ObservableObject {
     /// label with an indeterminate "Finalizing" progress bar so the UI doesn't
     /// lie about progress during the concat window (can be 1-10s on big files).
     @Published var isFinalizing: Bool = false
+
+    /// Mirror of `MenuBarController.localUploadPhase` (written only by its
+    /// `didSet`). Locks the mode picker while a Local upload has no job id yet.
+    @Published var localUploadPhase: LocalUploadPhase = .none
+
+    /// Mirror of `MenuBarController.dictationsInFlight` (written only by its
+    /// `didSet`). The popover status line shows "transcribing N".
+    @Published var dictationsInFlight: Int = 0
+
+    /// Set by `MenuBarController.openKeyEntry()` (FN pressed in Online with no
+    /// key). The popover reveals Advanced, focuses the OpenAI key field and
+    /// clears it.
+    @Published var keyEntryRequested: Bool = false
+
+    /// Saved recordings in `retry/` (newest first), refreshed by
+    /// `MenuBarController.refreshRetryList()` after every spool operation.
+    @Published var retryItems: [RetryItem] = []
+    /// Result line under the Retry list (last Retry / Export).
+    @Published var retryStatus: String? = nil
+
+    /// Mercury outcome of the last dictation (shown under Smart formatting).
+    @Published var lastFormatting: Formatting? = nil
 
     /// Reset every per-job field. Caller is responsible for also clearing
     /// the UserDefaults `activeJobID` key — `reset()` only touches in-memory
@@ -64,6 +90,7 @@ final class RecordingState: ObservableObject {
         phaseElapsedS = nil
         audioDurationS = nil
         activeJobID = nil
+        serverFinishingJobID = nil
         isFinalizing = false
     }
 
@@ -83,8 +110,6 @@ final class RecordingState: ObservableObject {
         "ffmpeg_decode": "Decoding audio",
         "transcribe_load": "Loading transcription model",
         "transcribe": "Transcribing",
-        "diarize_load": "Loading speaker model",
-        "diarize": "Identifying speakers",
         "merge": "Finalizing transcript",
         "output_write": "Writing outputs",
     ]

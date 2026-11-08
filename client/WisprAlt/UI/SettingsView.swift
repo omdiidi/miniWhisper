@@ -1,6 +1,7 @@
 import SwiftUI
 import ServiceManagement
 import AppKit
+import WisprAltCore
 
 /// Lightweight Apple-glass card used for the active-job indicator and other
 /// emphasis surfaces inside the popover. Kept private + inline because the
@@ -25,13 +26,17 @@ private struct GlassCard<Content: View>: View {
 /// Main settings panel hosted in the menubar popover.
 ///
 /// Layout is user-priority ordered:
-///   1. Quick Actions — admin portal + meetings folder shortcuts
-///   2. Connection status with a working Test button
-///   3. Hotkey timing + launch-at-login (frequently-tweaked)
-///   4. Meetings folder picker
-///   5. Advanced (collapsed) — server URL, API key, key export/import
+///   1. Mode picker — Online (OpenAI) / Local server
+///   2. Quick Actions — file transcription, admin portal + transcripts folder shortcuts
+///   3. Connection status with a working Test button (Local)
+///   4. Hotkey timing + launch-at-login (frequently-tweaked)
+///   5. Transcripts folder picker
+///   6. Advanced (collapsed) — OpenAI model + key; server URL, API key, key export/import (Local)
+///
+/// In Online every server-only row is hidden behind one `isLocal` predicate.
 struct SettingsView: View {
     @EnvironmentObject private var settings: Settings
+    @EnvironmentObject private var recordingState: RecordingState
 
     // MARK: - Local ephemeral state
 
@@ -49,19 +54,10 @@ struct SettingsView: View {
     @State private var isTesting: Bool = false
     /// File picker presented when "Browse" is tapped.
     @State private var showingFolderPicker: Bool = false
-    /// Error message shown below the export/import buttons when an operation fails.
-    @State private var exportImportError: String?
-    /// Reveals the Server URL / API Key / Export-Import block at the bottom of the form.
+    /// Reveals the Server URL / API Key block at the bottom of the form.
     @State private var showAdvanced: Bool = false
-    @State private var copyFeedback: String?
-    @State private var hasStoredAPIKey: Bool = false
-    /// Shown for ~5s when UpdateChecker.triggerInstall() couldn't open Terminal
-    /// (TCC denied / Terminal missing) and fell back to copying the install
-    /// command to the clipboard. Listens for `.updaterFallbackToClipboard`.
-    @State private var updateFallbackToastVisible: Bool = false
-    /// Shown for ~5s when the user pressed "Install now…" while a meeting was
-    /// recording. Listens for `.updaterMeetingActive`.
-    @State private var updateMeetingActiveToastVisible: Bool = false
+    /// Shown for ~5s after "Copy update command". Listens for `.updaterCommandCopied`.
+    @State private var updateCopiedVisible: Bool = false
 
     // Identity (display_name) editing state. Tri-state Optional<String> fixes the
     // snap-back bug:
@@ -72,6 +68,22 @@ struct SettingsView: View {
     @State private var savingName: Bool = false
     @State private var nameError: String?
 
+    // OpenAI key entry (Advanced). The field never shows the stored key.
+    @State private var openAIKeyText: String = ""
+    @State private var hasOpenAIKey: Bool = false
+    @State private var openAIKeyError: String?
+    @FocusState private var openAIKeyFocused: Bool
+    // OpenRouter key entry (Smart formatting). Read only while the toggle is on.
+    @State private var openRouterKeyText: String = ""
+    @State private var hasOpenRouterKey: Bool = false
+    /// Last Local `/healthz` result for the status line (nil = not checked yet).
+    /// Checked only on popover open in Local or on a switch to Local.
+    @State private var localHealthy: Bool? = nil
+
+    /// Server-only rows (connection, server, API key, identity, portal links,
+    /// server log) exist only in Local mode.
+    private var isLocal: Bool { settings.mode == .local }
+
     private enum ConnectionFeedbackKind {
         case neutral, success, warning, error
     }
@@ -80,33 +92,147 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            modeSection
             quickActionsSection
-            connectionSection
+            if isLocal {
+                connectionSection
+            }
             inputMicSection
             smartFormattingSection
-            // v0.4.6: streamingDictationSection removed — streaming is always on.
-            // The DictationRecorder hardcodes `streamingEnabledForThisSession = true`
-            // at start(), so no user-facing toggle. No
-            // Settings flag exists (the old streamingDictation property was removed).
+            // No streaming toggle: Local dictation always streams; Online never does.
             hotkeySection
             launchAtLoginSection
-            meetingsFolderSection
+            transcriptsFolderSection
             advancedToggleSection
             if showAdvanced {
                 updateSection
-                serverSection
-                apiKeySection
-                apiKeyExportImportSection
+                openAIModelSection
+                openAIKeySection
+                if isLocal {
+                    serverSection
+                    apiKeySection
+                }
                 aboutAndQuitSection
             }
-            identitySection
+            if isLocal {
+                identitySection
+            }
         }
         .formStyle(.grouped)
         .frame(width: 360)
-        .onAppear(perform: loadCurrentValues)
+        .onAppear {
+            loadCurrentValues()
+            handleKeyEntryRequest()
+            checkLocalHealth()
+        }
+        .onChange(of: settings.mode) { _, _ in checkLocalHealth() }
+        .onChange(of: recordingState.keyEntryRequested) { _, _ in handleKeyEntryRequest() }
     }
 
     // MARK: - Sections
+
+    /// Online (OpenAI) / Local server. A change applies to the next dictation;
+    /// locked while a Local upload has no server job id yet.
+    private var modeSection: some View {
+        Section {
+            Picker("Mode", selection: Binding(
+                get: { settings.mode },
+                set: { MenuBarController.shared?.applyModeSwitch(to: $0) }
+            )) {
+                Text("Online (OpenAI)").tag(TranscriptionMode.online)
+                Text("Local server").tag(TranscriptionMode.local)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(recordingState.localUploadPhase.locksModePicker)
+            if recordingState.localUploadPhase.locksModePicker {
+                Text("Finish or cancel the upload first")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(statusLine)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            SpendLine()
+        }
+    }
+
+    /// `Online · <model> · key saved|key missing` (key presence only, no
+    /// network) or `Local · <host>` (+ last `/healthz`), plus "transcribing N".
+    private var statusLine: String {
+        var parts: [String]
+        if isLocal {
+            parts = ["Local", settings.serverURL?.host() ?? "no server set"]
+            if let ok = localHealthy { parts.append(ok ? "reachable" : "unreachable") }
+        } else {
+            parts = ["Online", settings.openAIModel, hasOpenAIKey ? "key saved" : "key missing"]
+        }
+        if recordingState.dictationsInFlight > 0 {
+            parts.append("transcribing \(recordingState.dictationsInFlight)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// OpenAI model picker: id, small price text and retire tag per row.
+    /// Applies to the next dictation (the snapshot is taken at FN press).
+    private var openAIModelSection: some View {
+        Section("OpenAI Model") {
+            Picker("Model", selection: $settings.openAIModel) {
+                ForEach(OpenAIModels.all) { m in
+                    HStack(spacing: 6) {
+                        Text(m.id)
+                        Text(m.displayPrice).font(.caption).foregroundStyle(.secondary)
+                        if let tag = m.retireTag {
+                            Text(tag).font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                    .tag(m.id)
+                }
+            }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+            Text("Files always use a file model. Dictation stops at "
+                 + "\(OpenAIModels.resolve(id: settings.openAIModel).dictationCapSeconds / 60) min for this model.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Live models stream audio while you hold FN and give the text when you release it "
+                 + "(no text while speaking). They cost about 3.8× gpt-transcribe.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// OpenAI key (Keychain `co.wispralt.openai` / `default`). Saved via the
+    /// field or from Terminal; either works while the app runs.
+    private var openAIKeySection: some View {
+        Section("OpenAI API Key") {
+            HStack {
+                SecureField(hasOpenAIKey ? "Key saved — paste to replace" : "Paste OpenAI API key…",
+                            text: $openAIKeyText)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($openAIKeyFocused)
+                    .onSubmit(saveOpenAIKey)
+                Button("Save", action: saveOpenAIKey)
+                    .disabled(openAIKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Remove", role: .destructive, action: removeOpenAIKey)
+                    .disabled(!hasOpenAIKey)
+            }
+            Text(hasOpenAIKey ? "Key saved" : "Key missing")
+                .font(.caption)
+                .foregroundStyle(hasOpenAIKey ? .green : .orange)
+            Text("Or from Terminal:")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("security add-generic-password -U -s co.wispralt.openai -a default -w")
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            if let err = openAIKeyError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
 
     /// Top of the popover: the actions a daily user actually reaches for.
     /// Delegates to `QuickActionsSection` so the file-watcher view-models can
@@ -122,6 +248,17 @@ struct SettingsView: View {
         }
     }
 
+    /// `MenuBarController.localFileJobActiveOrSaved` (the invite guard's
+    /// predicate): changing the Local server URL or key now would point that
+    /// job at another server and strand its transcript. Re-read on every
+    /// render; `localUploadPhase` / `activeJobID` publish its changes.
+    private var localServerConfigLocked: Bool {
+        MenuBarController.shared?.localFileJobActiveOrSaved ?? false
+    }
+
+    private static let localServerConfigLockedCaption =
+        "Locked while a Local file transcription is running or waiting to resume."
+
     private var serverSection: some View {
         Section("Server") {
             VStack(alignment: .leading, spacing: 4) {
@@ -129,7 +266,13 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(commitServerURL)
                     .autocorrectionDisabled()
+                    .disabled(localServerConfigLocked)
 
+                if localServerConfigLocked {
+                    Text(Self.localServerConfigLockedCaption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if let err = serverURLError {
                     Text(err)
                         .font(.caption)
@@ -145,14 +288,22 @@ struct SettingsView: View {
             SecureField("Paste API key…", text: $apiKeyText)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(commitAPIKey)
+                .disabled(localServerConfigLocked)
+            if localServerConfigLocked {
+                Text(Self.localServerConfigLockedCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Text("Stored securely in your macOS Keychain.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
     }
 
-    private var meetingsFolderSection: some View {
-        Section("Meetings Folder") {
+    /// Where file-transcription outputs are saved (`Settings.meetingsPath`;
+    /// the property/key name is kept so existing transcripts stay put).
+    private var transcriptsFolderSection: some View {
+        Section("Transcripts Folder") {
             HStack {
                 Text(settings.meetingsPath.path)
                     .lineLimit(1)
@@ -184,30 +335,6 @@ struct SettingsView: View {
                 }
             }
             .help("Minimum FN-hold time before dictation starts.")
-
-            LabeledContent("Triple-tap window (s)") {
-                Stepper(
-                    value: $settings.tripleTapWindow,
-                    in: 0.20...1.00,
-                    step: 0.05
-                ) {
-                    Text(String(format: "%.2f", settings.tripleTapWindow))
-                        .monospacedDigit()
-                }
-            }
-            .help("Maximum time between taps to count as a triple-tap.")
-
-            LabeledContent("Max meeting length (min)") {
-                Stepper(
-                    value: $settings.maxMeetingMinutes,
-                    in: 5...240,
-                    step: 5
-                ) {
-                    Text("\(settings.maxMeetingMinutes)")
-                        .monospacedDigit()
-                }
-            }
-            .help("Maximum meeting recording duration (5–240 min). Default 90.")
         }
     }
 
@@ -225,75 +352,7 @@ struct SettingsView: View {
         }
     }
 
-    private var apiKeyExportImportSection: some View {
-        Section("API Key Backup") {
-            HStack {
-                Button("Copy API Key") {
-                    copyAPIKeyToClipboard()
-                }
-                .disabled(!hasStoredAPIKey)
-                .help(hasStoredAPIKey ? "Copy your API key. Auto-cleared from clipboard after 60 seconds." : "Paste an API key first")
-
-                Button("Export API Key…") {
-                    let panel = NSSavePanel()
-                    panel.allowedContentTypes = [.text]
-                    panel.nameFieldStringValue = "wispralt-api-key.wispralt-key"
-                    panel.directoryURL = FileManager.default.urls(
-                        for: .desktopDirectory, in: .userDomainMask
-                    ).first
-                    panel.message = "Exports your API key. Treat this file like a password."
-                    guard panel.runModal() == .OK, let url = panel.url else { return }
-                    do {
-                        try KeychainHelper.exportAPIKey(to: url)
-                        exportImportError = nil
-                    } catch {
-                        Log.error("API key export failed: \(error)", category: "storage")
-                        exportImportError = "Export failed: \(error.localizedDescription)"
-                    }
-                }
-
-                Button("Import API Key…") {
-                    let panel = NSOpenPanel()
-                    panel.allowedContentTypes = [.text]
-                    panel.directoryURL = FileManager.default.urls(
-                        for: .desktopDirectory, in: .userDomainMask
-                    ).first
-                    panel.message = "Importing replaces any existing API key in the Keychain."
-                    guard panel.runModal() == .OK, let url = panel.url else { return }
-                    do {
-                        try KeychainHelper.importAPIKey(from: url)
-                        exportImportError = nil
-                        // Refresh the in-memory text field so the UI reflects the new key.
-                        do {
-                            apiKeyText = (try KeychainHelper.getAPIKey()) ?? ""
-                        } catch {
-                            Log.error("Failed to re-read API key after import: \(error)", category: "settings")
-                        }
-                    } catch {
-                        Log.error("API key import failed: \(error)", category: "storage")
-                        exportImportError = "Import failed: \(error.localizedDescription)"
-                    }
-                }
-            }
-
-            Text("Save exports to your Desktop, not Documents (Documents may sync to iCloud).")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            if let msg = exportImportError {
-                Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-            if let msg = copyFeedback {
-                Text(msg)
-                    .font(.caption)
-                    .foregroundStyle(.green)
-            }
-        }
-    }
-
-    /// Update awareness — shows "Update available: vX.Y.Z" + Install button when
+    /// Update awareness — shows "Update available: vX.Y.Z" + a copy-command button when
     /// `Settings.shared.updateAvailable` is set; otherwise shows the current
     /// version + a manual "Check for updates" button. Set by UpdateChecker.
     private var updateSection: some View {
@@ -305,13 +364,13 @@ struct SettingsView: View {
                     Text("Update available: v\(remote)")
                         .font(.body.weight(.medium))
                     Spacer()
-                    Button("Install now…") {
-                        UpdateChecker.shared.triggerInstall()
+                    Button("Copy update command") {
+                        UpdateChecker.shared.copyUpdateCommand()
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
                 }
-                Text("Opens Terminal to download and install the latest WisprAlt. The current version will quit during the install.")
+                Text("Run `\(UpdateChecker.updateCommand)` in Terminal. It updates and reinstalls WisprAlt, which quits during the install, so finish any dictation or file transcription first.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -325,31 +384,18 @@ struct SettingsView: View {
                     .buttonStyle(.bordered)
                 }
             }
-            if updateFallbackToastVisible {
-                Text("Couldn't open Terminal — install command copied to clipboard. Paste it into a new Terminal window.")
+            if updateCopiedVisible {
+                Text("Copied. Paste it into Terminal and press Return.")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .transition(.opacity)
             }
-            if updateMeetingActiveToastVisible {
-                Text("Finish your current meeting recording before installing — the installer will quit the app.")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .transition(.opacity)
-            }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .updaterFallbackToClipboard)) { _ in
-            updateFallbackToastVisible = true
+        .onReceive(NotificationCenter.default.publisher(for: .updaterCommandCopied)) { _ in
+            updateCopiedVisible = true
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
-                updateFallbackToastVisible = false
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .updaterMeetingActive)) { _ in
-            updateMeetingActiveToastVisible = true
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
-                updateMeetingActiveToastVisible = false
+                updateCopiedVisible = false
             }
         }
     }
@@ -427,24 +473,59 @@ struct SettingsView: View {
         )
     }
 
-    /// Smart-formatting toggle. Off by default. Adds light cleanup to longer
-    /// dictations (punctuation, capitalization, paragraph breaks) without
-    /// changing the words you said. Adds a small amount of latency.
+    /// Smart-formatting toggle (Mercury 2 on OpenRouter, run by this app in
+    /// both modes). Off by default. Sends the dictated text, never audio.
     private var smartFormattingSection: some View {
         Section {
             Toggle("Smart formatting", isOn: Binding(
                 get: { settings.smartFormatting },
-                set: { settings.smartFormatting = $0 }
+                set: { settings.smartFormatting = $0; if $0 { hasOpenRouterKey = OpenRouterKey.current() != nil } }
             ))
-            Text("Adds light cleanup — punctuation, capitalization, paragraph breaks — to longer dictations. Your wording is preserved. Off by default.")
+            Text("Adds light cleanup — punctuation, capitalization, paragraph breaks — to dictations of \(MercuryPolicy.minWords)+ words. Your wording is preserved. Off by default.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if settings.smartFormatting {
+                Text("Privacy: the dictated text (never audio) is sent to OpenRouter (Mercury 2) for cleanup.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    SecureField(hasOpenRouterKey ? "Key saved — paste to replace" : "Paste OpenRouter API key…",
+                                text: $openRouterKeyText)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(saveOpenRouterKey)
+                    Button("Save", action: saveOpenRouterKey)
+                        .disabled(openRouterKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Remove", role: .destructive) {
+                        do { try OpenRouterKey.remove(); hasOpenRouterKey = false } catch {
+                            Log.error("OpenRouter key remove failed: \(ErrorLog.describe(error))", category: "settings")
+                        }
+                    }
+                    .disabled(!hasOpenRouterKey)
+                }
+                Text(hasOpenRouterKey ? "OpenRouter key saved" : "OpenRouter key missing")
+                    .font(.caption)
+                    .foregroundStyle(hasOpenRouterKey ? .green : .orange)
+                if let status = LastTranscriptCaption.formattingStatus(recordingState.lastFormatting) {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
+            }
         } header: { Text("Quality") }
     }
 
-    /// Input mic picker — applies ONLY to WisprAlt's own dictation. Meeting
-    /// recording uses the macOS system default (SCStream has no per-stream
-    /// device API). The picker shows live AVCaptureDevice discovery results.
+    private func saveOpenRouterKey() {
+        let trimmed = openRouterKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try OpenRouterKey.save(trimmed)
+            openRouterKeyText = ""
+            hasOpenRouterKey = true
+        } catch {
+            Log.error("OpenRouter key save failed: \(ErrorLog.describe(error))", category: "settings")
+        }
+    }
+
+    /// Input mic picker — applies ONLY to WisprAlt's own dictation. The picker
+    /// shows live AVCaptureDevice discovery results.
     private var inputMicSection: some View {
         Section("Input Mic") {
             Picker("", selection: micSelectionBinding) {
@@ -457,7 +538,7 @@ struct SettingsView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .help("Choose which mic WisprAlt uses for dictation. Meeting recording always uses the macOS system default.")
+            .help("Choose which mic WisprAlt uses for dictation.")
         }
         .onAppear {
             availableMics = MicEnumerator.availableInputs()
@@ -515,29 +596,79 @@ struct SettingsView: View {
     // MARK: - Actions
 
     private func loadCurrentValues() {
+        hasOpenAIKey = OpenAIKey.current() != nil
+        if settings.smartFormatting { hasOpenRouterKey = OpenRouterKey.current() != nil }
         serverURLText = settings.serverURL?.absoluteString ?? ""
+        // The Local key is read only in Local mode (its rows are hidden in Online).
+        guard isLocal else { return }
         // Load API key from Keychain (not from Settings).
         do {
             apiKeyText = (try KeychainHelper.getAPIKey()) ?? ""
         } catch {
-            Log.error("Failed to read API key from Keychain: \(error)", category: "settings")
+            Log.error("Failed to read API key from Keychain: \(ErrorLog.describe(error))", category: "settings")
         }
-        hasStoredAPIKey = ((try? KeychainHelper.getAPIKey()) ?? nil)?.isEmpty == false
+    }
+
+    /// Local `/healthz` for the status line. Never runs in Online (the Local
+    /// host is not contacted there).
+    private func checkLocalHealth() {
+        localHealthy = nil
+        guard isLocal, settings.serverURL != nil else { return }
+        Task {
+            let ok = (try? await ServerClient.shared.healthz()) ?? false
+            await MainActor.run { if isLocal { localHealthy = ok } }
+        }
+    }
+
+    /// FN pressed in Online with no key: reveal Advanced and focus the key field.
+    private func handleKeyEntryRequest() {
+        guard recordingState.keyEntryRequested else { return }
+        recordingState.keyEntryRequested = false
+        showAdvanced = true
+        DispatchQueue.main.async { openAIKeyFocused = true }
+    }
+
+    private func saveOpenAIKey() {
+        let trimmed = openAIKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try OpenAIKey.save(trimmed)
+            openAIKeyText = ""
+            openAIKeyError = nil
+            hasOpenAIKey = true
+            Log.info("OpenAI key saved to Keychain.", category: "settings")
+        } catch {
+            Log.error("OpenAI key save failed: \(ErrorLog.describe(error))", category: "settings")
+            openAIKeyError = "Could not save the key to the Keychain."
+        }
+    }
+
+    private func removeOpenAIKey() {
+        do {
+            try OpenAIKey.remove()
+            openAIKeyError = nil
+            hasOpenAIKey = false
+            Log.info("OpenAI key removed from Keychain.", category: "settings")
+        } catch {
+            Log.error("OpenAI key remove failed: \(ErrorLog.describe(error))", category: "settings")
+            openAIKeyError = "Could not remove the key from the Keychain."
+        }
     }
 
     private func commitServerURL() {
+        guard !localServerConfigLocked else { return }
         serverURLError = nil
         let trimmed = serverURLText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             settings.serverURL = nil
             return
         }
-        guard let url = URL(string: trimmed), url.scheme == "https" else {
-            serverURLError = "URL must begin with https://"
+        guard let url = URL(string: trimmed), LocalURLPolicy.isAllowed(url) else {
+            serverURLError = LocalURLPolicy.hint
             return
         }
         settings.serverURL = url
-        Log.info("Server URL saved: \(url.absoluteString)", category: "settings")
+        Log.info("Server URL saved.", category: "settings")
     }
 
     /// Commit the in-progress `nameDraft` to the server via `PATCH /me`.
@@ -564,53 +695,21 @@ struct SettingsView: View {
             nameDraft = nil   // exit edit mode ONLY on success
             nameError = nil
         } catch {
-            Log.warning("display_name update failed: \(error)", category: "settings")
+            Log.warning("display_name update failed: \(ErrorLog.describe(error))", category: "settings")
             nameError = "Couldn't save: \(error.localizedDescription)"
             // KEEP nameDraft so user can retry without retyping.
         }
     }
 
     private func commitAPIKey() {
+        guard !localServerConfigLocked else { return }
         let trimmed = apiKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
             try KeychainHelper.setAPIKey(trimmed)
             Log.info("API key saved to Keychain.", category: "settings")
         } catch {
-            Log.error("Failed to save API key: \(error)", category: "settings")
-        }
-    }
-
-    private func copyAPIKeyToClipboard() {
-        do {
-            guard let key = try KeychainHelper.getAPIKey(), !key.isEmpty else {
-                copyFeedback = "No API key to copy."
-                return
-            }
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(key, forType: .string)
-            let mark = pb.changeCount  // post-write changeCount
-            copyFeedback = "Copied! Auto-clearing in 60s."
-            Log.info("API key copied to clipboard.", category: "settings")
-
-            // Two timers: caption fades fast, clipboard auto-clears slow.
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 2 * 1_000_000_000)
-                copyFeedback = nil
-            }
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
-                if NSPasteboard.general.changeCount == mark {
-                    NSPasteboard.general.clearContents()
-                    Log.info("Auto-cleared API key from clipboard (changeCount unchanged).", category: "settings")
-                } else {
-                    Log.info("Skipped clipboard auto-clear — pasteboard changed.", category: "settings")
-                }
-            }
-        } catch {
-            Log.error("Copy API key failed: \(error)", category: "settings")
-            copyFeedback = "Copy failed: \(error.localizedDescription)"
+            Log.error("Failed to save API key: \(ErrorLog.describe(error))", category: "settings")
         }
     }
 
@@ -620,9 +719,9 @@ struct SettingsView: View {
             // Gain a security-scoped bookmark for sandboxed access (future hardened runtime use).
             _ = url.startAccessingSecurityScopedResource()
             settings.meetingsPath = url
-            Log.info("Meetings folder set to: \(url.path)", category: "settings")
+            Log.info("Transcripts folder set.", category: "settings")
         case .failure(let error):
-            Log.error("Folder picker failed: \(error)", category: "settings")
+            Log.error("Folder picker failed: \(ErrorLog.describe(error))", category: "settings")
         }
     }
 
@@ -634,7 +733,6 @@ struct SettingsView: View {
     /// Probes in parallel:
     ///   - /healthz                  — server process alive at all
     ///   - /readyz/dictation         — Parakeet model loaded
-    ///   - /readyz/meeting           — meeting pipeline RAM-ready
     ///   - /me (authenticated)       — API key + Supabase user lookup work
     ///
     /// Surfaces a single status line color-coded green/orange/red.
@@ -653,12 +751,10 @@ struct SettingsView: View {
             do {
                 async let healthOK = client.healthz()
                 async let dictationReady = client.readyz(endpoint: "dictation")
-                async let meetingReady = client.readyz(endpoint: "meeting")
                 async let meAuth = MeAPI.get()      // verifies API key end-to-end
 
                 let h = try await healthOK
                 let d = try await dictationReady
-                let m = try await meetingReady
                 let me = try await meAuth           // throws .unauthorized on bad key
 
                 await MainActor.run {
@@ -669,24 +765,14 @@ struct SettingsView: View {
                         return
                     }
                     let who = me.display_name ?? me.label ?? "you"
-                    if d.ok && m.ok {
+                    if d.ok {
                         connectionFeedback = d.degraded
-                            ? "Connected as \(who) — dictation degraded (meeting using memory)"
-                            : "Connected as \(who) — dictation + meeting ready."
+                            ? "Connected as \(who) — dictation degraded (file job using memory)"
+                            : "Connected as \(who) — dictation ready."
                         connectionFeedbackKind = d.degraded ? .warning : .success
                         return
                     }
-                    if d.ok && !m.ok {
-                        connectionFeedback = "Connected as \(who) — meeting pipeline still loading."
-                        connectionFeedbackKind = .warning
-                        return
-                    }
-                    if !d.ok && m.ok {
-                        connectionFeedback = "Connected as \(who) — dictation pipeline still loading."
-                        connectionFeedbackKind = .warning
-                        return
-                    }
-                    connectionFeedback = "Connected as \(who) — pipelines still loading."
+                    connectionFeedback = "Connected as \(who) — dictation pipeline still loading."
                     connectionFeedbackKind = .warning
                 }
             } catch ServerError.unauthorized {
@@ -712,23 +798,14 @@ struct SettingsView: View {
         guard let base = settings.serverURL else { return }
         let url = base.appendingPathComponent("admin/login")
         NSWorkspace.shared.open(url)
-        Log.info("Opened portal: \(url.absoluteString)", category: "settings")
-    }
-
-    /// Reveal the meetings folder in Finder.
-    private func openMeetingsFolder() {
-        let url = settings.meetingsPath
-        // Make sure the directory exists; opening a non-existent path silently no-ops.
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(url)
-        Log.info("Opened meetings folder: \(url.path)", category: "settings")
+        Log.info("Opened portal.", category: "settings")
     }
 }
 
 // MARK: - QuickActionsSection
 
-/// Top-of-popover Section. Owns two `LastTranscriptCaptionViewModel` instances
-/// (meetings + custom transcriptions) so they can be `@StateObject`-bound,
+/// Top-of-popover Section. Owns the custom-transcriptions
+/// `LastTranscriptCaptionViewModel` so it can be `@StateObject`-bound,
 /// which is impossible inside `SettingsView`'s computed `quickActionsSection`.
 ///
 /// Lifetime mirrors the popover: watchers `start()` in `.onAppear`, `stop()`
@@ -741,11 +818,12 @@ private struct QuickActionsSection: View {
     /// SwiftUI `.sheet(isPresented:)` lifecycle drives the fetch.
     @State private var showingServerLogSheet: Bool = false
 
-    /// True while the current activeJobID indicates a transcription is in
-    /// flight (post-upload, post-cancel-with-server-still-finishing, or
+    /// True while a file job is in flight: the Online job, or a Local one
+    /// (post-upload, post-cancel-with-server-still-finishing, or
     /// resumed-from-launch). Used to gate Cancel + View-server-log controls.
     private var hasInFlightJob: Bool {
-        recordingState.activeJobID != nil
+        recordingState.onlineJobID != nil
+            || recordingState.activeJobID != nil
             || recordingState.serverFinishingJobID != nil
             || recordingState.uploadFraction > 0
             || recordingState.uploadError != nil
@@ -758,21 +836,11 @@ private struct QuickActionsSection: View {
         recordingState.activeJobID ?? recordingState.serverFinishingJobID
     }
 
-    // Known limitation: the watcher folder URLs below are captured ONCE at
+    // Known limitation: the watcher folder URL below is captured ONCE at
     // struct-init time. If the user changes `Settings.shared.meetingsPath`
-    // mid-session, the watchers keep pointing at the OLD URL until the popover
-    // is destroyed and recreated. Acceptable: meetings-path changes are rare
-    // and the popover is `.transient`, so reopening it picks up the new path.
-    @StateObject private var meetingViewModel = LastTranscriptCaptionViewModel(
-        folderURL: Settings.shared.meetingsPath,
-        lookup: {
-            CustomTranscriptionsStore.newestMeetingTranscript().flatMap {
-                try? $0.resourceValues(forKeys: [.contentModificationDateKey])
-                    .contentModificationDate
-            }
-        }
-    )
-
+    // mid-session, the watcher keeps pointing at the OLD URL until the popover
+    // is destroyed and recreated. Acceptable: transcripts-folder changes are
+    // rare and the popover is `.transient`, so reopening it picks up the new path.
     @StateObject private var customViewModel = LastTranscriptCaptionViewModel(
         folderURL: CustomTranscriptionsStore.directoryURL,
         lookup: {
@@ -787,15 +855,18 @@ private struct QuickActionsSection: View {
     /// fired so the toast renders directly beneath the right one.
     @State private var copyToast: (button: String, message: String)?
 
+    /// Server-only rows are hidden (or disabled) in Online.
+    private var isLocal: Bool { settings.mode == .local }
+
     var body: some View {
         Section {
-            // v0.5.0: surface most-recent server-persisted dictation so the
-            // user can re-paste it without rummaging through the portal.
+            // The last dictation's text, saved on this Mac before any paste
+            // (both modes; 7 days).
             Button("Copy last dictation", systemImage: "doc.on.clipboard") {
                 performLastDictationCopy()
             }
             .buttonStyle(.bordered)
-            .help("Copies the text of your most recent persisted dictation. May lag your current dictation by a second or two while it finalizes server-side.")
+            .help("Copies the text of your most recent dictation (kept on this Mac for 7 days).")
 
             if let toast = copyToast, toast.button == "last-dictation" {
                 Text(toast.message)
@@ -812,36 +883,30 @@ private struct QuickActionsSection: View {
                 inFlightSection
             }
 
+            if !recordingState.retryItems.isEmpty {
+                retrySection
+            }
+            Text("Saved text and failed recordings stay on this Mac for 7 days, protected by FileVault.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             Button("Transcribe file…", systemImage: "waveform.badge.plus") {
                 MenuBarController.shared?.transcribePickedFile()
             }
             .buttonStyle(.borderedProminent)
             .tint(.accentColor)
-            .disabled(recordingState.serverFinishingJobID != nil)
+            .disabled(isLocal && recordingState.serverFinishingJobID != nil)
             .help(
-                recordingState.serverFinishingJobID != nil
+                !isLocal
+                    ? "Pick any audio or video file. WisprAlt sends it to OpenAI and saves TXT + JSON."
+                    : recordingState.serverFinishingJobID != nil
                     ? "A previous transcription is still finishing on the server. New uploads are blocked until it completes."
-                    : "Pick any audio or video file. WisprAlt transcodes it locally and runs it through the meeting pipeline."
+                    : "Pick any audio or video file. WisprAlt extracts the audio locally and the server transcribes it."
             )
-
-            // Last-meeting copy + age on one row.
-            HStack(spacing: 6) {
-                Button("Copy last meeting", systemImage: "doc.on.clipboard") {
-                    performCopy(button: "meeting", source: CustomTranscriptionsStore.newestMeetingTranscript)
-                }
-                .buttonStyle(.bordered)
-                .disabled(meetingViewModel.lastModified == nil)
-                .help(meetingViewModel.lastModified == nil
-                      ? "No meeting transcripts yet."
-                      : "Copy the most recent meeting transcript to the clipboard.")
-                Spacer(minLength: 8)
-                LastTranscriptCaption(viewModel: meetingViewModel)
-            }
-            if let toast = copyToast, toast.button == "meeting" {
-                Text(toast.message)
+            if !isLocal {
+                Text("Online saves TXT + JSON. Subtitles (SRT/VTT) need Local mode.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .transition(.opacity)
             }
 
             // Last-custom copy + age on one row.
@@ -864,8 +929,8 @@ private struct QuickActionsSection: View {
                     .transition(.opacity)
             }
 
-            // v0.4.6 ordering: Open File Transcriptions sits right above Open Meetings
-            // Folder (the two "show me my outputs" buttons paired). Open Portal moved
+            // v0.4.6 ordering: Open File Transcriptions sits right above Open
+            // Transcripts Folder (the two "show me my outputs" buttons paired). Open Portal moved
             // to the bottom of the list (least-frequently-clicked of the three).
             Button("Open File Transcriptions", systemImage: "folder.badge.questionmark") {
                 let url = CustomTranscriptionsStore.directoryURL
@@ -874,64 +939,104 @@ private struct QuickActionsSection: View {
                     withIntermediateDirectories: true
                 )
                 NSWorkspace.shared.open(url)
-                Log.info("Opened custom transcriptions folder: \(url.path)", category: "settings")
+                Log.info("Opened custom transcriptions folder.", category: "settings")
             }
             .buttonStyle(.bordered)
             .help("Opens the File Transcriptions folder in Finder.")
 
-            Button("Open Meetings Folder", systemImage: "folder") {
+            Button("Open Transcripts Folder", systemImage: "folder") {
                 let url = settings.meetingsPath
                 try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
                 NSWorkspace.shared.open(url)
-                Log.info("Opened meetings folder: \(url.path)", category: "settings")
+                Log.info("Opened transcripts folder.", category: "settings")
             }
             .buttonStyle(.bordered)
             .help("Opens \(settings.meetingsPath.path) in Finder.")
 
-            Button("Open Portal", systemImage: "safari") {
-                guard let base = settings.serverURL else { return }
-                let url = base.appendingPathComponent("admin/login")
-                NSWorkspace.shared.open(url)
-                Log.info("Opened portal: \(url.absoluteString)", category: "settings")
+            if isLocal {
+                serverLinks
             }
-            .buttonStyle(.bordered)
-            .disabled(settings.serverURL == nil)
-            .help(
-                settings.serverURL == nil
-                    ? "Set a Server URL under Advanced first."
-                    : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
-            )
-
-            // v0.5.0: deep-link through /me/login?next=/me/history so first-time users
-            // land directly on their history after auth.
-            Button("Open My Dictations", systemImage: "list.bullet.rectangle") {
-                guard let base = settings.serverURL else { return }
-                var comps = URLComponents(url: base.appendingPathComponent("me/login"),
-                                          resolvingAgainstBaseURL: false)
-                comps?.queryItems = [URLQueryItem(name: "next", value: "/me/history")]
-                guard let url = comps?.url else { return }
-                NSWorkspace.shared.open(url)
-                Log.info("Opened /me/login?next=/me/history: \(url.absoluteString)", category: "settings")
-            }
-            .buttonStyle(.bordered)
-            .disabled(settings.serverURL == nil)
-            .help(
-                settings.serverURL == nil
-                    ? "Set a Server URL under Advanced first."
-                    : "Opens your personal dictation + meeting history in the browser."
-            )
         }
         .onAppear {
-            meetingViewModel.start()
             customViewModel.start()
+            Task { await MenuBarController.shared?.refreshRetryList() }
         }
         .onDisappear {
-            meetingViewModel.stop()
             customViewModel.stop()
         }
         .sheet(isPresented: $showingServerLogSheet) {
             ServerLogSheet(jobIDProvider: { serverLogJobID })
         }
+    }
+
+    /// "Retry N": saved recordings (newest 2, 7 days). Actions per entry come
+    /// from `RetryEntries.actions` for the current mode.
+    private var retrySection: some View {
+        DisclosureGroup("Retry \(recordingState.retryItems.count)") {
+            ForEach(recordingState.retryItems) { item in
+                let plan = RetryEntries.actions(sidecar: item.sidecar, currentMode: settings.mode)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(Self.retryCaption(item))
+                        .font(.caption)
+                    HStack {
+                        if plan.actions.contains(.retry) {
+                            Button("Retry") { MenuBarController.shared?.retrySaved(item.id) }
+                        }
+                        Button("Export…") { MenuBarController.shared?.exportSaved(item) }
+                        Button("Discard") { MenuBarController.shared?.discardSaved(item.id) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    if let hint = plan.hint {
+                        Text(hint).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let status = recordingState.retryStatus {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// "5 min ago · 0:42 · Online".
+    private static func retryCaption(_ item: RetryItem) -> String {
+        let age = RelativeDateTimeFormatter().localizedString(for: item.createdAt, relativeTo: Date())
+        let secs = Int(item.durationSeconds.rounded())
+        let mode = SpoolSidecar.decode(item.sidecar).map { $0.mode == .online ? "Online" : "Local" } ?? "unknown mode"
+        return "\(age) · \(secs / 60):\(String(format: "%02d", secs % 60)) · \(mode)"
+    }
+
+    /// Open Portal + Open My Dictations (Local only).
+    @ViewBuilder
+    private var serverLinks: some View {
+        Button("Open Portal", systemImage: "safari") {
+            guard let base = settings.serverURL, let url = LocalURLPolicy.url(base, path: "/admin/login") else { return }
+            NSWorkspace.shared.open(url)
+            Log.info("Opened portal.", category: "settings")
+        }
+        .buttonStyle(.bordered)
+        .disabled(settings.serverURL == nil)
+        .help(
+            settings.serverURL == nil
+                ? "Set a Server URL under Advanced first."
+                : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
+        )
+
+        // v0.5.0: deep-link through /me/login?next=/me/history so first-time users
+        // land directly on their history after auth.
+        Button("Open My Dictations", systemImage: "list.bullet.rectangle") {
+            guard let base = settings.serverURL,
+                  let url = LocalURLPolicy.url(base, path: "/me/login?next=/me/history") else { return }
+            NSWorkspace.shared.open(url)
+            Log.info("Opened /me/login?next=/me/history.", category: "settings")
+        }
+        .buttonStyle(.bordered)
+        .disabled(settings.serverURL == nil)
+        .help(
+            settings.serverURL == nil
+                ? "Set a Server URL under Advanced first."
+                : "Opens your personal dictation + transcription history in the browser."
+        )
     }
 
     /// Active-job glass card: animated headline, real progress (chunked
@@ -1054,14 +1159,16 @@ private struct QuickActionsSection: View {
                             : "Cancel the upload (clean) or the in-flight transcription (advisory — server may keep running)."
                     )
 
-                    Button {
-                        showingServerLogSheet = true
-                    } label: {
-                        Label("Log", systemImage: "doc.text.magnifyingglass")
+                    if isLocal {
+                        Button {
+                            showingServerLogSheet = true
+                        } label: {
+                            Label("Log", systemImage: "doc.text.magnifyingglass")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(serverLogJobID == nil)
+                        .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(serverLogJobID == nil)
-                    .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
                 }
             }
     }
@@ -1110,7 +1217,7 @@ private struct QuickActionsSection: View {
             let count = try CustomTranscriptionsStore.copyToPasteboard(url)
             copyToast = (button, "Copied — \(count.formatted(.number)) chars")
         } catch {
-            Log.warning("copyToPasteboard failed for \(url.path): \(error)", category: "settings")
+            Log.warning("copyToPasteboard failed: \(ErrorLog.describe(error))", category: "settings")
             copyToast = (button, "Copy failed: \(error.localizedDescription)")
         }
         Task { @MainActor in
@@ -1122,23 +1229,13 @@ private struct QuickActionsSection: View {
     }
 
     private func performLastDictationCopy() {
+        if let last = LastTextStore.load() {
+            ClipboardInjector.copyOnly(last.text)
+            copyToast = ("last-dictation", "Copied — \(last.text.count.formatted(.number)) chars")
+        } else {
+            copyToast = ("last-dictation", "No dictation in the last 7 days.")
+        }
         Task { @MainActor in
-            do {
-                let last = try await LastDictationAPI.fetch()
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.setString(last.text, forType: .string)
-                copyToast = ("last-dictation", "Copied — \(last.text.count.formatted(.number)) chars")
-            } catch ServerError.server(status: 404, _) {
-                copyToast = ("last-dictation", "No dictations yet — say something first.")
-            } catch ServerError.server(status: 403, _) {
-                copyToast = ("last-dictation", "Break-glass admin has no personal dictations.")
-            } catch ServerError.unauthorized {
-                copyToast = ("last-dictation", "API key rejected.")
-            } catch {
-                Log.warning("Copy-last-dictation failed: \(error)", category: "settings")
-                copyToast = ("last-dictation", "Couldn't fetch — try again.")
-            }
             try? await Task.sleep(nanoseconds: 1_800_000_000)
             if copyToast?.button == "last-dictation" { copyToast = nil }
         }
@@ -1147,7 +1244,7 @@ private struct QuickActionsSection: View {
 
 // MARK: - ServerLogSheet
 
-/// Modal sheet rendering `MeetingAPI.fetchServerLog(_:)` output for an
+/// Modal sheet rendering `FileJobAPI.fetchServerLog(_:)` output for an
 /// in-flight (or recently-cancelled) job. The job id is fetched lazily
 /// through `jobIDProvider` so the sheet can re-read it on Refresh and after
 /// `recordingState.activeJobID` flips to `serverFinishingJobID`.
@@ -1204,17 +1301,32 @@ private struct ServerLogSheet: View {
         loadError = nil
         defer { isLoading = false }
         do {
-            logText = try await MeetingAPI.fetchServerLog(JobID(raw: raw))
+            logText = try await FileJobAPI.fetchServerLog(JobID(raw: raw))
         } catch let error as ServerError {
             if case .server(let status, _) = error, status == 403 {
                 loadError = "Server logs are admin-only. Ask your administrator for help."
             } else {
                 loadError = "Failed to fetch log: \(error.localizedDescription)"
             }
-            Log.warning("ServerLogSheet fetch failed: \(error)", category: "ui")
+            Log.warning("ServerLogSheet fetch failed: \(ErrorLog.describe(error))", category: "ui")
         } catch {
             loadError = "Failed to fetch log: \(error.localizedDescription)"
-            Log.warning("ServerLogSheet fetch failed: \(error)", category: "ui")
+            Log.warning("ServerLogSheet fetch failed: \(ErrorLog.describe(error))", category: "ui")
         }
+    }
+}
+
+/// "OpenAI ≈ $0.03 today · $1.24 this month": estimated Online spend from
+/// `SpendStore` (audio minutes × the model's price; OpenAI's bill is authoritative).
+private struct SpendLine: View {
+    @ObservedObject private var spend = SpendStore.shared
+
+    var body: some View {
+        let now = Date()
+        Text("OpenAI ≈ \(SpendLedger.format(spend.ledger.today(now))) today · "
+             + "\(SpendLedger.format(spend.ledger.thisMonth(now))) this month")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .help("Estimated from audio length × each model's price. Your OpenAI bill is the exact figure.")
     }
 }

@@ -1,0 +1,36 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}People · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>People</h1>
+      <p class="muted">Each person can have several devices (keys). Open a person to add or remove a device.</p>
+    </div>
+    <div class="row">
+      <a class="btn" href="/admin/invites">Invite someone</a>
+      <a class="btn primary" href="/admin/people/new">Add employee</a>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Role</th><th>Created</th><th>Last seen</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for u in people %}
+          <tr>
+            <td>
+              <a href="/admin/people/{{ u.id }}">{{ u.display_name or u.label }}</a>
+              {% if u.display_name %}<span class="muted small">{{ u.label }}</span>{% endif %}
+            </td>
+            <td>{{ u.role }}</td>
+            <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
+            <td>{{ u.last_seen_at.strftime('%Y-%m-%d %H:%M') if u.last_seen_at else '—' }}</td>
+            <td>{% if u.disabled_at %}{{ ui.badge("disabled", "warn") }}{% else %}{{ ui.badge("active", "ok") }}{% endif %}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5">{{ ui.empty_state("No people yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

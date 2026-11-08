@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 
-from wispralt_server.observability import LatencyHistogram
+from wispralt.observability import LatencyHistogram
 
 
 class TestRecentWindowFiltering:
@@ -31,7 +31,7 @@ class TestRecentWindowFiltering:
         def fake_monotonic() -> float:
             return fake_now[0]
 
-        monkeypatch.setattr("wispralt_server.observability._time.monotonic", fake_monotonic)
+        monkeypatch.setattr("wispralt.observability._time.monotonic", fake_monotonic)
 
         # Old huge outlier — far outside the recent window
         h.record("transcribe/dictate", 197_000.0)  # 197 seconds (the historic poison value)
@@ -63,7 +63,7 @@ class TestRecentWindowFiltering:
         h = LatencyHistogram()
         fake_now = [1000.0]
         monkeypatch.setattr(
-            "wispralt_server.observability._time.monotonic", lambda: fake_now[0]
+            "wispralt.observability._time.monotonic", lambda: fake_now[0]
         )
         # Two observations
         h.record("transcribe/dictate", 100.0)

@@ -4,26 +4,21 @@ FastAPI-based transcription server for WisprAlt.
 
 ## Quick Start
 
-Run the one-step setup script from the repo root:
+From the repo root run `./install.sh --role host`. It installs this package as
+the `wispralt` CLI (`uv tool install`, console script `wispralt.cli.main:main`)
+and runs `wispralt setup`, which:
 
-```bash
-./scripts/setup-server.sh
-```
+1. Checks the Mac and installs the Apple Silicon `[host]` extra
+2. Writes `~/.config/wispralt/.env` (0600; only missing keys)
+3. Downloads and sha256-verifies the models (Parakeet for dictation, MLX
+   Whisper for file transcription; both public, no Hugging Face token needed)
+4. Creates the database and the first admin (key shown once)
+5. Registers the `co.wispralt.host` LaunchAgent and checks `/healthz`
 
-The script handles:
+The CLI code lives in `src/wispralt/cli/`. See `../docs/INSTALL.md` (command
+reference) and `../docs/SETUP-SERVER.md` (host details).
 
-1. Python 3.11 and `uv` availability checks
-2. Virtual-environment creation and dependency installation
-3. HuggingFace token validation and gated-model acceptance
-4. Model weight download (~5.6 GB total)
-5. API-key generation and `.env` permissions hardening
-6. Cloudflare Tunnel installation
-7. LaunchAgent registration (auto-starts on login)
-8. End-to-end health check via `doctor.sh`
-
-For a detailed walkthrough see `../docs/SETUP-SERVER.md`.
-
-**Note on `uv.lock`**: not committed yet. After installing `uv` (`brew install uv`), run `cd server && uv lock` to generate it. Commit the lockfile to ensure reproducible installs in CI.
+Dependencies are locked in `uv.lock`; run `uv lock` here after changing `pyproject.toml`.
 
 ## Manual Start (development)
 
@@ -32,8 +27,8 @@ cd server
 cp .env.example .env
 # fill in .env values
 chmod 600 .env
-uv sync
-uv run uvicorn wispralt_server.main:app --port 8000 --workers 1
+uv sync --extra host --extra dev
+uv run --extra host uvicorn wispralt.main:app --port 8000 --workers 1
 ```
 
 The server **must** run with `--workers 1` — multiple workers would load duplicate

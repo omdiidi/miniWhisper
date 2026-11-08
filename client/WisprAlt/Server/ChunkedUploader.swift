@@ -1,9 +1,10 @@
 import Foundation
+import WisprAltCore
 
 /// Three-step chunked upload client for files >50 MB.
 ///
 /// Why: Cloudflare's free/pro/biz plans enforce a 100 MB request-body limit
-/// per request. A 200 MB audio file (or 4 h meeting) would 413 at the edge
+/// per request. A 200 MB audio or video file would 413 at the edge
 /// before reaching the origin. Splitting into 50 MiB chunks keeps every
 /// individual request well under the limit; the server reassembles in its
 /// staging dir and routes the assembled file through the EXISTING
@@ -42,13 +43,12 @@ enum ChunkedUploader {
     /// `/init` response — if the server's value differs we trust it.
     static let defaultChunkSize = 50 * 1024 * 1024
     /// Threshold above which the caller should pick this path instead of the
-    /// single-shot `MeetingAPI.submitFile`.
+    /// single-shot `FileJobAPI.submitFile`.
     static let chunkThreshold: Int64 = 50 * 1024 * 1024
 
     // MARK: - Wire models
 
     private struct InitRequest: Encodable {
-        let mode: String
         let total_bytes: Int64
         let chunk_count: Int
         let original_filename: String
@@ -70,7 +70,6 @@ enum ChunkedUploader {
     ///
     /// - Parameters:
     ///   - fileURL: Local file to upload.
-    ///   - mode: Server-side processing mode (`"file"` or `"meeting"`).
     ///   - progress: Called on the main queue with overall fraction in `[0,1]`.
     ///   - sessionRegistered: Called ONCE with the URLSession used for the
     ///     entire upload so the caller can `invalidateAndCancel()` it on cancel.
@@ -78,7 +77,6 @@ enum ChunkedUploader {
     ///   unrecoverable failures.
     static func upload(
         fileURL: URL,
-        mode: String,
         progress: @escaping @Sendable (Double) -> Void,
         sessionRegistered: (@Sendable (URLSession) -> Void)? = nil,
         phaseHandler: (@Sendable (ChunkedPhase) -> Void)? = nil
@@ -126,10 +124,9 @@ enum ChunkedUploader {
         do {
             initResp = try await postJSON(
                 session: session,
-                url: baseURL.appendingPathComponent("/transcribe/file/chunked/init"),
+                url: try endpoint(baseURL, "/transcribe/file/chunked/init"),
                 apiKey: apiKey,
                 body: InitRequest(
-                    mode: mode,
                     total_bytes: fileSize,
                     chunk_count: Self.chunkCount(for: fileSize, chunkSize: defaultChunkSize),
                     original_filename: fileURL.lastPathComponent
@@ -201,7 +198,7 @@ enum ChunkedUploader {
         do {
             finalResp = try await postJSON(
                 session: session,
-                url: baseURL.appendingPathComponent("/transcribe/file/chunked/\(uploadID)/finalize"),
+                url: try endpoint(baseURL, "/transcribe/file/chunked/\(uploadID)/finalize"),
                 apiKey: apiKey,
                 body: EmptyBody(),
                 decode: FinalizeResponse.self
@@ -232,7 +229,8 @@ enum ChunkedUploader {
         chunkIndex: Int,
         data: Data
     ) async throws {
-        let url = baseURL.appendingPathComponent(
+        let url = try endpoint(
+            baseURL,
             "/transcribe/file/chunked/\(uploadID)/\(chunkIndex)"
         )
         var request = URLRequest(url: url)
@@ -292,6 +290,11 @@ enum ChunkedUploader {
 
     /// Compute how many chunks an upload of *fileSize* bytes will be split
     /// into given the agreed-on *chunkSize* (ceil division).
+    private static func endpoint(_ base: URL, _ path: String) throws -> URL {
+        guard let url = LocalURLPolicy.url(base, path: path) else { throw ServerError.invalidServerURL }
+        return url
+    }
+
     private static func chunkCount(for fileSize: Int64, chunkSize: Int) -> Int {
         let cs = Int64(chunkSize)
         return Int((fileSize + cs - 1) / cs)

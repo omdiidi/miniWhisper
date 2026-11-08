@@ -1,0 +1,31 @@
+{# The AI interpretation panel, visually separate from Measured. Needs `ai` (a
+   sources.build_view result or None), `ai_enabled`, `ai_team` (team scope) and
+   `viewer_is_admin`. #}
+{% import "_ui.html.j2" as ui %}
+{% from "_insight_cards.html.j2" import person_cards, team_cards %}
+<section class="ai-panel" aria-labelledby="ai-h">
+  <header>
+    <h2 id="ai-h">AI interpretation {{ ui.badge("AI", "ai") }}</h2>
+    {% if ai and not ai.legacy %}
+      <span class="muted small">{{ ai.model }} · generated {{ ai.generated_at | ts }} · ${{ "%.4f" | format(ai.cost_usd) }}</span>
+    {% endif %}
+  </header>
+  {% if ai is none %}
+    {% if not ai_enabled %}
+      <p>AI interpretation is off.
+        {% if viewer_is_admin %}<a href="/admin/settings">Read the disclosure and turn it on</a>.
+        {% else %}Your admin has not turned it on.{% endif %}</p>
+    {% else %}
+      <p class="empty">No AI insight for this week yet.</p>
+    {% endif %}
+  {% elif ai.legacy %}
+    <p class="notice warn">This insight was made in an older format without sources, so it is not shown.
+      {% if viewer_is_admin %}Regenerate it from <a href="/admin/data#runs">Data → Runs</a>.{% else %}Ask your admin to regenerate it.{% endif %}</p>
+  {% else %}
+    {% if ai.stale_count %}
+      <p class="notice warn">{{ ui.badge("stale", "warn") }} {{ ai.stale_count }} record{{ "s" if ai.stale_count != 1 }} from this week {{ "were" if ai.stale_count != 1 else "was" }} added after it was generated.</p>
+    {% endif %}
+    {% if ai_team %}{{ team_cards(ai) }}{% else %}{{ person_cards(ai) }}{% endif %}
+  {% endif %}
+  <p class="muted small">AI-generated and may be wrong. Every item links to the records it came from; items whose records were deleted are hidden.</p>
+</section>

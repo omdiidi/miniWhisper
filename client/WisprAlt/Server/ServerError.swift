@@ -1,4 +1,5 @@
 import Foundation
+import WisprAltCore
 
 /// Typed errors from the WisprAlt server. Each case maps to a distinct HTTP condition
 /// or transport failure so callers can handle them specifically.
@@ -16,9 +17,9 @@ enum ServerError: Error, LocalizedError {
     /// `retryAfter` is the value of the `Retry-After` header in seconds, if present.
     case rateLimited(retryAfter: TimeInterval?)
 
-    /// Server returned HTTP 429 with body "meeting in progress" — a meeting job is already
-    /// running on the server and only one may run at a time.
-    case meetingInProgress
+    /// Server returned HTTP 429 with `code=file_job_busy` — a file transcription job is
+    /// already running (or still finishing after a cancel) and only one may run at a time.
+    case fileJobInProgress
 
     /// Server returned HTTP 413 — the upload payload exceeded the server limit.
     case uploadTooLarge
@@ -51,21 +52,49 @@ enum ServerError: Error, LocalizedError {
                 return String(format: "Too many requests. Retry in %.0f seconds.", seconds)
             }
             return "Too many requests. Please wait before trying again."
-        case .meetingInProgress:
-            return "A meeting is already being processed on the server. Wait for it to finish before submitting a new recording."
+        case .fileJobInProgress:
+            return "The previous file job is still finishing on the server. Wait for it to finish, then try again."
         case .uploadTooLarge:
-            return "The recording is too large for the server to accept. Check the server MAX_UPLOAD_BYTES setting."
+            return "The file is too large for the server to accept. Check the server MAX_UPLOAD_BYTES setting."
         case .uploadTruncated:
-            return "The upload appears incomplete or corrupted. Please try recording again."
-        case .server(let status, let body):
-            if let body {
-                return "Server error \(status): \(body)"
-            }
+            return "The upload appears incomplete or corrupted. Please try again."
+        case .server(let status, _):
+            // The body stays on the value for code paths; it never reaches
+            // user-facing or log text.
             return "Server error \(status)."
         case .decoding(let underlying):
             return "Could not parse the server response: \(underlying.localizedDescription)"
         case .transport(let underlying):
             return "Network error: \(underlying.localizedDescription)"
+        }
+    }
+}
+
+/// Log text never includes the response body; only the status or error kind.
+extension ServerError: LogSafeError {
+    var logDescription: String {
+        switch self {
+        case .missingConfiguration: return "missingConfiguration"
+        case .invalidServerURL: return "invalidServerURL"
+        case .unauthorized: return "server(status: 401)"
+        case .rateLimited: return "server(status: 429)"
+        case .fileJobInProgress: return "fileJobInProgress"
+        case .uploadTooLarge: return "server(status: 413)"
+        case .uploadTruncated: return "server(status: 422)"
+        case .server(let status, _): return "server(status: \(status))"
+        case .decoding: return "decoding"
+        case .transport(let underlying): return "transport(\(ErrorLog.describe(underlying)))"
+        }
+    }
+
+    var outcomeKind: ErrorOutcome {
+        switch self {
+        case .unauthorized: return .failed(.auth)
+        case .transport(let underlying):
+            if let url = underlying as? URLError, url.code == .cancelled { return .cancelled }
+            return .failed(.network)
+        case .rateLimited, .fileJobInProgress, .server, .decoding: return .failed(.server)
+        case .missingConfiguration, .invalidServerURL, .uploadTooLarge, .uploadTruncated: return .failed(.other)
         }
     }
 }

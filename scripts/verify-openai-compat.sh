@@ -2,7 +2,8 @@
 # verify-openai-compat.sh — Live smoke test for /v1/* OpenAI-compatibility surface.
 #
 # Usage:
-#   BASE_URL=https://transcribe.integrateapi.ai/v1 API_KEY=<token> bash scripts/verify-openai-compat.sh
+#   API_KEY=<token> bash scripts/verify-openai-compat.sh            # the local host
+#   BASE_URL=https://<your-host>/v1 API_KEY=<token> bash scripts/verify-openai-compat.sh
 #   bash scripts/verify-openai-compat.sh --slow    # adds rate-limit enforcement check (60+ calls)
 #
 # Run after a mini deploy to confirm the /v1 surface is healthy end-to-end.
@@ -10,7 +11,7 @@
 
 set -uo pipefail
 
-BASE_URL="${BASE_URL:-https://transcribe.integrateapi.ai/v1}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
 API_KEY="${API_KEY:-}"
 SLOW="${1:-}"
 
