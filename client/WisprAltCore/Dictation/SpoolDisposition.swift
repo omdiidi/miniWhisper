@@ -30,7 +30,7 @@ public enum InjectOutcome: Equatable, Sendable {
 }
 
 public enum SpoolToast: Equatable, Sendable {
-    case copiedNotPasted, possiblyTruncated, notSavedOnServer
+    case copiedNotPasted, possiblyTruncated, notSavedOnServer, noSpeech
     case failed(FailureKind)
 }
 
@@ -49,8 +49,11 @@ public struct SpoolDecision: Equatable, Sendable {
 public enum SpoolDisposition {
     public static func decide(_ outcome: DictationOutcome, delivery: InjectOutcome?) -> SpoolDecision {
         switch outcome {
-        case .emptyText, .emptyRecording:
+        case .emptyRecording:
             return SpoolDecision(keep: false)
+        case .emptyText:
+            // Audio exists but no words came back: keep it so nothing said is lost.
+            return SpoolDecision(keep: true, toasts: [.noSpeech])
         case .failed(.rejected):
             // Terminal (410 dictation_deleted / 409 dedup_conflict): never retried.
             return SpoolDecision(keep: false, toasts: [.failed(.rejected)])

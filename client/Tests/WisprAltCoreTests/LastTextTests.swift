@@ -21,6 +21,20 @@ import WisprAltCore
         #expect((dirAttrs[.posixPermissions] as? NSNumber)?.intValue == 0o700)
     }
 
+    @Test func atomicCopy_replaces_andAFailedCopyKeepsTheOldFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("src"), dest = dir.appendingPathComponent("dest")
+        try Data("new".utf8).write(to: src)
+        try Data("old".utf8).write(to: dest)
+        #expect(throws: (any Error).self) { try AtomicFile.copy(dir.appendingPathComponent("missing"), to: dest) }
+        #expect(try Data(contentsOf: dest) == Data("old".utf8))
+        try AtomicFile.copy(src, to: dest)
+        #expect(try Data(contentsOf: dest) == Data("new".utf8))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted() == ["dest", "src"])
+    }
+
     @Test func expiresAfter7Days_andIsDeleted() throws {
         let url = tempURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
