@@ -1,8 +1,8 @@
 // WisprAltProbe — real-API assumption gates for Online mode (Part 3, Task 4).
 //
-//   WisprAltProbe preflight [--only P1|P3|P4|P5]
+//   WisprAltProbe preflight [--only P1|P3|P3b|P4|P5]
 //       P5 Keychain read, P1 long-clip report, P3 one 600 s gpt-live-transcribe
-//       commit (P3b at 210 s only on a commit error), P4 live latency report
+//       commit (P3b at 210 s when it is refused or its tail is cut), P4 live latency report
 //   WisprAltProbe suite-file   every file model on a short clip + one direct m4a upload
 //   WisprAltProbe suite-live   both live models on a short clip + one recovery case
 //
@@ -464,10 +464,20 @@ let p3Model = "gpt-live-transcribe"
 func runP3(name: String, limit: Double?) async -> String? {
     guard let key = requireKey(name) else { return nil }
     let model = OpenAIModels.model(id: p3Model)!
-    guard let spoken = fixtureText() else { report(name, .fail, "probe FAIL (fixture): unreadable fixture"); return nil }
+    guard let text = fixtureText() else { report(name, .fail, "probe FAIL (fixture): unreadable fixture"); return nil }
+    // A shorter commit speaks the fixture's opening words plus its closing marker,
+    // so the tail check still proves the whole commit came back.
+    let spoken: String
+    if let limit {
+        let words = text.split(whereSeparator: \.isWhitespace)
+        spoken = words.prefix(Int(Double(words.count) * limit / 600 * 0.95)).joined(separator: " ")
+            + "\n\nFinal marker zebra quartz."
+    } else {
+        spoken = text
+    }
     let audio: URL, full: Double, all: [Float]
     do {
-        audio = try speak(spoken, name: "p3")
+        audio = try speak(spoken, name: "p3-\(name)")
         full = try durationSeconds(audio)
         all = try liveSamples(audio)
     } catch {
@@ -477,22 +487,26 @@ func runP3(name: String, limit: Double?) async -> String? {
         report(name, .fail, String(format: "probe FAIL (fixture): clip is %.1f s, outside 590-600 s; no API call", full))
         return nil
     }
-    let seconds = min(limit ?? full, full)
+    let seconds = full
     let samples = Array(all.prefix(Int(seconds * Double(RealtimeProtocol.sampleRate))))
     let est = Ledger.estimate(model, seconds: seconds)
     if let why = Ledger.refusal(projected: est, scope: .preflight) { report(name, .blocked, why); return nil }
     Ledger.record(probe: name, model: model.id, seconds: seconds, estUSD: est)
-    // 5× real time keeps the 10 s send queue far from full on a normal uplink.
+    // Real time by default: streaming 5× faster than speech lost the last ~10% of
+    // the commit (measured 2026-11-07), which real dictation never does.
+    // PROBE_SPEED=5 is a quick but unrepresentative smoke run.
     let run = await streamLive(liveProvider(model, key: key), samples,
                                recording: Recording(fileURL: audio, durationSeconds: seconds, interruptedByDeviceChange: false),
-                               speed: 5)
+                               speed: Double(ProcessInfo.processInfo.environment["PROBE_SPEED"] ?? "") ?? 1)
     switch run.result {
     case .success(let r):
-        let marker = limit == nil ? tailMarker(r.text) : "n/a (cut clip)"
-        report(name, .pass, String(format: "commit=%.1f s completed words=%d output_tokens=%@ marker=%@ finish_ms=%d est_usd=%.4f",
-                                   seconds, normalizedWords(r.text).count, r.outputTokens.map(String.init) ?? "n/a",
-                                   marker, run.finishMs, est))
-        return nil
+        let marker = tailMarker(r.text)
+        // A dropped tail is the commit limit showing itself: a finding, not a pass.
+        report(name, marker == "OK" ? .pass : .fail,
+               String(format: "commit=%.1f s completed words=%d output_tokens=%@ marker=%@ finish_ms=%d est_usd=%.4f",
+                      seconds, normalizedWords(r.text).count, r.outputTokens.map(String.init) ?? "n/a",
+                      marker, run.finishMs, est))
+        return marker == "OK" ? nil : "truncated"
     case .failure(ProviderError.realtime(let type)):
         report(name, .fail, String(format: "commit=%.1f s refused: realtime(type: %@) finish_ms=%d", seconds, type, run.finishMs))
         return type
@@ -505,7 +519,7 @@ func runP3(name: String, limit: Double?) async -> String? {
 @MainActor func runP3WithFallback() async {
     let before = statuses.count
     guard await runP3(name: "P3", limit: nil) != nil else { return }
-    // A commit error at 600 s: P3 is a finding, not a failure, if 210 s passes.
+    // A refused or truncated 600 s commit: P3 is a finding, not a failure, if 210 s passes.
     statuses.remove(at: before)
     await runP3(name: "P3b", limit: 210)
     if statuses.last == .pass { print("P3 result: realtimeCommitLimit = 210 (set it in OpenAIModels)") }
@@ -637,6 +651,7 @@ case "preflight":
     case "P5": runP5()
     case "P1": await runP1()
     case "P3": await runP3WithFallback()
+    case "P3b": await runP3(name: "P3b", limit: 210)
     case "P4": await runP4()
     default: usage()
     }
