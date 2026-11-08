@@ -136,6 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.warning("Invite link rejected (malformed, or the server address is not allowed).", category: "app")
             return showAlert("This invite link is not valid.", info: LocalURLPolicy.hint)
         }
+        guard !refuseInviteForLocalJob() else { return }
         let confirm = NSAlert()
         confirm.messageText = "Join the WisprAlt server?"
         confirm.informativeText = "Server: \(link.host.host ?? "")\n\nThis Mac will dictate through this server "
@@ -144,6 +145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         confirm.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        // A file may have been picked while the dialog was open.
+        guard !refuseInviteForLocalJob() else { return }
         Task { @MainActor in
             do {
                 let request = link.redeemRequest(deviceLabel: Host.current().localizedName)
@@ -163,6 +166,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           info: (error as? InviteError)?.message ?? "Check your connection and try again.")
             }
         }
+    }
+
+    /// Shows why and returns true while a Local file job exists: redeeming
+    /// would point that job at the new server and strand its transcript.
+    @MainActor private func refuseInviteForLocalJob() -> Bool {
+        guard menuBarController.refusesInviteForLocalJob else { return false }
+        Log.info("Invite refused: a Local file job is active or saved.", category: "app")
+        showAlert(InviteLink.localJobBusyTitle, info: InviteLink.localJobBusyMessage)
+        return true
     }
 
     @MainActor private func showAlert(_ message: String, info: String) {

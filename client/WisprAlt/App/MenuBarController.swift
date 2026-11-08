@@ -232,6 +232,14 @@ final class MenuBarController: NSObject {
                              meFetchedThisLaunch: meFetchedThisLaunch)
     }
 
+    /// Whether a Local file job exists (converting, uploading, polled, or its
+    /// id saved for resume). An invite is refused while this is true.
+    @MainActor var refusesInviteForLocalJob: Bool {
+        let saved = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey)
+        return InviteLink.refusedForLocalJob(phase: localUploadPhase, pollerRunning: activeJobTask != nil,
+                                             hasSavedJobID: saved?.isEmpty == false)
+    }
+
     /// Runs the launch / mode-switch decision. Called by `AppDelegate` at
     /// launch and by `applyModeSwitch(to:)`.
     @MainActor func applyModeEvent(_ event: ModeEvent) {
