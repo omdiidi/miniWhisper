@@ -933,9 +933,12 @@ insights timezone (DB setting, else `INSIGHTS_TIMEZONE`, else the host zone from
    person's prompt), can never survive. `quotable_line` is kept only when its text is an
    exact substring of the record it cites. The team pass receives the validated person
    insights of the week (saved earlier or new in this run) and its items may cite only
-   refs those insights cite. A team reply left with no items at all (`{}` parses, since
-   every list defaults to empty) is an `InsightShapeError` too: it is retried once, then
-   the run ends `team_unusable`, so an empty team insight is never saved.
+   refs those insights cite. A reply left with nothing usable (`{}` parses, since every
+   field defaults to empty; a person reply also needs no surviving quote) is an
+   `InsightShapeError` too, through one shared check (`_require_usable`): a person reply
+   counts as a `schema` failure (the run ends `failed`, so it is retried), and a team
+   reply is retried once, then the run ends `team_unusable`. An empty insight is never
+   saved.
 4. **Render.** `sources.build_view` re-checks refs at view time
    (`JobStore.refs_exist(refs, viewer, is_admin)`): refs to deleted records, or to
    records the viewer may not open, are hidden, and an item left with none is hidden.
