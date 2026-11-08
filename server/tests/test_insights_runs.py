@@ -502,3 +502,22 @@ async def test_a_cancelled_run_closes_its_row_and_releases_the_lock(
         _app(job_store, accounts, settings_store, Stub()), week, trigger="manual"
     )
     assert outcome is not None and outcome.people_done == 3
+
+
+async def test_an_empty_team_reply_is_never_saved(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    _ai_on(settings_store)
+
+    class EmptyTeam(Stub):
+        async def analyze(self, *, system_prompt: str, user_prompt: str, **kw: Any) -> InsightsResponse:
+            resp = await super().analyze(system_prompt=system_prompt, user_prompt=user_prompt, **kw)
+            return resp.model_copy(update={"content": "{}"}) if self.calls > 3 else resp
+
+    stub = EmptyTeam()
+    await cron.run_weekly_insights(_app(job_store, accounts, settings_store, stub), week,
+                                   trigger="manual")
+    assert stub.calls == 5  # three people, the team call and its one retry
+    [run] = job_store.recent_insight_runs()
+    assert (run["status"], run["error_class"]) == ("failed", "team_unusable")
+    assert job_store.get_weekly_insight_team(*week) is None
