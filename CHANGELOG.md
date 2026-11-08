@@ -16,6 +16,20 @@ All notable changes to WisprAlt are documented here.
   the installer lint also syntax-checks `scripts/*.sh`.
 - **Docs** match the SQLite host, the `wispralt` CLI and `/admin/people`; new concise
   `README.md` and `AGENTS.md`. Personal names and domains replaced with placeholders.
+- **`wispralt import export|snapshot|files`** runs the history importer against the
+  host's `.env`, stopping and restarting the service around a real import.
+- **One server test runner** (`scripts/test-server.sh`) for local runs and CI.
+
+### Fixed (found by the end-to-end run on a real Mac)
+
+- `backup`, `restore` and `update` could leave the host unloaded: `launchctl bootout`
+  returns before the job is gone, so the restart kickstarted a dying job. `stop` now
+  waits until launchd no longer lists it.
+- `setup` downloaded Parakeet a second time into `~/.cache/huggingface` (2.3 GB):
+  `HF_HOME` is now pinned before anything imports `huggingface_hub`.
+- The live-model probe streamed at 5× real time, which cut the commit's tail; it now
+  streams in real time and fails on a cut tail. A 10-minute `gpt-live-transcribe`
+  dictation returns complete (2,358/2,360 words), so no shorter live cap is needed.
 
 ### Removed
 
