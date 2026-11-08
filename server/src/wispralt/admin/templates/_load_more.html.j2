@@ -1,0 +1,11 @@
+{# The "Load more" button for history/records lists. Needs `filter_vals`, `next_offset`
+   (search / records) or the two list cursors, and `load_more_url`. #}
+{% set _url = load_more_url | default("/me/history") %}
+{% if next_offset is not none %}
+  <button id="load-more" hx-get="{{ _url }}" hx-vals='{{ dict(filter_vals, offset=next_offset) | tojson }}'
+          hx-target="this" hx-swap="outerHTML">Load more</button>
+{% elif next_dict_cursor or next_jobs_cursor %}
+  <button id="load-more" hx-get="{{ _url }}"
+          hx-vals='{{ dict(filter_vals, dict_cursor=next_dict_cursor or "", jobs_cursor=next_jobs_cursor or "") | tojson }}'
+          hx-target="this" hx-swap="outerHTML">Load more</button>
+{% endif %}

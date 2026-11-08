@@ -24,12 +24,11 @@ import json
 import logging
 import secrets
 import string
-import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -47,6 +46,7 @@ from wispralt.insights.timewindow import (
     epoch_for_range,
     last_full_iso_week,
 )
+from wispralt.web import records
 from wispralt.web.htmx import is_htmx
 from wispralt.web.templates_env import templates
 
@@ -308,16 +308,7 @@ def _decode_cursor(s: str | None) -> tuple[float, str] | None:
 
 def _decorate_row(row: dict, tz_name: str) -> dict:
     """Attach an ISO-formatted timestamp for template render. Pure; returns new dict."""
-    ts = row.get("created_at")
-    iso = ""
-    if ts is not None:
-        try:
-            iso = datetime.fromtimestamp(
-                float(ts), ZoneInfo(tz_name),
-            ).isoformat(timespec="minutes")
-        except (ValueError, OSError):
-            iso = ""
-    return {**row, "created_at_iso": iso}
+    return records.decorate(row, tz_name)
 
 
 @router.get("/history", response_class=HTMLResponse)
@@ -326,48 +317,53 @@ async def me_history(
     user: User = Depends(forbid_integration_kind),
     range: str = "30d",
     kind: str | None = None,
-    search: str | None = None,
+    q: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
     dict_cursor: str | None = None,
     jobs_cursor: str | None = None,
+    offset: int = Query(0, ge=0),
 ) -> HTMLResponse:
-    """Personal transcript archive (dictations + meetings).
+    """Personal transcript archive (dictations + file transcriptions).
 
-    Search shorter than 3 chars is silently dropped to keep the LIKE-scan
-    cost bounded.
+    With ``q`` of 2+ characters it is a full-text search (FTS5, ``search_history`` —
+    scoped to this user in SQL) with highlighted snippets and offset paging; otherwise
+    the plain newest-first list with per-leg cursors. ``since``/``until`` (unix seconds)
+    override the ``range`` tab (the measured-stats tiles link here with them).
     """
-
-    if search is not None:
-        search = search.strip() or None
-    if search and len(search) < 3:
-        search = None
-
-    # Normalize empty-string kind from form-select to None
-    if kind == "":
+    if kind not in ("dictation", "file"):
         kind = None
-
-    since = epoch_for_range(range, settings.insights_timezone)
-    until = time.time()
-
-    dc = _decode_cursor(dict_cursor)
-    jc = _decode_cursor(jobs_cursor)
-
+    tz = settings.insights_timezone
+    lo, hi = records.window(range, since, until, tz)
+    query = records.wants_search(q)
     job_store: JobStore = request.app.state.job_store
-    rows, next_dc, next_jc = await asyncio.to_thread(
-        job_store.transcripts_in_range_filtered,
-        user.id,
-        since_epoch=since,
-        until_epoch=until,
-        kind=kind,
-        search=search,
-        dict_cursor=dc,
-        jobs_cursor=jc,
-        limit=settings.history_page_size,
-    )
+    page = settings.history_page_size
+    next_dc = next_jc = next_offset = None
 
-    decorated = [_decorate_row(r, settings.insights_timezone) for r in rows]
+    if query is not None:
+        hits = await asyncio.to_thread(
+            job_store.search_history, user.id, query,
+            since=lo, until=hi, kind=kind, limit=page + 1, offset=offset,
+        )
+        rows = [records.hit_row(h, tz) for h in hits[:page]]
+        next_offset = offset + page if len(hits) > page else None
+    else:
+        dc = _decode_cursor(dict_cursor)
+        jc = _decode_cursor(jobs_cursor)
+        raw, ndc, njc = await asyncio.to_thread(
+            job_store.transcripts_in_range_filtered,
+            user.id,
+            since_epoch=lo,
+            until_epoch=hi,
+            kind=kind,
+            dict_cursor=dc,
+            jobs_cursor=jc,
+            limit=page,
+        )
+        rows = [_decorate_row(r, tz) for r in raw]
+        next_dc, next_jc = _encode_cursor(ndc), _encode_cursor(njc)
 
-    is_loadmore = bool(dc or jc)
-    if is_loadmore:
+    if dict_cursor or jobs_cursor or offset:
         template_name = "_me_history_page.html.j2"
     elif is_htmx(request):
         template_name = "_me_history_body.html.j2"
@@ -378,12 +374,19 @@ async def me_history(
     ctx = {
         "request": request,
         "user": user,
-        "rows": decorated,
-        "next_dict_cursor": _encode_cursor(next_dc),
-        "next_jobs_cursor": _encode_cursor(next_jc),
+        "rows": rows,
+        "next_dict_cursor": next_dc,
+        "next_jobs_cursor": next_jc,
+        "next_offset": next_offset,
         "range": range,
         "kind": kind,
-        "search": search,
+        "q": q or "",
+        "searching": query is not None,
+        "filter_vals": {
+            k: v
+            for k, v in {"range": range, "kind": kind, "q": q, "since": since, "until": until}.items()
+            if v not in (None, "")
+        },
         "csrf_token": csrf,
     }
     response = templates.TemplateResponse(request, template_name, ctx)
@@ -399,35 +402,32 @@ async def me_history_row(
     user: User = Depends(forbid_integration_kind),
     compact: bool = False,
 ) -> HTMLResponse:
-    """Expanded (or compact, if ``?compact=1``) single-row partial.
+    """One owned record: the expanded (or ``?compact=1``) table-row partial for HTMX,
+    else a full record page (the target of insight source links).
 
-    Unknown ``kind`` or non-owned ``row_id`` both return 404 uniformly so we
-    don't leak existence to other users.
+    Unknown ``kind`` and another user's ``row_id`` both return 404 (no existence leak).
     """
-    if kind not in ("dictation", "file"):
-        raise HTTPException(status_code=404)
-
     job_store: JobStore = request.app.state.job_store
-    row = await asyncio.to_thread(
-        job_store.get_history_row, user.id, kind, row_id,
-    )
+    row = await asyncio.to_thread(job_store.get_history_row, user.id, kind, row_id)
     if row is None:
         raise HTTPException(status_code=404)
 
     decorated = _decorate_row(row, settings.insights_timezone)
     decorated["kind"] = kind
     decorated["row_id"] = row_id
-
     csrf = secrets.token_urlsafe(32)
-    template_name = (
-        "_me_history_row.html.j2" if compact
-        else "_me_history_row_expanded.html.j2"
-    )
+    if compact:
+        template_name = "_me_history_row.html.j2"
+    elif is_htmx(request):
+        template_name = "_me_history_row_expanded.html.j2"
+    else:
+        template_name = "record_detail.html.j2"
     ctx = {
         "request": request,
         "row": decorated,
         "kind": kind,
         "csrf_token": csrf,
+        "admin_view": False,
     }
     response = templates.TemplateResponse(request, template_name, ctx)
     set_csrf_cookie(response, csrf)

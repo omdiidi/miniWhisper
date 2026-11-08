@@ -19,13 +19,14 @@ import logging
 import secrets
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from ..auth import require_admin, set_csrf_cookie, verify_csrf
 from ..config import settings
 from ..insights.cron import run_weekly_insights
 from ..insights.timewindow import epoch_for_range, last_full_iso_week
+from ..web import records
 from ..web.htmx import is_htmx
 from ..web.templates_env import templates
 
@@ -162,6 +163,88 @@ async def admin_data(
     response = templates.TemplateResponse(request, "data.html.j2", ctx)
     set_csrf_cookie(response, csrf)
     return response
+
+
+# ── /admin/records — team transcripts (LD 15: admins may read them) ─────────
+
+
+@router.get("/records", response_class=HTMLResponse)
+async def admin_records(
+    request: Request,
+    _admin: User = Depends(require_admin),
+    q: str | None = None,
+    user_id: int | None = None,
+    kind: str | None = None,
+    range: str = "30d",
+    since: float | None = None,
+    until: float | None = None,
+    offset: int = Query(0, ge=0),
+) -> HTMLResponse:
+    """Team search (``search_history_team``) or the newest-first team list, with owners."""
+    if kind not in ("dictation", "file"):
+        kind = None
+    tz = settings.insights_timezone
+    lo, hi = records.window(range, since, until, tz)
+    query = records.wants_search(q)
+    job_store: JobStore = request.app.state.job_store
+    page = settings.history_page_size
+    if query is not None:
+        hits = await asyncio.to_thread(
+            job_store.search_history_team, query, user_id=user_id,
+            since=lo, until=hi, kind=kind, limit=page + 1, offset=offset,
+        )
+        rows = [records.hit_row(h, tz) for h in hits]
+    else:
+        raw = await asyncio.to_thread(
+            lambda: job_store.list_records_team(
+                user_id=user_id, since=lo, until=hi, kind=kind, limit=page + 1, offset=offset
+            )
+        )
+        rows = [records.decorate(r, tz) for r in raw]
+    people = await asyncio.to_thread(request.app.state.accounts.list_people)
+    ctx = {
+        "request": request,
+        "rows": rows[:page],
+        "next_offset": offset + page if len(rows) > page else None,
+        "q": q or "",
+        "searching": query is not None,
+        "user_id": user_id,
+        "kind": kind,
+        "range": range,
+        "since": since,
+        "until": until,
+        "people": people,
+        "load_more_url": "/admin/records",
+        "filter_vals": {
+            k: v
+            for k, v in {
+                "q": q, "user_id": user_id, "kind": kind, "range": range,
+                "since": since, "until": until,
+            }.items()
+            if v not in (None, "")
+        },
+    }
+    if offset:
+        return templates.TemplateResponse(request, "_records_page.html.j2", ctx)
+    if is_htmx(request):
+        return templates.TemplateResponse(request, "_records_body.html.j2", ctx)
+    return templates.TemplateResponse(request, "records.html.j2", ctx)
+
+
+@router.get("/records/{kind}/{row_id}", response_class=HTMLResponse)
+async def admin_record(
+    request: Request, kind: str, row_id: str, admin: User = Depends(require_admin)
+) -> HTMLResponse:
+    job_store: JobStore = request.app.state.job_store
+    row = await asyncio.to_thread(
+        lambda: job_store.get_record_scoped(kind, row_id, viewer_id=admin.id, is_admin=True)
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+    row = {**records.decorate(row, settings.insights_timezone), "kind": kind, "row_id": row_id}
+    return templates.TemplateResponse(
+        request, "record_detail.html.j2", {"request": request, "row": row, "admin_view": True}
+    )
 
 
 # ── manual weekly-insights trigger ───────────────────────────────────────────

@@ -31,6 +31,7 @@ ADMIN_PAGES = [
     "/admin/integrations/new",
     "/admin/invites",
     "/admin/usage",
+    "/admin/records",
     "/admin/data",
     "/admin/system",
 ]
@@ -42,6 +43,7 @@ ADMIN_NAV_LINKS = (
     'href="/admin/data"',
     'href="/admin/usage"',
     'href="/admin/system"',
+    'href="/admin/records"',
 )
 
 

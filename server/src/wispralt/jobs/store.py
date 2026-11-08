@@ -673,14 +673,14 @@ class JobStore:
         since_epoch: float,
         until_epoch: float,
         kind: str | None = None,
-        search: str | None = None,
         dict_cursor: tuple[float, str] | None = None,
         jobs_cursor: tuple[float, str] | None = None,
         limit: int = 50,
     ) -> tuple[list[dict[str, Any]], tuple[float, str] | None, tuple[float, str] | None]:
         """Personal history with per-leg cursors: ``(rows, next_dict_cursor, next_jobs_cursor)``.
 
-        Each leg's cursor is set only when that leg returned ``limit`` rows.
+        Each leg's cursor is set only when that leg returned ``limit`` rows. Text search is
+        :meth:`search_history` (FTS5), not a filter here.
         """
         dict_rows: list[dict[str, Any]] = []
         job_rows: list[dict[str, Any]] = []
@@ -693,9 +693,6 @@ class JobStore:
                     " WHERE user_id = ? AND created_at >= ? AND created_at < ? AND deleted_at IS NULL"
                 )
                 args: list[object] = [user_id, since_epoch, until_epoch]
-                if search:
-                    sql += " AND text LIKE ?"
-                    args.append(f"%{search}%")
                 if dict_cursor is not None:
                     # dictations.id is INTEGER: compare as INTEGER (a text compare
                     # disagrees across digit widths).
@@ -712,9 +709,6 @@ class JobStore:
                     " AND transcript_text IS NOT NULL AND deleted_at IS NULL"
                 )
                 args = [user_id, since_epoch, until_epoch]
-                if search:
-                    sql += " AND transcript_text LIKE ?"
-                    args.append(f"%{search}%")
                 if jobs_cursor is not None:
                     sql += " AND (created_at, id) < (?, ?)"
                     args.extend(jobs_cursor)
@@ -815,23 +809,83 @@ class JobStore:
 
     # ── /me/history rows (kind: dictation | file) ─────────────────────────────
 
-    def get_history_row(self, user_id: int, kind: str, row_id: str) -> dict[str, Any] | None:
-        """Owner-checked, non-deleted single row (``SELECT *``), or None."""
+    def get_record_scoped(
+        self, kind: str, row_id: str, *, viewer_id: int, is_admin: bool
+    ) -> dict[str, Any] | None:
+        """One non-deleted record (``SELECT *`` + ``user_label``) the viewer may open, else None.
+
+        The scope is in SQL: an employee matches only rows they own; an admin any row
+        (LD 15: admins may read team transcripts). Unknown kind → None.
+        """
         if kind == "dictation":
             sql = (
-                "SELECT * FROM dictations WHERE user_id=? AND id=CAST(? AS INTEGER)"
-                " AND deleted_at IS NULL"
+                "SELECT r.*, COALESCE(u.display_name, u.label) AS user_label FROM dictations r"
+                " JOIN users u ON u.id = r.user_id"
+                " WHERE r.id = CAST(? AS INTEGER) AND r.deleted_at IS NULL"
             )
         elif kind == "file":
             sql = (
-                "SELECT * FROM jobs WHERE user_id=? AND id=?"
-                " AND transcript_text IS NOT NULL AND deleted_at IS NULL"
+                "SELECT r.*, COALESCE(u.display_name, u.label) AS user_label FROM jobs r"
+                " JOIN users u ON u.id = r.user_id"
+                " WHERE r.id = ? AND r.transcript_text IS NOT NULL AND r.deleted_at IS NULL"
             )
         else:
             return None
+        sql += " AND (? OR r.user_id = ?)"
         with self.db.read() as con:
-            r = con.execute(sql, (user_id, row_id)).fetchone()
+            r = con.execute(sql, (row_id, 1 if is_admin else 0, viewer_id)).fetchone()
         return None if r is None else dict(r)
+
+    def get_history_row(self, user_id: int, kind: str, row_id: str) -> dict[str, Any] | None:
+        """Owner-checked, non-deleted single row, or None (the /me surface)."""
+        return self.get_record_scoped(kind, row_id, viewer_id=user_id, is_admin=False)
+
+    def list_records_team(
+        self,
+        *,
+        user_id: int | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Admin records list (no text query), newest first, with owner labels. Admin only."""
+        legs = []
+        if kind in (None, "dictation"):
+            legs.append(
+                "SELECT 'dictation' AS kind, CAST(r.id AS TEXT) AS row_id, r.user_id AS user_id,"
+                " r.created_at AS created_at, r.word_count AS word_count,"
+                " substr(r.text, 1, 200) AS preview FROM dictations r"
+                " WHERE r.deleted_at IS NULL AND r.created_at >= :s AND r.created_at < :u"
+                + (" AND r.user_id = :uid" if user_id is not None else "")
+            )
+        if kind in (None, "file"):
+            legs.append(
+                "SELECT 'file' AS kind, r.id AS row_id, r.user_id AS user_id,"
+                " r.created_at AS created_at, r.word_count AS word_count,"
+                " substr(r.transcript_text, 1, 200) AS preview FROM jobs r"
+                " WHERE r.deleted_at IS NULL AND r.transcript_text IS NOT NULL"
+                " AND r.created_at >= :s AND r.created_at < :u"
+                + (" AND r.user_id = :uid" if user_id is not None else "")
+            )
+        if not legs:
+            return []
+        sql = (
+            "SELECT x.*, COALESCE(u.display_name, u.label) AS user_label FROM ("
+            + " UNION ALL ".join(legs)
+            + ") x JOIN users u ON u.id = x.user_id"
+            " ORDER BY x.created_at DESC, x.row_id LIMIT :lim OFFSET :off"
+        )
+        params = {
+            "uid": user_id,
+            "s": 0.0 if since is None else since,
+            "u": _FAR_FUTURE if until is None else until,
+            "lim": limit,
+            "off": offset,
+        }
+        with self.db.read() as con:
+            return [dict(r) for r in con.execute(sql, params)]
 
     def _set_deleted(self, user_id: int, kind: str, row_id: str, *, deleted: bool) -> bool:
         if kind not in _HISTORY_KINDS:

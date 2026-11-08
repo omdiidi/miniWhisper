@@ -1,0 +1,11 @@
+{% if rows %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Person</th><th>Kind</th><th>When</th><th class="num">Words</th><th>{{ "Match" if searching else "Text" }}</th><th><span class="sr-only">Open</span></th></tr></thead>
+    <tbody id="history-rows">{% for row in rows %}{% include "_records_row.html.j2" %}{% endfor %}</tbody>
+  </table>
+</div>
+{% include "_load_more.html.j2" %}
+{% else %}
+<p class="empty">{% if searching %}Nothing matches “{{ q }}”.{% else %}No records in this range.{% endif %}</p>
+{% endif %}
