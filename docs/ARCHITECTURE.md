@@ -777,7 +777,9 @@ memory, fine for this history's size. A fresh snapshot dir is created per run
 `.part` file is kept, and nothing is ever deleted or overwritten. An unreachable or paused project raises `ExportBlocked`
 and leaves `BLOCKED.json`; nothing ever calls a Supabase management API or
 unpauses it. `JsonPagesSource(dir)` reads `<table>.json` arrays saved by hand from
-the same SELECTs (read-only MCP fallback).
+the same SELECTs (read-only MCP fallback). Every table needs its file: a missing,
+unparseable or non-array file raises `ImportIntegrityError`, so an incomplete
+manual export never passes as empty tables; an empty table is saved as `[]`.
 
 **Snapshot import.** `importer/supabase_import.py` verifies every `<table>.jsonl`
 against `counts.json` (sha256 and line count) before anything is written, then maps
