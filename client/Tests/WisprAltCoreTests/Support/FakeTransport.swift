@@ -5,12 +5,15 @@ import WisprAltCore
 /// - `openFails`: the first send (the socket opening) throws `.notConnected`.
 /// - `gated`: the first send waits until `openGate()`.
 /// - `ignoresCancel`: `receive` never returns, even after `close`.
-/// - `reply`: server events queued in answer to each sent message.
+/// - `reply`: server events queued in answer to each sent message. A
+///   `session.update` with no scripted reply is answered with `session.updated`
+///   unless `acksSession` is false.
 final class FakeTransport: WebSocketTransport, @unchecked Sendable {
     private let lock = NSLock()
     private let openFails: Bool
     private let ignoresCancel: Bool
     private let reply: @Sendable (String) -> [String]
+    private let acksSession: Bool
     private var gate: CheckedContinuation<Void, Never>?
     private var gateOpen: Bool
     private var sentMessages: [String] = []
@@ -21,7 +24,8 @@ final class FakeTransport: WebSocketTransport, @unchecked Sendable {
     private var closes = 0
 
     init(openFails: Bool = false, gated: Bool = false, ignoresCancel: Bool = false,
-         reply: @escaping @Sendable (String) -> [String] = { _ in [] }) {
+         acksSession: Bool = true, reply: @escaping @Sendable (String) -> [String] = { _ in [] }) {
+        self.acksSession = acksSession
         self.openFails = openFails
         self.gateOpen = !gated
         self.ignoresCancel = ignoresCancel
@@ -60,7 +64,11 @@ final class FakeTransport: WebSocketTransport, @unchecked Sendable {
             return closed
         }
         if isClosed { throw ProviderError.notConnected }
-        for event in reply(text) { deliver(event) }
+        var events = reply(text)
+        if events.isEmpty, acksSession, text.contains(#""type":"session.update""#) {
+            events = [#"{"type":"session.updated","session":{}}"#]
+        }
+        for event in events { deliver(event) }
     }
 
     func receive() async throws -> String {

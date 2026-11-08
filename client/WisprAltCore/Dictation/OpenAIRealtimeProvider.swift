@@ -21,7 +21,8 @@ public enum RealtimeRecovery {
 /// the socket and sends `session.update`; `append` streams 200 ms messages
 /// while FN is held, queued in order until the socket is open (at most 10 s
 /// waiting, else `.notConnected`; the spool keeps every frame regardless).
-/// `finish` drains (5 s), commits and waits for that item's `completed` under
+/// `finish` drains (5 s), waits for the `session.updated` ack (an `error`
+/// instead ends the run, no commit), commits and waits for that item's `completed` under
 /// `max(15, 5 + 0.25 × duration)` s. A recoverable failure re-sends the
 /// recording through `fileRecovery` when `recoveryEnabled`. The socket is
 /// closed on every path.
@@ -168,10 +169,22 @@ public final class OpenAIRealtimeProvider: DictationProvider, LiveFrameSink, @un
         let events = events, modelID = model.id
         return try await withDeadline(seconds: commitDeadline(recording.durationSeconds),
                                       onTimeout: { transport.close() }) { [self] in
+            // Commit only once the reply to `session.update` has been read, in
+            // the same ordered event stream: its ack, or the error that ends the run.
+            var stream = events.makeAsyncIterator()
+            var acked = false
+            while !acked, let event = await stream.next() {
+                switch event {
+                case .session(let type) where type.hasSuffix(".updated"): acked = true
+                case .error(let code): throw ProviderError.realtime(type: code)
+                default: continue
+                }
+            }
+            guard acked else { throw currentFailure() ?? ProviderError.notConnected }   // closed before the ack
             try await transport.send(RealtimeProtocol.commit)
             var committed: String?
             var completed: [String: DictationResult] = [:]
-            for await event in events {
+            while let event = await stream.next() {
                 switch event {
                 case .committed(let id):
                     committed = id
