@@ -46,6 +46,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
+from .. import setup_code
+from .._errors import AlreadyBootstrapped
 from ..accounts import service as account_service
 from ..accounts.store import AccountStore, User
 from ..auth import (
@@ -155,6 +157,72 @@ async def login_submit(
     return resp
 
 
+# ── /admin/setup — portal first-admin setup (unauthenticated, gated) ─────────
+#
+# Exists only while no enabled admin exists (else 404) and only with the code from
+# ``data_dir/setup-code`` (written at startup by ``setup_code.prepare``). The race
+# between two submitters is settled by ``bootstrap_first_admin`` (``AlreadyBootstrapped``).
+
+NO_STORE = {"Cache-Control": "no-store"}
+
+
+async def _setup_open(request: Request) -> None:
+    if await asyncio.to_thread(_accounts(request).has_enabled_admin):
+        raise HTTPException(status_code=404)
+
+
+def _setup_form(request: Request, *, error: str | None = None, label: str = "owner",
+                status_code: int = 200) -> HTMLResponse:
+    return _form_page(
+        request,
+        "setup.html.j2",
+        {"hide_chrome": True, "error": error, "form_label": label,
+         "code_file": setup_code.FILENAME},
+        status_code=status_code,
+    )
+
+
+@public_router.get("/setup", response_class=HTMLResponse)
+async def setup_form(request: Request) -> HTMLResponse:
+    await _setup_open(request)
+    return _setup_form(request)
+
+
+@public_router.post("/setup", response_class=HTMLResponse)
+async def setup_submit(
+    request: Request,
+    code: str = Form(...),
+    label: str = Form("owner"),
+    csrf_token: str = Form(...),
+) -> HTMLResponse:
+    """Create the first admin with the on-disk setup code; show its key once."""
+    if not verify_csrf(request, csrf_token):
+        return _setup_form(request, error="Form expired. Reload and try again.", status_code=403)
+    await _setup_open(request)
+    clean_label, err = _validate_label(label)
+    if err is not None:
+        return _setup_form(request, error=err, label=label, status_code=400)
+    if not setup_code.matches(settings.data_dir, code):
+        logger.warning("admin setup refused: wrong or missing setup code")
+        return _setup_form(request, error="That setup code is not valid.", label=label,
+                           status_code=403)
+    try:
+        user, plaintext = await asyncio.to_thread(
+            account_service.bootstrap_first_admin, _accounts(request), clean_label
+        )
+    except AlreadyBootstrapped as exc:
+        raise HTTPException(status_code=404) from exc
+    setup_code.consume(settings.data_dir)
+    response = templates.TemplateResponse(
+        "setup.html.j2",
+        {"request": request, "hide_chrome": True, "created": user, "plaintext": plaintext,
+         "server_url": settings.server_url},
+        headers=NO_STORE,
+    )
+    set_session_cookie(response, plaintext)
+    return response
+
+
 # ── authed routes ─────────────────────────────────────────────────────────────
 
 
@@ -173,12 +241,6 @@ async def overview(request: Request) -> HTMLResponse:
         "overview.html.j2",
         {"request": request, "integration_count": integration_count, **stats},
     )
-
-
-@authed_router.get("/users", response_class=HTMLResponse)
-async def users_list(request: Request) -> HTMLResponse:
-    rows = await asyncio.to_thread(_accounts(request).list_people)
-    return _form_page(request, "users.html.j2", {"users": rows})
 
 
 _VALID_ROLES = {"admin", "employee"}
@@ -236,9 +298,24 @@ def _build_install_command(server_url: str, plaintext: str) -> str:
     )
 
 
-@authed_router.get("/users/new", response_class=HTMLResponse)
-async def users_add_form(request: Request) -> HTMLResponse:
-    """Render the add-employee form."""
+# ── /admin/people — humans (employee-kind users) and their devices (keys) ────
+#
+# Rotate = revoke every active key of the person, issue one, re-enable them.
+# Revoke device = revoke ONE key (``/admin/keys/{key_id}/revoke``).
+# Disable person = no key of theirs authenticates from the next request.
+# Every page that shows a key sends ``Cache-Control: no-store``. Mutations take
+# ``require_admin_csrf`` as a PARAMETER dependency (auth first, then CSRF; a valid
+# Bearer skips the token).
+
+
+@authed_router.get("/people", response_class=HTMLResponse)
+async def people_list(request: Request) -> HTMLResponse:
+    rows = await asyncio.to_thread(_accounts(request).list_people)
+    return _form_page(request, "people.html.j2", {"people": rows})
+
+
+@authed_router.get("/people/new", response_class=HTMLResponse)
+async def people_add_form(request: Request) -> HTMLResponse:
     return _form_page(
         request,
         "add_employee.html.j2",
@@ -246,22 +323,17 @@ async def users_add_form(request: Request) -> HTMLResponse:
     )
 
 
-# The six admin mutations take their user through ``require_admin_csrf`` as a
-# PARAMETER dependency (auth first, then CSRF; a valid Bearer skips the token).
-
-
-@authed_router.post("/users/new", response_class=HTMLResponse)
-async def users_add_submit(
+@authed_router.post("/people/new", response_class=HTMLResponse)
+async def people_add_submit(
     request: Request,
     label: str = Form(...),
     role: str = Form("employee"),
     display_name: str = Form(""),
     _admin: User = Depends(require_admin_csrf),
 ) -> HTMLResponse:
-    """Create a new user, mint a token, and render the install one-liner.
+    """Create a person with one key and show the install command once.
 
-    ``display_name`` is optional. When provided, it is pre-set on the row so
-    the employee's :class:`FirstLaunchCoordinator` skips its name-sheet prompt.
+    A pre-set ``display_name`` makes the app skip its first-launch name prompt.
     """
     clean_label, err = _validate_label(label)
     clean_display_name, dn_err = _validate_optional_display_name(display_name)
@@ -302,32 +374,45 @@ async def users_add_submit(
             "plaintext": plaintext,
             "install_command": _build_install_command(settings.server_url, plaintext),
         },
+        headers=NO_STORE,
     )
 
 
-@authed_router.post("/users/{user_id}/revoke")
-async def users_revoke(
-    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+@authed_router.post("/people/{user_id}/disable")
+async def people_disable(
+    request: Request, user_id: int, admin: User = Depends(require_admin_csrf)
 ) -> RedirectResponse:
-    """Disable *user_id*: none of its keys authenticate from the next request."""
+    """Disable a person: none of their keys authenticate from the next request."""
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="You cannot disable yourself")
     await asyncio.to_thread(_accounts(request).disable_user, user_id)
-    return RedirectResponse("/admin/users", status_code=303)
+    return RedirectResponse(f"/admin/people/{user_id}", status_code=303)
 
 
-@authed_router.post("/users/{user_id}/mint", response_class=HTMLResponse)
-async def users_mint(
+@authed_router.post("/people/{user_id}/rotate", response_class=HTMLResponse)
+async def people_rotate(
     request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
 ) -> HTMLResponse:
-    """Revoke the user's keys, issue one new key (re-enabling the user); show it once."""
+    """Revoke the person's keys, issue one new key (re-enabling them); show it once."""
     new_plaintext = await _rotate_or_404(request, user_id)
     return templates.TemplateResponse(
         "token_minted.html.j2",
-        {
-            "request": request,
-            "user_id": user_id,
-            "plaintext": new_plaintext,
-        },
+        {"request": request, "user_id": user_id, "plaintext": new_plaintext},
+        headers=NO_STORE,
     )
+
+
+@authed_router.post("/keys/{key_id}/revoke")
+async def device_revoke(
+    request: Request, key_id: int, _admin: User = Depends(require_admin_csrf)
+) -> RedirectResponse:
+    """Revoke ONE key (remove one device); the person's other keys keep working."""
+    accounts = _accounts(request)
+    owner = await asyncio.to_thread(accounts.key_owner, key_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    await asyncio.to_thread(accounts.revoke_key, key_id)
+    return RedirectResponse(f"/admin/people/{owner}", status_code=303)
 
 
 async def _rotate_or_404(request: Request, user_id: int) -> str:
@@ -341,13 +426,43 @@ async def _rotate_or_404(request: Request, user_id: int) -> str:
     return plaintext
 
 
-# ── /admin/keys — integration API keys (OpenAI-compat /v1 callers) ────────────
+async def _render_person(request: Request, user_id: int, *, admin_view: bool) -> HTMLResponse:
+    """The admin person page (devices + actions) and the employee self page."""
+    accounts = _accounts(request)
+    person = await asyncio.to_thread(accounts.profile, user_id)
+    if person is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    usage = _usage(request)
+    ctx: dict[str, Any] = {
+        "person": person,
+        "admin_view": admin_view,
+        "totals": await asyncio.to_thread(usage.user_totals, user_id, time.time()),
+        "events": await asyncio.to_thread(usage.recent_events, user_id, 20),
+        "keys": await asyncio.to_thread(accounts.list_keys, user_id),
+    }
+    if admin_view:
+        return _form_page(request, "person_detail.html.j2", ctx)
+    return templates.TemplateResponse("person_detail.html.j2", {"request": request, **ctx})
+
+
+@authed_router.get("/people/{user_id}", response_class=HTMLResponse)
+async def person_detail(request: Request, user_id: int) -> HTMLResponse:
+    return await _render_person(request, user_id, admin_view=True)
+
+
+@me_router.get("/me", response_class=HTMLResponse)
+async def me(request: Request, user: User = Depends(require_api_key)) -> Any:
+    """Self-only landing page: admins go to the dashboard, employees see their usage."""
+    if user.role == "admin":
+        return RedirectResponse("/admin/", status_code=303)
+    return await _render_person(request, user.id, admin_view=False)
+
+
+# ── /admin/integrations — keys for third-party programs (OpenAI-compat /v1) ──
 #
-# Distinct from /admin/users (humans) — these are tokens issued for third-party
-# programs (Buzz, MacWhisper, Open WebUI, etc.) that talk to /v1/audio/*.
-# Under the hood: a users row with role='employee' and kind='integration'
-# (plus its api_keys row), which both (a) hides them from /admin/users and
-# (b) blocks them from /me/* via forbid_integration_kind.
+# Distinct from people: a users row with role='employee' and kind='integration'
+# (plus its key), which hides it from People and blocks it from /me/* via
+# forbid_integration_kind.
 
 
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -367,37 +482,24 @@ def _slugify_program_name(raw: str) -> str:
     return collapsed[:_KEY_SLUG_MAX_LEN]
 
 
-@authed_router.get("/keys", response_class=HTMLResponse)
-async def keys_list(request: Request) -> HTMLResponse:
-    """List all non-revoked integration keys (kind='integration')."""
+@authed_router.get("/integrations", response_class=HTMLResponse)
+async def integrations_list(request: Request) -> HTMLResponse:
     rows = await asyncio.to_thread(_accounts(request).list_integrations)
     return _form_page(request, "keys.html.j2", {"keys": rows})
 
 
-@authed_router.get("/keys/new", response_class=HTMLResponse)
-async def keys_add_form(request: Request) -> HTMLResponse:
-    """Render the add-integration-key form."""
+@authed_router.get("/integrations/new", response_class=HTMLResponse)
+async def integrations_add_form(request: Request) -> HTMLResponse:
     return _form_page(request, "add_key.html.j2", {"form_program_name": ""})
 
 
-@authed_router.post("/keys/new", response_class=HTMLResponse)
-async def keys_add_submit(
+@authed_router.post("/integrations/new", response_class=HTMLResponse)
+async def integrations_add_submit(
     request: Request,
     program_name: str = Form(...),
     _admin: User = Depends(require_admin_csrf),
 ) -> HTMLResponse:
-    """Mint an integration API key tied to a third-party program name.
-
-    Steps:
-        1. Validate ``program_name`` (1..MAX_DISPLAY_NAME_LEN chars, no
-           control chars). Reuses ``_validate_optional_display_name`` but
-           treats empty as an error here (Add Employee allows empty).
-        2. Slugify the name into ``label = "key-<slug>"``.
-        3. Create the integration user + key in one transaction
-           (role='employee', kind='integration', display_name=program_name).
-        4. Render the key_added page with the plaintext + OpenAI env-var
-           snippet.
-    """
+    """Create an integration key named after a third-party program; show it once."""
     clean_name, err = _validate_optional_display_name(program_name)
     if err is not None or not clean_name:
         return _form_page(
@@ -406,7 +508,6 @@ async def keys_add_submit(
             {"error": err or "Program name is required.", "form_program_name": program_name},
             status_code=400,
         )
-
     slug = _slugify_program_name(clean_name)
     if not slug:
         return _form_page(
@@ -418,9 +519,7 @@ async def keys_add_submit(
             },
             status_code=400,
         )
-
     label = f"{_KEY_LABEL_PREFIX}{slug}"
-
     user, plaintext = await asyncio.to_thread(
         lambda: account_service.create_user(
             _accounts(request),
@@ -430,7 +529,6 @@ async def keys_add_submit(
             display_name=clean_name,
         )
     )
-
     return templates.TemplateResponse(
         "key_added.html.j2",
         {
@@ -442,80 +540,39 @@ async def keys_add_submit(
             "kind": user.kind,
             "server_url": settings.server_url.rstrip("/"),
         },
+        headers=NO_STORE,
     )
 
 
-@authed_router.post("/keys/{user_id}/revoke")
-async def keys_revoke(
+@authed_router.post("/integrations/{user_id}/revoke")
+async def integrations_revoke(
     request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
 ) -> RedirectResponse:
-    """Revoke an integration key (disables its user; applies to the next request)."""
+    """Revoke an integration (disables its user; applies to the next request)."""
     await asyncio.to_thread(_accounts(request).disable_user, user_id)
-    return RedirectResponse("/admin/keys", status_code=303)
+    return RedirectResponse("/admin/integrations", status_code=303)
 
 
-@authed_router.post("/keys/{user_id}/rotate", response_class=HTMLResponse)
-async def keys_rotate(
+@authed_router.post("/integrations/{user_id}/rotate", response_class=HTMLResponse)
+async def integrations_rotate(
     request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
 ) -> HTMLResponse:
-    """Rotate an integration key in place; show the new plaintext once."""
+    """Rotate an integration key in place; show the new key once."""
     new_plaintext = await _rotate_or_404(request, user_id)
-    # Re-fetch so we can show the original program name on the success page.
     profile = await asyncio.to_thread(_accounts(request).profile, user_id)
-    program_name = profile.display_name if profile is not None else None
-    label = profile.label if profile is not None else None
-
     return templates.TemplateResponse(
         "key_added.html.j2",
         {
             "request": request,
             "mode": "rotate",
-            "program_name": program_name,
+            "program_name": profile.display_name if profile is not None else None,
             "plaintext": new_plaintext,
-            "label": label,
+            "label": profile.label if profile is not None else None,
             "kind": "integration",
             "server_url": settings.server_url.rstrip("/"),
         },
+        headers=NO_STORE,
     )
-
-
-async def _render_user_detail(request: Request, user_id: int) -> HTMLResponse:
-    """Shared body for the admin /admin/users/{id} and self-only /admin/me routes."""
-    user = await asyncio.to_thread(_accounts(request).profile, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    usage = _usage(request)
-    totals = await asyncio.to_thread(usage.user_totals, user_id, time.time())
-    events = await asyncio.to_thread(usage.recent_events, user_id, 50)
-    return templates.TemplateResponse(
-        "user_detail.html.j2",
-        {
-            "request": request,
-            "user": user,
-            "totals": totals,
-            "events": events,
-        },
-    )
-
-
-@authed_router.get("/users/{user_id}", response_class=HTMLResponse)
-async def user_detail(request: Request, user_id: int) -> HTMLResponse:
-    return await _render_user_detail(request, user_id)
-
-
-@me_router.get("/me", response_class=HTMLResponse)
-async def me(request: Request, user: User = Depends(require_api_key)) -> Any:
-    """Self-only landing page.
-
-    Admins are redirected to the global dashboard so /admin/me is a safe
-    universal entry point regardless of role — that lets the macOS client
-    open ``<server>/admin/login`` without needing to know the role first.
-    Employees see their own user_detail page (24h/7d/30d tiles + last 50
-    events) with the admin nav links hidden by base.html.j2.
-    """
-    if user.role == "admin":
-        return RedirectResponse("/admin/", status_code=303)
-    return await _render_user_detail(request, user.id)
 
 
 def _parse_dt(raw: str | None) -> datetime | None:

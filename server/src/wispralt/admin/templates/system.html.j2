@@ -1,0 +1,13 @@
+{% extends "base.html.j2" %}
+{% block title %}System · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>System</h1>
+      <p class="muted">Live state of this host. Refreshes every 5 seconds.</p>
+    </div>
+  </div>
+  <div id="system-body" hx-get="/admin/system/snapshot" hx-trigger="every 5s" hx-swap="innerHTML">
+    {% include "_system_body.html.j2" %}
+  </div>
+{% endblock %}

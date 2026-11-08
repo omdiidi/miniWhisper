@@ -61,6 +61,11 @@ INSIGHTS_PRICING_PER_1K = {
 }
 
 
+def input_rate_per_1k(model: str) -> float:
+    """USD per 1K input tokens (``_default`` — deliberately high — for unknown models)."""
+    return (INSIGHTS_PRICING_PER_1K.get(model) or INSIGHTS_PRICING_PER_1K["_default"])["input"]
+
+
 def _estimate_cost_from_tokens(
     model: str, input_tokens: int, output_tokens: int
 ) -> float:
@@ -120,8 +125,11 @@ class InsightsClient:
         user_prompt: str,
         max_tokens: int = 2000,
         temperature: float = 0.2,
+        model: str | None = None,
     ) -> InsightsResponse:
-        """One LLM round-trip with JSON-object response format."""
+        """One LLM round-trip with JSON-object response format. ``model`` overrides the
+        default (the admin's runtime setting)."""
+        model = model or self._model
         try:
             # `httpx.Timeout(...)` only bounds individual phases (connect,
             # read, write, pool) — NOT a wall-clock budget. Wrap in
@@ -135,7 +143,7 @@ class InsightsClient:
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": self._model,
+                        "model": model,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
@@ -182,9 +190,7 @@ class InsightsClient:
         if isinstance(body_cost, (int, float)) and body_cost > 0:
             cost_usd = float(body_cost)
         else:
-            cost_usd = _estimate_cost_from_tokens(
-                self._model, input_tokens, output_tokens
-            )
+            cost_usd = _estimate_cost_from_tokens(model, input_tokens, output_tokens)
 
         return InsightsResponse(
             content=content,

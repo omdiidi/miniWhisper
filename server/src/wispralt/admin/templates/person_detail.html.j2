@@ -1,0 +1,91 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}{{ person.display_name or person.label }} · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>{{ person.display_name or person.label }} {{ ui.badge(person.role) }}
+        {% if person.disabled_at %}{{ ui.badge("disabled", "warn") }}{% endif %}</h1>
+      <p class="muted">{% if person.display_name %}{{ person.label }} · {% endif %}joined {{ person.created_at.strftime('%Y-%m-%d') }}</p>
+    </div>
+    {% if admin_view %}
+    <div class="row">
+      <form class="inline" method="post" action="/admin/invites">
+        {{ ui.csrf(csrf_token) }}
+        <input type="hidden" name="user_id" value="{{ person.id }}">
+        <button type="submit">Add device</button>
+      </form>
+      <form class="inline" method="post" action="/admin/people/{{ person.id }}/rotate"
+            onsubmit="return confirm('Rotate? Every key of {{ person.label }} stops working and one new key is shown.');">
+        {{ ui.csrf(csrf_token) }}
+        <button type="submit">Rotate key</button>
+      </form>
+      {% if not person.disabled_at %}
+      <form class="inline" method="post" action="/admin/people/{{ person.id }}/disable"
+            onsubmit="return confirm('Disable {{ person.label }}? None of their keys will work.');">
+        {{ ui.csrf(csrf_token) }}
+        <button type="submit" class="danger">Disable person</button>
+      </form>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="tiles">
+    {{ ui.tile("Requests 24h", totals.dictations_24h or 0) }}
+    {{ ui.tile("Requests 7d", totals.dictations_7d or 0) }}
+    {{ ui.tile("Requests 30d", totals.dictations_30d or 0) }}
+    {{ ui.tile("Errors 24h", totals.errors_24h or 0) }}
+    {{ ui.tile("p50 latency 24h", ("%.0f ms" | format(totals.p50_24h)) if totals.p50_24h else "—") }}
+  </div>
+
+  <h2>Devices</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Device</th><th>Added</th><th>Last seen</th><th>Status</th>{% if admin_view %}<th><span class="sr-only">Actions</span></th>{% endif %}</tr></thead>
+      <tbody>
+        {% for k in keys %}
+          <tr>
+            <td>{{ k.label or ("Key #" ~ k.id) }}</td>
+            <td>{{ k.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td>{{ k.last_seen_at.strftime('%Y-%m-%d %H:%M') if k.last_seen_at else '—' }}</td>
+            <td>{% if k.revoked_at %}{{ ui.badge("revoked") }}{% else %}{{ ui.badge("active", "ok") }}{% endif %}</td>
+            {% if admin_view %}
+            <td>
+              {% if not k.revoked_at %}
+              <form class="inline" method="post" action="/admin/keys/{{ k.id }}/revoke"
+                    onsubmit="return confirm('Remove this device? Its key stops working; other devices keep working.');">
+                {{ ui.csrf(csrf_token) }}
+                <button type="submit" class="danger">Revoke device</button>
+              </form>
+              {% endif %}
+            </td>
+            {% endif %}
+          </tr>
+        {% else %}
+          <tr><td colspan="5">{{ ui.empty_state("No devices.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Recent requests</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>When</th><th>Kind</th><th>Status</th><th class="num">Duration (ms)</th><th>Request ID</th></tr></thead>
+      <tbody>
+        {% for e in events %}
+          <tr>
+            <td>{{ e.ts.strftime('%Y-%m-%d %H:%M:%S') if e.ts else '—' }}</td>
+            <td>{{ e.kind }}</td>
+            <td>{{ e.status }}</td>
+            <td class="num">{% if e.duration_ms is not none %}{{ "%.0f" | format(e.duration_ms) }}{% else %}—{% endif %}</td>
+            <td><code>{{ e.request_id or '—' }}</code></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5">{{ ui.empty_state("No requests yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

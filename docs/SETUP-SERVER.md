@@ -64,7 +64,8 @@ missing keys. `server/.env.example` lists every key:
 | `DATA_DIR` | Yes | — | Absolute path of the data root that holds `wispralt.db`, `outputs/` and `staging/`; `wispralt setup` writes `$HOME/Library/Application Support/WisprAlt/host` (or `--data-dir`). An empty or relative value is rejected. The server never creates it (setup does) and refuses to start if it is missing. |
 | `SERVER_URL` | Yes | — | The URL clients use. Setup writes `http://127.0.0.1:<port>`; set your `tailscale serve` or tunnel URL here (or pass `--server-url`) and `wispralt restart` |
 | `SERVER_LOG_PATH` | No | `~/Library/Logs/WisprAlt/wispralt.log` | The rotating application log; setup writes it so a re-rooted install logs inside its root |
-| `OPENROUTER_API_KEY` | No | — | Enables the weekly insights cron (Sunday-night LLM summary via OpenRouter). When unset, the cron is a no-op. Server smart formatting (Mercury) was removed in Part 4. Get a key at https://openrouter.ai/keys. |
+| `OPENROUTER_API_KEY` | No | — | Needed for the optional weekly AI insights (OpenRouter). AI also stays off until an admin enables it at `/admin/settings` after the disclosure; the model, 30-day cap and timezone are set there too. When unset, no insights run starts. Server smart formatting (Mercury) was removed in Part 4. Get a key at https://openrouter.ai/keys. |
+| `INSIGHTS_TIMEZONE` | No | host zone, else `UTC` | Default IANA timezone for insight weeks and charts when none is set at `/admin/settings`. (Part 6 removed `INSIGHTS_MAX_30D_COST_USD`, `INSIGHTS_SCHEDULE_*` and `INSIGHTS_CATCHUP_ENABLED`: the cap is a portal setting and the scheduler is an hourly due-check.) |
 | `FILE_MODEL_IDLE_EVICTION_SECONDS` | No | `60` | Seconds the file model (MLX Whisper) may sit idle before it is evicted to reclaim memory |
 | `MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum upload size in bytes (default 2 GiB) |
 

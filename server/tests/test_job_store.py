@@ -201,7 +201,7 @@ def test_insight_upserts_keep_one_row_per_scope(job_store: JobStore, uid: int) -
                 iso_year=2026,
                 iso_week=44,
                 user_id=user_id,
-                insight={"n": n, "filler_word_count": n},
+                insight={"n": n},
                 input_tokens=1,
                 output_tokens=1,
                 cost_usd=0.5,
@@ -212,7 +212,6 @@ def test_insight_upserts_keep_one_row_per_scope(job_store: JobStore, uid: int) -
     assert keys == ["team", f"user:{uid}"]
     assert job_store.get_weekly_insight_team(2026, 44)["n"] == 2
     assert job_store.get_weekly_insight_person(uid, 2026, 44)["n"] == 2
-    assert job_store.list_filler_counts_for_week(2026, 44) == [(uid, 2)]
     assert job_store.rolling_insights_cost_usd(30) == 1.0
 
 

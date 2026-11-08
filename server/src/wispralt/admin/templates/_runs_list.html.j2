@@ -1,0 +1,32 @@
+{# Recent runs. Polls itself every 2 s while one is running (outerHTML swap), and stops
+   once none is. Read-only: no form, no CSRF cookie. #}
+{% import "_ui.html.j2" as ui %}
+<div id="runs-list"{% if running %} hx-get="/admin/data/runs/current" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  {% if runs %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Started</th><th>Week</th><th>Trigger</th><th>Status</th><th>People</th><th class="num">Cost</th><th class="num">Estimate</th><th>Failures</th></tr></thead>
+      <tbody>
+        {% for r in runs %}
+          <tr>
+            <td>{{ r.started_at | ts }}</td>
+            <td>{{ r.iso_year }}-W{{ "%02d" | format(r.iso_week) }}</td>
+            <td>{{ r.trigger }}</td>
+            <td>{{ ui.badge(r.status, {"done": "ok", "running": "warn", "failed": "bad", "aborted": "bad"}.get(r.status, "")) }}
+              {% if r.error_class %}<span class="muted small">{{ r.error_class }}</span>{% endif %}</td>
+            <td>
+              <span class="people-progress">{{ r.people_done }} / {{ r.people_total }}</span>
+              {% if r.status == "running" and r.people_total %}
+                <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="{{ r.people_total }}" aria-valuenow="{{ r.people_done }}"><div style="width: {{ (100 * r.people_done / r.people_total) | round(0) }}%"></div></div>
+              {% endif %}
+            </td>
+            <td class="num">${{ "%.4f" | format(r.cost_usd) }}</td>
+            <td class="num">{{ "$%.4f" | format(r.estimated_usd) if r.estimated_usd is not none else "—" }}</td>
+            <td>{% for f in r.failures %}<span class="badge">#{{ f.user_id }} {{ f.error_class }}</span> {% else %}—{% endfor %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="empty">No runs yet.</p>{% endif %}
+</div>

@@ -2,6 +2,52 @@
 
 All notable changes to WisprAlt are documented here.
 
+## [Unreleased] - 2026-11-07 — Part 6: modern portal, Data & Insights
+
+### Added
+
+- **Portal shell.** One stylesheet (`admin/static/portal.css`, light/dark, phone
+  layout), shared macros, a role-aware sidebar: Overview · People · Integrations ·
+  Invites · Usage · Records · Data · System · Settings, plus My history / My insights.
+  No build step, no CDN.
+- **First-admin setup in the portal** (`/admin/setup`), unlocked by the one-time
+  `DATA_DIR/setup-code` file written while no admin exists. The CLI bootstrap stays.
+- **People and devices.** Person pages list each device (key) with its own last seen;
+  **Add device** (invite), **Revoke device**, **Rotate key** and **Disable person**.
+- **Invites.** Single-use, 10-minute links `wispralt://join?host=…&invite=…` (stored as
+  a hash, shown once) and the public `POST /invites/redeem`, which answers every
+  failure with the same `400 invite_invalid` and is rate-limited.
+- **System page** (`/admin/system`): uptime/starts, version, CPU, memory, disk and data
+  sizes, models, queue, 5xx rate, failure counters, latency, DB, network, active vs
+  recent clients.
+- **Full-text history search** (SQLite FTS5) on `/me/history` and the admin-only
+  `/admin/records`, with highlighted, escaped snippets. Scope is enforced in SQL.
+- **Measured stats** computed from the database (counts, words, active days, file
+  audio minutes, filler words, time saved as a labelled estimate, latency, error rate,
+  8-week trend, hour of day); every tile opens its records.
+- **AI insights v2.** Every AI item cites the records it came from (validated against
+  what was in the prompt, re-checked at render), with stale and "seen N weeks" notices.
+- **Runs, scheduler and settings.** `insight_runs` with live progress; an hourly due-check
+  for the last full week; rerun and backfill (up to 12 weeks) with a cost estimate shown
+  first; AI is off until an admin accepts the disclosure in Settings; the 30-day cap is
+  checked before every call.
+- Migration `0002_portal.sql` (FTS + triggers, `insight_runs`, `usage_events.key_id`,
+  settings seeds).
+
+### Changed
+
+- `/admin/users*` → `/admin/people*`; `/admin/keys*` (integration keys) →
+  `/admin/integrations*`; `/admin/keys/{key_id}/revoke` now revokes one device.
+- `/me/history` searches with `q` (2+ characters, FTS) instead of `search` (LIKE).
+- Insight timezone defaults to the host zone (else UTC) instead of America/Los_Angeles.
+
+### Removed
+
+- LLM-invented numbers (`pct_time`, `filler_word_count`, `wow_delta`, `tool_mentions`),
+  the substring hallucination scrub, the Sunday-23:00 sleep, the opt-in startup catch-up,
+  `POST /admin/data/insights/run-now`, and the `INSIGHTS_MAX_30D_COST_USD`,
+  `INSIGHTS_SCHEDULE_*` and `INSIGHTS_CATCHUP_ENABLED` settings.
+
 ## [Unreleased] - 2026-11-07 — Part 5: the `wispralt` CLI and install
 
 One command now installs, runs and maintains a host and/or client on any

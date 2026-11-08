@@ -16,6 +16,11 @@ class AlreadyBootstrapped(Exception):
     """First-admin bootstrap refused: an enabled admin already exists."""
 
 
+class InviteInvalid(Exception):
+    """Invite redeem refused: unknown, used, expired, revoked, or its creator is no longer an
+    enabled admin. Deliberately one class: the public route answers every case identically."""
+
+
 class DedupConflict(Exception):
     """The dictation dedup id is already stored for another user (HTTP 409 ``dedup_conflict``)."""
 

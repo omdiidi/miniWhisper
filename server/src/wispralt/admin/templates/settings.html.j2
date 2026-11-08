@@ -1,0 +1,31 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Settings · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head"><h1>Settings</h1></div>
+  {% if saved %}<p class="notice" role="status">Saved.</p>{% endif %}
+  {% if error %}<p class="notice bad" role="alert">{{ error }}</p>{% endif %}
+  <form class="form card" method="post" action="/admin/settings">
+    {{ ui.csrf(csrf_token) }}
+    <h3>AI interpretation</h3>
+    <p class="muted">Measured stats never need AI. AI interpretation adds a weekly summary, action items, decisions and topics, each linked to the records it came from.</p>
+    <div class="notice warn" id="disclosure">
+      <strong>Disclosure.</strong> When AI interpretation is on, the text of each person's dictations and file transcriptions from the week (up to about 30,000 words per person) is sent to OpenRouter and the model below. Nothing is sent while it is off. Spending stops at the 30-day cap.
+      {% if cfg.disclosure_ack_at %}<br><span class="muted small">Accepted {{ cfg.disclosure_ack_at | ts }}.</span>{% endif %}
+    </div>
+    {% if not cfg.disclosure_ack_at %}
+      <label class="check"><input type="checkbox" name="acknowledge" value="1"> I have read the disclosure and accept it for this team.</label>
+    {% endif %}
+    <label class="check"><input type="checkbox" name="enabled" value="1" {% if cfg.enabled %}checked{% endif %}> Turn AI interpretation on</label>
+    <p class="hint">OpenRouter key: {% if key_configured %}{{ ui.badge("configured", "ok") }}{% else %}{{ ui.badge("not set", "warn") }} set <code>OPENROUTER_API_KEY</code> in <code>server/.env</code> (the CLI does this) and restart.{% endif %}</p>
+
+    <label for="model">Model</label>
+    <input id="model" name="model" type="text" maxlength="100" value="{{ cfg.model }}">
+    <label for="cap">30-day spending cap (USD)</label>
+    <input id="cap" name="cap_30d_usd" type="number" min="0" max="1000" step="0.5" value="{{ cfg.cap_30d_usd }}">
+    <label for="tz">Timezone for weeks and charts</label>
+    <input id="tz" name="timezone" type="text" maxlength="64" value="{{ stored_tz or '' }}" placeholder="{{ cfg.timezone }}" aria-describedby="tz-hint">
+    <p class="hint" id="tz-hint">IANA name, e.g. Europe/Berlin. Blank uses the server's zone ({{ cfg.timezone }}).</p>
+    <div class="actions"><button type="submit" class="primary">Save</button></div>
+  </form>
+{% endblock %}

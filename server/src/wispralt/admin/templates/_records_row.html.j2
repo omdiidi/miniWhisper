@@ -1,0 +1,8 @@
+<tr>
+  <td><a href="/admin/people/{{ row.user_id }}">{{ row.user_label }}</a></td>
+  <td><span class="badge">{{ "Dictation" if row.kind == "dictation" else "File" }}</span></td>
+  <td>{{ row.created_at_iso }}</td>
+  <td class="num">{{ row.word_count or 0 }}</td>
+  <td class="snippet">{% if row.snippet is defined %}{{ row.snippet | highlight }}{% else %}{{ row.preview }}{% endif %}</td>
+  <td><a href="/admin/records/{{ row.kind }}/{{ row.row_id }}">Open</a></td>
+</tr>

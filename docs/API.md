@@ -430,27 +430,26 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 **Auth:** Bearer or session cookie (any role; integration keys get 403).
 
-Per-employee weekly insights page. Returns the most recent `weekly_insights` row with `scope='person'` for the calling user, plus a time-range stats grid (transcript volume, word count, dictation/file-transcription split) for the selected window.
+Per-employee insights page (Part 6). Two separate parts: **Measured** stats for the selected window, computed from the caller's own rows (`insights.measured.compute`: counts, words, active days, file audio minutes, regex filler counts, time saved as a labelled 40 wpm estimate, dictation latency p50/p95, error rate, 8-week trend, hour-of-day), each count tile linking to `/me/history?since=&until=` for the same window; and the **AI interpretation** of the last full ISO week (schema v2: every item links to its source records, hidden when they were deleted; "AI interpretation is off" until an admin enables it).
 
 **Query parameters:**
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `range` | enum | `7d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all`. Drives the stats grid window only — the weekly digest card always shows the most recent completed ISO week. |
+| `range` | enum | `7d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all` (unknown → `7d`). Drives the Measured window only — the AI panel always shows the most recent completed ISO week. |
 
 **Response 200** — full page. `Content-Type: text/html` rendering `me_insights.html.j2`.
 
-**Response 200 (HTMX partial)** — when the request carries `HX-Request: true`, the handler returns only the `_stats_grid_partial.html.j2` fragment for in-place swap. Use this for time-range tab clicks; the full page is only needed on first navigation.
+**Response 200 (HTMX partial)** — when the request carries `HX-Request: true`, the handler returns only `_me_insights_body.html.j2` (Measured + AI panel) for in-place swap.
 
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer. |
-| 422 | `range` is not one of the accepted values. |
 | 503 | Auth lookup failed (`sqlite3.Error`). |
 
-The hallucination disclaimer ("AI-generated, may be inaccurate") is rendered inline on each insight card — see [ARCHITECTURE.md → Weekly insights](ARCHITECTURE.md#weekly-insights) for the two-tier scrub policy that backs it.
+How the AI items are tied to records is described in [ARCHITECTURE.md → Weekly insights](ARCHITECTURE.md#weekly-insights).
 
 Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
@@ -460,7 +459,7 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 **Auth:** Bearer or session cookie (any role; integration keys get 403).
 
-Personal transcript archive — the calling user's own dictations + file transcriptions in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `user_id` AND `deleted_at IS NULL`).
+Personal transcript archive — the calling user's own dictations + file transcriptions in one chronological list. Filterable by time range and kind. Without `q` it is the plain list (`JobStore.transcripts_in_range_filtered`, per-leg cursors); with `q` of 2+ characters it is a **full-text search** (SQLite FTS5, `JobStore.search_history`, the caller's `user_id` bound in SQL) returning highlighted snippets (escaped first, then `<mark>`) with offset paging.
 
 **Query parameters:**
 
@@ -468,7 +467,9 @@ Personal transcript archive — the calling user's own dictations + file transcr
 |---|---|---|---|
 | `range` | enum | `30d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all`. Reuses `insights.timewindow.epoch_for_range`. |
 | `kind` | enum \| empty | unset | Either `dictation` or `file` (displayed as "File transcriptions"). Empty string from a `<select>` is normalized to "no filter". The row routes `/me/history/{kind}/{row_id}` take the same two kinds; `meeting` (pre-Part 4) now 404s. |
-| `search` | string | unset | Free-text LIKE filter on the transcript body. Strings shorter than **3 chars after `.strip()`** are silently dropped to keep the scan bounded. |
+| `q` | string | unset | Full-text query (Part 6; replaces the old `search` LIKE filter). Fewer than **2 chars after `.strip()`** → the plain list. Never passed raw to FTS: each whitespace token is quoted, tokens are ANDed, the last is a prefix match; capped at 200 chars / 12 tokens. Diacritics are folded (`cafe` finds `café`). |
+| `since` / `until` | unix seconds | unset | Override the `range` tab (the Measured tiles link here with them). |
+| `offset` | int ≥ 0 | 0 | Search-mode paging. |
 | `dict_cursor` | opaque | unset | Base64-urlsafe encoded `(created_at, row_id)` tuple for the dictations leg. Malformed → silently restart pagination. |
 | `jobs_cursor` | opaque | unset | Same shape, for the jobs (file transcription) leg. |
 
@@ -476,7 +477,7 @@ Personal transcript archive — the calling user's own dictations + file transcr
 
 **Response 200 (HTMX nav)** — when `HX-Request: true` is present and no cursor was sent, returns `_me_history_body.html.j2` (the body fragment for in-place swap).
 
-**Response 200 (HTMX Load-more)** — when a cursor was sent, returns `_me_history_page.html.j2` (the next batch of `<tr>` rows + the updated Load-more button). Page size is `settings.history_page_size` (default **50**) per leg.
+**Response 200 (HTMX Load-more)** — when a cursor or an `offset` was sent, returns `_me_history_page.html.j2` (the next batch of `<tr>` rows + the updated Load-more button). Page size is `settings.history_page_size` (default **50**).
 
 **Errors:**
 
@@ -494,7 +495,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 **Auth:** Bearer required. Ownership-checked.
 
-Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `kind`, unknown `row_id`, or a `row_id` owned by another user all uniformly return **404** so we never leak existence to non-owners.
+One owned record. With `HX-Request: true` it returns the expanded row partial (or the compact one with `?compact=1`); a plain browser request returns a full **record page** (`record_detail.html.j2`, the target of AI source links). Unknown `kind`, unknown `row_id`, or a `row_id` owned by another user all uniformly return **404** so we never leak existence to non-owners.
 
 **Path parameters:**
 
@@ -509,7 +510,7 @@ Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `
 |---|---|---|---|
 | `compact` | bool | `false` | When `true`, return `_me_history_row.html.j2` (collapsed). Otherwise return `_me_history_row_expanded.html.j2` with the full transcript text + Delete + Download buttons. |
 
-**Response 200** — partial HTML fragment ready for HTMX swap-in.
+**Response 200** — partial HTML fragment ready for HTMX swap-in, or the full record page.
 
 **Errors:**
 
@@ -518,7 +519,7 @@ Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `
 | 401 | Missing or invalid bearer. |
 | 404 | Unknown kind, unknown row_id, soft-deleted, or owned by another user. |
 
-Source: `server/src/wispralt/routes/me.py` (Plan A).
+Source: `server/src/wispralt/routes/me.py` (Plan A; record page Part 6).
 
 ---
 
@@ -592,71 +593,74 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ### `GET /admin/data`
 
-**Auth:** Bearer required + `role='admin'`. Handler-level `require_admin`: employee tokens get 403.
+**Auth:** Bearer or session cookie + `role='admin'` (employees get 403).
 
-Admin Data tab. Renders the team `weekly_insights` row (most recent completed ISO week) on top, plus a per-user leaderboard underneath. `?user_id=N` drills into one employee using the same card layout the employee self-view (`me_insights.html.j2`) renders, so admin and employee see identical surfaces.
+Data & Insights for the team, or one person with `?user_id=N`: **Measured** stats (`insights.measured.compute`; tiles link to `/admin/records?since=&until=` [+ `user_id`]), the separate **AI interpretation** panel (team or person insight of the last full ISO week, every item linked to `/admin/records/{kind}/{id}`), the per-person table (team view) and the **AI runs** panel.
 
-**Query parameters:**
+**Query parameters:** `range` (as `GET /me/insights`), `user_id` (optional).
 
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `range` | enum | `7d` | Same set as `GET /me/insights`. Drives the stats grid window. |
-| `user_id` | integer | unset | When present, scope the page to that employee's `'person'`-scope insight + their stats. Without it, the page shows the team insight + per-user leaderboard. |
+**Response 200** — full page (`data.html.j2`); mints the CSRF token the runs form carries. **Response 200 (HTMX partial)** — with `HX-Request: true`, only `_admin_data_body.html.j2`, and the CSRF cookie is NOT rotated.
 
-**Response 200** — full page (`data.html.j2`).
-
-**Response 200 (HTMX partial)** — when the request carries `HX-Request: true`, the handler returns only the `_stats_grid_partial.html.j2` fragment for in-place swap.
-
-**Errors:**
-
-| Code | Condition |
-|---|---|
-| 401 | Missing or invalid bearer. |
-| 403 | Token is valid but role is not `admin`. |
-| 404 | `user_id` was supplied but no such user exists. |
-| 422 | `range` is not one of the accepted values. |
-| 503 | Auth lookup failed (`sqlite3.Error`). |
-
-Source: `server/src/wispralt/routes/admin_data.py` (Phase 2).
+Source: `server/src/wispralt/routes/admin_data.py`.
 
 ---
 
-### `POST /admin/data/insights/run-now`
+### `POST /admin/data/runs`
 
-**Auth:** Bearer + `wispralt_admin_token` session cookie + `role='admin'`. Handler-level `require_admin`: an employee token gets **403**.
+**Auth:** admin + CSRF (form `csrf_token` / `X-CSRF-Token`, or a Bearer token). Employees 403.
 
-Admin-only manual trigger for `insights.cron.run_weekly_insights` against the **current in-progress ISO week**. Fire-and-forget — the handler returns immediately with a tiny HTML body (toast + OOB-swap button fragment) for HTMX to render in place. The spawned task is strong-referenced in `app.state.weekly_insights_manual_tasks` (set of `asyncio.Task`) and removed by a closure-based done-callback that also logs any unhandled exception.
-
-Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip — if a `weekly_insights` row already exists for `(iso_year, iso_week, scope_key='user:<id>')`, the OpenRouter call is skipped. The in-flight lock pre-check is purely UX.
-
-**Request:** `application/x-www-form-urlencoded`
+Start weekly AI insights for the last full week or a backfill — estimate first.
 
 | Field | Type | Notes |
 |---|---|---|
-| `csrf_token` | string | Double-submit value matched against the `wispralt_csrf` cookie set by the prior `GET /admin/data` full-page render. Constant-time compare via `hmac.compare_digest`. 30-minute cookie TTL. |
+| `weeks` | int | 1..12 (clamped). 1 = the last full ISO week (`trigger='manual'`); more = that many weeks ending with it (`trigger='backfill'`, run one after another under the insights lock). |
+| `force` | bool | Regenerate people who already have an insight for the week. |
+| `confirm` | bool | Without it: **no run**; returns the estimate (words × 1.35 / 1000 × the model's input rate, plus the 30-day spend vs cap) and a Start button. With `confirm=1`: starts the run(s) in a background task. |
 
-**Response 200** — `text/html`. Body composes a toast (`<div class="admin-toast">…</div>`) with one of:
+**Response 200** — `text/html` fragment for `#run-confirm` (estimate, or "Started"). **409** — AI interpretation is off, `OPENROUTER_API_KEY` is not configured, or a run already holds the lock.
 
-| Toast | Trigger |
-|---|---|
-| `Insights run started for Wxx. Refresh page in ~1 minute to see results.` | Happy path — task spawned. Body also includes an OOB-swap `#admin-run-insights-button` fragment that paints the button as `Running…` (disabled). |
-| `Insights unavailable — OPENROUTER_API_KEY not configured.` | `app.state.insights_client is None`. No task spawned. |
-| `Budget exceeded ($X.XX / $Y.YY cap). Run skipped.` | Rolling 30-day insights spend exceeds `settings.insights_max_30d_cost_usd` (default $8). No task spawned. |
-| `A run is already in progress. Refresh in ~1 minute.` | `app.state.weekly_insights_lock.locked()` is True. Body also includes the OOB-swap disabled button. No task spawned. |
+### `GET /admin/data/runs/current`
 
-**Response 403** — `text/html`. Body is the toast `Session expired. Refresh the page and try again.` so HTMX's `hx-target-403` swaps it into `#admin-run-insights-toast`. Triggered by missing / mismatched / expired `csrf_token`.
+**Auth:** admin. The recent `insight_runs` list partial (status, people done / total, cost, estimate, failures `{user_id, error_class}`). While a run is going the fragment re-polls itself every 2 s. Never sets a CSRF cookie.
 
-**Response 403** — empty body. Triggered by non-admin role (the standard `require_admin` 403 path; employees never reach this surface via the UI).
+### `GET /admin/settings`, `POST /admin/settings`
 
-**Response 503** — auth lookup failed (`sqlite3.Error`).
+**Auth:** admin; POST also CSRF. Form fields: `enabled`, `acknowledge` (the disclosure; required once before `enabled` can be on), `model` (OpenRouter id), `cap_30d_usd` (0..1000), `timezone` (IANA name; blank = server zone). Success → 303 `/admin/settings?saved=1`; a validation error (no ack, bad cap/model/timezone) → 400 with the form. The OpenRouter key is never accepted here.
 
-**Notes:**
+### `GET /admin/records`, `GET /admin/records/{kind}/{row_id}`
 
-- Targets the **current** in-progress ISO week (NOT last completed). The Sunday 23:00 cron will UPSERT-replace these rows on its next fire — no orphan rows.
-- Server logs one `INFO` line per trigger: `Manual insights run started by admin_id=<id> for W<nn> (user=<label>)`. Operators distinguish manual vs scheduled runs by grepping for this prefix.
-- Fire-and-forget tasks are NOT durable across SIGTERM — see `docs/ADMIN.md` for the re-click recovery path.
+**Auth:** admin (employees 403). Team records: `q` (2+ chars → full-text search via `search_history_team`, highlighted, owner names), `user_id`, `kind`, `range` / `since` / `until`, `offset`. The record page shows one record with its owner and states that admins can read team transcripts; 404 for an unknown or deleted record.
 
-Source: `server/src/wispralt/routes/admin_data.py`.
+### `GET /admin/system`, `GET /admin/system/snapshot`
+
+**Auth:** admin. The system page and its 5 s HTMX partial; `?format=json` on the snapshot returns `{host, cpu, mem, disk, models, queue, latency, errors, counters, db, network, clients}` (see [ADMIN.md → System](ADMIN.md#get-adminsystem--system)). A DB failure yields `db.ok: false`, never a 500.
+
+---
+
+### `POST /invites/redeem`
+
+**Auth:** none (public; reachable through the tunnel). Rate limit: 10 attempts per 60 s per client IP (`CF-Connecting-IP`, else the peer) → **429** `{"error": "rate_limited"}`.
+
+Redeems a single-use invite made at `/admin/invites`. The invite reaches the app as the join link **`wispralt://join?host=<url-encoded SERVER_URL>&invite=<token>`** (or the token pasted by hand); the app posts the token here.
+
+**Request:** `application/json`
+
+| Field | Type | Notes |
+|---|---|---|
+| `invite` | string | The invite token (1..200 chars). |
+| `device_label` | string, optional | Shown as the device name on the person's page (control characters dropped, 80 chars max). |
+
+**Response 200** (`Cache-Control: no-store`):
+
+```json
+{"token": "<64-hex API key>", "user_label": "sarah", "host": "https://transcribe.example.com"}
+```
+
+In one `BEGIN IMMEDIATE` transaction the server checks the invite exists, is unredeemed and unexpired (10-minute TTL) and that its creator is still an enabled admin; creates the person (new-person invite, kind `employee`) or adds a key to them ("add device"); and marks the invite used. Redeeming never revokes the person's other keys.
+
+**Response 400** — `{"error": "invite_invalid"}` for **every** failure: unknown, already used, expired, revoked, creator disabled, target person disabled, malformed body. The body is identical in all cases.
+
+Source: `server/src/wispralt/routes/admin_invites.py`, `accounts/service.py` (`redeem_invite`, `join_link`).
 
 ---
 
@@ -949,9 +953,9 @@ Source: `server/src/wispralt/routes/admin_ui.py` +
 
 **Auth split (be720a1):** Three routers under the same `/admin` prefix.
 
-- `/admin/login` — public (no auth).
-- `/admin/me` — any authenticated role (admin OR employee). Admins are 303'd to `/admin/`; employees see their own `user_detail` page with admin nav hidden. Universal entry point — the macOS client's "Open Portal" button targets `/admin/login` and the server figures out where to send each role.
-- `/admin/`, `/admin/users`, `/admin/users/{id}`, `/admin/users/{id}/mint`, `/admin/users/{id}/revoke`, `/admin/usage`, `/admin/usage.csv` — admin-only (employee tokens get **403**).
+- `/admin/login` and `/admin/setup` — public (no auth; setup 404s once an enabled admin exists and needs the `setup-code` file's content).
+- `/admin/me` — any authenticated role (admin OR employee). Admins are 303'd to `/admin/`; employees see their own person page without admin actions. Universal entry point — the macOS client's "Open Portal" button targets `/admin/login` and the server figures out where to send each role.
+- Everything else under `/admin/` — admin-only (employee tokens get **403**). `POST /invites/redeem` is the one public non-`/admin` portal route.
 
 Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; curl/Postman users send `Authorization: Bearer <token>` on each request. See [ARCHITECTURE.md → Admin UI](ARCHITECTURE.md#admin-ui) for the three-router pattern.
 
@@ -959,15 +963,26 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 |---|---|---|---|
 | GET | `/admin/login` | none | HTML form (200) |
 | POST | `/admin/login` | none | 303 → `/admin/` (admin) or `/admin/me` (employee) + `Set-Cookie: wispralt_admin_token=...`. 401 on invalid token. |
-| GET | `/admin/me` | any role | Admin: 303 → `/admin/`. Employee: 200 with that user's `user_detail` page (admin nav hidden). |
+| GET | `/admin/me` | any role | Admin: 303 → `/admin/`. Employee: 200 with their own person page (no admin actions or nav). |
+| GET/POST | `/admin/setup` | none (gated) | First-admin setup: code from `DATA_DIR/setup-code` + label → one admin, key shown once (`no-store`), session cookie. 403 wrong code / missing CSRF; 404 once an admin exists. |
 | GET | `/admin/` | admin | Overview dashboard HTML |
-| GET | `/admin/users` | admin | Users-list HTML with per-row Mint/Revoke forms |
-| POST | `/admin/users/{id}/mint` | admin | Revokes the user's keys, issues one new key (re-enabling a revoked user); HTML page shows it **once**. 404 for an unknown user. |
-| POST | `/admin/users/{id}/revoke` | admin | 303 → `/admin/users` (disables the user; its keys 401 from the next request) |
-| GET | `/admin/users/{id}` | admin | Per-user detail HTML (24h/7d/30d tiles + last 50 events) |
+| GET | `/admin/people` | admin | People list |
+| GET/POST | `/admin/people/new` | admin | Add employee form / create + install command (key shown once, `no-store`) |
+| GET | `/admin/people/{id}` | admin | Person page: tiles, devices (per-key last seen), recent requests, actions |
+| POST | `/admin/people/{id}/rotate` | admin + CSRF | Revoke all the person's keys, issue one (re-enables); key shown once (`no-store`). 404 unknown. |
+| POST | `/admin/people/{id}/disable` | admin + CSRF | 303 → person page; every key 401s from the next request. 400 for yourself. |
+| POST | `/admin/keys/{key_id}/revoke` | admin + CSRF | Revoke one device; 303 → its person; 404 unknown key. |
+| GET/POST | `/admin/invites` | admin (+ CSRF on POST) | Invites list / create (new person `label`+`role`, or `user_id` = add device); link + code shown once (`no-store`). |
+| POST | `/admin/invites/{id}/revoke` | admin + CSRF | Expire a pending invite; 303 → `/admin/invites`. |
+| GET/POST | `/admin/integrations`, `/admin/integrations/new` | admin (+ CSRF on POST) | Integration keys list / create (key + OpenAI env snippet shown once, `no-store`). |
+| POST | `/admin/integrations/{id}/rotate`, `/admin/integrations/{id}/revoke` | admin + CSRF | Rotate (new key once) / revoke (disable) an integration. |
 | GET | `/admin/usage` | admin | Drill-down HTML, paginated 100/page. Filters: `kind`, `status`, `user_id`, `since`, `until`, `offset`. |
 | GET | `/admin/usage.csv` | admin | `text/csv` stream (max 10000 rows) |
-| GET | `/admin/data` | admin | Phase 2 — weekly insights Data tab (`data.html.j2`). HTMX partial swap returns `_stats_grid_partial.html.j2`. Documented in detail above under `GET /admin/data`. |
-| POST | `/admin/data/insights/run-now` | admin | Manual trigger for the weekly-insights cron against the current in-progress ISO week. Form-style CSRF. Fire-and-forget; returns HTML toast + OOB-swap button fragment. Documented in detail above under `POST /admin/data/insights/run-now`. |
+| GET | `/admin/records`, `/admin/records/{kind}/{id}` | admin | Team records search/list and one record. |
+| GET | `/admin/data` | admin | Data & Insights (Measured + AI panel + runs). |
+| POST | `/admin/data/runs` | admin + CSRF | Estimate, then (`confirm=1`) start a run or backfill. |
+| GET | `/admin/data/runs/current` | admin | Runs list partial (polls every 2 s while running). |
+| GET/POST | `/admin/settings` | admin (+ CSRF on POST) | AI enablement + disclosure, model, cap, timezone. |
+| GET | `/admin/system`, `/admin/system/snapshot` | admin | System page and its partial (`?format=json`). |
 
 All admin pages read the local SQLite DB (`AccountStore` / `UsageStore`); an auth lookup failure returns **503**.

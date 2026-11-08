@@ -1,0 +1,92 @@
+{% import "_ui.html.j2" as ui %}
+{% macro dur(seconds) -%}
+  {%- if seconds is none -%}—
+  {%- elif seconds >= 86400 -%}{{ (seconds // 86400) | int }}d {{ ((seconds % 86400) // 3600) | int }}h
+  {%- elif seconds >= 3600 -%}{{ (seconds // 3600) | int }}h {{ ((seconds % 3600) // 60) | int }}m
+  {%- elif seconds >= 60 -%}{{ (seconds // 60) | int }}m
+  {%- else -%}{{ seconds | int }}s{%- endif -%}
+{%- endmacro %}
+{% macro size(n) -%}{{ "—" if n is none else (n | filesizeformat) }}{%- endmacro %}
+{% macro pct(x) -%}{{ "—" if x is none else ("%.1f%%" | format(x * 100)) }}{%- endmacro %}
+
+<div class="tiles">
+  {{ ui.tile("Uptime", dur(s.host.uptime_s), hint="started " ~ (s.host.starts or "?") ~ " times") }}
+  {{ ui.tile("CPU", "%.0f%%" | format(s.cpu.pct), hint=("load " ~ (s.cpu.load | map("round", 2) | join(" / "))) if s.cpu.load else None) }}
+  {{ ui.tile("Memory", size(s.mem.used) ~ " / " ~ size(s.mem.total), hint="server RSS " ~ size(s.mem.rss)) }}
+  {{ ui.tile("Disk free", size(s.disk.free), hint="of " ~ size(s.disk.total)) }}
+  {{ ui.tile("Queue", (s.queue.pending if s.queue.pending is not none else "—") ~ " pending", hint=(s.queue.running if s.queue.running is not none else "—") ~ " running · " ~ (s.queue.failed_24h if s.queue.failed_24h is not none else "—") ~ " failed 24h") }}
+  {{ ui.tile("5xx rate 1h", pct(s.errors.rate_5xx_1h), hint=(s.errors.requests_1h if s.errors.requests_1h is not none else "—") ~ " requests") }}
+  {{ ui.tile("Clients active", s.clients.active | length, hint="seen in the last 2 min") }}
+</div>
+
+<div class="grid">
+  {% call ui.card("Host") %}
+    <table>
+      <tr><th>Name</th><td>{{ s.host.name }}</td></tr>
+      <tr><th>Version</th><td>{{ s.host.version or "—" }}{% if s.host.git_sha %} <code>{{ s.host.git_sha }}</code>{% endif %}</td></tr>
+      <tr><th>Models</th><td>
+        Dictation {{ ui.badge("ready", "ok") if s.models.dictation_ready else ui.badge("not ready", "bad") }}
+        File {{ ui.badge("loading", "warn") if s.models.file_loading else (ui.badge("loaded", "ok") if s.models.file_loaded else ui.badge("idle")) }}
+      </td></tr>
+      <tr><th>Oldest pending job</th><td>{{ dur(s.queue.oldest_pending_age_s) }}</td></tr>
+    </table>
+  {% endcall %}
+  {% call ui.card("Database and storage") %}
+    <table>
+      <tr><th>Health</th><td>{{ ui.badge("ok", "ok") if s.db.ok else ui.badge(s.db.reason or "error", "bad") }}</td></tr>
+      <tr><th>Schema</th><td>{{ s.db.schema_version or "—" }}{% if s.db.code_schema_version %} / code {{ s.db.code_schema_version }}{% endif %} · {{ s.db.journal_mode or "—" }}</td></tr>
+      <tr><th>DB / WAL</th><td>{{ size(s.disk.db_bytes) }} / {{ size(s.disk.wal_bytes) }}</td></tr>
+      <tr><th>Outputs / staging</th><td>{{ size(s.disk.outputs_bytes) }} / {{ size(s.disk.staging_bytes) }}</td></tr>
+    </table>
+  {% endcall %}
+  {% call ui.card("Network") %}
+    <table>
+      <tr><th>Server URL</th><td><code>{{ s.network.server_url or "—" }}</code></td></tr>
+      <tr><th>Reachable</th><td>{% if s.network.reachable is none %}{{ ui.badge("unknown") }}{% elif s.network.reachable %}{{ ui.badge("yes", "ok") }}{% else %}{{ ui.badge("no", "bad") }}{% endif %}</td></tr>
+    </table>
+  {% endcall %}
+  {% call ui.card("Failure counters (since start)") %}
+    <table>
+      <tr><th>Usage writes lost</th><td class="num">{{ s.counters.usage_write_failures }}</td></tr>
+      <tr><th>Dictations not saved</th><td class="num">{{ s.counters.dictation_save_failures }}</td></tr>
+      <tr><th>Eviction self-check</th><td class="num">{{ s.counters.eviction_failures }}</td></tr>
+      <tr><th>Stream aborts</th><td class="num">{{ s.counters.stream_aborts }}</td></tr>
+    </table>
+  {% endcall %}
+</div>
+
+<h2>Latency (recent, per route)</h2>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Route</th><th class="num">p50 ms</th><th class="num">p95 ms</th></tr></thead>
+    <tbody>
+      {% for route, p in s.latency.items() %}
+        <tr><td><code>{{ route }}</code></td>
+          <td class="num">{{ "%.0f" | format(p.p50) if p.p50 is not none else "—" }}</td>
+          <td class="num">{{ "%.0f" | format(p.p95) if p.p95 is not none else "—" }}</td></tr>
+      {% else %}
+        <tr><td colspan="3">{{ ui.empty_state("No requests since start.") }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Clients</h2>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Person</th><th>Device</th><th>Kind</th><th>Last seen</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for c in s.clients.active + s.clients.recent %}
+        <tr>
+          <td><a href="/admin/people/{{ c.user_id }}">{{ c.user_label }}</a></td>
+          <td>{{ c.key_label or ("Key #" ~ c.key_id) }}</td>
+          <td>{{ c.kind }}</td>
+          <td>{{ dur(s.generated_at - c.last_seen) }} ago</td>
+          <td>{{ ui.badge("active", "ok") if c in s.clients.active else ui.badge("recent") }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5">{{ ui.empty_state("No client seen in the last 7 days.") }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

@@ -1,0 +1,22 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}{{ "Dictation" if row.kind == "dictation" else "File transcription" }} · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>{{ "Dictation" if row.kind == "dictation" else "File transcription" }}</h1>
+      <p class="muted">{{ row.created_at_iso }} · {{ row.word_count or 0 }} words{% if admin_view %} · by <a href="/admin/people/{{ row.user_id }}">{{ row.user_label }}</a>{% endif %}</p>
+    </div>
+    <a class="btn" href="{{ '/admin/records' if admin_view else '/me/history' }}">Back</a>
+  </div>
+  {% if admin_view %}<p class="notice">Admins can read every team transcript. This view is not shown to {{ row.user_label }}.</p>{% endif %}
+  {% call ui.card() %}
+    <pre class="transcript">{{ row.text or row.transcript_text or '' }}</pre>
+    {% if not admin_view %}
+    <div class="row">
+      <a href="/me/history/{{ row.kind }}/{{ row.row_id }}/download/txt" download>Download TXT</a>
+      <a href="/me/history/{{ row.kind }}/{{ row.row_id }}/download/json" download>Download JSON</a>
+    </div>
+    {% endif %}
+  {% endcall %}
+{% endblock %}

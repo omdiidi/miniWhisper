@@ -1,0 +1,40 @@
+{# Measured stats: computed from the DB, shown with AI on or off.
+   Needs `m` (insights.measured.compute), `link_base` (/me/history or /admin/records)
+   and optional `link_params` (e.g. {"user_id": 3}). Every tile opens the records
+   behind it for the same window. #}
+{% import "_ui.html.j2" as ui %}
+{% set lp = link_params | default({}) %}
+{% set win = dict(lp, since=m.window.since, until=m.window.until) %}
+{% set all_href = link_base ~ "?" ~ (win | urlencode) %}
+{% set dict_href = link_base ~ "?" ~ (dict(win, kind="dictation") | urlencode) %}
+{% set file_href = link_base ~ "?" ~ (dict(win, kind="file") | urlencode) %}
+<section aria-labelledby="measured-h">
+  <div class="spread"><h2 id="measured-h">Measured</h2><span class="muted small">From your records, not AI.</span></div>
+  <div class="tiles">
+    {{ ui.tile("Dictations", "{:,}".format(m.dictation_count), href=dict_href) }}
+    {{ ui.tile("File transcriptions", "{:,}".format(m.file_count), href=file_href) }}
+    {{ ui.tile("Words", "{:,}".format(m.words), href=all_href) }}
+    {{ ui.tile("Active days", m.active_days, href=all_href) }}
+    {{ ui.tile("File audio (min)", m.file_audio_minutes, href=file_href) }}
+    {{ ui.tile("Filler words", "{:,}".format(m.fillers.total), href=dict_href, hint="um " ~ m.fillers.um ~ " · uh " ~ m.fillers.uh ~ " · like " ~ m.fillers.like ~ " · you know " ~ m.fillers["you know"]) }}
+    {{ ui.tile("Time saved (hrs)", m.time_saved_hours, href=all_href, hint="estimate, 40 wpm typing baseline") }}
+    {{ ui.tile("Dictation latency", ("%.0f / %.0f ms" | format(m.latency_p50_ms, m.latency_p95_ms)) if m.latency_p50_ms is not none else "—", hint="p50 / p95") }}
+    {{ ui.tile("Error rate", ("%.1f%%" | format(m.error_rate * 100)) if m.error_rate is not none else "—", hint=m.requests ~ " requests") }}
+  </div>
+  <div class="grid">
+    {% call ui.card("Last 8 weeks") %}
+      {% set tmax = m.trend | map(attribute="count") | max %}
+      <div class="bars" role="img" aria-label="Records per week, last 8 weeks">
+        {% for b in m.trend %}<div title="{{ b.label }}: {{ b.count }} records, {{ b.words }} words" style="height: {{ (100 * b.count / tmax) | round(1) if tmax else 0 }}%"></div>{% endfor %}
+      </div>
+      <div class="bars-axis"><span>{{ m.trend[0].label }}</span><span>{{ m.trend[-1].label }}</span></div>
+    {% endcall %}
+    {% call ui.card("Time of day") %}
+      {% set hmax = m.hours | max %}
+      <div class="bars" role="img" aria-label="Records by hour of day">
+        {% for n in m.hours %}<div title="{{ loop.index0 }}:00 — {{ n }}" style="height: {{ (100 * n / hmax) | round(1) if hmax else 0 }}%"></div>{% endfor %}
+      </div>
+      <div class="bars-axis"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
+    {% endcall %}
+  </div>
+</section>

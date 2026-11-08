@@ -1,0 +1,30 @@
+{% extends "base.html.j2" %}
+{% set KIND_LABELS = [('', 'All kinds'), ('dictation', 'Dictations'), ('file', 'File transcriptions')] %}
+{% block title %}Records · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>Team records</h1>
+      <p class="muted">Every person's dictations and file transcriptions. Admins can read team transcripts; employees only ever see their own.</p>
+    </div>
+  </div>
+  <form class="filters" role="search" hx-get="/admin/records" hx-target="#records-body" hx-swap="innerHTML"
+        hx-push-url="true" hx-trigger="input changed delay:300ms from:#records-q, search from:#records-q, change, submit">
+    <input type="hidden" name="range" value="{{ range }}">
+    {% if since is not none %}<input type="hidden" name="since" value="{{ since }}">{% endif %}
+    {% if until is not none %}<input type="hidden" name="until" value="{{ until }}">{% endif %}
+    <label class="sr-only" for="records-q">Search</label>
+    <input id="records-q" type="search" name="q" placeholder="Search team transcripts…" value="{{ q }}" maxlength="200">
+    <label class="sr-only" for="records-user">Person</label>
+    <select id="records-user" name="user_id">
+      <option value="">Everyone</option>
+      {% for p in people %}<option value="{{ p.id }}" {% if user_id == p.id %}selected{% endif %}>{{ p.display_name or p.label }}</option>{% endfor %}
+    </select>
+    <label class="sr-only" for="records-kind">Kind</label>
+    <select id="records-kind" name="kind">
+      {% for v, l in KIND_LABELS %}<option value="{{ v }}" {% if (kind or '') == v %}selected{% endif %}>{{ l }}</option>{% endfor %}
+    </select>
+  </form>
+  {% if since is not none or until is not none %}<p class="notice">Showing a fixed time window. <a href="/admin/records">Clear</a></p>{% endif %}
+  <div id="records-body">{% include "_records_body.html.j2" %}</div>
+{% endblock %}

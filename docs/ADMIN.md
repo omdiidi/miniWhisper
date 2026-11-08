@@ -4,19 +4,28 @@ title: Admin UI
 
 # Admin UI
 
-Server-rendered Jinja2 dashboard at `https://transcribe.<your-domain>/admin/*`.
-Lets the operator mint tokens, revoke users, browse usage events, and export
-CSV without ever touching the database directly.
+Server-rendered Jinja2 portal at `https://transcribe.<your-domain>/admin/*`
+(Jinja + vendored HTMX/Alpine, one stylesheet `admin/static/portal.css`, no build
+step). It lets the operator manage people, devices, invites and integration keys,
+watch the host, search team transcripts, read measured stats and (optionally) AI
+insights, without touching the database directly.
 
-Source: `server/src/wispralt/routes/admin_ui.py` +
-`server/src/wispralt/admin/templates/*.html.j2`.
+Source: `server/src/wispralt/routes/{admin_ui,admin_invites,admin_system,admin_data}.py`
++ `server/src/wispralt/admin/templates/*.html.j2`.
+
+Navigation (admins): **Overview · People · Integrations · Invites · Usage · Records ·
+Data · System · Settings**, plus **My history · My insights**. Employees see only
+**My history · My insights · My usage**. The sidebar becomes a scrolling strip on a
+phone; light and dark follow the system setting.
 
 ---
 
 ## When to use it
 
-- Onboarding a new employee: mint a token, text it to them.
-- Off-boarding: revoke the user; their next request gets 401.
+- Onboarding a new person: send an invite link, or create them and send the
+  install command.
+- Adding a device for someone who already has an account: **Add device** on their page.
+- Off-boarding: disable the person; their next request gets 401.
 - Spot-checking usage: who's been active, what error rates look like, which
   requests failed and when.
 - Auditing for billing or CRM tie-in (see [Future hooks](#future-hooks-crm)).
@@ -41,6 +50,17 @@ revokes the old key and issues a new one. `python -m wispralt.bootstrap`
 remains as a shim over the same code (run it where the host `.env` is). There
 is no env admin key and no break-glass path.
 
+### First-admin setup in the portal (`/admin/setup`)
+
+The terminal bootstrap stays the primary path. As an alternative, while **no enabled
+admin exists** the server writes a one-time code to `DATA_DIR/setup-code` (mode 0600,
+128 bits) at startup and logs only its path. Open `/admin/setup`, paste the file's
+content (`cat "$DATA_DIR/setup-code"` on the server) and a label: the server creates
+the admin, shows its key **once** (`Cache-Control: no-store`), signs the browser in
+and deletes the file. From then on `/admin/setup` returns 404. Reading the file
+proves local access to the host; the page cannot be used from the tunnel without it.
+Two people submitting at once still produce exactly one admin.
+
 ---
 
 ## Logging in
@@ -50,7 +70,7 @@ Two authentication methods, both resolved by `auth.py`:
 ### Header (curl / Postman)
 
 ```
-GET /admin/users HTTP/1.1
+GET /admin/people HTTP/1.1
 Host: transcribe.example.com
 Authorization: Bearer <admin-token>
 ```
@@ -68,9 +88,9 @@ request (no cache).
    `SameSite=Strict`, `max_age=8h`.
 4. **Role-based redirect on success:**
    - `role='admin'` → 303 to `/admin/` (full overview dashboard).
-   - `role='employee'` → 303 to `/admin/me` (the employee's own
-     `user_detail` page; admin-only nav links are hidden by
-     `base.html.j2`, replaced with a single "My Usage" link).
+   - `role='employee'` → 303 to `/admin/me` (the employee's own person page,
+     without the admin actions; the sidebar shows only My history, My insights
+     and My usage).
 
 The macOS client's menubar **Open Portal** button targets
 `<server>/admin/login` for everyone, so the same install ships to admins
@@ -79,7 +99,7 @@ and employees without a per-role configuration.
 The cookie is read by `auth._extract_bearer` as a fallback when no
 `Authorization: Bearer` header is present.
 
-**CSRF (Part 4).** Every cookie-authenticated mutation (Add employee, Add key, user Revoke / Mint, key Revoke / Rotate, `PATCH /me`, `/me/history` delete / restore) needs the double-submit token: the `X-CSRF-Token` header or the `csrf_token` form field must equal the `wispralt_csrf` cookie (set by the page that rendered the form), else **403**. A request that authenticated with a valid `Authorization: Bearer` header needs no token (a cross-site page cannot set that header). A non-Bearer `Authorization` header (e.g. `Basic`) falls back to the cookie and so needs the token; an invalid Bearer is a 401, never a cookie fallback. `SameSite=Strict` on the cookies is a second layer.
+**CSRF (Part 4).** Every cookie-authenticated mutation (Add employee, person Rotate / Disable, Revoke device, Invites create / revoke, integration Add / Rotate / Revoke, AI runs, Settings, `PATCH /me`, `/me/history` delete / restore) needs the double-submit token: the `X-CSRF-Token` header or the `csrf_token` form field must equal the `wispralt_csrf` cookie (set by the page that rendered the form), else **403**. A request that authenticated with a valid `Authorization: Bearer` header needs no token (a cross-site page cannot set that header). A non-Bearer `Authorization` header (e.g. `Basic`) falls back to the cookie and so needs the token; an invalid Bearer is a 401, never a cookie fallback. `SameSite=Strict` on the cookies is a second layer.
 
 ---
 
@@ -97,135 +117,122 @@ Single-CTE dashboard (`_OVERVIEW_SQL` in `routes/admin_ui.py`). Tiles:
 - Last-14-day usage rendered as a CSS-bar table (no chart library; works
   offline).
 
-### `GET /admin/users` — Users
+### `GET /admin/people` — People
 
-Lists every employee-kind user, including revoked ones (most-recently-created first). The
-displayed identifier is `display_name (label)` when both are populated
-(e.g. `Alice (alice@example.com)`), or just `label` when
-`display_name IS NULL`. Admins can **optionally pre-set** the
-`display_name` at create-time via the add-employee form (see "Adding a
-new employee" below); when provided, the employee's
-`FirstLaunchCoordinator` skips its name-prompt sheet. Employees can
-still self-manage their own `display_name` after the fact via the macOS
-client's Settings → Identity section, which calls `PATCH /me` (see
-[API.md](API.md)). There is no admin UI to edit another employee's
-`display_name` after creation — post-create edits are intentionally
-self-service.
+Lists every employee-kind person, including disabled ones (newest first): name
+(`display_name`, else `label`), role, created, last seen (derived from
+`MAX(usage_events.ts)`, never written per request) and status. Admins can
+**optionally pre-set** `display_name` when adding someone (the app then skips its
+name prompt); afterwards it is self-service through `PATCH /me` (see [API.md](API.md)).
 
-Per-row controls:
+### `GET /admin/people/{id}` — Person page
 
-- **Mint** — `POST /admin/users/{id}/mint` revokes the user's active keys
-  and issues one new key (same id / label / role); it also re-enables a
-  revoked user. The page renders
-  `token_minted.html.j2` which shows the new plaintext **once**. Copy it,
-  text it to the employee, close the tab.
-- **Revoke** — `POST /admin/users/{id}/revoke` sets `users.disabled_at`;
-  none of the user's keys authenticate from their next request (401).
+Request tiles (24 h / 7 d / 30 d, errors, p50), **Devices** and recent requests.
+Each device is one API key with its label (from the invite), when it was added and
+when it was **last seen** (`usage_events.key_id`, recorded per request since Part 6).
+The three actions differ on purpose:
 
-`last_seen_at` is **derived** from `MAX(usage_events.ts)` per user — it is
-not written on every request.
+| Action | Route | Effect |
+|---|---|---|
+| **Add device** | `POST /admin/invites` with `user_id` | A single-use invite for this person; redeeming adds a key. Existing devices keep working. |
+| **Revoke device** | `POST /admin/keys/{key_id}/revoke` | That one key stops working on its next request; the person's other devices keep working. |
+| **Rotate key** | `POST /admin/people/{id}/rotate` | Revokes **every** key of the person, issues one new key shown **once** (`no-store`) and re-enables a disabled person. |
+| **Disable person** | `POST /admin/people/{id}/disable` | None of their keys authenticate from the next request (401). You cannot disable yourself. Rotate re-enables. |
 
-### `GET /admin/users/{id}` — User detail
-
-Per-user metrics scoped to one row plus the last 50 `usage_events` for
-that user. Same 24h / 7d / 30d / errors_24h / p50_24h tiles, narrowed to
-`WHERE user_id = $1`. **Admin-only.**
+Auth looks every key up on every request (no cache), so each change applies to the
+next request with no restart.
 
 ### `GET /admin/me` — My usage (employee self-service)
 
-Same `user_detail` template as `/admin/users/{id}`, scoped to the
-**calling user's own id**. Mounted on a separate router that requires
-`require_api_key` (any authenticated role) instead of `require_admin`,
-so employees can view their own dictation history without being able to
-see anyone else's. Admins hitting `/admin/me` are 303'd to `/admin/`.
+The same person page scoped to the **calling user** without the admin actions.
+Mounted on a router that only requires a valid key, so employees see their own
+devices and requests and nobody else's. Admins hitting `/admin/me` are 303'd to `/admin/`.
 
-`base.html.j2` reads `request.state.user.role` and:
+### `GET /admin/invites` — Invites
 
-- Hides the admin-only nav (Overview / Users / Usage) for non-admin
-  sessions, replacing it with a single "My Usage" link.
-- Flips the header title from "Wispralt Admin" to "Wispralt Portal" for
-  non-admins.
+Invite a new person (label + role) or, from a person page, add a device. Each invite
+is **single use**, expires after **10 minutes**, and is stored only as a sha256 hash.
+The result page shows, once and with `Cache-Control: no-store`:
 
-The macOS menubar **Open Portal** button (renamed from "Open Admin
-Portal" in be720a1) targets `/admin/login`, so a single client build
-serves both roles correctly.
+- the join link `wispralt://join?host=<SERVER_URL>&invite=<token>` (the app consumes
+  it; the client handler is Part 5), and
+- the raw invite code, for pasting into the app.
 
-### `GET /admin/data` — Manual insights trigger
+The app redeems it with `POST /invites/redeem` (see [API.md](API.md#post-invitesredeem)),
+which creates the person (new invites) or adds a key (add device) atomically. The list
+shows each invite as pending, expired or redeemed; **Revoke** expires a pending one.
+An invite also stops working when the admin who made it is disabled.
 
-The Data tab has a **Run insights now** button at the top-right of the
-range-tabs row, with the muted hint "Costs ~$0.65 per run". Clicking it
-fires `insights.cron.run_weekly_insights` against the **current
-in-progress ISO week** as an admin-initiated, fire-and-forget background
-task. The Sunday 23:00 cron continues to fire unchanged — when it runs,
-it UPSERT-replaces the manual-run rows for the now-complete week, so
-there are no orphan rows.
+### `GET /admin/records` — Team records
 
-Source: `routes/admin_data.py:admin_data_run_insights_now` (`POST
-/admin/data/insights/run-now`). API contract:
-[API.md → POST /admin/data/insights/run-now](API.md#post-admindatainsightsrun-now).
+Search or list every person's dictations and file transcriptions (full-text search,
+highlighted matches; filter by person and kind). **Admins can read team transcripts**;
+the record page (`/admin/records/{kind}/{id}`) says so. Employees never reach this
+page (403): they only ever see their own history at `/me/history`.
 
-**Why use it**
+### `GET /admin/data` — Data & Insights
 
-- Spot-check a configuration change without waiting until Sunday.
-- Demo the insight cards for an employee onboarding.
-- Recover from a Sunday miss (uvicorn was down, the cron task crashed,
-  etc.) — clicking re-runs cleanly because the per-user idempotency skip
-  (`cron.py:167-176`) short-circuits OpenRouter calls for users whose
-  rows already exist.
+Two clearly separate parts, for the team or one person (`?user_id=N`), over the
+selected range (Today / 7d / 30d / 90d / 1y / All):
 
-**Cost + budget protection**
+- **Measured** — computed from the database, shown whether AI is on or off:
+  dictations, file transcriptions, words, active days, file audio minutes, filler
+  words (um, uh, like, you know), **time saved (an estimate against a 40 wpm typing
+  baseline)**, dictation latency p50/p95, error rate, an 8-week trend and an
+  hour-of-day chart. Every count tile opens the records behind it for the same
+  window. The team view adds a per-person table (dictations, files, words, fillers,
+  time saved).
+- **AI interpretation** — only when an admin has enabled it in **Settings**. Shows the
+  model, when it was generated and its cost. Every item (digest, action items,
+  decisions, blockers, projects, topics, quotable line; for the team: themes, action
+  items, blockers, decisions, knowledge gaps) links to the records it came from;
+  items whose records were deleted are hidden. A **stale** notice appears when
+  records from that week arrived after it was generated, and a topic also seen in
+  earlier weeks says "seen N weeks". Insights made in the old format without sources
+  show a "regenerate" notice instead.
 
-Each manual run costs roughly $0.65 (varies with team size and weekly
-transcript volume). The server pre-checks the rolling 30-day insights
-spend against `settings.insights_max_30d_cost_usd` (default $8) BEFORE
-spawning the task — over-cap clicks return a toast like
-`Budget exceeded ($8.12 / $8.00 cap). Run skipped.` instead of silently
-incurring a charge.
+**AI runs** (bottom of the page): pick the last full week or a backfill of up to 12
+weeks, optionally **Regenerate existing**, and click **Estimate cost**. The estimate
+(words that would be sent × 1.35 tokens/word × the model's input rate, plus your
+30-day spend against the cap) appears with a **Start** button; nothing is sent until
+you press it. Progress (people done / total) updates every 2 seconds while a run is
+going. Each run ends as `done`, `failed`, `aborted` (`budget`: the 30-day cap was
+reached, checked before every call; `rate_limit`: OpenRouter returned 429) or
+`skipped` (AI off). Failures list only the person id and an error class.
 
-**Toast meanings**
+The scheduler checks once an hour and runs the **last full week** when it has no
+finished scheduled run (a failed attempt is retried after 6 hours). Older weeks are
+only run by a backfill.
 
-| Toast | What it means | What to do |
-|---|---|---|
-| `Insights run started for Wxx. Refresh page in ~1 minute to see results.` | Task spawned successfully. Button switched to `Running…` (disabled). | Wait ~30–60 seconds, then full-page-refresh `/admin/data` to see the new rows in the per-user drill-down. |
-| `Insights unavailable — OPENROUTER_API_KEY not configured.` | `OPENROUTER_API_KEY` env var is unset. No task spawned, no charge. | Set the key in `server/.env`, restart the server, click again. |
-| `Budget exceeded ($X.XX / $Y.YY cap). Run skipped.` | Rolling 30-day spend already over the cap. No task spawned, no charge. | Wait for the rolling window to clear, OR raise `insights_max_30d_cost_usd` in `server/.env` and restart. |
-| `A run is already in progress. Refresh in ~1 minute.` | The lock is held — another manual or scheduled run is mid-flight. The button repaints as `Running…`. | Wait. The lock auto-releases when the in-flight run completes. |
-| `Session expired. Refresh the page and try again.` | The CSRF cookie has expired (30-minute TTL — `auth._CSRF_COOKIE_MAX_AGE_S`). | Refresh the page to mint a new cookie, then click again. |
+### `GET /admin/settings` — Settings
 
-**Known limitations**
+AI interpretation is **off** until an admin turns it on here after reading the
+disclosure: when on, the text of each person's dictations and file transcriptions
+from the week (up to about 30,000 words per person) is sent to OpenRouter and the
+chosen model. Turning it on requires ticking the acknowledgement once (its time is
+recorded). Also here: the **model** (default `x-ai/grok-4.3`), the **30-day spending
+cap** (default $8) and the **timezone** for weeks and charts (blank = the server's
+zone, else UTC). The OpenRouter key is never entered in the portal: the page shows
+whether `OPENROUTER_API_KEY` is configured in `server/.env`.
 
-- **Refresh-to-resync model.** The button + toast live OUTSIDE
-  `#insights-body`, so clicking a range tab (Today / 7d / 30d / etc.)
-  does NOT repaint either of them — including not updating
-  `Running…` → enabled when the in-flight run completes. The disabled
-  state is read from `app.state.weekly_insights_lock.locked()` at GET
-  time, so a full-page refresh is the way to re-sync the button after a
-  run finishes. This is intentional per the brief (no polling, no SSE).
-- **Phase 2 team-aggregate display bug.** After a manual run completes,
-  the team-aggregate top-level tiles on `/admin/data` may still show 0
-  across the board — that's a pre-existing display bug being tracked
-  separately, NOT a failure of the manual trigger. The actual rows DID
-  land in `weekly_insights`; confirm by drilling into a specific user
-  via `/admin/data?user_id=N` (the per-user cards render correctly).
-- **SIGTERM mid-run.** Manual-trigger tasks are held in
-  `app.state.weekly_insights_manual_tasks` (a `set[asyncio.Task]`) but
-  are NOT included in the lifespan shutdown's cancel loop — restarting
-  uvicorn (or a `launchctl unload`) mid-run drops the task on the
-  floor. Click the button again post-restart: the per-user idempotency
-  skip means already-processed users are not re-charged, and only the
-  un-processed tail of the team re-uses OpenRouter quota.
-- **Single-process assumption.** `weekly_insights_lock` is
-  process-local. If the deployment ever scales to multiple uvicorn
-  workers, the lock-based UX disable will stop working (two workers
-  would each show the button as enabled while the other is running).
-  The double-billing safety still holds via the per-user idempotency
-  skip.
+### `GET /admin/system` — System
+
+Live host state, refreshed every 5 seconds: uptime and how many times the server has
+started, version and git commit, CPU and load, memory (and the server's RSS), disk
+free plus the sizes of the DB, its WAL, `outputs/` and `staging/`, model readiness
+(dictation ready, file model loaded or loading), the file-job queue (pending,
+running, failed in 24 h, oldest pending), the 5xx rate over the last hour, failure
+counters since start (usage writes lost, dictations not saved, eviction self-check,
+stream aborts), per-route latency, DB health and schema version, whether
+`SERVER_URL` answers `/healthz` (checked at most once a minute), and clients:
+**active** (seen in the last 2 minutes) versus **recent** (last 7 days), per device.
+`/admin/system/snapshot?format=json` returns the same data as JSON.
 
 ### `GET /admin/usage` — Usage drill-down
 
 Filters: `kind` (e.g. `dictate`, `file`; rows recorded before file jobs were renamed carry `meeting`), `status` (HTTP status),
 `user_id`, `since`, `until`. Paginated 100 per page. Each row links back
-to its user detail.
+to the person's page.
 
 Meetings were removed in Part 2. Portal pages (`/me/history`, the stats
 grid, the insight split card, the admin data table) now **display** rows
@@ -246,7 +253,10 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
 
 ## Adding a new employee
 
-1. Open `/admin/users` and click **+ Add employee** (top-right).
+Prefer an **invite** (`/admin/invites`): the app signs itself in from the link and
+no key is ever pasted. To create the person directly instead:
+
+1. Open `/admin/people` and click **Add employee** (top-right).
 2. Enter a `label` (1–80 chars, no control characters — e.g.
    `nicholas`, `alex-laptop`, `contractor-q2`), optionally enter a
    `display_name` (1–40 chars, no control characters — e.g. `Sarah Chen`;
@@ -262,16 +272,16 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
 
    Click **Copy install command**, paste into Signal / iMessage. The
    plaintext token is shown **once** — closing the page without copying
-   means rotating via **Mint new token** on the user's row.
+   means rotating via **Rotate key** on the person's page.
 4. The employee pastes the command into Terminal on their Mac. The
    installer downloads the latest signed DMG from GitHub Releases,
    copies the app to `/Applications`, seeds the token into the Keychain,
    and opens the System Settings panes for the three macOS permissions.
 5. Their first dictation populates `usage_events`; they appear on
-   `/admin/users` with a non-null `last_seen_at`.
+   `/admin/people` with a non-null last seen.
 
-The route handlers live at `routes/admin_ui.py:users_add_form` (GET) and
-`users_add_submit` (POST). Both are gated by `require_admin`; the latter
+The route handlers live at `routes/admin_ui.py:people_add_form` (GET) and
+`people_add_submit` (POST). Both are gated by `require_admin`; the latter
 calls `accounts.service.create_user` and renders
 `employee_added.html.j2` with the install one-liner composed from
 `settings.server_url`.
@@ -300,9 +310,9 @@ the `kind` column (`'employee'` or `'integration'`).
 
 ### Minting an integration key
 
-1. Open `/admin/keys/new`.
-2. Enter a `label` (1–80 chars, no control chars — name it after the
-   program, e.g. `buzz-laptop`, `obs-streaming`, `bazarr-server`).
+1. Open `/admin/integrations/new` (**Integrations → Add API key**).
+2. Enter the program name (1–40 chars, no control chars — e.g. `Buzz on
+   Bob's MacBook`, `Open WebUI prod`); the label becomes `key-<slug>`.
 3. Submit. The result page shows:
    - The plaintext token **once** (copy now or rotate later).
    - A ready-to-paste OpenAI env-var snippet:
@@ -319,19 +329,19 @@ the `kind` column (`'employee'` or `'integration'`).
 
 ### Listing integration keys
 
-`/admin/keys` lists every integration key (analogous to `/admin/users`
+`/admin/integrations` lists every integration key (analogous to `/admin/people`
 for employees). Rows: label, created_at, last_seen_at, revoked status.
 
 ### Rotating an integration key
 
-`/admin/keys/{id}/rotate` revokes the key and issues a new one: same id /
+`POST /admin/integrations/{id}/rotate` revokes the key and issues a new one: same id /
 label / kind. The page shows the new plaintext once. Update the program's
 env var, restart the program. The old token stops working on its next
 request.
 
 ### Revoking an integration key
 
-`/admin/keys/{id}/revoke` disables the key's user (`users.disabled_at`).
+`POST /admin/integrations/{id}/revoke` disables the key's user (`users.disabled_at`).
 Its next `/v1` request returns **401**.
 
 ### What integration keys can / can't access
@@ -349,13 +359,14 @@ formats — lives in [OPENAI-COMPAT.md](OPENAI-COMPAT.md).
 
 ---
 
-## Revoking an employee
+## Off-boarding, lost devices and rotation
 
-1. `/admin/users` → find the row → click **Revoke**.
-2. The route sets `users.disabled_at`. Auth looks the key up on every
-   request (there is no token cache), so the employee's next request gets
-   401 — no wait, no restart.
-3. **Mint** on the same row later issues a fresh key and re-enables them.
+- **A person leaves:** People → their page → **Disable person**. Every key of theirs
+  gets 401 from the next request (no token cache, no restart).
+- **One laptop is lost:** their page → **Revoke device** on that row. Their other
+  devices keep working.
+- **A key may have leaked, or they need a fresh start:** **Rotate key** revokes all
+  of their keys and shows one new key once. It also re-enables a disabled person.
 
 ### From the command line
 
@@ -388,7 +399,8 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 |---|---|---|
 | `DATA_DIR` | Yes | Absolute path of the data directory (`wispralt.db`, outputs, staging). `wispralt setup` writes `$HOME/Library/Application Support/WisprAlt/host` (or `--data-dir`). |
 | `SERVER_LOG_PATH` / `SERVER_LOG_MAX_BYTES` / `SERVER_LOG_BACKUP_COUNT` | No | Rotating application log (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). `/admin/server-log` reads it. launchd's `server.log` / `server.err.log` hold crash output only. |
-| `OPENROUTER_API_KEY` | No | Enables weekly insights. When unset, the insights cron is a no-op. (Server smart formatting was removed in Part 4.) Get a key at https://openrouter.ai/keys. |
+| `OPENROUTER_API_KEY` | No | Needed for AI insights, which also stay off until an admin enables them in **Settings** after the disclosure. When unset, no run can start. (Server smart formatting was removed in Part 4.) Get a key at https://openrouter.ai/keys. |
+| `INSIGHTS_TIMEZONE` | No | Default timezone for insight weeks and charts when none is set in **Settings**; unset = the host's zone (`/etc/localtime`), else UTC. |
 
 ---
 
@@ -397,8 +409,8 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 Third-party API traffic via the OpenAI-compat shim is recorded with
 `kind = "v1_dictate"` (native client traffic uses `kind = "dictate"`).
 Both `kind` values land in the same `usage_events` table and are folded
-into the per-user request tiles on `/admin/users/{id}` (the overview's
-Dictations tiles count `dictations` rows, which `/v1` does not write). Per-user event lists on `/admin/users/{id}` show
+into the per-person request tiles on `/admin/people/{id}` (the overview's
+Dictations tiles count `dictations` rows, which `/v1` does not write). Per-person request lists on `/admin/people/{id}` show
 `v1_dictate` rows alongside `dictate` and `file` rows so you can see
 which path generated each request.
 

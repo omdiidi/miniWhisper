@@ -120,9 +120,9 @@ def test_require_admin_role_gate() -> None:
 def test_add_employee_form_admin_only(
     client: TestClient, make_user: MakeUser, admin: tuple[User, dict[str, str]]
 ) -> None:
-    assert "Add employee" in client.get("/admin/users/new", headers=admin[1]).text
+    assert "Add employee" in client.get("/admin/people/new", headers=admin[1]).text
     _u, token = make_user()
-    assert client.get("/admin/users/new", headers=_bearer(token)).status_code == 403
+    assert client.get("/admin/people/new", headers=_bearer(token)).status_code == 403
 
 
 def test_add_employee_creates_user_and_install_command(
@@ -133,7 +133,7 @@ def test_add_employee_creates_user_and_install_command(
 ) -> None:
     monkeypatch.setattr(admin_ui.settings, "server_url", "https://example.test")
     resp = client.post(
-        "/admin/users/new", data={"label": "  nicholas  ", "role": "employee"}, headers=admin[1]
+        "/admin/people/new", data={"label": "  nicholas  ", "role": "employee"}, headers=admin[1]
     )
     assert resp.status_code == 200, resp.text
     assert "WISPRALT_API_KEY=" in resp.text and "WISPRALT_SERVER=https://example.test" in resp.text
@@ -157,7 +157,7 @@ def test_add_employee_rejects_invalid_input(
     data: dict[str, str],
     message: str,
 ) -> None:
-    resp = client.post("/admin/users/new", data=data, headers=admin[1])
+    resp = client.post("/admin/people/new", data=data, headers=admin[1])
     assert resp.status_code == 400 and message in resp.text
     assert [u.label for u in accounts.list_people()] == ["omid"]
 
@@ -166,11 +166,11 @@ def test_users_page_shows_disabled_state(
     client: TestClient, make_user: MakeUser, admin: tuple[User, dict[str, str]]
 ) -> None:
     emp, token = make_user(label="bob")
-    resp = client.post(f"/admin/users/{emp.id}/revoke", headers=admin[1], follow_redirects=False)
+    resp = client.post(f"/admin/people/{emp.id}/disable", headers=admin[1], follow_redirects=False)
     assert resp.status_code == 303
     assert client.get("/admin/", headers=_bearer(token)).status_code == 401
-    page = client.get("/admin/users", headers=admin[1]).text
-    assert "bob" in page and "revoked" in page
+    page = client.get("/admin/people", headers=admin[1]).text
+    assert "bob" in page and "disabled" in page
 
 
 # ── page numbers come from UsageStore ─────────────────────────────────────────
@@ -247,9 +247,9 @@ def test_streamed_dictation_counts_once(
 def test_user_detail_and_usage_pages(
     client: TestClient, admin: tuple[User, dict[str, str]], seeded: User
 ) -> None:
-    detail = client.get(f"/admin/users/{seeded.id}", headers=admin[1])
+    detail = client.get(f"/admin/people/{seeded.id}", headers=admin[1])
     assert detail.status_code == 200 and "alice" in detail.text
-    assert client.get("/admin/users/9999", headers=admin[1]).status_code == 404
+    assert client.get("/admin/people/9999", headers=admin[1]).status_code == 404
 
     page = client.get("/admin/usage", params={"status": 500}, headers=admin[1])
     assert page.status_code == 200 and page.text.count("<td>500</td>") == 1
@@ -279,19 +279,29 @@ def csrf_client(wire: Wire) -> TestClient:
 def _mutation(name: str, employee: User, integration: User) -> tuple[str, str, dict, int]:
     """(method, path, body kwargs, success status) for each guarded mutation."""
     return {
-        "users_new": ("POST", "/admin/users/new", {"data": {"label": "newbie"}}, 200),
-        "users_revoke": ("POST", f"/admin/users/{employee.id}/revoke", {"data": {}}, 303),
-        "users_mint": ("POST", f"/admin/users/{employee.id}/mint", {"data": {}}, 200),
-        "keys_new": ("POST", "/admin/keys/new", {"data": {"program_name": "Buzz"}}, 200),
-        "keys_revoke": ("POST", f"/admin/keys/{integration.id}/revoke", {"data": {}}, 303),
-        "keys_rotate": ("POST", f"/admin/keys/{integration.id}/rotate", {"data": {}}, 200),
+        "people_new": ("POST", "/admin/people/new", {"data": {"label": "newbie"}}, 200),
+        "people_disable": ("POST", f"/admin/people/{employee.id}/disable", {"data": {}}, 303),
+        "people_rotate": ("POST", f"/admin/people/{employee.id}/rotate", {"data": {}}, 200),
+        "device_revoke": ("POST", f"/admin/keys/{employee.key_id}/revoke", {"data": {}}, 303),
+        "integrations_new": ("POST", "/admin/integrations/new", {"data": {"program_name": "Buzz"}}, 200),
+        "integrations_revoke": ("POST", f"/admin/integrations/{integration.id}/revoke", {"data": {}}, 303),
+        "integrations_rotate": ("POST", f"/admin/integrations/{integration.id}/rotate", {"data": {}}, 200),
         "patch_me": ("PATCH", "/me", {"json": {"display_name": "Omid Z"}}, 200),
     }[name]
 
 
 @pytest.mark.parametrize(
     "name",
-    ["users_new", "users_revoke", "users_mint", "keys_new", "keys_revoke", "keys_rotate", "patch_me"],
+    [
+        "people_new",
+        "people_disable",
+        "people_rotate",
+        "device_revoke",
+        "integrations_new",
+        "integrations_revoke",
+        "integrations_rotate",
+        "patch_me",
+    ],
 )
 @pytest.mark.parametrize(
     "mode", ["cookie_no_token", "cookie_token", "bearer_only", "basic_plus_cookie", "bad_bearer_cookie"]
@@ -340,17 +350,22 @@ def test_csrf_matrix(
 def test_form_pages_embed_the_csrf_token_and_round_trip(
     csrf_client: TestClient, admin: tuple[User, dict[str, str]], make_user: MakeUser
 ) -> None:
-    make_user(kind="integration", label="key-buzz")  # so /admin/keys renders its forms
+    make_user(kind="integration", label="key-buzz")  # so /admin/integrations renders its forms
     token = admin[1]["Authorization"].removeprefix("Bearer ")
     csrf_client.cookies.set(SESSION_COOKIE_NAME, token)
-    for page in ("/admin/users", "/admin/keys", "/admin/users/new", "/admin/keys/new"):
+    for page in (
+        f"/admin/people/{admin[0].id}",
+        "/admin/integrations",
+        "/admin/people/new",
+        "/admin/integrations/new",
+    ):
         resp = csrf_client.get(page)
         assert resp.status_code == 200, page
         assert auth_mod.CSRF_COOKIE_NAME in resp.headers.get("set-cookie", ""), page
         assert re.search(r'name="csrf_token" value="[^"]+"', resp.text), page
-    form = csrf_client.get("/admin/keys/new")  # the browser keeps the cookie it just got
+    form = csrf_client.get("/admin/integrations/new")  # the browser keeps the cookie it just got
     csrf = re.search(r'name="csrf_token" value="([^"]+)"', form.text).group(1)
-    resp = csrf_client.post("/admin/keys/new", data={"program_name": "Open WebUI", "csrf_token": csrf})
+    resp = csrf_client.post("/admin/integrations/new", data={"program_name": "Open WebUI", "csrf_token": csrf})
     assert resp.status_code == 200, resp.text
 
 
@@ -358,6 +373,6 @@ def test_key_added_shows_the_configured_server_url(
     csrf_client: TestClient, admin: tuple[User, dict[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(admin_ui.settings, "server_url", "https://mini.example.test/")
-    resp = csrf_client.post("/admin/keys/new", data={"program_name": "Buzz"}, headers=admin[1])
+    resp = csrf_client.post("/admin/integrations/new", data={"program_name": "Buzz"}, headers=admin[1])
     assert "export OPENAI_BASE_URL=https://mini.example.test/v1" in resp.text
     assert "integrateapi" not in resp.text

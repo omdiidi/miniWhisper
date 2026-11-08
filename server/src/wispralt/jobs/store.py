@@ -25,6 +25,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,7 @@ from wispralt.ops.staging import validate_wav_completeness
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Iterator
 
     from wispralt.database import Database
 
@@ -67,6 +69,62 @@ class Job:
     client_app_version: str | None = None
     outputs_removed_at: float | None = None
     deleted_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryHit:
+    """One full-text hit. ``snippet`` is RAW text with matches wrapped in ``\\x02…\\x03``:
+    render it only through ``web.templates_env.highlight`` (escape, then ``<mark>``)."""
+
+    kind: str  # dictation | file
+    row_id: str
+    user_id: int
+    created_at: float
+    word_count: int | None
+    snippet: str
+    user_label: str | None = None  # team search only
+
+
+_FTS_MAX_CHARS = 200
+_FTS_MAX_TOKENS = 12
+_FAR_FUTURE = 1e12
+
+
+def fts_query(q: str | None) -> str | None:
+    """User input → a safe FTS5 MATCH expression, or None (no search).
+
+    Never passes input through raw: whitespace tokens, each double-quoted (``"`` → ``""``),
+    implicitly ANDed, the last one a prefix match. Tokens with no letter or digit are dropped
+    (an empty phrase matches nothing useful). Capped at 200 chars and 12 tokens.
+    """
+    if not q:
+        return None
+    tokens = [t for t in q[:_FTS_MAX_CHARS].split() if any(c.isalnum() for c in t)]
+    tokens = tokens[:_FTS_MAX_TOKENS]
+    if not tokens:
+        return None
+    quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
+    quoted[-1] += "*"
+    return " ".join(quoted)
+
+
+# One leg per source table. {who} selects the owner label (team) or NULL; {scope} binds
+# the owner. Both legs always join the source row, so deleted rows never surface.
+_SEARCH_DICTATIONS = (
+    "SELECT 'dictation' AS kind, CAST(d.id AS TEXT) AS row_id, d.user_id AS user_id,"
+    " d.created_at AS created_at, d.word_count AS word_count, snippet(dictations_fts, 0, char(2), char(3), '…', 12) AS snippet, {who}"
+    " FROM dictations_fts JOIN dictations d ON d.id = dictations_fts.rowid {join}"
+    " WHERE dictations_fts MATCH :m AND d.deleted_at IS NULL"
+    " AND d.created_at >= :s AND d.created_at < :u {scope}"
+)
+_SEARCH_JOBS = (
+    "SELECT 'file' AS kind, j.id AS row_id, j.user_id AS user_id, j.created_at AS created_at,"
+    " j.word_count AS word_count,"
+    " snippet(jobs_fts, 0, char(2), char(3), '…', 12) AS snippet, {who}"
+    " FROM jobs_fts JOIN jobs j ON j.id = jobs_fts.job_id {join}"
+    " WHERE jobs_fts MATCH :m AND j.deleted_at IS NULL AND j.transcript_text IS NOT NULL"
+    " AND j.created_at >= :s AND j.created_at < :u {scope}"
+)
 
 
 def _word_count(text: str | None) -> int | None:
@@ -266,6 +324,25 @@ class JobStore:
                 "SELECT COUNT(*) FROM jobs WHERE status=? AND finished_at > ?",
                 (status, time.time() - _DAY),
             ).fetchone()[0]
+
+    def queue_counts(self, now: float) -> dict[str, float | int | None]:
+        """System page: pending / running now, failed in the last 24 h, oldest pending age."""
+        with self.db.read() as con:
+            r = con.execute(
+                "SELECT COALESCE(SUM(status = 'pending'), 0) AS pending,"
+                " COALESCE(SUM(status = 'running'), 0) AS running,"
+                " COALESCE(SUM(status = 'failed' AND finished_at > ?), 0) AS failed_24h,"
+                " MIN(CASE WHEN status = 'pending' THEN created_at END) AS oldest_pending"
+                " FROM jobs",
+                (now - _DAY,),
+            ).fetchone()
+        oldest = r["oldest_pending"]
+        return {
+            "pending": int(r["pending"]),
+            "running": int(r["running"]),
+            "failed_24h": int(r["failed_24h"]),
+            "oldest_pending_age_s": None if oldest is None else max(0.0, now - oldest),
+        }
 
     def list_active_jobs(self) -> list[Job]:
         with self.db.read() as con:
@@ -528,34 +605,191 @@ class JobStore:
                 is not None
             )
 
-    def list_filler_counts_for_week(self, iso_year: int, iso_week: int) -> list[tuple[int, int]]:
-        """``[(user_id, filler_word_count)]`` of the week's person rows, highest first."""
-        out: list[tuple[int, int]] = []
+    def weekly_insight(
+        self, user_id: int | None, iso_year: int, iso_week: int
+    ) -> dict[str, Any] | None:
+        """The stored row for one scope and week (``user_id=None`` = team) with its metadata:
+        ``insight`` (parsed JSON), ``model``, ``generated_at``, ``cost_usd``."""
+        scope_key = "team" if user_id is None else f"user:{user_id}"
+        with self.db.read() as con:
+            r = con.execute(
+                "SELECT insight_json, model, generated_at, cost_usd FROM weekly_insights"
+                " WHERE iso_year=? AND iso_week=? AND scope_key=?",
+                (iso_year, iso_week, scope_key),
+            ).fetchone()
+        if r is None:
+            return None
+        try:
+            insight = json.loads(r["insight_json"])
+        except ValueError:
+            insight = None
+        return {"insight": insight, "model": r["model"], "generated_at": r["generated_at"],
+                "cost_usd": r["cost_usd"]}
+
+    def refs_exist(self, refs: set[str], *, viewer_id: int, is_admin: bool) -> set[str]:
+        """The subset of insight refs (``d:<id>`` / ``f:<job id>``) whose record still exists
+        (not deleted) AND that the viewer may open (own rows; any row for an admin)."""
+        dict_ids = sorted({r[2:] for r in refs if r.startswith("d:") and r[2:].isdigit()})
+        job_ids = sorted({r[2:] for r in refs if r.startswith("f:") and r[2:]})
+        found: set[str] = set()
+        scope = "" if is_admin else " AND user_id = ?"
+        extra = () if is_admin else (viewer_id,)
+        with self.db.read() as con:
+            for i in range(0, len(dict_ids), 500):
+                batch = [int(x) for x in dict_ids[i : i + 500]]
+                found.update(
+                    f"d:{r[0]}"
+                    for r in con.execute(
+                        f"SELECT id FROM dictations WHERE deleted_at IS NULL{scope}"
+                        f" AND id IN ({','.join('?' * len(batch))})",
+                        (*extra, *batch),
+                    )
+                )
+            for i in range(0, len(job_ids), 500):
+                batch = job_ids[i : i + 500]
+                found.update(
+                    f"f:{r[0]}"
+                    for r in con.execute(
+                        "SELECT id FROM jobs WHERE deleted_at IS NULL AND transcript_text IS NOT NULL"
+                        f"{scope} AND id IN ({','.join('?' * len(batch))})",
+                        (*extra, *batch),
+                    )
+                )
+        return found
+
+    def count_records_after(
+        self, user_id: int | None, since: float, until: float, generated_at: float
+    ) -> int:
+        """Records in ``[since, until)`` created after an insight was generated (stale badge)."""
+        lo = max(since, generated_at)
+        if lo >= until:
+            return 0
+        window = self.measured_window(user_id, lo, until)
+        return int(window["dictation_count"]) + int(window["file_count"])
+
+    def recent_topic_labels(
+        self, user_id: int | None, iso_year: int, iso_week: int, *, weeks: int = 4
+    ) -> dict[str, int]:
+        """Casefolded topic/theme label → how many of the previous *weeks* stored insights
+        (same scope) mention it. Computed, not asked of the LLM."""
+        monday = date.fromisocalendar(iso_year, iso_week, 1)
+        prior = [(monday - timedelta(weeks=k)).isocalendar()[:2] for k in range(1, weeks + 1)]
+        scope_key = "team" if user_id is None else f"user:{user_id}"
+        counts: dict[str, int] = {}
+        with self.db.read() as con:
+            for y, w in prior:
+                r = con.execute(
+                    "SELECT insight_json FROM weekly_insights"
+                    " WHERE iso_year=? AND iso_week=? AND scope_key=?",
+                    (y, w, scope_key),
+                ).fetchone()
+                if r is None:
+                    continue
+                try:
+                    insight = json.loads(r[0])
+                except ValueError:
+                    continue
+                labels = {
+                    str(t.get("label", "")).casefold()
+                    for key in ("topics", "themes")
+                    for t in (insight.get(key) or [])
+                    if isinstance(t, dict) and t.get("label")
+                }
+                for label in labels:
+                    counts[label] = counts.get(label, 0) + 1
+        return counts
+
+    # ── insight runs (migration 0002): one row per run, progress polled by the portal ──
+
+    def start_insight_run(
+        self, *, trigger: str, iso_year: int, iso_week: int, estimated_usd: float | None,
+        now: float,
+    ) -> int:
+        with self.db.write() as con:
+            return con.execute(
+                "INSERT INTO insight_runs(trigger, iso_year, iso_week, status, estimated_usd,"
+                " started_at) VALUES (?, ?, ?, 'running', ?, ?) RETURNING id",
+                (trigger, iso_year, iso_week, estimated_usd, now),
+            ).fetchone()[0]
+
+    def update_insight_run(
+        self, run_id: int, *, people_total: int, people_done: int,
+        failures: list[dict[str, Any]], cost_usd: float,
+    ) -> None:
+        """Progress. ``failures`` holds ``{user_id, error_class}`` only (never text)."""
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE insight_runs SET people_total=?, people_done=?, failures_json=?,"
+                " cost_usd=? WHERE id=?",
+                (people_total, people_done, json.dumps(failures), cost_usd, run_id),
+            )
+
+    def finish_insight_run(
+        self, run_id: int, *, status: str, error_class: str | None, now: float
+    ) -> None:
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE insight_runs SET status=?, error_class=?, finished_at=? WHERE id=?",
+                (status, error_class, now, run_id),
+            )
+
+    def recent_insight_runs(self, limit: int = 10) -> list[dict[str, Any]]:
         with self.db.read() as con:
             rows = con.execute(
-                "SELECT user_id, insight_json FROM weekly_insights"
-                " WHERE user_id IS NOT NULL AND iso_year=? AND iso_week=?",
-                (iso_year, iso_week),
+                "SELECT * FROM insight_runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
             ).fetchall()
+        out = []
         for r in rows:
-            try:
-                n = json.loads(r["insight_json"]).get("filler_word_count")
-            except (TypeError, ValueError, AttributeError):
-                logger.warning("malformed insight_json for user_id=%s W%02d", r["user_id"], iso_week)
-                continue
-            if isinstance(n, int):
-                out.append((int(r["user_id"]), n))
-        out.sort(key=lambda t: t[1], reverse=True)
+            d = dict(r)
+            d["failures"] = json.loads(d.pop("failures_json") or "[]")
+            out.append(d)
         return out
 
-    def rolling_insights_cost_usd(self, days: int = 30) -> float:
+    def scheduled_run_state(self, iso_year: int, iso_week: int) -> dict[str, Any]:
+        """For the scheduler: whether a scheduled run of the week finished ``done``, and
+        when the latest scheduled attempt started."""
         with self.db.read() as con:
-            return float(
-                con.execute(
-                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM weekly_insights WHERE generated_at >= ?",
-                    (time.time() - days * _DAY,),
-                ).fetchone()[0]
+            r = con.execute(
+                "SELECT COALESCE(MAX(status = 'done'), 0) AS done, MAX(started_at) AS last_started"
+                " FROM insight_runs WHERE trigger = 'scheduled' AND iso_year = ? AND iso_week = ?",
+                (iso_year, iso_week),
+            ).fetchone()
+        return {"done": bool(r["done"]), "last_started": r["last_started"]}
+
+    def words_by_user(self, since: float, until: float) -> dict[int, dict[str, int]]:
+        """Per user in ``[since, until)``: dictation count, file count and words (estimates)."""
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT user_id, SUM(kind = 'dictation') AS dictations, SUM(kind = 'file') AS files,"
+                " COALESCE(SUM(word_count), 0) AS words FROM ("
+                " SELECT user_id, 'dictation' AS kind, word_count FROM dictations"
+                "  WHERE deleted_at IS NULL AND created_at >= :s AND created_at < :u"
+                " UNION ALL SELECT user_id, 'file', word_count FROM jobs"
+                "  WHERE deleted_at IS NULL AND transcript_text IS NOT NULL"
+                "  AND created_at >= :s AND created_at < :u) GROUP BY user_id",
+                {"s": since, "u": until},
             )
+            return {
+                r["user_id"]: {"dictations": int(r["dictations"]), "files": int(r["files"]),
+                               "words": int(r["words"])}
+                for r in rows
+            }
+
+    def rolling_insights_cost_usd(self, days: int = 30) -> float:
+        """Insights spend in the last *days*: the larger of the stored insights' cost and the
+        runs' recorded spend (a forced rerun overwrites a row's cost; runs also count
+        replies that were billed but unusable)."""
+        since = time.time() - days * _DAY
+        with self.db.read() as con:
+            stored = con.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM weekly_insights WHERE generated_at >= ?",
+                (since,),
+            ).fetchone()[0]
+            runs = con.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM insight_runs WHERE started_at >= ?",
+                (since,),
+            ).fetchone()[0]
+        return float(max(stored, runs))
 
     # ── per-user stats + transcripts ──────────────────────────────────────────
 
@@ -567,6 +801,66 @@ class JobStore:
             ).fetchone()
         return _stats(r if r is not None and r["user_id"] is not None else None)
 
+    # ── measured stats (Part 6): computed from rows, never from the LLM ───────
+
+    @staticmethod
+    def _scope(alias: str, user_id: int | None) -> str:
+        return f" AND {alias}.user_id = :uid" if user_id is not None else ""
+
+    def measured_window(
+        self, user_id: int | None, since: float, until: float
+    ) -> dict[str, int | float]:
+        """One grouped query over ``[since, until)``: dictation/file counts, words, file audio
+        seconds and dictation inference ms. ``user_id=None`` = the whole team (admin pages)."""
+        sql = (
+            "SELECT COALESCE(SUM(kind = 'dictation'), 0) AS dictation_count,"
+            " COALESCE(SUM(kind = 'file'), 0) AS file_count,"
+            " COALESCE(SUM(word_count), 0) AS words,"
+            " COALESCE(SUM(audio_s), 0) AS file_audio_s,"
+            " COALESCE(SUM(infer_ms), 0) AS dictation_inference_ms FROM ("
+            " SELECT 'dictation' AS kind, d.word_count, NULL AS audio_s, d.duration_ms AS infer_ms"
+            " FROM dictations d WHERE d.deleted_at IS NULL"
+            " AND d.created_at >= :s AND d.created_at < :u" + self._scope("d", user_id) +
+            " UNION ALL"
+            " SELECT 'file', j.word_count, j.audio_duration_s, NULL FROM jobs j"
+            " WHERE j.deleted_at IS NULL AND j.transcript_text IS NOT NULL"
+            " AND j.created_at >= :s AND j.created_at < :u" + self._scope("j", user_id) + ")"
+        )
+        with self.db.read() as con:
+            r = con.execute(sql, {"s": since, "u": until, "uid": user_id}).fetchone()
+        return {k: (float(v) if k == "file_audio_s" else int(v)) for k, v in dict(r).items()}
+
+    def activity_points(
+        self, user_id: int | None, since: float, until: float
+    ) -> list[tuple[float, int]]:
+        """``(created_at, word_count)`` of every non-deleted record in the window (trend,
+        hour-of-day histogram and active days are bucketed in Python, in a timezone)."""
+        sql = (
+            "SELECT d.created_at, COALESCE(d.word_count, 0) FROM dictations d"
+            " WHERE d.deleted_at IS NULL AND d.created_at >= :s AND d.created_at < :u"
+            + self._scope("d", user_id) +
+            " UNION ALL SELECT j.created_at, COALESCE(j.word_count, 0) FROM jobs j"
+            " WHERE j.deleted_at IS NULL AND j.transcript_text IS NOT NULL"
+            " AND j.created_at >= :s AND j.created_at < :u" + self._scope("j", user_id)
+        )
+        with self.db.read() as con:
+            return [(r[0], r[1]) for r in con.execute(sql, {"s": since, "u": until, "uid": user_id})]
+
+    def iter_dictation_texts(
+        self, user_id: int | None, since: float, until: float
+    ) -> Iterator[tuple[int, str]]:
+        """``(user_id, text)`` of non-deleted dictations in the window (filler counting).
+        Consume it in one thread."""
+        with self.db.read() as con:
+            yield from (
+                (r[0], r[1])
+                for r in con.execute(
+                    "SELECT d.user_id, d.text FROM dictations d WHERE d.deleted_at IS NULL"
+                    " AND d.created_at >= :s AND d.created_at < :u" + self._scope("d", user_id),
+                    {"s": since, "u": until, "uid": user_id},
+                )
+            )
+
     def stats_by_user(self, since_epoch: float) -> dict[int, dict[str, int | float]]:
         """``compute_user_stats`` for every user with activity, in one grouped query."""
         with self.db.read() as con:
@@ -576,17 +870,18 @@ class JobStore:
     def transcripts_in_range(
         self, user_id: int, *, since_epoch: float, until_epoch: float
     ) -> list[dict[str, Any]]:
-        """``{created_at, text, kind}`` (kind ``dictation`` | ``file``), newest first."""
+        """``{created_at, text, kind, row_id}`` (kind ``dictation`` | ``file``), newest first."""
         with self.db.read() as con:
             rows = con.execute(
-                "SELECT created_at, text, kind FROM ("
-                " SELECT created_at, text, 'dictation' AS kind FROM dictations"
+                "SELECT created_at, text, kind, row_id FROM ("
+                " SELECT created_at, text, 'dictation' AS kind, CAST(id AS TEXT) AS row_id"
+                "  FROM dictations"
                 "  WHERE user_id = ? AND created_at >= ? AND created_at < ? AND deleted_at IS NULL"
                 " UNION ALL"
-                " SELECT created_at, transcript_text AS text, 'file' AS kind FROM jobs"
+                " SELECT created_at, transcript_text AS text, 'file' AS kind, id AS row_id FROM jobs"
                 "  WHERE user_id = ? AND transcript_text IS NOT NULL AND deleted_at IS NULL"
                 "  AND created_at >= ? AND created_at < ?"
-                ") ORDER BY created_at DESC",
+                ") ORDER BY created_at DESC, row_id",
                 (user_id, since_epoch, until_epoch, user_id, since_epoch, until_epoch),
             )
             return [dict(r) for r in rows]
@@ -598,14 +893,14 @@ class JobStore:
         since_epoch: float,
         until_epoch: float,
         kind: str | None = None,
-        search: str | None = None,
         dict_cursor: tuple[float, str] | None = None,
         jobs_cursor: tuple[float, str] | None = None,
         limit: int = 50,
     ) -> tuple[list[dict[str, Any]], tuple[float, str] | None, tuple[float, str] | None]:
         """Personal history with per-leg cursors: ``(rows, next_dict_cursor, next_jobs_cursor)``.
 
-        Each leg's cursor is set only when that leg returned ``limit`` rows.
+        Each leg's cursor is set only when that leg returned ``limit`` rows. Text search is
+        :meth:`search_history` (FTS5), not a filter here.
         """
         dict_rows: list[dict[str, Any]] = []
         job_rows: list[dict[str, Any]] = []
@@ -618,9 +913,6 @@ class JobStore:
                     " WHERE user_id = ? AND created_at >= ? AND created_at < ? AND deleted_at IS NULL"
                 )
                 args: list[object] = [user_id, since_epoch, until_epoch]
-                if search:
-                    sql += " AND text LIKE ?"
-                    args.append(f"%{search}%")
                 if dict_cursor is not None:
                     # dictations.id is INTEGER: compare as INTEGER (a text compare
                     # disagrees across digit widths).
@@ -637,9 +929,6 @@ class JobStore:
                     " AND transcript_text IS NOT NULL AND deleted_at IS NULL"
                 )
                 args = [user_id, since_epoch, until_epoch]
-                if search:
-                    sql += " AND transcript_text LIKE ?"
-                    args.append(f"%{search}%")
                 if jobs_cursor is not None:
                     sql += " AND (created_at, id) < (?, ?)"
                     args.extend(jobs_cursor)
@@ -653,25 +942,170 @@ class JobStore:
 
         return merged, _next(dict_rows), _next(job_rows)
 
+    # ── full-text history search (FTS5, migration 0002) ──────────────────────
+
+    def _search(
+        self,
+        match: str,
+        *,
+        owner_id: int | None,
+        team: bool,
+        since: float | None,
+        until: float | None,
+        kind: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[HistoryHit]:
+        legs = []
+        for leg_kind, template, alias in (
+            ("dictation", _SEARCH_DICTATIONS, "d"),
+            ("file", _SEARCH_JOBS, "j"),
+        ):
+            if kind in (None, leg_kind):
+                legs.append(
+                    template.format(
+                        who="COALESCE(u.display_name, u.label) AS user_label" if team else
+                        "NULL AS user_label",
+                        join=f"JOIN users u ON u.id = {alias}.user_id" if team else "",
+                        scope=f"AND {alias}.user_id = :uid" if owner_id is not None else "",
+                    )
+                )
+        if not legs:
+            return []
+        sql = (
+            "SELECT * FROM (" + " UNION ALL ".join(legs) + ")"
+            " ORDER BY created_at DESC, row_id LIMIT :lim OFFSET :off"
+        )
+        params = {
+            "m": match,
+            "uid": owner_id,
+            "s": 0.0 if since is None else since,
+            "u": _FAR_FUTURE if until is None else until,
+            "lim": limit,
+            "off": offset,
+        }
+        with self.db.read() as con:
+            return [HistoryHit(**dict(r)) for r in con.execute(sql, params)]
+
+    def search_history(
+        self,
+        user_id: int,
+        q: str,
+        *,
+        since: float | None = None,
+        until: float | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[HistoryHit]:
+        """The viewer's OWN matching rows, newest first. ``user_id`` is always bound in SQL."""
+        match = fts_query(q)
+        if match is None:
+            return []
+        return self._search(
+            match, owner_id=int(user_id), team=False, since=since, until=until,
+            kind=kind, limit=limit, offset=offset,
+        )
+
+    def search_history_team(
+        self,
+        q: str,
+        *,
+        user_id: int | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[HistoryHit]:
+        """Team-wide search with owner labels. Admin routes only (LD 15)."""
+        match = fts_query(q)
+        if match is None:
+            return []
+        return self._search(
+            match, owner_id=user_id, team=True, since=since, until=until,
+            kind=kind, limit=limit, offset=offset,
+        )
+
     # ── /me/history rows (kind: dictation | file) ─────────────────────────────
 
-    def get_history_row(self, user_id: int, kind: str, row_id: str) -> dict[str, Any] | None:
-        """Owner-checked, non-deleted single row (``SELECT *``), or None."""
+    def get_record_scoped(
+        self, kind: str, row_id: str, *, viewer_id: int, is_admin: bool
+    ) -> dict[str, Any] | None:
+        """One non-deleted record (``SELECT *`` + ``user_label``) the viewer may open, else None.
+
+        The scope is in SQL: an employee matches only rows they own; an admin any row
+        (LD 15: admins may read team transcripts). Unknown kind → None.
+        """
         if kind == "dictation":
             sql = (
-                "SELECT * FROM dictations WHERE user_id=? AND id=CAST(? AS INTEGER)"
-                " AND deleted_at IS NULL"
+                "SELECT r.*, COALESCE(u.display_name, u.label) AS user_label FROM dictations r"
+                " JOIN users u ON u.id = r.user_id"
+                " WHERE r.id = CAST(? AS INTEGER) AND r.deleted_at IS NULL"
             )
         elif kind == "file":
             sql = (
-                "SELECT * FROM jobs WHERE user_id=? AND id=?"
-                " AND transcript_text IS NOT NULL AND deleted_at IS NULL"
+                "SELECT r.*, COALESCE(u.display_name, u.label) AS user_label FROM jobs r"
+                " JOIN users u ON u.id = r.user_id"
+                " WHERE r.id = ? AND r.transcript_text IS NOT NULL AND r.deleted_at IS NULL"
             )
         else:
             return None
+        sql += " AND (? OR r.user_id = ?)"
         with self.db.read() as con:
-            r = con.execute(sql, (user_id, row_id)).fetchone()
+            r = con.execute(sql, (row_id, 1 if is_admin else 0, viewer_id)).fetchone()
         return None if r is None else dict(r)
+
+    def get_history_row(self, user_id: int, kind: str, row_id: str) -> dict[str, Any] | None:
+        """Owner-checked, non-deleted single row, or None (the /me surface)."""
+        return self.get_record_scoped(kind, row_id, viewer_id=user_id, is_admin=False)
+
+    def list_records_team(
+        self,
+        *,
+        user_id: int | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Admin records list (no text query), newest first, with owner labels. Admin only."""
+        legs = []
+        if kind in (None, "dictation"):
+            legs.append(
+                "SELECT 'dictation' AS kind, CAST(r.id AS TEXT) AS row_id, r.user_id AS user_id,"
+                " r.created_at AS created_at, r.word_count AS word_count,"
+                " substr(r.text, 1, 200) AS preview FROM dictations r"
+                " WHERE r.deleted_at IS NULL AND r.created_at >= :s AND r.created_at < :u"
+                + (" AND r.user_id = :uid" if user_id is not None else "")
+            )
+        if kind in (None, "file"):
+            legs.append(
+                "SELECT 'file' AS kind, r.id AS row_id, r.user_id AS user_id,"
+                " r.created_at AS created_at, r.word_count AS word_count,"
+                " substr(r.transcript_text, 1, 200) AS preview FROM jobs r"
+                " WHERE r.deleted_at IS NULL AND r.transcript_text IS NOT NULL"
+                " AND r.created_at >= :s AND r.created_at < :u"
+                + (" AND r.user_id = :uid" if user_id is not None else "")
+            )
+        if not legs:
+            return []
+        sql = (
+            "SELECT x.*, COALESCE(u.display_name, u.label) AS user_label FROM ("
+            + " UNION ALL ".join(legs)
+            + ") x JOIN users u ON u.id = x.user_id"
+            " ORDER BY x.created_at DESC, x.row_id LIMIT :lim OFFSET :off"
+        )
+        params = {
+            "uid": user_id,
+            "s": 0.0 if since is None else since,
+            "u": _FAR_FUTURE if until is None else until,
+            "lim": limit,
+            "off": offset,
+        }
+        with self.db.read() as con:
+            return [dict(r) for r in con.execute(sql, params)]
 
     def _set_deleted(self, user_id: int, kind: str, row_id: str, *, deleted: bool) -> bool:
         if kind not in _HISTORY_KINDS:
