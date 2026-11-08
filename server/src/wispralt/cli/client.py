@@ -6,7 +6,7 @@ cli/client.py — the WisprAlt menubar app on this Mac.
 clone with ``scripts/build-client-local.sh``, then swaps it into place. Role
 ``both`` also points the app at the local host (``defaults``) and stores the
 admin key in the Keychain through ``security -i`` on **stdin**, so the key is
-never in an argv. The OpenAI key is never handled here.
+never in an argv; ``-T`` trusts the installed app so it reads the key without a prompt. The OpenAI key is never handled here.
 """
 
 from __future__ import annotations
@@ -96,9 +96,25 @@ def build_and_install(ctx: Ctx, source: Path, *, rebuild: bool) -> None:
     install_app(ctx, source / "client" / "build" / "WisprAlt.app")
 
 
+def _arg(value: str) -> str:
+    """One ``security -i`` word: quoted when it holds whitespace (its parser handles that)."""
+    if '"' in value or "\n" in value:
+        raise CliError(2, f"unsupported character in {value!r}")
+    return f'"{value}"' if any(c.isspace() for c in value) else value
+
+
 def store_local_key(ctx: Ctx, token: str) -> None:
-    """Keychain ``co.wispralt`` via ``security -i`` (stdin): the key never enters an argv."""
-    line = f"add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w {token}\n"
+    """Keychain ``co.wispralt`` via ``security -i`` (stdin): the key never enters an argv.
+
+    ``-T`` puts the installed app (and ``/usr/bin/security``) on the item's access
+    list, so the app's ``SecItemCopyMatching`` read does not raise a password prompt.
+    The list pins the app's code signature: a client re-signed by another identity
+    gets one "Always Allow" prompt.
+    """
+    line = (
+        f"add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT}"
+        f" -T {_arg(str(ctx.paths.app))} -T /usr/bin/security -w {token}\n"
+    )
     ctx.runner.run(["security", "-i"], input=line)
 
 
