@@ -971,7 +971,7 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 | GET | `/admin/people/{id}` | admin | Person page: tiles, devices (per-key last seen), recent requests, actions |
 | POST | `/admin/people/{id}/rotate` | admin + CSRF | Revoke all the person's keys, issue one (re-enables); key shown once (`no-store`). 404 unknown. |
 | POST | `/admin/people/{id}/disable` | admin + CSRF | 303 → person page; every key 401s from the next request. 400 for yourself. |
-| POST | `/admin/keys/{key_id}/revoke` | admin + CSRF | Revoke one device; 303 → its person; 404 unknown key. |
+| POST | `/admin/keys/{key_id}/revoke` | admin + CSRF | Revoke one device; 303 → its person; 404 unknown key; 400 for the acting admin's own last active key. |
 | GET/POST | `/admin/invites` | admin (+ CSRF on POST) | Invites list / create (new person `label`+`role`, or `user_id` = add device); link + code shown once (`no-store`). |
 | POST | `/admin/invites/{id}/revoke` | admin + CSRF | Expire a pending invite; 303 → `/admin/invites`. |
 | GET/POST | `/admin/integrations`, `/admin/integrations/new` | admin (+ CSRF on POST) | Integration keys list / create (key + OpenAI env snippet shown once, `no-store`). |

@@ -389,3 +389,33 @@ def test_key_added_shows_the_configured_server_url(
     monkeypatch.setattr(admin_ui.settings, "server_url", "https://mini.example.test/")
     resp = csrf_client.post("/admin/integrations/new", data={"program_name": "Buzz"}, headers=admin[1])
     assert "export OPENAI_BASE_URL=https://mini.example.test/v1" in resp.text
+
+
+def test_admin_cannot_revoke_their_own_last_active_key(
+    client: TestClient,
+    admin: tuple[User, dict[str, str]],
+    accounts: AccountStore,
+    make_user: MakeUser,
+) -> None:
+    admin_user, bearer = admin
+    resp = client.post(f"/admin/keys/{admin_user.key_id}/revoke", headers=bearer, follow_redirects=False)
+    assert resp.status_code == 400, resp.text
+    assert "last active key" in resp.json()["detail"]
+    assert client.get("/admin/", headers=bearer).status_code == 200  # still signed in
+
+    # With a second active device the first may go; the second is then the last.
+    with accounts.db.write() as con:
+        second = con.execute(
+            "INSERT INTO api_keys(user_id, token_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+            (admin_user.id, hash_token("b" * 64), time.time()),
+        ).fetchone()[0]
+    resp = client.post(f"/admin/keys/{admin_user.key_id}/revoke", headers=bearer, follow_redirects=False)
+    assert resp.status_code == 303, resp.text
+    second_bearer = {"Authorization": "Bearer " + "b" * 64}
+    resp = client.post(f"/admin/keys/{second}/revoke", headers=second_bearer, follow_redirects=False)
+    assert resp.status_code == 400, resp.text
+
+    # Another person's last key is still revocable (the guard is for yourself only).
+    employee, _ = make_user(label="emp-last")
+    resp = client.post(f"/admin/keys/{employee.key_id}/revoke", headers=second_bearer, follow_redirects=False)
+    assert resp.status_code == 303, resp.text

@@ -401,13 +401,26 @@ async def people_rotate(
 
 @authed_router.post("/keys/{key_id}/revoke")
 async def device_revoke(
-    request: Request, key_id: int, _admin: User = Depends(require_admin_csrf)
+    request: Request, key_id: int, admin: User = Depends(require_admin_csrf)
 ) -> RedirectResponse:
-    """Revoke ONE key (remove one device); the person's other keys keep working."""
+    """Revoke ONE key (remove one device); the person's other keys keep working.
+
+    Refuses (400) the acting admin's own last active key: that would lock them
+    out of the portal they are using (the same rule as disabling yourself).
+    """
     accounts = _accounts(request)
     owner = await asyncio.to_thread(accounts.key_owner, key_id)
     if owner is None:
         raise HTTPException(status_code=404, detail="Key not found")
+    if owner == admin.id:
+        active = [k.id for k in await asyncio.to_thread(accounts.list_keys, admin.id)
+                  if k.revoked_at is None]
+        if active == [key_id]:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot revoke your own last active key: you would be locked out."
+                " Add another device first, or use Rotate key.",
+            )
     await asyncio.to_thread(accounts.revoke_key, key_id)
     return RedirectResponse(f"/admin/people/{owner}", status_code=303)
 

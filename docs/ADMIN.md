@@ -137,7 +137,7 @@ The three actions differ on purpose:
 | Action | Route | Effect |
 |---|---|---|
 | **Add device** | `POST /admin/invites` with `user_id` | A single-use invite for this person; redeeming adds a key. Existing devices keep working. |
-| **Revoke device** | `POST /admin/keys/{key_id}/revoke` | That one key stops working on its next request; the person's other devices keep working. |
+| **Revoke device** | `POST /admin/keys/{key_id}/revoke` | That one key stops working on its next request; the person's other devices keep working. Your own last active key is refused (400): you would lock yourself out, so add another device or use Rotate key instead. |
 | **Rotate key** | `POST /admin/people/{id}/rotate` | Revokes **every** key of the person, issues one new key shown **once** (`no-store`) and re-enables a disabled person. |
 | **Disable person** | `POST /admin/people/{id}/disable` | None of their keys authenticate from the next request (401). You cannot disable yourself. Rotate re-enables. |
 
