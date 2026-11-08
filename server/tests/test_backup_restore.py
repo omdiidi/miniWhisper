@@ -142,6 +142,22 @@ def test_a_running_server_blocks_backup_restore_and_a_second_server(
         bk.backup(data, tmp_path_factory.mktemp("bk3") / "b3")
 
 
+def test_server_lock_is_shared_through_a_symlinked_data_dir(tmp_path: Path) -> None:
+    """A server started on a symlinked DATA_DIR locks the same file restore takes."""
+    real = tmp_path / "real-data"
+    real.mkdir()
+    link = tmp_path / "link-data"
+    link.symlink_to(real)
+    bkdir = tmp_path / "some-backup"
+    bkdir.mkdir()
+    assert bk.lock_path(link) == bk.lock_path(real)
+    with bk.server_lock(link):  # what the lifespan does with settings.data_dir
+        with pytest.raises(ServerRunning):
+            bk.server_lock(real).__enter__()
+        with pytest.raises(ServerRunning):
+            bk.restore(bkdir, link)
+
+
 def test_server_lock_is_exclusive_across_descriptors(tmp_path: Path) -> None:
     with bk.server_lock(tmp_path):
         with pytest.raises(ServerRunning):

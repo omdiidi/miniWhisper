@@ -2,7 +2,8 @@
 ops/backup.py — the server lock and offline backup / restore (Locked Decision 9).
 
 * ``server_lock(data_dir)`` — ``flock(LOCK_EX | LOCK_NB)`` on the sibling
-  ``<data_dir>.lock`` (outside the tree restore swaps, so it never moves).
+  ``<data_dir>.lock`` of the *resolved* data dir (one lock however the path
+  is spelled, symlinks included; outside the tree restore swaps, so it never moves).
   The lifespan holds it for the server's life; backup and restore take it
   too, so each refuses (``ServerRunning``) while a server runs. The Part 5
   CLI stops the service, runs them, and restarts it.
@@ -45,13 +46,19 @@ _CHUNK = 1 << 20
 
 
 def lock_path(data_dir: Path) -> Path:
-    return data_dir.with_name(data_dir.name + ".lock")
+    """``<data_dir>.lock`` beside the *resolved* data dir.
+
+    Every holder (server lifespan, backup, restore, importers, CLI) derives the
+    path here, so a symlinked ``DATA_DIR`` and its target share one lock.
+    """
+    data = Path(data_dir).resolve()
+    return data.with_name(data.name + ".lock")
 
 
 @contextmanager
 def server_lock(data_dir: Path) -> Iterator[Path]:
     """Hold ``<data_dir>.lock`` exclusively, or raise ``ServerRunning`` at once."""
-    path = lock_path(Path(data_dir))
+    path = lock_path(data_dir)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         try:

@@ -670,7 +670,8 @@ raw with `\x02…\x03` sentinels and are rendered by `web.templates_env.highligh
 sibling `<data_dir>.lock` (`ops.backup.server_lock`) before it opens the DB and
 releases it last; a second server on the same `DATA_DIR` refuses to start
 (`ServerRunning`). The lock lives beside, not inside, `DATA_DIR`, so a restore's
-directory swap never moves it. (In WAL mode an idle server holds no SQLite lock,
+directory swap never moves it. `lock_path` resolves `DATA_DIR` first, so a
+symlinked `DATA_DIR` and its target share one lock. (In WAL mode an idle server holds no SQLite lock,
 so no SQLite probe can prove the server is stopped; only this flock can.)
 
 **Offline backup and restore** (`ops/backup.py`; the Part 5 CLI stops the service,
