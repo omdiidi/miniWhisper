@@ -29,14 +29,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-import asyncpg
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
-from wispralt import auth as auth_mod
 from wispralt.auth import (
     forbid_integration_kind,
+    resolve_token,
     set_csrf_cookie,
     set_session_cookie,
     verify_csrf,
@@ -47,13 +46,12 @@ from wispralt.insights.timewindow import (
     epoch_for_range,
     last_full_iso_week,
 )
-from wispralt.users import store as users_store
 from wispralt.web.htmx import is_htmx
 from wispralt.web.templates_env import templates
 
 if TYPE_CHECKING:
+    from wispralt.accounts.store import AccountStore, User, UserProfile
     from wispralt.jobs.store import JobStore
-    from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +83,7 @@ class PatchMeRequest(BaseModel):
         return v
 
 
-def _profile_to_response(p: users_store.UserProfile) -> MeResponse:
+def _profile_to_response(p: UserProfile) -> MeResponse:
     return MeResponse(
         label=p.label,
         display_name=p.display_name,
@@ -99,9 +97,8 @@ def _profile_to_response(p: users_store.UserProfile) -> MeResponse:
 async def get_me(
     request: Request, user: User = Depends(forbid_integration_kind)
 ) -> MeResponse:
-    profile = await users_store.fetch_profile_by_id(
-        request.app.state.db_pool, user.id
-    )
+    accounts: AccountStore = request.app.state.accounts
+    profile = await asyncio.to_thread(accounts.profile, user.id)
     if profile is None:
         raise HTTPException(status_code=404, detail="user_not_found")
     return _profile_to_response(profile)
@@ -113,11 +110,11 @@ async def patch_me(
     body: PatchMeRequest,
     user: User = Depends(forbid_integration_kind),
 ) -> MeResponse:
-    pool = request.app.state.db_pool
-    await users_store.update_display_name(pool, user.id, body.display_name)
-    # No token-cache invalidation needed — display_name is not cached on the auth User.
-    profile = await users_store.fetch_profile_by_id(pool, user.id)
-    assert profile is not None  # we just authed via forbid_integration_kind, the row exists
+    accounts: AccountStore = request.app.state.accounts
+    await asyncio.to_thread(accounts.update_display_name, user.id, body.display_name)
+    profile = await asyncio.to_thread(accounts.profile, user.id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
     return _profile_to_response(profile)
 
 
@@ -134,12 +131,7 @@ async def me_last_dictation(
     last dictation (for cross-user analytics they use /admin/data).
 
     Returns 404 if the user has zero (non-deleted, non-empty) dictations.
-    Break-glass admin (id < 0) gets 403 — no personal dictation row exists
-    for the env-derived admin.
     """
-    if user.id < 0:
-        raise HTTPException(403, "Break-glass admin has no personal dictations")
-
     job_store: JobStore = request.app.state.job_store
     row = await asyncio.to_thread(
         job_store.get_most_recent_dictation, user.id,
@@ -243,9 +235,7 @@ async def me_login_submit(
 ):
     """Validate *token* and set the session cookie.
 
-    Mirrors /admin/login's 3-stage lookup (cache → Postgres → break-glass) but
-    rejects break-glass with a clear message instead of letting an admin
-    sentinel sneak into the employee surface.
+    Same lookup as /admin/login (:func:`resolve_token`).
     """
     if not verify_csrf(request, csrf_token):
         return _render_me_login_error(
@@ -261,40 +251,7 @@ async def me_login_submit(
             request, error="Invalid or revoked token.", status_code=401,
         )
 
-    th = users_store.hash_token(token)
-    pool = getattr(request.app.state, "db_pool", None)
-    user: User | None = None
-
-    # 1. Cache fast-path
-    cached = auth_mod.token_cache.get(th)
-    if cached is not None:
-        user = cached
-
-    # 2. Postgres lookup
-    if user is None and pool is not None:
-        try:
-            user = await users_store.lookup(pool, th)
-        except (asyncpg.PostgresError, asyncpg.InterfaceError):
-            # asyncpg has NO common base class for these two — PostgresError
-            # (server-side) and InterfaceError ("pool is closed", client-side)
-            # both inherit directly from Exception via separate private
-            # hierarchies. The explicit tuple is the only correct form.
-            # See 2026-05-17 postmortem.
-            logger.exception("Postgres lookup failed during /me/login")
-            user = None
-        if user is not None:
-            auth_mod.token_cache.put(th, user)
-
-    # 3. Break-glass: REJECTED at /me/login (admin-only surface). User gets a
-    # clear message instead of authing then 403'ing at /me/insights.
-    bg = getattr(request.app.state, "break_glass_token_hash", None)
-    if user is None and bg is not None and th == bg:
-        return _render_me_login_error(
-            request,
-            error="Break-glass token is admin-only — use /admin/login.",
-            status_code=403,
-        )
-
+    user = await resolve_token(request.app, token)
     if user is None:
         return _render_me_login_error(
             request, error="Invalid or revoked token.", status_code=401,
@@ -320,11 +277,7 @@ async def me_insights(
 ):
     """Employee self-view of their last-week LLM insight + time-range stats.
 
-    Break-glass admin (user.id < 0) redirects to /admin/data — they don't
-    have a person row to insight on.
     """
-    if user.id < 0:
-        return RedirectResponse(url="/admin/data", status_code=303)
 
     iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
     job_store: JobStore = request.app.state.job_store
@@ -405,12 +358,9 @@ async def me_history(
 ) -> HTMLResponse:
     """Personal transcript archive (dictations + meetings).
 
-    Break-glass admins (``user.id < 0``) have no person row, so they get
-    redirected to ``/admin/data``. Search shorter than 3 chars is silently
-    dropped to keep the LIKE-scan cost bounded.
+    Search shorter than 3 chars is silently dropped to keep the LIKE-scan
+    cost bounded.
     """
-    if user.id < 0:
-        return RedirectResponse(url="/admin/data", status_code=303)
 
     if search is not None:
         search = search.strip() or None
@@ -480,8 +430,6 @@ async def me_history_row(
     Unknown ``kind`` or non-owned ``row_id`` both return 404 uniformly so we
     don't leak existence to other users.
     """
-    if user.id < 0:
-        raise HTTPException(status_code=404)
     if kind not in ("dictation", "meeting"):
         raise HTTPException(status_code=404)
 
@@ -521,8 +469,6 @@ async def me_history_delete(
     user: User = Depends(forbid_integration_kind),
 ) -> Response:
     """Soft-delete one owned row. Returns an HTMX OOB delete fragment."""
-    if user.id < 0:
-        raise HTTPException(status_code=404)
     if kind not in ("dictation", "meeting"):
         raise HTTPException(status_code=404)
     if not verify_csrf(request, csrf_token):
@@ -550,8 +496,6 @@ async def me_history_restore(
     user: User = Depends(forbid_integration_kind),
 ) -> HTMLResponse:
     """Restore one soft-deleted owned row. Returns the compact row partial."""
-    if user.id < 0:
-        raise HTTPException(status_code=404)
     if kind not in ("dictation", "meeting"):
         raise HTTPException(status_code=404)
     if not verify_csrf(request, csrf_token):
@@ -597,8 +541,6 @@ async def me_history_download(
     user: User = Depends(forbid_integration_kind),
 ) -> Response:
     """Plain-text or JSON download of one owned row."""
-    if user.id < 0:
-        raise HTTPException(status_code=404)
     if kind not in ("dictation", "meeting"):
         raise HTTPException(status_code=404)
     if fmt not in ("txt", "json"):

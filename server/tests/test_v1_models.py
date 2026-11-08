@@ -16,7 +16,6 @@ from typing import Any
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
 # wispralt import so the tests work on a bare dev box without a .env.
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
 os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
 os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
@@ -29,7 +28,7 @@ from starlette.testclient import TestClient
 from wispralt.auth import require_api_key_v1
 from wispralt.middleware import openai_errors
 from wispralt.routes.v1_models import router as v1_models_router
-from wispralt.users.store import User
+from wispralt.accounts.store import User
 
 
 class _RequestIdMiddleware(BaseHTTPMiddleware):
@@ -53,6 +52,7 @@ def _build_app(*, override_auth: bool = True) -> FastAPI:
         async def _fake(_request: Any = None) -> User:
             return User(
                 id=99,
+                key_id=None,
                 label="key-test",
                 role="employee",
                 kind="integration",

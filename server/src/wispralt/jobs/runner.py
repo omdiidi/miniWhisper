@@ -152,7 +152,7 @@ class FileJobRunner:
 
         ``client_version`` + ``api_key_id`` are persisted on the original
         ``store.create`` so they survive worker crashes and restart-driven
-        re-enqueues. Pass ``api_key_id=None`` for break-glass admin requests.
+        re-enqueues.
 
         Raises FileJobInProgressError (the route converts it to HTTP 429 with
         ``code`` in the body) if:

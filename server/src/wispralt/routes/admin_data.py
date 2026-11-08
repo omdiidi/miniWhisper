@@ -8,10 +8,8 @@ Lives in its own module (separate from :mod:`routes.admin_ui`) to avoid
 merge contention with the existing 600-line admin UI file and to keep the
 Phase 2 surface area isolated.
 
-Auth: router-level ``_require_db_pool`` short-circuits to 503 when Postgres
-is unavailable. The handler param ``user: User = Depends(require_admin)``
-is the single source of admin-role enforcement; FastAPI runs each dep once
-per request so we drop the duplicate router-level ``require_admin`` here.
+Auth: the handler param ``user: User = Depends(require_admin)`` is the single
+source of admin-role enforcement. The user list comes from ``AccountStore``.
 """
 from __future__ import annotations
 
@@ -21,7 +19,7 @@ import logging
 import secrets
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
 from ..auth import require_admin, set_csrf_cookie, verify_csrf
@@ -32,36 +30,13 @@ from ..web.htmx import is_htmx
 from ..web.templates_env import templates
 
 if TYPE_CHECKING:
-    import asyncpg
-
+    from ..accounts.store import AccountStore, User
     from ..jobs.store import JobStore
-    from ..users.store import User
 
 logger = logging.getLogger(__name__)
 
 
-async def _require_db_pool(request: Request) -> asyncpg.Pool:
-    """Dependency: 503 if the asyncpg pool is unavailable.
-
-    Mirrors ``admin_ui._require_db_pool`` — the Data tab queries Postgres for
-    the user list, so fail loudly rather than crash on AttributeError later.
-    """
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is None:
-        raise HTTPException(
-            status_code=503, detail="Admin Data unavailable: Postgres degraded."
-        )
-    return pool
-
-
-# Router-level dep covers the DB pool short-circuit. Admin-role enforcement
-# lives on the handler param (typed `user`) — keeping it there as the single
-# invocation point.
-router = APIRouter(
-    prefix="/admin",
-    tags=["admin-data"],
-    dependencies=[Depends(_require_db_pool)],
-)
+router = APIRouter(prefix="/admin", tags=["admin-data"])
 
 
 # ── route ────────────────────────────────────────────────────────────────────
@@ -77,7 +52,7 @@ async def admin_data(
     """Admin Data tab — team overview, leaderboards, drill-down by ?user_id."""
     iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
     job_store: JobStore = request.app.state.job_store
-    pool: asyncpg.Pool = request.app.state.db_pool
+    accounts: AccountStore = request.app.state.accounts
     since = epoch_for_range(range, settings.insights_timezone)
 
     team_insight = job_store.get_weekly_insight_team(iso_year, iso_week)
@@ -93,25 +68,22 @@ async def admin_data(
         stats = await asyncio.to_thread(
             job_store.compute_user_stats, user_id, since_epoch=since,
         )
-        users = await pool.fetch(
-            "SELECT id, label, display_name, role FROM wispralt.users WHERE id = $1",
-            user_id,
-        )
-        target_user = users[0] if users else None
+        profile = await asyncio.to_thread(accounts.profile, user_id)
+        users = [profile] if profile is not None else []
+        target_user = profile
     else:
         person_insight = None
         target_user = None
-        users = await pool.fetch(
-            "SELECT id, label, display_name, role FROM wispralt.users "
-            "WHERE revoked_at IS NULL ORDER BY id"
+        users = sorted(
+            await asyncio.to_thread(accounts.list_people, active=True), key=lambda u: u.id
         )
         # Per-user stats for the leaderboard. Bounded by user count (small on
         # this deployment); each call is a single SQLite query through the
         # same connection so no N+1 round-trip blow-up.
         per_user_stats = {}
         for u in users:
-            per_user_stats[u["id"]] = await asyncio.to_thread(
-                job_store.compute_user_stats, u["id"], since_epoch=since,
+            per_user_stats[u.id] = await asyncio.to_thread(
+                job_store.compute_user_stats, u.id, since_epoch=since,
             )
         # Top-tile aggregate for team view — sum the per-user stats we already
         # computed instead of leaving the tiles at 0. Time-saved is re-derived
@@ -139,7 +111,7 @@ async def admin_data(
         # display_name so the UI reads "Alice: 42 fillers" instead of an opaque
         # numeric id.
         users_by_id: dict[int, str] = {
-            u["id"]: (u["display_name"] or u["label"]) for u in users
+            u.id: (u.display_name or u.label) for u in users
         }
         for api_key_id, n in job_store.list_filler_counts_for_week(
             iso_year, iso_week,

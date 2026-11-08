@@ -144,9 +144,9 @@ The setup writes three files containing secrets. None are committed:
 
 | File | Mode | Contains |
 |---|---:|---|
-| `~/wispralt/server/.env` | 0600 | `WISPRALT_API_KEY`, optional `OPENROUTER_API_KEY` (weekly insights) |
+| `~/wispralt/server/.env` | 0600 | `DATA_DIR`, `SERVER_URL`, optional `OPENROUTER_API_KEY` (weekly insights). No API key: keys live hashed in `DATA_DIR/wispralt.db` |
 | `~/.config/wispralt/cloudflare-token` | 0600 | Cloudflare tunnel token only |
-| `~/.config/wispralt/client-config.txt` | 0600 | `SERVER_URL`, `WISPRALT_API_KEY` (for paste-into-client) |
+| `~/.config/wispralt/client-config.txt` | 0600 | Legacy (pre-Part 4) copy of `SERVER_URL` + the old env key; the bootstrap step now prints the token to the terminal only, so delete this file on an upgraded host |
 
 `.gitignore` covers all three. Cloudflare tunnel token is **never** stored in `server/.env` — it lives in `~/.config/wispralt/cloudflare-token` and is read by the cloudflared LaunchAgent via `--token-file` at start time.
 
@@ -156,7 +156,7 @@ After any setup involving copy/paste into shared tools (chat, screen recordings,
 
 - **`OPENROUTER_API_KEY`** (if set, for weekly insights): rotate at <https://openrouter.ai/keys>, update `server/.env`, restart the FastAPI LaunchAgent.
 - **Cloudflare tunnel token:** in the Zero Trust dashboard → tunnel → Configure → Rotate token. See "Cloudflared LaunchAgent (user-level)" below for the rotation procedure — the steps differ depending on whether your cloudflared version supports `--token-file`.
-- **`WISPRALT_API_KEY`:** `curl -X POST -H "Authorization: Bearer $OLD" $SERVER_URL/admin/rotate-key` returns `{"rotated": true}` and writes the new key to the server log; copy it into the client.
+- **Admin token:** on the server, `cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin` revokes the old key and prints a new one (terminal only); enter it in the client. Employee / integration keys rotate from the admin UI.
 
 ## Client (`client/`) — Swift package gotchas
 

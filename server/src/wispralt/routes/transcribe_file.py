@@ -132,8 +132,7 @@ def _load_meta_or_404(chunked_dir: Path) -> dict:
 def _require_owner(request: Request, meta: dict) -> None:
     """R-B: caller's authenticated user.id must match the one recorded at init.
 
-    Raises HTTPException(403) on mismatch. Anonymous / break-glass requests
-    (user.id < 0) cannot own uploads — they would not have hit init either.
+    Raises HTTPException(403) on mismatch, 401 when no user is authenticated.
     """
     user = getattr(request.state, "user", None)
     if user is None or not hasattr(user, "id"):
@@ -218,11 +217,7 @@ async def submit_file(
     # at submit time so they survive worker crashes and restart re-enqueue.
     client_version = request.headers.get("X-WisprAlt-Client-Version")
     user = getattr(request.state, "user", None)
-    api_key_id = (
-        int(user.id)
-        if user is not None and hasattr(user, "id") and int(user.id) >= 0
-        else None
-    )
+    api_key_id = int(user.id) if user is not None else None
     try:
         # Worker (_run_source) runs ffprobe + ffmpeg + pipeline. Route returns
         # 202 immediately so Cloudflare Tunnel doesn't see a long-running
@@ -324,11 +319,8 @@ async def init_chunked(
         )
 
     user = getattr(request.state, "user", None)
-    if user is None or not hasattr(user, "id") or int(user.id) < 0:
-        # Break-glass admin (id=-1) cannot own uploads because we cannot
-        # later verify ownership across requests. Force them through the
-        # single-shot route.
-        raise HTTPException(403, "Chunked upload requires a per-user API key")
+    if user is None:
+        raise HTTPException(401, "Unauthenticated")
 
     upload_id = secrets.token_urlsafe(16)
     chunked_dir = chunked_root / upload_id
@@ -597,11 +589,7 @@ async def finalize_chunked(
     # /init (more robust than the live header — survives mid-upload client
     # upgrade). api_key_id is already ownership-verified above.
     client_version = meta.get("client_app_version")
-    try:
-        meta_api_key_id = int(meta.get("api_key_id", -999))
-    except (TypeError, ValueError):
-        meta_api_key_id = -999
-    api_key_id = meta_api_key_id if meta_api_key_id >= 0 else None
+    api_key_id = int(meta["api_key_id"])
     try:
         jid = await runner.submit_source_or_429(
             out_path,

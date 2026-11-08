@@ -28,7 +28,7 @@ from wispralt.constants import (
     OPENAI_KNOWN_MODELS_CREATED,
     OPENAI_KNOWN_MODELS_OWNED_BY,
 )
-from wispralt.users.store import User
+from wispralt.accounts.store import User
 
 logger = logging.getLogger(__name__)
 

@@ -14,27 +14,23 @@ git clone <repo> && cd wisprflowALT
 | Order | Script | Purpose |
 |-------|--------|---------|
 | 1 | `download-models.sh` | Download ~2.7 GB of model weights from Hugging Face (public, no token) |
-| 2 | `generate-api-key.sh` | Generate `openssl rand -hex 32` key; write to `server/.env` (mode 0600) |
+| 2 | `python -m wispralt.bootstrap --label owner` (from `server/`) | Create the first admin; print the client config (server URL + token) once, terminal only |
 | 3 | `setup-cloudflared.sh` | Install cloudflared; configure HTTPS tunnel; persist `SERVER_URL` to `.env` |
 | 4 | `server-launchd.sh install` | Register FastAPI server as a macOS LaunchAgent |
-| 5 | `doctor.sh` | Verify all checks pass; run dictation round-trip |
+| 5 | `doctor.sh` | Verify all checks pass (`/healthz`, `/readyz/*`, admin exists; no key needed) |
 
 ## Script reference
 
 ### `setup-server.sh`
 End-to-end orchestrator. Checks macOS ≥ 13.0, Python 3.11, Homebrew. Runs all
-sub-scripts in order. Prints `SERVER_URL` + `API_KEY` at the end for pasting into
-the client.
+sub-scripts in order. Writes an absolute `DATA_DIR` into `server/.env`, then the
+bootstrap step prints the client config (server URL + one-time admin token);
+setup itself never prints or stores a key.
 
 ### `download-models.sh`
 - Pre-flight: requires ≥ 4 GB free on `$HOME`
 - Downloads (public repos, no token): Parakeet (~1.2 GB) for dictation and mlx-whisper large-v3-turbo (~1.6 GB) for file transcription; each download retries 3 times with a 5 s backoff
 - Reports total HF cache size after completion
-
-### `generate-api-key.sh`
-Idempotent. Generates `openssl rand -hex 32`. Replaces existing `WISPRALT_API_KEY`
-line in `server/.env` or appends it. Always sets `server/.env` to mode 0600.
-Echoes the generated key once for copy-paste into the client.
 
 ### `setup-cloudflared.sh`
 - Installs cloudflared via Homebrew if not present

@@ -9,13 +9,13 @@
 #   2. Python 3.11 check
 #   3. Homebrew check + install ffmpeg
 #   4. uv venv + uv sync (server Python deps)
-#   5. server/.env from .env.example if missing
+#   5. server/.env from .env.example if missing; absolute DATA_DIR
 #   6. download-models.sh
-#   7. generate-api-key.sh
+#   7. First admin: python -m wispralt.bootstrap (prints the client config once)
 #   8. setup-cloudflared.sh
 #   9. server-launchd.sh install
 #  10. doctor.sh
-#  11. Print client config one-liner (SERVER_URL + API_KEY)
+#  11. Point at the server URL + token printed in step 7
 
 set -euo pipefail
 
@@ -128,13 +128,31 @@ if ! grep -q "^OPENROUTER_TIMEOUT_MS=" "$ENV_FILE" 2>/dev/null; then
 fi
 chmod 600 "$ENV_FILE"
 
+# DATA_DIR (wispralt.db, outputs/, staging/) must be an absolute path. Write the
+# default when the key is absent or empty; refuse a relative value, which would
+# put the database wherever the server happens to start.
+DATA_DIR_VAL="$(grep "^DATA_DIR=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
+if [[ -z "$DATA_DIR_VAL" ]]; then
+    sed -i '' '/^DATA_DIR=/d' "$ENV_FILE"
+    printf 'DATA_DIR="%s"\n' "$HOME/Library/Application Support/WisprAlt" >> "$ENV_FILE"
+    echo "DATA_DIR set to $HOME/Library/Application Support/WisprAlt"
+elif [[ "$DATA_DIR_VAL" != /* ]]; then
+    die "DATA_DIR in $ENV_FILE must be an absolute path (got: $DATA_DIR_VAL)"
+fi
+chmod 600 "$ENV_FILE"
+
 # ── 6. Download model weights ─────────────────────────────────────────────────
 step "Downloading model weights..."
 bash "$SCRIPT_DIR/download-models.sh"
 
-# ── 7. Generate API key ───────────────────────────────────────────────────────
-step "Generating API key..."
-bash "$SCRIPT_DIR/generate-api-key.sh"
+# ── 7. First admin (the client credential handoff) ───────────────────────────
+# Prints the client config (server URL + one-time admin token) to this
+# terminal only; it refuses a non-TTY stdout so no log ever holds the token.
+# Re-running it on a host that already has an admin is a no-op error; a lost
+# key is recovered with `--rotate-admin`.
+step "Creating the first admin (copy the token it prints — shown once)..."
+(cd "$REPO_ROOT/server" && .venv/bin/python -m wispralt.bootstrap --label owner) \
+    || warn "Bootstrap did not create an admin (one may already exist). Lost key? cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin"
 
 # ── 8. Set up Cloudflare Tunnel ───────────────────────────────────────────────
 step "Setting up Cloudflare Tunnel..."
@@ -148,22 +166,14 @@ bash "$SCRIPT_DIR/server-launchd.sh" install
 step "Running system health check (doctor.sh)..."
 bash "$SCRIPT_DIR/doctor.sh"
 
-# ── 11. Print client configuration ───────────────────────────────────────────
-step "Setup complete! Client configuration:"
+# ── 11. Client configuration ─────────────────────────────────────────────────
+step "Setup complete!"
 SERVER_URL_VAL="$(grep "^SERVER_URL=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
-API_KEY_VAL="$(grep "^WISPRALT_API_KEY=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
-
 echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║             WisprAlt Client Configuration                   ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
-echo ""
-echo "  SERVER_URL   $SERVER_URL_VAL"
-echo "  API_KEY      $API_KEY_VAL"
-echo ""
-echo "Paste these into the macOS client:"
-echo "  WisprAlt menubar → Settings → Server URL  (paste SERVER_URL)"
-echo "  WisprAlt menubar → Settings → API Key     (paste API_KEY)"
+echo "Configure the macOS client with the server URL and the token printed in step 7:"
+echo "  WisprAlt menubar → Settings → Server URL  ($SERVER_URL_VAL)"
+echo "  WisprAlt menubar → Settings → API Key     (the token from step 7)"
 echo "  Click 'Test Connection' — expect green ✓"
 echo ""
-echo "To re-print this config at any time:  grep -E 'SERVER_URL|WISPRALT_API_KEY' server/.env"
+echo "The token is never stored in plaintext. Lost it? Issue a new one:"
+echo "  cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin"

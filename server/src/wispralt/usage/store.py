@@ -3,8 +3,7 @@ usage/store.py — ``UsageStore``: per-request ``usage_events`` rows and the por
 
 ``record`` is one INSERT in its own ``BEGIN IMMEDIATE`` (an unknown user is a
 ``sqlite3.IntegrityError``). The reads serve the portal overview, the user
-detail page, the usage drilldown and its CSV export with the same numbers the
-Postgres queries produced: windows are relative to the ``now`` passed in, the
+detail page, the usage drilldown and its CSV export: windows are relative to the ``now`` passed in, the
 p50 is the median of the window's ``duration_ms`` values (computed in Python,
 like ``percentile_cont(0.5)``), and the daily buckets are UTC days.
 """

@@ -24,7 +24,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
 os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
 os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
@@ -45,12 +44,12 @@ from wispralt.jobs.runner import FileJobRunner
 from wispralt.jobs.store import JobStore
 from wispralt.ops import staging
 from wispralt.routes import transcribe_file as transcribe_file_routes
-from wispralt.users.store import User
+from wispralt.accounts.store import User
 
 _FORMATS = ("json", "srt", "vtt", "txt")
-OWNER = User(id=1, label="owner", role="employee")
-OTHER = User(id=2, label="other", role="employee")
-ADMIN = User(id=3, label="admin", role="admin")
+OWNER = User(id=1, key_id=None, label="owner", role="employee", kind="employee")
+OTHER = User(id=2, key_id=None, label="other", role="employee", kind="employee")
+ADMIN = User(id=3, key_id=None, label="admin", role="admin", kind="employee")
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────

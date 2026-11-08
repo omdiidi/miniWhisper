@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from pydantic import SecretStr, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Re-export verify_env_perms from ops.env_writer so callers that import it
@@ -28,21 +28,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Secrets — never logged or serialized
-    wispralt_api_key: SecretStr
-
-    # Supabase Postgres URL for multi-tenant auth + usage events.
-    # Optional: when None, the server runs in break-glass-only mode
-    # (env-var WISPRALT_API_KEY grants admin; no per-user lookups).
-    supabase_database_url: SecretStr | None = None
-
     # Server identity
     server_url: str
 
     # Local-mode data root: wispralt.db, outputs/ and staging/ live here.
-    # Must be absolute (an empty value would mean cwd). Optional until the
-    # auth cutover makes it required; see db_path / outputs_dir below.
-    data_dir: Path | None = None
+    # Required and absolute (an empty value would mean cwd). setup-server.sh
+    # writes it into .env; the server never creates it (bootstrap does).
+    data_dir: Path
 
     # Filesystem paths — resolved to absolute on access
     meeting_output_dir: Path
@@ -153,24 +145,17 @@ class Settings(BaseSettings):
     @field_validator("data_dir", mode="before")
     @classmethod
     def _absolute_data_dir(cls, value: object) -> object:
-        if value is None:
-            return None
-        if not str(value).strip() or not Path(str(value)).is_absolute():
+        if value is None or not str(value).strip() or not Path(str(value)).is_absolute():
             raise ValueError("DATA_DIR must be an absolute path")
         return Path(str(value))
 
-    def _require_data_dir(self) -> Path:
-        if self.data_dir is None:
-            raise ValueError("DATA_DIR is not set")
-        return self.data_dir
-
     @property
     def db_path(self) -> Path:
-        return self._require_data_dir() / "wispralt.db"
+        return self.data_dir / "wispralt.db"
 
     @property
     def outputs_dir(self) -> Path:
-        return self._require_data_dir() / "outputs"
+        return self.data_dir / "outputs"
 
 
 # Module-level singleton — import as ``from wispralt.config import settings``

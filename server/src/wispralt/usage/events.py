@@ -2,7 +2,7 @@
 usage/events.py — :class:`UsageEvent` dataclass.
 
 A single per-request observation captured by the observability middleware
-and drained into ``wispralt.usage_events`` by the background writer.
+and written to ``usage_events`` by ``UsageStore.record``.
 
 Fields are nullable when not applicable to the kind of event (e.g. a
 ``meeting`` create has no ``chars`` count yet).
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class UsageEvent:
-    """One row to be inserted into ``wispralt.usage_events``."""
+    """One row of ``usage_events``."""
 
     user_id: int
     ts: float  # unix seconds

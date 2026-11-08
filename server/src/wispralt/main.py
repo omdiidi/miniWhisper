@@ -16,6 +16,9 @@ Startup sequence (Phase 2 / Task 13b)
     call sys.exit(0) so launchd ExitTimeOut=15 can observe a clean exit code.
 9.  Expose state on app.state for routes and health endpoints.
 
+Before any of that, ``Database(settings.db_path).migrate()`` opens the one
+SQLite DB (``app.state.db``) and its ``accounts`` / ``usage`` repositories.
+
 Shutdown
 --------
 Logs "clean shutdown" message.  The SIGTERM handler handles graceful job
@@ -38,13 +41,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-import asyncpg
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from wispralt import db, observability
+from wispralt import observability
+from wispralt.accounts.store import AccountStore
 from wispralt.config import settings, verify_env_perms
+from wispralt.database import Database
 from wispralt.dictate.parakeet import ParakeetService
 from wispralt.dictate.streaming_session import (
     StreamingSessionStore,
@@ -75,9 +79,8 @@ from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
 from wispralt.routes import v1_models, v1_transcriptions
-from wispralt.usage import writer as usage_writer
 from wispralt.usage.events import UsageEvent
-from wispralt.users import store as users_store
+from wispralt.usage.store import UsageStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,29 +90,6 @@ logger = logging.getLogger(__name__)
 
 
 # ── lifespan ──────────────────────────────────────────────────────────────────
-
-
-async def _seed_admin_if_empty(pool: asyncpg.Pool) -> None:
-    """Idempotently insert a row for the env-var break-glass token.
-
-    Bails when ``wispralt.users`` already has any row.  ``ON CONFLICT
-    (token_hash) DO NOTHING`` makes a restart with the same env-var token
-    (after a manual revoke) a no-op rather than a crash.
-    """
-    n = await pool.fetchval("SELECT COUNT(*) FROM wispralt.users")
-    if n and n > 0:
-        return
-    bearer = settings.wispralt_api_key.get_secret_value()
-    th = users_store.hash_token(bearer)
-    await pool.execute(
-        "INSERT INTO wispralt.users (label, token_hash, role, notes) "
-        "VALUES ($1, $2, 'admin', $3) "
-        "ON CONFLICT (token_hash) DO NOTHING",
-        "break-glass-admin (seeded from env)",
-        th,
-        "Auto-seeded on first startup. Rotate via /admin/users to a real label.",
-    )
-    logger.info("Seeded first admin user from WISPRALT_API_KEY env var.")
 
 
 @asynccontextmanager
@@ -128,20 +108,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.server_log_backup_count,
     )
 
-    # Verify the watcher's exception coverage. asyncpg has NO common base
-    # class for the two failure modes we need to catch: PostgresError
-    # (server-side) and InterfaceError ("pool is closed", client-side).
-    # Both inherit directly from Exception via separate private hierarchies
-    # (verified asyncpg 0.31.0). The watcher and route catches enumerate
-    # both explicitly; this assertion confirms both class names still exist
-    # at module top-level. A future asyncpg rename/unexport will fail boot
-    # loudly instead of silently regressing the watcher to the 2026-05-17 bug.
-    assert hasattr(asyncpg, "PostgresError") and hasattr(asyncpg, "InterfaceError"), (
-        "asyncpg taxonomy changed — PostgresError or InterfaceError no longer "
-        "exposed at the package top-level. Audit every "
-        "`except (asyncpg.PostgresError, asyncpg.InterfaceError)` site and "
-        "re-verify the watcher path covers both. See 2026-05-17 postmortem."
-    )
+    # 0. The one SQLite DB. DATA_DIR must already exist (setup / bootstrap
+    #    create it); the server never creates it, so a server started against
+    #    a missing or half-restored tree fails instead of writing into it.
+    if not settings.data_dir.is_dir():
+        raise RuntimeError(f"DATA_DIR does not exist: {settings.data_dir}")
+    database = Database(settings.db_path)
+    applied = database.migrate()
+    if applied:
+        logger.info("Database migrations applied: %s", applied)
+    app.state.db = database
+    app.state.accounts = AccountStore(database)
+    app.state.usage = UsageStore(database)
 
     # 1. Validate .env permissions
     env_path = find_env_path()
@@ -371,9 +349,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    signal module.
     #
     #    The handler signals graceful shutdown via uvicorn's `should_exit` flag,
-    #    NOT `os._exit(0)`.  `os._exit` skips the lifespan teardown — which
-    #    means the usage-event drainer's final flush is lost and any queued
-    #    events are dropped.  We instead let uvicorn run its normal shutdown
+    #    NOT `os._exit(0)`, which would skip the lifespan teardown.  We instead
+    #    let uvicorn run its normal shutdown
     #    path (which invokes our lifespan ``finally`` block) and trust
     #    launchd's ExitTimeout=15 to bound the wait.
     def _sigterm_handler() -> None:
@@ -386,8 +363,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except (OSError, RuntimeError) as exc:
             logger.warning("Could not mark running jobs failed on SIGTERM: %s", exc)
 
-        # Trigger uvicorn graceful shutdown so the lifespan teardown runs
-        # (drainer cancel + usage flush + db.close_pool).  Fallback to raising
+        # Trigger uvicorn graceful shutdown so the lifespan teardown runs.
+        # Fallback to raising
         # SIGINT in the same loop if no uvicorn server is registered (e.g.
         # tests running the app via TestClient).
         server_obj = getattr(app.state, "uvicorn_server", None)
@@ -401,41 +378,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
-
-    # 9. Auth: break-glass admin hash + Postgres pool + usage drainer.
-    #    Order matters:
-    #      a. break_glass_token_hash is pure compute — set it FIRST so even
-    #         if the pool init below explodes, the operator can still hit
-    #         /admin/* via the env-var token.
-    #      b. Pre-set db_pool / usage_drainer to None so the shutdown
-    #         branch can safely test them with getattr().
-    #      c. Try to spin up the pool, seed the admin row, and start the
-    #         drainer.  Catch only typed Postgres / OS errors.
-    app.state.break_glass_token_hash = users_store.hash_token(
-        settings.wispralt_api_key.get_secret_value()
-    )
-    app.state.db_pool = None
-    app.state.usage_drainer = None
-
-    try:
-        pool = await db.get_pool()
-        app.state.db_pool = pool
-        await _seed_admin_if_empty(pool)
-        app.state.usage_drainer = asyncio.create_task(
-            usage_writer.drain_loop(observability.usage_queue, pool)
-        )
-    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, db.PostgresUnavailable):
-        logger.exception(
-            "Postgres unavailable at startup; only break-glass admin will work"
-        )
-
-    # 9b. Pool watcher — every 10s, probe the pool with SELECT 1 and recreate
-    #     if dead. Without this, a transient Supabase blip leaves db_pool=None
-    #     forever and every authenticated request returns 503 until the
-    #     operator restarts the server. Triggered by a real outage 2026-05-02.
-    app.state.db_watcher_task = None
-
-    app.state.db_watcher_task = asyncio.create_task(background.db_watcher_loop(app))
 
     # Initialize per-token rate-limit state for /v1/* routes. Idempotent.
     # Imported locally to avoid a top-of-module cycle with the auth/users modules.
@@ -452,9 +394,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # the SQLite write-lock isn't being released mid-INSERT below. The 2 s
     # budget is total across all pending persists (gather waits for ALL),
     # not 2 s each; under a SIGTERM burst some tasks may be abandoned and
-    # the warning log records the count. insert_dictation is SQLite-only
-    # today — placing the drain first keeps the teardown rule clear if a
-    # future persist path ever adds Postgres reads.
+    # the warning log records the count.
     pending: set[asyncio.Task[None]] | None = getattr(
         app.state, "pending_persists", None
     )
@@ -485,30 +425,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             with contextlib.suppress(asyncio.CancelledError):
                 await _task
 
-    # Cancel the db pool watcher first so it stops trying to probe / rebuild
-    # while the rest of shutdown is tearing the pool down.
-    db_watcher: asyncio.Task | None = getattr(app.state, "db_watcher_task", None)
-    if db_watcher is not None and not db_watcher.done():
-        db_watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await db_watcher
-
     # Cancel the idle-eviction loop first so it stops emitting log noise.
     eviction_task: asyncio.Task | None = getattr(app.state, "eviction_task", None)
     if eviction_task is not None and not eviction_task.done():
         eviction_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await eviction_task
-
-    # Cancel the usage-event drainer so its CancelledError handler can
-    # do the final flush of any pending events.  getattr is defensive —
-    # the lifespan pre-sets the attr, so we only fall through if the
-    # startup branch was bypassed entirely.
-    drainer: asyncio.Task | None = getattr(app.state, "usage_drainer", None)
-    if drainer is not None:
-        drainer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await drainer
 
     # Streaming-dictation sweeper + active sessions. Cancel the sweeper first
     # so it stops mutating session state, then walk surviving sessions and
@@ -550,8 +472,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("insights_client.aclose failed: %s", exc)
 
-    await db.close_pool()
-
     logger.info("WisprAlt server clean shutdown.")
 
 
@@ -585,10 +505,11 @@ _KIND_MAP = {
 class _ObservabilityMiddleware(BaseHTTPMiddleware):
     """Times each request and records it in the observability singletons (G4).
 
-    Also enqueues a :class:`UsageEvent` after the latency record when the
-    request resolved to a real (non-break-glass) user on a tracked route +
-    method.  Enqueue is fire-and-forget; the background drainer in
-    ``usage.writer`` flushes batches into Postgres off the hot path.
+    Also writes one ``usage_events`` row (``UsageStore.record`` in a thread,
+    about 1 ms) when the request authenticated a user on a tracked route +
+    method and was not a dedup replay. Best-effort: a ``sqlite3.Error`` loses
+    the row, bumps ``usage_write_failures_total`` and logs the error type;
+    the response is unaffected.
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[type-arg]
@@ -608,33 +529,36 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
             observability.error_counter.increment(route_key, response.status_code)
         observability.latency_histogram.record(route_key, latency_ms)
 
-        # Enqueue a usage event when:
-        #   - auth resolved to a real DB user (skip None and break-glass id<0),
-        #   - the route is one we track, and
-        #   - the method creates work (skip GET status polls).
+        # Record a usage row when auth resolved a user, the route is tracked,
+        # the method creates work (skip GET polls), and it was not a replay.
         user = getattr(request.state, "user", None)
+        usage: UsageStore | None = getattr(request.app.state, "usage", None)
         if (
             user is not None
-            and user.id >= 0
+            and usage is not None
             and route_key in TRACKED_ROUTES
             and request.method in TRACKED_METHODS
+            and not getattr(request.state, "dedup_replay", False)
         ):
             try:
                 bytes_in = int(request.headers.get("content-length", 0) or 0)
             except ValueError:
                 bytes_in = 0
-            observability.usage_queue.offer(
-                UsageEvent(
-                    user_id=user.id,
-                    ts=time.time(),
-                    kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
-                    status=response.status_code,
-                    duration_ms=latency_ms,
-                    bytes_in=bytes_in,
-                    request_id=request.headers.get("x-request-id")
-                    or getattr(request.state, "request_id", None),
-                )
+            event = UsageEvent(
+                user_id=user.id,
+                ts=time.time(),
+                kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
+                status=response.status_code,
+                duration_ms=latency_ms,
+                bytes_in=bytes_in,
+                request_id=request.headers.get("x-request-id")
+                or getattr(request.state, "request_id", None),
             )
+            try:
+                await asyncio.to_thread(usage.record, event)
+            except sqlite3.Error as exc:
+                observability.usage_write_failures_total.increment()
+                logger.error("usage write failed: %s", type(exc).__name__)
 
         return response
 
@@ -725,7 +649,7 @@ def create_app() -> FastAPI:
     # /transcribe/dictate/stream/* — additive streaming path; same auth as
     # /transcribe/dictate.
     app.include_router(dictate_stream_routes.router)
-    # /admin/* legacy JSON endpoints (rotate-key, /metrics) — auth per-route.
+    # /admin/* JSON endpoints (/metrics, /admin/active, server-log) — auth per-route.
     app.include_router(admin.router)
     # /admin/* Jinja2 UI: three routers under the same prefix.
     # public_router  — /admin/login (must be reachable WITHOUT auth).

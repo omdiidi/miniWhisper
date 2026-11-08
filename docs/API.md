@@ -16,11 +16,12 @@ Most routes require:
 Authorization: Bearer <token>
 ```
 
-The bearer is sha256-hashed and resolved against `wispralt.users` via the asyncpg pool, with a 60-second in-process `TokenCache` in front. See [ARCHITECTURE.md → Auth (multi-token)](ARCHITECTURE.md#auth-multi-token) for the full path.
+The bearer is sha256-hashed and looked up in the local SQLite DB (`api_keys ⋈ users`: key not revoked, user not disabled) on **every** request — there is no cache, so a revoke applies to the next request. See [ARCHITECTURE.md → Auth](ARCHITECTURE.md#auth-local-sqlite-no-cache) for the full path.
 
 **Unauthenticated endpoints** (probe-style + admin login, no API key required):
 - `GET /healthz` — liveness probe
 - `GET /readyz/dictation` — dictation-pipeline readiness probe
+- `GET /readyz/db` — local SQLite DB readiness (`reason`: `db_error` / `schema_outdated`; body carries `usage_write_failures`)
 - `GET /admin/login` and `POST /admin/login` — admin UI login form (chicken-and-egg: must be reachable without the cookie it sets)
 - `GET /me/login` and `POST /me/login` — employee portal login form (Phase 2; same chicken-and-egg reason)
 
@@ -56,7 +57,7 @@ storage + 90-day retention sweep details.
 - A missing or invalid token returns **401**.
 - An empty token after the `Bearer ` prefix returns **401**.
 - Multiple `Authorization` headers in one request return **400** `"Multiple Authorization headers not allowed"`.
-- When Postgres is unreachable AND the bearer doesn't match the break-glass env-var hash, the server returns **503** `"Auth temporarily unavailable"` rather than 401, so the operator can distinguish "wrong key" from "DB down".
+- When the auth lookup itself fails (`sqlite3.Error`), the server returns **503** `"Auth temporarily unavailable"` rather than 401, so the operator can distinguish "wrong key" from "DB down". There is no fallback admin.
 
 ---
 
@@ -329,7 +330,7 @@ Return the calling user's own profile. Each user can only read their own row —
 |---|---|
 | 401 | Missing/invalid bearer |
 | 404 | User row genuinely missing (should not happen for an authed token; indicates DB drift) |
-| 503 | Postgres pool unavailable |
+| 503 | Auth lookup failed (`sqlite3.Error`) |
 
 ---
 
@@ -357,9 +358,9 @@ Update the calling user's own `display_name`. The `label` and `role` are not use
 |---|---|
 | 401 | Missing/invalid bearer |
 | 422 | `display_name` length out of range or contains control chars |
-| 503 | Postgres pool unavailable |
+| 503 | Auth lookup failed (`sqlite3.Error`) |
 
-The token cache is **not** invalidated on `display_name` change because the auth `User` object only carries `(id, label, role)` — `display_name` is fetched fresh from `wispralt.users` each time the client opens its Identity section.
+`display_name` is read fresh from `users` each time (auth never caches the `User`).
 
 Source: `server/src/wispralt/routes/me.py`.
 
@@ -391,7 +392,6 @@ on identical `created_at` is `id DESC`.
 | Code | Condition |
 |---|---|
 | 401 | Missing / invalid bearer. |
-| 403 | Caller is the break-glass admin (`user.id < 0`) — break-glass identities have no personal dictation history. |
 | 404 | Caller has zero non-deleted dictations. |
 | 503 | SQLite job store transiently unavailable. |
 
@@ -415,23 +415,22 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 **Auth:** None required (this endpoint is what produces the auth cookie).
 
-Validate a pasted token and set the session cookie. Mirrors `POST /admin/login` but rejects break-glass admin tokens at this surface so the break-glass identity stays scoped to emergency admin use.
+Validate a pasted token and set the session cookie. Mirrors `POST /admin/login`.
 
 **Request:** `application/x-www-form-urlencoded`
 
 | Field | Type | Notes |
 |---|---|---|
-| `token` | string | 64-char hex bearer token. Validated through the same 3-stage lookup as admin login: `TokenCache` → asyncpg `wispralt.users` → break-glass env-var hash. |
+| `token` | string | 64-char hex bearer token. Validated with the same lookup as every request (`auth.resolve_token`). |
 
-**Response 303** — token valid (non-break-glass). Redirects to `/me/insights` by default, or to the value of the optional `?next=` query parameter when it's a **relative path under `/me/*`** (open-redirect guard — absolute URLs, scheme-prefixed values, and paths outside `/me/*` are silently ignored and the redirect falls back to `/me/insights`). The menubar "Open My Dictations" button (v0.5.0) uses `?next=/me/history` so first-time employees land directly on their history page after token-paste. Sets `wispralt_admin_token` cookie with `path="/"`, `HttpOnly`, `Secure`, `SameSite=Strict`, `max-age=8h`. The `path="/"` scoping lets the same cookie cover both `/admin/*` and `/me/*` surfaces; admin login was simultaneously broadened to set the cookie with `path="/"` as well.
+**Response 303** — token valid. Redirects to `/me/insights` by default, or to the value of the optional `?next=` query parameter when it's a **relative path under `/me/*`** (open-redirect guard — absolute URLs, scheme-prefixed values, and paths outside `/me/*` are silently ignored and the redirect falls back to `/me/insights`). The menubar "Open My Dictations" button (v0.5.0) uses `?next=/me/history` so first-time employees land directly on their history page after token-paste. Sets `wispralt_admin_token` cookie with `path="/"`, `HttpOnly`, `Secure`, `SameSite=Strict`, `max-age=8h`. The `path="/"` scoping lets the same cookie cover both `/admin/*` and `/me/*` surfaces; admin login was simultaneously broadened to set the cookie with `path="/"` as well.
 
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Invalid / revoked token — re-renders `me_login.html.j2` with an error message. |
-| 403 | Token resolved to the break-glass admin identity — rejected at this surface with an explanatory error. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 See [ARCHITECTURE.md → Data portal](ARCHITECTURE.md#data-portal) for the rationale behind sharing the cookie between admin + employee surfaces.
 
@@ -441,7 +440,7 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 ### `GET /me/insights`
 
-**Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
+**Auth:** Bearer or session cookie (any role; integration keys get 403).
 
 Per-employee weekly insights page. Returns the most recent `weekly_insights` row with `scope='person'` for the calling user, plus a time-range stats grid (transcript volume, word count, dictation/file-transcription split) for the selected window.
 
@@ -455,15 +454,13 @@ Per-employee weekly insights page. Returns the most recent `weekly_insights` row
 
 **Response 200 (HTMX partial)** — when the request carries `HX-Request: true`, the handler returns only the `_stats_grid_partial.html.j2` fragment for in-place swap. Use this for time-range tab clicks; the full page is only needed on first navigation.
 
-**Response 303** — caller is break-glass admin (`user.id < 0`). Redirects to `/admin/data` because break-glass identities have no per-user transcript history to summarize.
-
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer. |
 | 422 | `range` is not one of the accepted values. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 The hallucination disclaimer ("AI-generated, may be inaccurate") is rendered inline on each insight card — see [ARCHITECTURE.md → Weekly insights](ARCHITECTURE.md#weekly-insights) for the two-tier scrub policy that backs it.
 
@@ -473,7 +470,7 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 ### `GET /me/history`
 
-**Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
+**Auth:** Bearer or session cookie (any role; integration keys get 403).
 
 Personal transcript archive — the calling user's own dictations + file transcriptions (including legacy meeting rows) in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `api_key_id` AND `deleted_at IS NULL`).
 
@@ -493,15 +490,13 @@ Personal transcript archive — the calling user's own dictations + file transcr
 
 **Response 200 (HTMX Load-more)** — when a cursor was sent, returns `_me_history_page.html.j2` (the next batch of `<tr>` rows + the updated Load-more button). Page size is `settings.history_page_size` (default **50**) per leg.
 
-**Response 303** — caller is break-glass admin (`user.id < 0`). Redirects to `/admin/data`.
-
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer. |
 | 422 | `range` is not one of the accepted values. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 Source: `server/src/wispralt/routes/me.py` (Plan A).
 
@@ -609,7 +604,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ### `GET /admin/data`
 
-**Auth:** Bearer required + `role='admin'`. Router-level `require_admin` + `_require_db_pool` deps mean employee tokens get 403 and a degraded Postgres pool gets 503 — never an `AttributeError` deeper in the handler.
+**Auth:** Bearer required + `role='admin'`. Handler-level `require_admin`: employee tokens get 403.
 
 Admin Data tab. Renders the team `weekly_insights` row (most recent completed ISO week) on top, plus a per-user leaderboard underneath. `?user_id=N` drills into one employee using the same card layout the employee self-view (`me_insights.html.j2`) renders, so admin and employee see identical surfaces.
 
@@ -630,9 +625,9 @@ Admin Data tab. Renders the team `weekly_insights` row (most recent completed IS
 |---|---|
 | 401 | Missing or invalid bearer. |
 | 403 | Token is valid but role is not `admin`. |
-| 404 | `user_id` was supplied but no such user exists in `wispralt.users`. |
+| 404 | `user_id` was supplied but no such user exists. |
 | 422 | `range` is not one of the accepted values. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 Source: `server/src/wispralt/routes/admin_data.py` (Phase 2).
 
@@ -640,7 +635,7 @@ Source: `server/src/wispralt/routes/admin_data.py` (Phase 2).
 
 ### `POST /admin/data/insights/run-now`
 
-**Auth:** Bearer + `wispralt_admin_token` session cookie + `role='admin'`. Router-level `_require_db_pool` + handler-level `require_admin` mean an employee token gets **403** and a degraded Postgres pool gets **503**.
+**Auth:** Bearer + `wispralt_admin_token` session cookie + `role='admin'`. Handler-level `require_admin`: an employee token gets **403**.
 
 Admin-only manual trigger for `insights.cron.run_weekly_insights` against the **current in-progress ISO week**. Fire-and-forget — the handler returns immediately with a tiny HTML body (toast + OOB-swap button fragment) for HTMX to render in place. The spawned task is strong-referenced in `app.state.weekly_insights_manual_tasks` (set of `asyncio.Task`) and removed by a closure-based done-callback that also logs any unhandled exception.
 
@@ -665,7 +660,7 @@ Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip �
 
 **Response 403** — empty body. Triggered by non-admin role (the standard `require_admin` 403 path; employees never reach this surface via the UI).
 
-**Response 503** — Postgres pool unavailable (`_require_db_pool`).
+**Response 503** — auth lookup failed (`sqlite3.Error`).
 
 **Notes:**
 
@@ -830,7 +825,7 @@ Open a chunked upload to bypass Cloudflare's 100 MB request-body cap on free / p
 
 `upload_id` is a `secrets.token_urlsafe(16)` value (22 URL-safe chars). The server records the caller's API-key user id in the upload's metadata; subsequent chunk + finalize calls MUST present a bearer token resolving to the same user id (403 otherwise). Break-glass / single-key clients cannot use chunked upload — they must fall back to single-shot `POST /transcribe/file`.
 
-**Errors:** 403 (anonymous / break-glass caller), 413 (`total_bytes` over limit), 415 (extension), 422 (`chunk_count` out of range), 503 (RAM <4 GiB), 507 (disk).
+**Errors:** 401 (unauthenticated), 413 (`total_bytes` over limit), 415 (extension), 422 (`chunk_count` out of range), 503 (RAM <4 GiB), 507 (disk).
 
 ---
 
@@ -873,27 +868,9 @@ From this point the client polls `GET /transcribe/file/{job_id}` exactly as it w
 
 ---
 
-### `POST /admin/rotate-key`
+### `POST /admin/rotate-key` (removed)
 
-**Auth:** Bearer required (current key — this invalidates immediately on success).
-
-Rotate the API key. No server restart required.
-
-**Response 200:**
-```json
-{ "rotated": true }
-```
-
-The new key is **not** in the response body. It is emitted to stdout (captured by launchd to `~/Library/Logs/WisprAlt/server.log`) as `NEW_API_KEY=<key>` and written to `~/Library/Application Support/WisprAlt/.last-rotation-key` (mode 0600).
-
-Steps performed (see `routes/admin.py:rotate_key`):
-1. Generate `secrets.token_hex(32)` (64 hex chars).
-2. Atomically rewrite `server/.env` via `env_writer.rewrite_env_var` (tempfile-in-same-dir + `os.replace`, mode 0600 preserved).
-3. Write to `.last-rotation-key` (mode 0600, using `os.O_CREAT | os.O_WRONLY | os.O_TRUNC`).
-4. Print `NEW_API_KEY=<key>` to stdout.
-5. Call `auth.set_current_key(new_key)` — hot-swaps the in-memory key.
-
-**Errors:** 500 if `.env` rewrite fails.
+Removed in Part 4 with the env admin key. The first admin comes from `python -m wispralt.bootstrap --label NAME`; a lost admin key is replaced with `python -m wispralt.bootstrap --rotate-admin` (both run from `server/` in a terminal and print the token once). Employee and integration keys are rotated from the admin UI (`/admin/users/{id}/mint`, `/admin/keys/{id}/rotate`).
 
 ---
 
@@ -940,6 +917,7 @@ Structured server observability snapshot.
     "transcribe/dictate": {"p50": 143.0, "p95": 198.5, "p99": 240.1},
     "transcribe/file": {"p50": null, "p95": null, "p99": null}
   },
+  "usage_write_failures_total": 0,
   "process_uptime_seconds": 3712.4
 }
 ```
@@ -967,13 +945,14 @@ Structured server observability snapshot.
 | `requests_total` | Request counts keyed by `"route:status"` (last process lifetime) |
 | `errors_total` | Error counts keyed by `"route:status"` for 4xx/5xx responses |
 | `latencies` | Per-route p50/p95/p99 latency in ms; `null` if fewer than 2 observations. **Recent-window only**: percentiles include only observations from the last 5 minutes (`LatencyHistogram._RECENT_WINDOW_S`). This protects p50 from being poisoned by a single old outlier (e.g. a hung 197-second upload). The full deque (last 1000 entries, all-time) remains queryable via `LatencyHistogram.percentiles(route, recent_only=False)` for callers that need the legacy view. Regression-locked by `server/tests/test_observability_time_window.py`. |
+| `usage_write_failures_total` | Usage rows lost because `UsageStore.record` raised `sqlite3.Error` (usage is best-effort; the request itself succeeded). Resets on restart. Also in the `/readyz/db` body as `usage_write_failures`. |
 | `process_uptime_seconds` | Wall time since the FastAPI lifespan started (`time.monotonic() - observability.process_started_at_monotonic`). Useful as a deploy/restart sentinel: `< 60` immediately after `bash scripts/server-launchd.sh restart`. |
 
 ---
 
 ## Admin API
 
-The `/admin/*` routes (other than `/admin/rotate-key` and `/admin/login`) render **HTML** via Jinja2 templates, not JSON. They are intended for browser navigation; curl/Postman work too but you'll get markup back.
+The `/admin/*` routes (other than `/admin/login`, `/admin/active`, `/admin/server-log` and `/metrics`) render **HTML** via Jinja2 templates, not JSON. They are intended for browser navigation; curl/Postman work too but you'll get markup back.
 
 Source: `server/src/wispralt/routes/admin_ui.py` +
 `server/src/wispralt/admin/templates/*.html.j2`.
@@ -993,12 +972,12 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 | GET | `/admin/me` | any role | Admin: 303 → `/admin/`. Employee: 200 with that user's `user_detail` page (admin nav hidden). |
 | GET | `/admin/` | admin | Overview dashboard HTML |
 | GET | `/admin/users` | admin | Users-list HTML with per-row Mint/Revoke forms |
-| POST | `/admin/users/{id}/mint` | admin | HTML page showing the new plaintext token **once** |
-| POST | `/admin/users/{id}/revoke` | admin | 303 → `/admin/users` (revokes + invalidates cache by hash) |
+| POST | `/admin/users/{id}/mint` | admin | Revokes the user's keys, issues one new key (re-enabling a revoked user); HTML page shows it **once**. 404 for an unknown user. |
+| POST | `/admin/users/{id}/revoke` | admin | 303 → `/admin/users` (disables the user; its keys 401 from the next request) |
 | GET | `/admin/users/{id}` | admin | Per-user detail HTML (24h/7d/30d tiles + last 50 events) |
 | GET | `/admin/usage` | admin | Drill-down HTML, paginated 100/page. Filters: `kind`, `status`, `user_id`, `since`, `until`, `offset`. |
 | GET | `/admin/usage.csv` | admin | `text/csv` stream (max 10000 rows) |
 | GET | `/admin/data` | admin | Phase 2 — weekly insights Data tab (`data.html.j2`). HTMX partial swap returns `_stats_grid_partial.html.j2`. Documented in detail above under `GET /admin/data`. |
 | POST | `/admin/data/insights/run-now` | admin | Manual trigger for the weekly-insights cron against the current in-progress ISO week. Form-style CSRF. Fire-and-forget; returns HTML toast + OOB-swap button fragment. Documented in detail above under `POST /admin/data/insights/run-now`. |
 
-All authed admin routes return **503** "Admin UI unavailable: Postgres degraded." when `app.state.db_pool` is `None` — the admin UI is unusable without a pool, so it fails loudly rather than crashing on `AttributeError` deeper in. The break-glass admin path (env-var bearer when Postgres is unreachable) lets the operator authenticate to the rest of the API but **not** to the admin UI; restart the server once Postgres is back to recover.
+All admin pages read the local SQLite DB (`AccountStore` / `UsageStore`); an auth lookup failure returns **503**.

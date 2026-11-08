@@ -9,21 +9,16 @@ kill the task.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from pathlib import Path
 from typing import Callable
 
-import asyncpg
 from fastapi import FastAPI
 
-from wispralt import db, observability
 from wispralt.config import settings
 from wispralt.jobs.store import JobStore
 from wispralt.files.output import remove_job_outputs, sweep_stale_tmp
 from wispralt.ops import staging
-from wispralt.ops.logging_setup import RepeatedFailureLogger
-from wispralt.usage import writer as usage_writer
 
 logger = logging.getLogger(__name__)
 
@@ -146,79 +141,3 @@ async def eviction_loop(app: FastAPI, file_runner, files_pipeline) -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.exception("Idle-eviction loop iteration failed")
-
-
-async def db_watcher_loop(
-    app: FastAPI,
-    interval_s: float = 10.0,
-    summary_interval_s: float = 300.0,
-) -> None:
-    """Probe the Postgres pool every *interval_s* and rebuild it if dead.
-
-    Without this, a transient Supabase blip leaves db_pool=None forever and
-    every authenticated request returns 503 until the operator restarts the
-    server (real outage 2026-05-02). Repeated identical failures are logged
-    once in full, then summarised every *summary_interval_s* (a past outage
-    produced ~23,000 identical "pool is closed" tracebacks).
-    """
-    # One limiter per failure kind: sharing one would flip keys every
-    # iteration (unhealthy -> rebuild-failed -> unhealthy ...) and defeat dedupe.
-    unhealthy_log = RepeatedFailureLogger(logger, summary_interval_s)
-    rebuild_log = RepeatedFailureLogger(logger, summary_interval_s)
-    unexpected_log = RepeatedFailureLogger(logger, summary_interval_s)
-    while not getattr(app.state, "shutting_down", False):
-        try:
-            await asyncio.sleep(interval_s)
-            pool = getattr(app.state, "db_pool", None)
-            healthy = pool is not None and await db.health_check(pool)
-            if healthy:
-                unhealthy_log.recovered()
-                rebuild_log.recovered()
-                unexpected_log.recovered()
-                continue
-            unhealthy_log.failure(
-                "pool-unhealthy",
-                "db_watcher: pool unhealthy (pool=%s) — attempting rebuild",
-                "None" if pool is None else "dead",
-            )
-            try:
-                new_pool = await db.recreate_pool()
-            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, db.PostgresUnavailable) as exc:
-                rebuild_log.failure(
-                    f"rebuild-failed:{type(exc).__name__}:{exc}",
-                    "db_watcher: rebuild failed; will retry in %.0fs",
-                    interval_s,
-                    exc_info=True,
-                )
-                continue
-            app.state.db_pool = new_pool
-            # Restart the usage drainer against the new pool. Cancel the
-            # old one (if any) — it's holding a reference to the dead pool
-            # and will throw on next acquire.
-            old_drainer = getattr(app.state, "usage_drainer", None)
-            if old_drainer is not None and not old_drainer.done():
-                old_drainer.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await old_drainer
-            app.state.usage_drainer = asyncio.create_task(
-                usage_writer.drain_loop(observability.usage_queue, new_pool)
-            )
-            unhealthy_log.recovered()
-            rebuild_log.recovered()
-            logger.info("db_watcher: pool rebuilt; usage drainer restarted")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — watcher must never crash silently
-            # POSTMORTEM 2026-05-17: do NOT narrow this catch. It is the
-            # last-resort guard. The bug we fixed was that asyncpg.InterfaceError
-            # ("pool is closed") slipped past health_check's narrow
-            # asyncpg.PostgresError catch and got swallowed HERE — silently
-            # looping for 5 hours. The right fix was to broaden the INNER
-            # catches (f5178be), not to make this outer one type-specific.
-            # Any new code added inside the loop MUST catch its own
-            # exceptions narrowly so this catch-all doesn't mask new bug shapes.
-            unexpected_log.failure(
-                f"unexpected:{type(exc).__name__}:{exc}",
-                "db_watcher: unexpected error; continuing loop",
-                exc_info=True,
-            )

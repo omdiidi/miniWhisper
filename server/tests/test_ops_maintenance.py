@@ -1,25 +1,19 @@
 """
-test_ops_maintenance.py — retention sweep, staging sweeps, db_watcher log dedupe.
+test_ops_maintenance.py — retention sweep and staging sweeps.
 
-No MLX, no Postgres, no network: JobStore runs on a tmp SQLite file and the
-db_watcher loop runs against faked ``db`` functions.
+No MLX, no network: JobStore runs on a tmp SQLite file.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
 import os
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from wispralt import db
 from wispralt.jobs.store import JobStore
 from wispralt.ops import background, staging
-from wispralt.ops.logging_setup import RepeatedFailureLogger
 
 DAY = 86400
 
@@ -138,53 +132,6 @@ def test_run_daily_sweeps_invokes_staging_and_retention(
     assert not (out / f"{old}.txt").exists()
     assert not stale_tmp.exists()
     assert not stale_wav.exists()
-
-
-# ── log dedupe ────────────────────────────────────────────────────────────────
-
-
-def test_repeated_failure_logger_dedupes_and_summarises(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    now = [0.0]
-    lim = RepeatedFailureLogger(
-        logging.getLogger("t.dedupe"), 300.0, clock=lambda: now[0]
-    )
-    with caplog.at_level(logging.INFO, logger="t.dedupe"):
-        assert lim.failure("k", "boom") is True
-        for _ in range(100):
-            now[0] += 10
-            lim.failure("k", "boom")
-    # 1 full log + a summary roughly every 300 s (1000 s elapsed -> 3).
-    assert 2 <= len(caplog.records) <= 5
-    assert "repeated" in caplog.records[-1].getMessage()
-    assert lim.failure("other", "different") is True
-
-
-def test_db_watcher_logs_repeated_outage_once(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    app = SimpleNamespace(state=SimpleNamespace(db_pool=None, shutting_down=False))
-    calls = {"n": 0}
-
-    async def _recreate() -> object:
-        calls["n"] += 1
-        if calls["n"] >= 50:
-            app.state.shutting_down = True
-        raise db.PostgresUnavailable("pool is closed")
-
-    monkeypatch.setattr(db, "recreate_pool", _recreate)
-
-    async def _run() -> None:
-        await background.db_watcher_loop(app, interval_s=0.0)
-
-    with caplog.at_level(logging.WARNING, logger=background.logger.name):
-        asyncio.run(_run())
-
-    assert calls["n"] == 50  # self-healing: it kept retrying every iteration
-    tracebacks = [r for r in caplog.records if r.exc_info]
-    assert len(tracebacks) == 1
-    assert len(caplog.records) <= 4
 
 
 # ── retention safeguards ──────────────────────────────────────────────────────

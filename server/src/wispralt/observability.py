@@ -205,6 +205,11 @@ streaming_sessions_aborted_total = _LabeledCounter()
 # and /admin/metrics exposes mlx_active_mb as the cross-cutting invariant).
 eviction_failures_total = _MonotonicCounter()
 
+# Usage rows are written in-request and best-effort: a ``sqlite3.Error`` from
+# ``UsageStore.record`` loses that one row and increments this counter (shown
+# in /metrics and /readyz/db) so the loss is visible. Resets on restart.
+usage_write_failures_total = _MonotonicCounter()
+
 
 def mlx_active_mb() -> int:
     """Return MLX active memory in MB; 0 on any failure.
@@ -234,10 +239,3 @@ def mlx_cache_mb() -> int:
 # Captured once at module import; the `/metrics` route subtracts from
 # `time.monotonic()` to expose process uptime.
 process_started_at_monotonic: float = _time.monotonic()
-
-# Per-request usage events drained into wispralt.usage_events by the
-# background writer task started in main.py's lifespan.  Bounded queue;
-# overflow drops oldest with a WARNING log.
-from wispralt.usage.queue import UsageEventQueue  # noqa: E402
-
-usage_queue = UsageEventQueue()

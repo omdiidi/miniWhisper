@@ -27,7 +27,7 @@ from ..auth import require_api_key
 from ..config import settings
 from ..dictate.parakeet import MODEL_ID
 from ..jobs.store import JobStore
-from ..users.store import User
+from ..accounts.store import User
 
 logger = logging.getLogger(__name__)
 
@@ -142,13 +142,12 @@ async def transcribe_dictate(
     )
 
     # Phase 1 transcript-storage: fire-and-forget INSERT into the dictations
-    # table. Skip break-glass admin (user.id < 0) and empty/whitespace-only
-    # text — both would pollute the future weekly-insights cron with noise.
+    # table. Skip empty/whitespace-only text — it would pollute the
+    # weekly-insights cron with noise.
     # The dictation HTTP response has already been computed above; this task
     # runs after the route returns and never blocks the user-facing path.
     if (
         user is not None
-        and user.id >= 0
         and text
         and text.strip()
     ):

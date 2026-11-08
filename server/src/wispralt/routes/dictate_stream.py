@@ -11,9 +11,8 @@ Two POSTs under ``/transcribe/dictate/stream/{session_id}/...``:
   a hard timeout), joins partial transcripts, persists one idempotent dictation row, and
   returns the final transcript.
 
-Auth: same ``require_api_key`` dep as ``/transcribe/dictate``. Break-glass
-admin (``user.id < 0``) is rejected — streaming requires a per-user api_key
-because session ownership is enforced by ``api_key_id``.
+Auth: same ``require_api_key`` dep as ``/transcribe/dictate``; session
+ownership is enforced by the authenticated user's id.
 
 Concurrency contract: every read or write of ``StreamingSession`` state must
 hold ``session.lock``; this route obeys that rule and snapshots ``pending_tasks``
@@ -50,7 +49,7 @@ from ..dictate.streaming_session import (
     StreamingSessionStore,
 )
 from ..jobs.store import JobStore
-from ..users.store import User
+from ..accounts.store import User
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +74,6 @@ async def stream_chunk(
 ) -> JSONResponse:
     if not _UUID_RE.match(session_id) or index < 0:
         raise HTTPException(422, "Invalid session_id or index")
-    if int(user.id) < 0:
-        raise HTTPException(403, "Streaming requires per-user API key")
 
     store: StreamingSessionStore = request.app.state.streaming_sessions
     session, status_code = await store.open_or_get(session_id, int(user.id))
@@ -154,8 +151,6 @@ async def stream_finalize(
 ) -> JSONResponse:
     if not _UUID_RE.match(session_id) or not _UUID_RE.match(client_dedup_id):
         raise HTTPException(422, "Invalid session_id or client_dedup_id")
-    if int(user.id) < 0:
-        raise HTTPException(403, "Streaming requires per-user API key")
     store: StreamingSessionStore = request.app.state.streaming_sessions
     session = await store.get_for_owner(session_id, int(user.id))
 

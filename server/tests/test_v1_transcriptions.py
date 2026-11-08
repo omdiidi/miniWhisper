@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
 # wispralt import so the tests work on a bare dev box without a .env.
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
 os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
 os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
@@ -49,7 +48,7 @@ from wispralt.ratelimit_per_token import (
     init_rate_limit_state,
 )
 from wispralt.routes.v1_transcriptions import router as v1_router
-from wispralt.users.store import User
+from wispralt.accounts.store import User
 
 if TYPE_CHECKING:
     import pytest
@@ -121,7 +120,7 @@ def _override_auth(app: FastAPI, *, user: User | None = None) -> User:
     once per request.
     """
     if user is None:
-        user = User(id=42, label="key-test-app", role="employee", kind="integration")
+        user = User(id=42, key_id=None, label="key-test-app", role="employee", kind="integration")
 
     async def _fake(_request: Any = None) -> User:
         return user

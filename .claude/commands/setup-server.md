@@ -1,5 +1,5 @@
 ---
-description: Bootstrap the WisprAlt FastAPI server on a Mac mini (M-series, 16GB+) with Cloudflare Tunnel, model weights, launchd, and a generated API key.
+description: Bootstrap the WisprAlt FastAPI server on a Mac mini (M-series, 16GB+) with Cloudflare Tunnel, model weights, launchd, and a first-admin token.
 ---
 
 # /setup-server
@@ -28,11 +28,11 @@ No Hugging Face token is needed: both models (Parakeet for dictation, MLX Whispe
 
 `bash scripts/setup-server.sh`
 
-The script handles: ffmpeg install, `uv sync`, model downloads (~2.7GB, with retries and per-model progress), API key generation (chmod 600), Cloudflare Tunnel registration (token via stdin, never written to .env), launchd registration with `ExitTimeOut=15`, and a final `doctor.sh` health check.
+The script handles: ffmpeg install, `uv sync`, model downloads (~2.7GB, with retries and per-model progress), an absolute `DATA_DIR` in `server/.env`, the first-admin token (printed once, terminal only — `python -m wispralt.bootstrap`), Cloudflare Tunnel registration (token via stdin, never written to .env), launchd registration with `ExitTimeOut=15`, and a final `doctor.sh` health check.
 
 ## After completion
 
-The script prints a config snippet ending with `SERVER_URL=...` and `API_KEY=...`. **Save this to `tmp/client-config.txt`** (gitignored — already covered by `.gitignore`).
+Step 7 (`python -m wispralt.bootstrap --label owner`) prints the client config once: the server URL and the admin token. The token is never stored in plaintext, so the user must copy it then; a lost key is replaced with `python -m wispralt.bootstrap --rotate-admin` (run from `server/`).
 
 Tell the user:
 

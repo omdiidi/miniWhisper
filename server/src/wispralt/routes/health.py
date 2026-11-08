@@ -14,7 +14,8 @@ GET /readyz/dictation  (no auth)
     or the file transcription model is lazy-loading (the client reads it).
 
 GET /readyz/db  (no auth)
-    Probes the asyncpg pool (observability only).
+    ``SELECT`` on the local SQLite DB plus "schema current" (observability only).
+    Also reports ``usage_write_failures`` (best-effort usage rows lost).
 
 Auth note: readiness probes intentionally bypass bearer auth so that
 Kubernetes-style probes, Cloudflare health checks, and external monitoring
@@ -24,21 +25,15 @@ memory-available booleans — no user data, no audio, no model output.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from wispralt import db
+from wispralt import observability
 from wispralt.files import pipeline as files_pipeline
 
 router = APIRouter()
-
-# 500ms is the budget for an external HTTP health probe. The asyncpg
-# command_timeout is 10s (db.py:67); pool acquire under load can queue
-# briefly. 500ms is well above the cross-region floor for Supabase
-# pooler + Cloudflare tunnel + dev machine triangulation, and well below
-# the watcher's own 2s probe (which has a different SLA — it runs
-# once per 10s and can afford to wait).
-READYZ_DB_TIMEOUT_S = 0.5
 
 
 @router.get("/healthz", summary="Liveness probe — no auth required")
@@ -85,32 +80,19 @@ async def readyz_dictation(request: Request) -> JSONResponse:
 
 @router.get(
     "/readyz/db",
-    summary="Readiness probe for Postgres pool — no auth required",
+    summary="Readiness probe for the local SQLite DB — no auth required",
 )
 async def readyz_db(request: Request) -> JSONResponse:
-    """Probe the asyncpg pool with a sub-500ms SELECT 1.
+    """200 when the DB answers and its schema is current, else 503 with a reason.
 
-    Returns 503 when pool is None or health_check returns False — the same
-    state the db_watcher uses to trigger a rebuild.
+    ``reason`` is ``db_error`` (any ``sqlite3.Error``, e.g. the file is
+    unreadable) or ``schema_outdated`` (a migration is not applied).
 
-    !!! OBSERVABILITY-ONLY !!! This endpoint is for monitoring/alerting,
-    NOT a restart trigger. A flaky pool causing cascading restarts would
-    amplify the outage this endpoint is meant to detect.
-    DO NOT wire into Cloudflare origin health-check (use /healthz),
-    DO NOT wire into launchd HTTP KeepAlive (uses process exit),
-    DO NOT wire into any liveness probe that restarts on failure.
-    External uptime monitors should alert-only.
+    Observability only: do not wire this into a restart trigger.
     """
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is None:
-        return JSONResponse(
-            {"status": "degraded", "reason": "no_pool"},
-            status_code=503,
-        )
-    ok = await db.health_check(pool, timeout_s=READYZ_DB_TIMEOUT_S)
-    if not ok:
-        return JSONResponse(
-            {"status": "degraded", "reason": "pool_unhealthy"},
-            status_code=503,
-        )
-    return JSONResponse({"status": "ok"})
+    failures = {"usage_write_failures": observability.usage_write_failures_total.value}
+    db = getattr(request.app.state, "db", None)
+    reason = "db_error" if db is None else await asyncio.to_thread(db.check)
+    if reason is not None:
+        return JSONResponse({"status": "degraded", "reason": reason, **failures}, status_code=503)
+    return JSONResponse({"status": "ok", **failures})

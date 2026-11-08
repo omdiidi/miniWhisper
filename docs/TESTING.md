@@ -79,15 +79,16 @@ This section describes the rollback strategy that was in place during Phases 1�
 | `server/tests/test_dictate_corrupt_audio.py` | LibsndfileError → CorruptAudioError boundary |
 | `server/tests/test_dictate_route_422.py` | `/transcribe/dictate` HTTP 422/415/413/200 contract; `X-Smart-Format` / finalize `smart_format` ignored (raw text, no `smart_formatted`) |
 | `server/tests/test_observability_time_window.py` | recent-window p50 + low-traffic fallback on `/metrics` |
-| `server/tests/test_token_cache.py` | LRU + 60 s TTL on `TokenCache` |
-| `server/tests/test_usage_writer.py` | UsageEventQueue overflow + drainer batch + FK-violation retry |
-| `server/tests/test_admin_routes_auth.py` | `/admin/*` 403 employee / 200 admin |
-| `server/tests/conftest.py` | shared harness: `DATA_DIR` set before import, per-test `settings.data_dir = tmp_path`, migrated `db` fixture, `accounts` / `usage` stores, `make_user` |
+| `server/tests/test_admin_routes_auth.py` | `/admin/*` 401/403/200 with real tokens, login cookie, Add employee, revoke; portal numbers equal `UsageStore` |
+| `server/tests/test_admin_keys.py` | `/admin/keys/*` create / revoke / rotate on real SQLite |
+| `server/tests/test_integration_kind_guards.py` | integration keys: 403 on `/me/*`, allowed on `/v1` |
+| `server/tests/conftest.py` | shared harness: `DATA_DIR` set before import, per-test `settings.data_dir = tmp_path`, migrated `db` fixture, `accounts` / `usage` stores, `make_user`, `wire(app)` |
 | `server/tests/test_accounts.py` | `AccountStore` lookup / rotate / revoke / disable, first-admin bootstrap, no token in logs |
 | `server/tests/test_usage_store.py` | `UsageStore` record, overview, user totals, p50, drilldown filters, CSV rows |
 | `server/tests/test_database.py` | `Database` migrations (fresh, idempotent, failed, edited, missing, newer), pragmas, rollback, concurrent writers, `check()`, `DATA_DIR` validation |
-| `server/tests/test_db_health.py` | `db.health_check` + `db.recreate_pool` |
-| `server/tests/test_auth_break_glass.py` | Postgres-unreachable → env-var bearer → admin path |
+| `server/tests/test_db_health.py` | `/readyz/db` ok / `schema_outdated` / `db_error`; usage middleware writes one row per tracked POST; a failing write is counted, response kept |
+| `server/tests/test_auth.py` | per-request key lookup: revoked / disabled / unknown → 401, `sqlite3.Error` → 503, out-of-process revoke, disable → mint → new key works |
+| `server/tests/test_bootstrap.py` | `python -m wispralt.bootstrap` subprocesses under a pty: TTY refusal, client config + one token, already-exists, `--check`, `--rotate-admin`, bad `DATA_DIR` |
 | `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | 11-row injection truth table |
 | `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | 5-case secure-field refusal pin |
 | `client/Tests/WisprAltCoreTests/FileJobContractTests.swift` | `FileJobContract.cancelledByUserReason` matches the server's cancel reason |

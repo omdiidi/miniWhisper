@@ -152,7 +152,7 @@ class TestSmartFormatRemoved:
         from wispralt.auth import require_api_key
         from wispralt.dictate.streaming_session import StreamingSessionStore
         from wispralt.routes.dictate_stream import router as stream_router
-        from wispralt.users.store import User
+        from wispralt.accounts.store import User
 
         texts = iter(["um hello", "world"])
 
@@ -175,7 +175,7 @@ class TestSmartFormatRemoved:
         )
         app.include_router(stream_router)
         app.dependency_overrides[require_api_key] = lambda: User(
-            id=7, label="t", role="employee"
+            id=7, key_id=None, label="t", role="employee", kind="employee"
         )
         sid = "11111111-2222-4333-8444-555555555555"
         dedup = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"

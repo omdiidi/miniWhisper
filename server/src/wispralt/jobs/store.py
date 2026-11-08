@@ -319,10 +319,8 @@ class JobStore:
         crashes because it's persisted on the original INSERT, not at
         ``set_done`` time.
 
-        ``api_key_id`` is the owning user's ``wispralt.users.id``. Required
-        for per-employee filtering in the future weekly-insights cron. Pass
-        ``None`` for the break-glass admin (user.id < 0); those rows are
-        explicitly excluded from capture.
+        ``api_key_id`` is the owning user's ``users.id`` (per-employee
+        filtering in the weekly-insights cron).
         """
         jid = str(uuid.uuid4())
         self._exec(

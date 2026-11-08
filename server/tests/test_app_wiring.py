@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
 os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
 os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
@@ -88,3 +87,12 @@ def test_no_telemetry_or_dev_routes(routes: list[tuple[str, frozenset[str]]]) ->
         or p == _DEV_PREFIX
     ]
     assert offenders == []
+
+
+def test_removed_admin_key_routes_absent(routes: list[tuple[str, frozenset[str]]]) -> None:
+    # Break-glass key rotation is gone: the first admin comes from wispralt.bootstrap.
+    assert ("/admin/" + "rotate-key") not in {p for p, _ in routes}
+
+
+def test_readyz_db_present(routes: list[tuple[str, frozenset[str]]]) -> None:
+    assert "GET" in dict(routes)["/readyz/db"]

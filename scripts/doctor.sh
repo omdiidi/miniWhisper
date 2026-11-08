@@ -8,8 +8,11 @@
 #   4. STAGING_DIR and MEETING_OUTPUT_DIR on same filesystem
 #   5. Poll /healthz until 200 or 401 (max 60s)
 #   6. Poll /readyz/dictation until 200 (max 60s × 5s intervals)
-#   7. Generate test WAV via Python + POST to /transcribe/dictate
-#   8. GET /metrics and pretty-print JSON
+#   7. /readyz/db (local SQLite DB answers, schema current)
+#   8. An enabled admin exists (python -m wispralt.bootstrap --check)
+#
+# No API key is needed: every probe here is unauthenticated, and doctor never
+# reads or prints a token.
 #
 # The file-transcription model (MLX Whisper) loads lazily on the first file
 # job, so there is no readiness probe for it here.
@@ -59,7 +62,6 @@ _read_env_var() {
 }
 
 SERVER_URL="$(_read_env_var SERVER_URL)"
-WISPRALT_API_KEY="$(_read_env_var WISPRALT_API_KEY)"
 STAGING_DIR="$(_read_env_var STAGING_DIR)"
 MEETING_OUTPUT_DIR="$(_read_env_var MEETING_OUTPUT_DIR)"
 
@@ -169,14 +171,13 @@ fi
 # ── 6. Poll /readyz/dictation ─────────────────────────────────────────────────
 echo ""
 echo "Check 6: /readyz/dictation (max 60s — Parakeet model load)"
-if [[ -z "$SERVER_URL" || -z "$WISPRALT_API_KEY" ]]; then
-    fail "SERVER_URL or WISPRALT_API_KEY not set — skipping readyz checks"
+if [[ -z "$SERVER_URL" ]]; then
+    fail "SERVER_URL not set — skipping readyz checks"
 else
     DICTATION_OK=false
     for i in $(seq 1 12); do
-        HTTP_CODE="$(curl -fsS -o /dev/null -w "%{http_code}" \
+        HTTP_CODE="$(curl -sS -o /dev/null -w "%{http_code}" \
             --connect-timeout 5 --max-time 10 \
-            -H "Authorization: Bearer $WISPRALT_API_KEY" \
             "$SERVER_URL/readyz/dictation" 2>/dev/null || echo "000")"
         if [[ "$HTTP_CODE" == "200" ]]; then
             pass "/readyz/dictation returned 200 — Parakeet model ready"
@@ -195,52 +196,32 @@ else
     fi
 fi
 
-# ── 7. WAV round-trip test ────────────────────────────────────────────────────
+# ── 7. /readyz/db ─────────────────────────────────────────────────────────────
 echo ""
-echo "Check 7: Dictation round-trip (generate WAV → POST /transcribe/dictate)"
-TEST_WAV="/tmp/wispralt_test_$$.wav"
-# P4#9 / validation-loop fallback: use Python+numpy+soundfile (works without ffmpeg)
-if "$PYTHON_BIN" -c \
-    "import numpy as np, soundfile as sf; sf.write('$TEST_WAV', np.zeros(16000, dtype='float32'), 16000)" \
-    2>/dev/null; then
-    if [[ -z "$SERVER_URL" || -z "$WISPRALT_API_KEY" ]]; then
-        warn "SERVER_URL or API key not set — skipping round-trip test"
-    else
-        ROUNDTRIP_RESP="$(curl -fsS \
-            --connect-timeout 10 --max-time 30 \
-            -H "Authorization: Bearer $WISPRALT_API_KEY" \
-            -F "file=@$TEST_WAV;type=audio/wav" \
-            "$SERVER_URL/transcribe/dictate" 2>/dev/null || echo "")"
-        if echo "$ROUNDTRIP_RESP" | grep -q '"text"'; then
-            pass "Round-trip dictation response contains 'text' field"
-            info "Response: $ROUNDTRIP_RESP"
-        else
-            fail "Round-trip dictation did not return expected JSON with 'text' field"
-            info "Response was: $ROUNDTRIP_RESP"
-        fi
-    fi
-    rm -f "$TEST_WAV"
+echo "Check 7: /readyz/db (local SQLite database)"
+if [[ -z "$SERVER_URL" ]]; then
+    fail "SERVER_URL not set — skipping /readyz/db"
 else
-    warn "Could not generate test WAV (numpy/soundfile not available in $PYTHON_BIN)"
-    info "Install with: cd server && uv sync"
+    DB_RESP="$(curl -sS --connect-timeout 5 --max-time 10 \
+        -w "\n%{http_code}" "$SERVER_URL/readyz/db" 2>/dev/null || echo "000")"
+    DB_CODE="$(echo "$DB_RESP" | tail -1)"
+    if [[ "$DB_CODE" == "200" ]]; then
+        pass "/readyz/db returned 200"
+    else
+        fail "/readyz/db returned HTTP $DB_CODE"
+        info "Response: $(echo "$DB_RESP" | sed '$d')"
+        info "reason=db_error: DATA_DIR/wispralt.db unreadable; reason=schema_outdated: restart the server to migrate."
+    fi
 fi
 
-# ── 8. /metrics ───────────────────────────────────────────────────────────────
+# ── 8. An enabled admin exists ────────────────────────────────────────────────
 echo ""
-echo "Check 8: /metrics"
-if [[ -z "$SERVER_URL" || -z "$WISPRALT_API_KEY" ]]; then
-    warn "SERVER_URL or API key not set — skipping /metrics"
+echo "Check 8: first admin exists"
+if (cd "$REPO_ROOT/server" && "$PYTHON_BIN" -m wispralt.bootstrap --check) >/dev/null 2>&1; then
+    pass "An enabled admin exists"
 else
-    METRICS_RESP="$(curl -fsS \
-        --connect-timeout 5 --max-time 10 \
-        -H "Authorization: Bearer $WISPRALT_API_KEY" \
-        "$SERVER_URL/metrics" 2>/dev/null || echo "")"
-    if [[ -n "$METRICS_RESP" ]]; then
-        pass "/metrics returned data"
-        echo "$METRICS_RESP" | "$PYTHON_BIN" -m json.tool 2>/dev/null || echo "$METRICS_RESP"
-    else
-        warn "/metrics returned empty response (server may not yet support this endpoint)"
-    fi
+    fail "No enabled admin (or the database is unreadable)"
+    info "Create one: cd server && .venv/bin/python -m wispralt.bootstrap --label owner"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

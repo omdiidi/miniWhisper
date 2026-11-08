@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 # Must run before the first ``wispralt`` import: config.py builds ``settings`` at import.
 # DATA_DIR is forced (never a real host's data); the rest only default, as the test files do.
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="wispralt-test-data-")
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
 os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
 os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
@@ -27,9 +26,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
+    from fastapi import FastAPI
+
     from wispralt.accounts.store import User
 
     MakeUser = Callable[..., tuple[User, str]]
+    Wire = Callable[[FastAPI], FastAPI]
 
 
 @pytest.fixture(autouse=True)
@@ -69,3 +71,16 @@ def make_user(accounts: AccountStore) -> MakeUser:
         )
 
     return _make
+
+
+@pytest.fixture
+def wire(db: Database, accounts: AccountStore, usage: UsageStore) -> Wire:
+    """``wire(app)`` puts the per-test DB and stores on ``app.state`` (as the lifespan does)."""
+
+    def _wire(app: FastAPI) -> FastAPI:
+        app.state.db = db
+        app.state.accounts = accounts
+        app.state.usage = usage
+        return app
+
+    return _wire

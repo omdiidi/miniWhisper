@@ -28,7 +28,7 @@ WisprAlt is a two-component system: a native macOS menubar client running on you
                                        │
 ┌────────────────────  Server (Mac mini M4 16GB) ──────────────────────────────┐
 │ uvicorn 1 worker → FastAPI (lifespan: load models, run staging+orphan sweep) │
-│   /healthz  /readyz/dictation  /admin/rotate-key                             │
+│   /healthz  /readyz/dictation  /readyz/db                                    │
 │   /me  (GET, PATCH)   ──▶ JSON self-service identity (label, display_name)   │
 │   /v1/audio/transcriptions ──▶ OpenAI-compat shim → ParakeetService          │
 │       (sync, dictate-only, 25 MB cap)                                        │
@@ -434,120 +434,55 @@ Called once at startup (before the event loop accepts requests). Policy from `jo
 
 `/healthz`, `/readyz/*`, and `/admin/login` are intentionally **unauthenticated** so Kubernetes-style probes, Cloudflare health checks, external monitoring, and the admin login form can be reached without API credentials. The probes expose only a ready-flag boolean and the `X-Dictation-Degraded` header — no user data, no audio, no model output.
 
-Every other route requires `Authorization: Bearer <token>`. The legacy single-key compare path was replaced in `2026-04-27-team-distribution` by the multi-token flow described next; `secrets.compare_digest` no longer appears on the request hot path.
+Every other route requires `Authorization: Bearer <token>` (or, for browser pages, the session cookie).
 
-### Auth (multi-token)
+### Auth (local SQLite, no cache)
 
 ```
-Bearer <plaintext>
+Bearer <plaintext>  (or wispralt_admin_token cookie; never on /v1)
    │
    ▼
-sha256(plaintext) ─────────────► token_hash (hex)
-   │
-   ▼
-TokenCache.get(token_hash)        ← LRU 256 entries × 60s TTL, in-process
-   │ hit
-   ├──► User(id, label, role) ──► request.state.user
-   │
-   │ miss
-   ▼
-asyncpg pool ─► SELECT id, label, role
-                FROM wispralt.users
-               WHERE token_hash = $1
-                 AND revoked_at IS NULL
-   │
-   │ row found
-   ├──► TokenCache.put → User → request.state.user
-   │
-   │ row missing OR pool=None OR PostgresError
-   ▼
-break-glass branch
-   IF token_hash == app.state.break_glass_token_hash:
-       User(id=-1, label="break-glass-admin", role="admin")
-   ELSE:
-       401 Invalid bearer / 503 Auth temporarily unavailable
+sha256(plaintext) ──► AccountStore.lookup_key(token_hash)      (asyncio.to_thread)
+                        SELECT … FROM api_keys k JOIN users u ON u.id = k.user_id
+                         WHERE k.token_hash = ? AND k.revoked_at IS NULL
+                           AND u.disabled_at IS NULL
+   │ row          → User(id, key_id, label, role, kind) → request.state.user,
+   │                request.state.auth_via = "bearer" | "cookie"
+   │ no row       → 401
+   │ sqlite3.Error → 503 "Auth temporarily unavailable" (there is no fallback admin)
 ```
 
-Source: `server/src/wispralt/auth.py` +
-`server/src/wispralt/users/{cache.py,store.py}`.
+Source: `server/src/wispralt/auth.py` + `server/src/wispralt/accounts/{store.py,service.py}`.
 
 Key invariants:
 
-- **`request.state.user` is populated for every authenticated request.** The observability middleware reads it to attribute usage events; `routes/admin_ui.py:require_admin` reads it to gate role.
-- **The break-glass branch only fires when Postgres is unreachable** OR when the row genuinely is missing. On first boot the lifespan seeds a real `wispralt.users` row whose `token_hash` matches the env-var hash, so 99% of break-glass calls take the normal Postgres path and produce attributable usage events. The `id=-1` sentinel is reserved for the case where the pool is `None` (Postgres degraded).
-- **Pool watcher (added 2026-05-02).** The lifespan starts a background task that probes `app.state.db_pool` with `SELECT 1` (2s timeout) every 10 seconds. On failure it calls `db.recreate_pool()`, swaps `app.state.db_pool`, and restarts the usage drainer against the fresh pool. Without this, a transient Supabase blip leaves `db_pool=None` forever and every authenticated request returns 503 until a manual `launchctl kickstart` — the failure mode that bit production on 2026-05-02. Recovery latency is bounded by the 10s probe interval plus the asyncpg create_pool round-trip.
-- **Cookie fallback:** `_extract_bearer` falls back to the `wispralt_admin_token` cookie when no `Authorization` header is present. Set by `POST /admin/login` for browser navigation; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. CSRF is mitigated by `SameSite=Strict`.
+- **Lookup on every request.** There is no token cache: one indexed join per request (about the cost of a cache check), so a revoke, disable or rotate, made in this process or by another one (the Part 5 CLI), applies to the very next request.
+- **Identity vs credentials.** `users` holds identity (`role admin|employee`, `kind employee|integration`, `disabled_at`); `api_keys` holds credentials (`token_hash`, `revoked_at`). Rotating a user's key revokes its active keys, inserts one new key and clears `disabled_at` in one transaction (`AccountStore.rotate_user_key`); the portal's Revoke disables the user.
+- **Plaintext tokens exist only in `accounts/service.py`** and the one page or terminal that shows them. Logs carry ids only.
+- **First admin:** `python -m wispralt.bootstrap --label NAME` (TTY-only) creates it and prints the client config once; `--rotate-admin` replaces a lost admin key. There is no env admin key and no break-glass path.
+- **`request.state.user`** is set for every authenticated request; the usage middleware reads it.
+- **Cookie fallback:** `require_api_key` falls back to the `wispralt_admin_token` cookie when no Bearer header is present (`/v1` never does). Set by `POST /admin/login` / `POST /me/login`; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`.
 
-#### `wispralt.users` columns
+#### `users` and `api_keys` (SQLite, `migrations/0001_initial.sql`)
 
-| Column         | Type        | Notes                                                                                |
-|----------------|-------------|--------------------------------------------------------------------------------------|
-| `id`           | bigserial   | Primary key                                                                          |
-| `label`        | text        | Operator-visible identifier (typically the employee email or canonical handle)        |
-| `display_name` | text NULL   | Self-managed friendly name, edited by the user via `PATCH /me`. 1–40 chars, no control chars (CHECK constraint mirrors `MAX_DISPLAY_NAME_LEN` in `constants.py`). NULL until the user fills in the first-launch sheet. Added by migration `2026-04-27-v2-display-name.sql`. |
-| `role`         | text        | `'admin'` or `'employee'` (CHECK)                                                    |
-| `token_hash`   | text        | sha256(plaintext token), partial-indexed `WHERE revoked_at IS NULL`                   |
-| `created_at`   | timestamptz | Set at mint time                                                                     |
-| `revoked_at`   | timestamptz | NULL while active; set on revoke                                                     |
+| Table | Columns |
+|---|---|
+| `users` | `id`, `label`, `display_name` (self-managed via `PATCH /me`, 1–40 chars, no control chars), `notes`, `role` (`admin`/`employee`), `kind` (`employee`/`integration`), `created_at`, `disabled_at`, `source`/`source_id` (Part 7 import) |
+| `api_keys` | `id`, `user_id` → `users`, `token_hash` (sha256, unique), `label`, `created_at`, `revoked_at` |
 
-The admin UI's user list renders `display_name (label)` when both are populated, falling back to `label` alone when `display_name IS NULL`. See [ADMIN.md](ADMIN.md).
+Timestamps are REAL unix seconds; the repository returns UTC `datetime`s. The admin UI's user list renders `display_name (label)` when both are set. See [ADMIN.md](ADMIN.md).
 
-### Usage event tracking
+### Usage event tracking (in-request, best-effort)
 
-```
-                    request hot path                         background
-                                                             drainer
-┌─ middleware/observability.dispatch ─────────┐    ┌────────────────────────┐
-│ after call_next:                              │    │ usage.writer.drain_loop│
-│   if user.id >= 0 and route in TRACKED_ROUTES │    │  (asyncio task)        │
-│      and method == POST:                      │    │                        │
-│        observability.usage_queue.offer(       │    │  while True:           │
-│          UsageEvent(user_id, ts, kind,        │    │    e = await q.get()   │
-│            status, duration_ms, bytes_in,     │    │    batch.append(e)     │
-│            request_id))                       │    │    if len >= 50 OR     │
-└──────────────────┬───────────────────────────┘    │       1s elapsed:      │
-                   │ asyncio.Queue (maxsize=1000)    │      _flush(pool, batch)
-                   ▼                                  │      batch = []        │
-       UsageEventQueue (bounded)                      └──────────┬─────────────┘
-       full → drop oldest, log WARNING                           │
-                                                                  ▼
-                                                  asyncpg ── INSERT INTO
-                                                            wispralt.usage_events
-                                                            (executemany, in
-                                                             explicit transaction)
+After `call_next`, `_ObservabilityMiddleware` (main.py) writes **one** `usage_events` row with `await asyncio.to_thread(UsageStore.record, event)` (about 1 ms) when:
 
-                                                  on FK violation:
-                                                  filter survivors (user_id>=0)
-                                                  retry in fresh transaction
-```
+- auth resolved a user (`request.state.user`),
+- the route key is tracked and the method is POST (status-poll GETs are excluded), and
+- the request was not a dedup replay (`request.state.dedup_replay`).
 
-Source:
-`server/src/wispralt/usage/{events.py,queue.py,writer.py}` +
-`observability.py` (singleton) + `main.py` (drainer task lifecycle).
+Best-effort: a `sqlite3.Error` loses that row, increments `usage_write_failures_total` and logs only the error type; the response is unaffected. The counter is exposed in `/metrics` and in the `/readyz/db` body, so a loss is visible. There is no queue and no background drainer.
 
-Why fire-and-forget:
-
-- The dictation hot path is sub-200ms; a Postgres write per request would
-  add ~10–40ms of unified-memory contention.
-- Bounded queue caps unbounded memory growth if Postgres falls behind:
-  on overflow the oldest event is dropped and a WARNING is logged.
-- FK-violation retry is critical: a `ForeignKeyViolationError` aborts the
-  entire transaction, so we explicitly wrap in `async with conn.transaction():`,
-  filter `user_id >= 0` survivors on retry, and re-execute. Without the
-  explicit transaction the post-error connection would be in an aborted
-  state and the retry would hit `InFailedSQLTransactionError`.
-- Cancelled-on-shutdown: lifespan cancels the drainer task and awaits it;
-  `CancelledError` triggers a final batch flush before the task exits.
-
-Tracked routes: `transcribe/dictate`, `transcribe/file` (recorded as
-`kind = "file"`), and `v1/audio/transcriptions`, **POST only** — status-poll GETs are
-excluded so a client polling every 5s doesn't multiply the event volume
-by 60. The OpenAI-compat shim records its events with
-`kind = "v1_dictate"` so admins can split native-client traffic from
-third-party API traffic without parsing the `route` column. The current
-admin overview tiles (Dictations 24h/7d/30d) sum across all `kind`
-values; query `usage_events` directly with `WHERE kind = 'v1_dictate'`
-to isolate API traffic.
+Tracked routes: `transcribe/dictate`, `transcribe/file` (`kind = "file"`), `v1/audio/transcriptions` (`kind = "v1_dictate"`), plus the `/v1/models` and translations probes, **POST only**. Each stream chunk POST still records a row (request telemetry). The admin overview tiles (Dictations 24h/7d/30d) currently sum `usage_events` rows across all kinds.
 
 ### Admin UI
 
@@ -556,12 +491,11 @@ to isolate API traffic.
 │                                                     │
 │  public_router  ─► /admin/login (GET, POST)        │  no auth
 │                                                     │
-│  me_router      ─► /admin/me                       │  Depends=[require_api_key,
-│                                                     │           _require_db_pool]
+│  me_router      ─► /admin/me                       │  Depends=[require_api_key]
 │                                                     │  any role — admin or employee
 │                                                     │
-│  authed_router  ─► everything else                  │  Depends=[require_admin,
-│      /admin/                                        │           _require_db_pool]
+│  authed_router  ─► everything else                  │  Depends=[require_admin]
+│      /admin/                                        │
 │      /admin/users  /admin/users/{id}               │
 │      /admin/users/{id}/mint  …/revoke              │
 │      /admin/usage  /admin/usage.csv                 │
@@ -583,11 +517,9 @@ Three-router pattern (be720a1 split out `me_router`):
   own `user_detail` page; admin nav (Overview/Users/Usage) is hidden by
   `base.html.j2` for non-admin sessions and replaced with a single "My
   Usage" link. Header title flips to "Wispralt Portal".
-- **`authed_router`** has `dependencies=[Depends(require_admin),
-  Depends(_require_db_pool)]`, so a browser hitting `/admin/` without a
-  valid admin token gets 401/403, and a request hitting it while
-  Postgres is degraded gets 503 — never an `AttributeError` on
-  `app.state.db_pool`.
+- **`authed_router`** has `dependencies=[Depends(require_admin)]`, so a
+  browser hitting `/admin/` without a valid admin token gets 401/403.
+  Every page reads `AccountStore` / `UsageStore` in a worker thread.
 
 Auth model: `Authorization: Bearer ...` (curl/Postman) or
 `wispralt_admin_token` cookie (browser, set by `POST /admin/login`).
@@ -605,28 +537,11 @@ does **not** include this extension; `select_autoescape(enabled_extensions=("htm
 is set explicitly so user-supplied fields (label, notes, error_class)
 render escaped, closing the stored-XSS hole on the admin UI.
 
-### Legacy single-key shim
-
-`auth.current_key()` and `auth.set_current_key()` are retained as thin
-shims for `routes/admin.py:rotate_key`, the last-resort tool for
-rotating the env-var token while Postgres is unreachable. Once all
-rotation moves through the admin UI's mint flow, this endpoint can be
-removed.
-
-### Memory budget impact
-
-The asyncpg pool adds ~1 MB per resident connection. Pool sized
-`min_size=1, max_size=10`, so the steady-state footprint is ~1–10 MB
-on top of the existing ~6.5–7.0 GB resident model memory. The drainer
-holds at most one connection during the `executemany` window; auth
-lookups and admin UI requests compete for the other nine. Comfortable
-headroom for ≤10 employees.
-
 ---
 
 ## Background maintenance and logging
 
-`ops/background.py` hosts the lifespan's daemon loops. `daily_sweep_loop` runs every 24 h (in a worker thread): stale staging WAVs (>24 h, excluding WAVs of active jobs), stale chunked-upload dirs (>1 h), stale file-job output `.tmp` files, `sweep_transcripts` (below), and file-job retention (`sweep_old_meetings`, name kept) — finished (`done`/`failed`) job rows plus their `<id>.{txt,srt,vtt,json}` files older than `MEETING_JOB_RETENTION_DAYS` (default 90, 0 disables; pending/running and any job the runner still tracks as active are never touched; files are removed from each job's persisted `output_dir`, which must resolve inside `MEETING_OUTPUT_DIR`, and a job whose files fail to delete keeps its row for the next sweep). The same staging sweeps also run once at startup. `db_watcher_loop` logs repeated identical failures once in full and then a summary every 5 minutes (`RepeatedFailureLogger`), while still retrying every 10 s.
+`ops/background.py` hosts the lifespan's daemon loops. `daily_sweep_loop` runs every 24 h (in a worker thread): stale staging WAVs (>24 h, excluding WAVs of active jobs), stale chunked-upload dirs (>1 h), stale file-job output `.tmp` files, `sweep_transcripts` (below), and file-job retention (`sweep_old_meetings`, name kept) — finished (`done`/`failed`) job rows plus their `<id>.{txt,srt,vtt,json}` files older than `MEETING_JOB_RETENTION_DAYS` (default 90, 0 disables; pending/running and any job the runner still tracks as active are never touched; files are removed from each job's persisted `output_dir`, which must resolve inside `MEETING_OUTPUT_DIR`, and a job whose files fail to delete keeps its row for the next sweep). The same staging sweeps also run once at startup.
 
 Logging: launchd cannot rotate `server.log` / `server.err.log` without sudo, so `ops/logging_setup.configure_file_logging` sends root and uvicorn loggers to a `RotatingFileHandler` at `settings.server_log_path` (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). The launchd files now only capture crash output and the one-off `NEW_API_KEY=` print on key rotation. `/admin/server-log/{job_id}` reads `wispralt.log` plus its rotated backups (`.1`-`.5`).
 
@@ -911,25 +826,21 @@ _insight_cards, _stats_grid_partial}.html.j2`.
 
 ### Surfaces
 
-- **Admin Data tab — `GET /admin/data`.** Admin-only (router-level
-  `require_admin` + `_require_db_pool` deps). Renders the team `weekly_insights`
+- **Admin Data tab — `GET /admin/data`.** Admin-only (handler-level
+  `require_admin`); people come from `AccountStore`. Renders the team `weekly_insights`
   card stack on top + a per-user leaderboard underneath. The optional
   `?user_id=N` query param drills into one employee using the same
   `_insight_cards.html.j2` macro layout the employee self-view renders, so
   the admin sees exactly what the employee sees.
 - **Employee self-view — `GET /me/insights`.** Authenticated user only.
   Shows that user's `'person'`-scope insight (most recent week) plus a
-  time-range stats grid (Today / 7d / 30d / 90d / 1y / All). Break-glass
-  admin (`user.id < 0`) is 303'd to `/admin/data` because break-glass
-  identities have no per-user transcript history to summarize.
+  time-range stats grid (Today / 7d / 30d / 90d / 1y / All).
 - **Employee login — `GET /me/login` / `POST /me/login`.** Token-paste form
   mirroring the admin login flow. On success it sets the **same**
   `wispralt_admin_token` cookie that admin login sets, but with `path="/"`
   so a single cookie scopes across both `/admin/*` and `/me/*` surfaces
   (the admin login handler was simultaneously broadened to `path="/"` so
-  the cookie is interchangeable in both directions). Break-glass tokens are
-  rejected at this surface with an explanatory error — the break-glass
-  identity is intended for emergency admin access, not employee self-view.
+  the cookie is interchangeable in both directions).
 
 ### HTMX partial swaps
 

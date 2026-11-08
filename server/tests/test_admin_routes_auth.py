@@ -1,279 +1,222 @@
 """
-test_admin_routes_auth.py — Coverage for ``/admin/*`` access control.
+test_admin_routes_auth.py — ``/admin/*`` access control and page data, on a real tmp SQLite DB.
 
-The admin UI mounts two routers under the same ``/admin`` prefix:
-
-    - ``public_router`` exposes ``/admin/login`` (GET form, POST submit) —
-      these MUST be reachable without auth, otherwise the operator has no
-      way to acquire the session cookie that gates the rest.
-    - ``authed_router`` covers everything else and is gated by
-      ``Depends(require_admin)`` + ``Depends(_require_db_pool)``.
-
-These tests pin both invariants WITHOUT exercising the underlying SQL —
-``_aggregate_stats`` is monkey-patched to a stub so we test only the
-auth boundary, not the analytics CTE.
+- ``public_router`` (``/admin/login``) is reachable without auth.
+- ``authed_router`` is admin-only; ``me_router`` (``/admin/me``) any user.
+- The overview, user-detail, usage drilldown and CSV render the numbers
+  ``UsageStore`` computes from seeded ``usage_events``.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import csv
+import io
+import re
+import time
+from typing import TYPE_CHECKING
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from starlette.testclient import TestClient
 
-from wispralt.auth import require_admin, require_api_key
+from wispralt.accounts.service import hash_token
+from wispralt.accounts.store import User
+from wispralt.auth import SESSION_COOKIE_NAME, require_admin
 from wispralt.routes import admin_ui
-from wispralt.users import store as users_store
-from wispralt.users.store import User
+from wispralt.usage.events import UsageEvent
 
+if TYPE_CHECKING:
+    from wispralt.accounts.store import AccountStore
+    from wispralt.usage.store import UsageStore
 
-# ── fixtures ──────────────────────────────────────────────────────────────────
-
-
-def _stub_pool() -> object:
-    """A sentinel object — admin_ui only checks ``is None``."""
-    return object()
+    from .conftest import MakeUser, Wire
 
 
 @pytest.fixture
-def app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
-    """Build a minimal FastAPI app mounting just the admin routers.
-
-    Side effect: replaces ``admin_ui._aggregate_stats`` with a stub so
-    the overview route never reaches Postgres.  The goal of this file
-    is auth coverage; the SQL CTE has its own (manual) verification path.
-    """
-    application = FastAPI()
-    application.include_router(admin_ui.public_router)
-    application.include_router(admin_ui.authed_router)
-
-    # Stash a non-None pool so ``_require_db_pool`` doesn't 503.
-    application.state.db_pool = _stub_pool()
-
-    # Stub the SQL aggregator — auth tests must not require live Postgres.
-    async def _fake_aggregate_stats(_pool: Any) -> dict[str, Any]:
-        return {"totals": {}, "top_users": [], "daily": []}
-
-    monkeypatch.setattr(admin_ui, "_aggregate_stats", _fake_aggregate_stats)
-
-    # Stub count_kind — overview tile reads integration-key count; we don't
-    # want the auth test to require a live Postgres pool just for the tile.
-    async def _fake_count_kind(_pool: Any, _kind: str) -> int:
-        return 0
-
-    monkeypatch.setattr(users_store, "count_kind", _fake_count_kind)
-
-    return application
+def client(wire: Wire) -> TestClient:
+    app = FastAPI()
+    app.include_router(admin_ui.public_router)
+    app.include_router(admin_ui.me_router)
+    app.include_router(admin_ui.authed_router)
+    return TestClient(wire(app), base_url="https://testserver")  # Secure cookies
 
 
-# ── public router (login) ─────────────────────────────────────────────────────
+@pytest.fixture
+def admin(make_user: MakeUser) -> tuple[User, dict[str, str]]:
+    user, token = make_user(role="admin", label="omid")
+    return user, {"Authorization": f"Bearer {token}"}
 
 
-class TestPublicLoginRouter:
-    """``/admin/login`` must be reachable WITHOUT any authentication."""
-
-    def test_get_login_returns_200_unauth(self, app: FastAPI) -> None:
-        client = TestClient(app)
-        resp = client.get("/admin/login")
-        assert resp.status_code == 200
-        # Login form is HTML; the exact body shape is template-controlled
-        # but we can sanity-check that we got a non-empty response.
-        assert "text/html" in resp.headers.get("content-type", "")
-        assert len(resp.text) > 0
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
 
 
-# ── authed router (overview) ──────────────────────────────────────────────────
+# ── access control ────────────────────────────────────────────────────────────
 
 
-class TestAuthedOverviewRoute:
-    """``GET /admin/`` must enforce the admin-role gate."""
-
-    def test_no_auth_returns_401(self, app: FastAPI) -> None:
-        # No dependency override — the real ``require_api_key`` runs and
-        # rejects with 401 because there's no Authorization header and no
-        # cookie.
-        client = TestClient(app)
-        resp = client.get("/admin/")
-        assert resp.status_code == 401
-
-    def test_employee_role_returns_403(self, app: FastAPI) -> None:
-        # Override require_api_key to inject an employee user.  The
-        # downstream require_admin dependency will reject with 403.
-        async def _employee(_request: Any = None) -> User:
-            return User(id=42, label="alice", role="employee")
-
-        app.dependency_overrides[require_api_key] = _employee
-        try:
-            client = TestClient(app)
-            resp = client.get("/admin/")
-            assert resp.status_code == 403
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_admin_role_returns_200_html(self, app: FastAPI) -> None:
-        async def _admin(_request: Any = None) -> User:
-            return User(id=1, label="omid", role="admin")
-
-        app.dependency_overrides[require_api_key] = _admin
-        try:
-            client = TestClient(app)
-            resp = client.get("/admin/")
-            assert resp.status_code == 200
-            assert "text/html" in resp.headers.get("content-type", "")
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_admin_with_no_db_pool_returns_503(self, app: FastAPI) -> None:
-        # Even with a valid admin user, the overview route requires the
-        # pool to be present.  Setting it to None should trigger 503 from
-        # ``_require_db_pool``.
-        async def _admin(_request: Any = None) -> User:
-            return User(id=1, label="omid", role="admin")
-
-        app.dependency_overrides[require_api_key] = _admin
-        app.state.db_pool = None
-        try:
-            client = TestClient(app)
-            resp = client.get("/admin/")
-            assert resp.status_code == 503
-        finally:
-            app.dependency_overrides.clear()
-            app.state.db_pool = _stub_pool()
+def test_login_form_is_public(client: TestClient) -> None:
+    resp = client.get("/admin/login")
+    assert resp.status_code == 200 and "text/html" in resp.headers["content-type"]
 
 
-class TestAddEmployeeRoute:
-    """``GET /admin/users/new`` (form) and ``POST /admin/users/new`` (mint)."""
-
-    @staticmethod
-    def _override_admin(app: FastAPI) -> None:
-        async def _admin(_request: Any = None) -> User:
-            return User(id=1, label="omid", role="admin")
-
-        app.dependency_overrides[require_api_key] = _admin
-
-    def test_form_get_returns_200_for_admin(self, app: FastAPI) -> None:
-        self._override_admin(app)
-        try:
-            resp = TestClient(app).get("/admin/users/new")
-            assert resp.status_code == 200
-            assert "Add employee" in resp.text
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_form_get_employee_returns_403(self, app: FastAPI) -> None:
-        async def _employee(_request: Any = None) -> User:
-            return User(id=42, label="alice", role="employee")
-
-        app.dependency_overrides[require_api_key] = _employee
-        try:
-            assert TestClient(app).get("/admin/users/new").status_code == 403
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_post_mints_and_renders_install_command(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._override_admin(app)
-        captured: dict[str, Any] = {}
-
-        async def _fake_mint(
-            _pool: Any, *, label: str, role: str, display_name: str | None = None
-        ) -> tuple[User, str]:
-            captured["label"] = label
-            captured["role"] = role
-            return User(id=99, label=label, role=role), "deadbeef" * 8
-
-        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
-        # _build_install_command reads settings.server_url at call time;
-        # patch the module-level reference admin_ui imported.
-        monkeypatch.setattr(admin_ui.settings, "server_url", "https://example.test")
-
-        try:
-            resp = TestClient(app).post(
-                "/admin/users/new",
-                data={"label": "  nicholas  ", "role": "employee"},
-            )
-            assert resp.status_code == 200
-            # Label is trimmed before mint
-            assert captured == {"label": "nicholas", "role": "employee"}
-            # The install command and plaintext both surface in the page
-            assert "deadbeef" * 8 in resp.text
-            assert "WISPRALT_API_KEY=" in resp.text
-            assert "WISPRALT_SERVER=https://example.test" in resp.text
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_post_rejects_empty_label(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._override_admin(app)
-        called = {"n": 0}
-
-        async def _fake_mint(*_a: Any, **_kw: Any) -> Any:
-            called["n"] += 1
-            raise AssertionError("mint must not be called for invalid input")
-
-        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
-        try:
-            resp = TestClient(app).post(
-                "/admin/users/new", data={"label": "   ", "role": "employee"}
-            )
-            assert resp.status_code == 400
-            assert called["n"] == 0
-            assert "Label is required" in resp.text
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_post_rejects_invalid_role(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._override_admin(app)
-
-        async def _fake_mint(*_a: Any, **_kw: Any) -> Any:
-            raise AssertionError("mint must not be called for invalid role")
-
-        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
-        try:
-            resp = TestClient(app).post(
-                "/admin/users/new", data={"label": "alex", "role": "superuser"}
-            )
-            assert resp.status_code == 400
-            assert "Invalid role" in resp.text
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_post_rejects_control_chars_in_label(
-        self, app: FastAPI, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._override_admin(app)
-
-        async def _fake_mint(*_a: Any, **_kw: Any) -> Any:
-            raise AssertionError("mint must not be called for invalid label")
-
-        monkeypatch.setattr(admin_ui.users_store, "mint", _fake_mint)
-        try:
-            resp = TestClient(app).post(
-                "/admin/users/new",
-                data={"label": "alex\nadmin", "role": "employee"},
-            )
-            assert resp.status_code == 400
-            assert "control character" in resp.text
-        finally:
-            app.dependency_overrides.clear()
+def test_overview_without_auth_is_401(client: TestClient) -> None:
+    assert client.get("/admin/").status_code == 401
 
 
-class TestRequireAdminRoleEnforcement:
-    """Direct unit-test of the role gate, independent of HTTP plumbing."""
+def test_overview_employee_is_403(client: TestClient, make_user: MakeUser) -> None:
+    _u, token = make_user()
+    assert client.get("/admin/", headers=_bearer(token)).status_code == 403
 
-    def test_admin_user_passes(self) -> None:
-        u = User(id=1, label="omid", role="admin")
-        assert require_admin(u) is u
 
-    def test_employee_user_raises_403(self) -> None:
-        from fastapi import HTTPException
+def test_overview_admin_is_200(client: TestClient, admin: tuple[User, dict[str, str]]) -> None:
+    resp = client.get("/admin/", headers=admin[1])
+    assert resp.status_code == 200 and "text/html" in resp.headers["content-type"]
 
-        u = User(id=2, label="alice", role="employee")
-        with pytest.raises(HTTPException) as excinfo:
-            require_admin(u)
-        assert excinfo.value.status_code == 403
+
+def test_login_sets_cookie_and_cookie_authenticates(
+    client: TestClient, make_user: MakeUser
+) -> None:
+    _admin, token = make_user(role="admin")
+    form = client.get("/admin/login")
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', form.text).group(1)
+    resp = client.post(
+        "/admin/login", data={"token": token, "csrf_token": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303 and resp.headers["location"] == "/admin/"
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    assert client.get("/admin/").status_code == 200
+
+
+def test_login_rejects_unknown_token(client: TestClient) -> None:
+    form = client.get("/admin/login")
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', form.text).group(1)
+    resp = client.post("/admin/login", data={"token": "f" * 64, "csrf_token": csrf})
+    assert resp.status_code == 401
+
+
+def test_admin_me_redirects_admin_and_renders_employee(
+    client: TestClient, make_user: MakeUser, admin: tuple[User, dict[str, str]]
+) -> None:
+    resp = client.get("/admin/me", headers=admin[1], follow_redirects=False)
+    assert resp.status_code == 303 and resp.headers["location"] == "/admin/"
+    emp, token = make_user(label="alice")
+    resp = client.get("/admin/me", headers=_bearer(token))
+    assert resp.status_code == 200 and "alice" in resp.text
+
+
+def test_require_admin_role_gate() -> None:
+    admin_user = User(id=1, key_id=None, label="omid", role="admin", kind="employee")
+    assert require_admin(admin_user) is admin_user
+    with pytest.raises(HTTPException) as excinfo:
+        require_admin(User(id=2, key_id=None, label="alice", role="employee", kind="employee"))
+    assert excinfo.value.status_code == 403
+
+
+# ── employees ─────────────────────────────────────────────────────────────────
+
+
+def test_add_employee_form_admin_only(
+    client: TestClient, make_user: MakeUser, admin: tuple[User, dict[str, str]]
+) -> None:
+    assert "Add employee" in client.get("/admin/users/new", headers=admin[1]).text
+    _u, token = make_user()
+    assert client.get("/admin/users/new", headers=_bearer(token)).status_code == 403
+
+
+def test_add_employee_creates_user_and_install_command(
+    client: TestClient,
+    admin: tuple[User, dict[str, str]],
+    accounts: AccountStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(admin_ui.settings, "server_url", "https://example.test")
+    resp = client.post(
+        "/admin/users/new", data={"label": "  nicholas  ", "role": "employee"}, headers=admin[1]
+    )
+    assert resp.status_code == 200, resp.text
+    assert "WISPRALT_API_KEY=" in resp.text and "WISPRALT_SERVER=https://example.test" in resp.text
+    [token] = set(re.findall(r"\b[0-9a-f]{64}\b", resp.text))
+    user = accounts.lookup_key(hash_token(token))
+    assert user is not None and user.label == "nicholas" and user.kind == "employee"
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        ({"label": "   ", "role": "employee"}, "Label is required"),
+        ({"label": "alex", "role": "superuser"}, "Invalid role"),
+        ({"label": "alex\nadmin", "role": "employee"}, "control character"),
+    ],
+)
+def test_add_employee_rejects_invalid_input(
+    client: TestClient,
+    admin: tuple[User, dict[str, str]],
+    accounts: AccountStore,
+    data: dict[str, str],
+    message: str,
+) -> None:
+    resp = client.post("/admin/users/new", data=data, headers=admin[1])
+    assert resp.status_code == 400 and message in resp.text
+    assert [u.label for u in accounts.list_people()] == ["omid"]
+
+
+def test_users_page_shows_disabled_state(
+    client: TestClient, make_user: MakeUser, admin: tuple[User, dict[str, str]]
+) -> None:
+    emp, token = make_user(label="bob")
+    resp = client.post(f"/admin/users/{emp.id}/revoke", headers=admin[1], follow_redirects=False)
+    assert resp.status_code == 303
+    assert client.get("/admin/", headers=_bearer(token)).status_code == 401
+    page = client.get("/admin/users", headers=admin[1]).text
+    assert "bob" in page and "revoked" in page
+
+
+# ── page numbers come from UsageStore ─────────────────────────────────────────
+
+
+@pytest.fixture
+def seeded(make_user: MakeUser, usage: UsageStore) -> User:
+    alice, _ = make_user(label="alice")
+    now = time.time()
+    for ts, status, ms in [
+        (now - 60, 200, 100.0),
+        (now - 120, 200, 300.0),
+        (now - 3600, 500, 200.0),
+        (now - 3 * 86400, 200, 50.0),
+        (now - 20 * 86400, 200, 50.0),
+    ]:
+        usage.record(UsageEvent(user_id=alice.id, ts=ts, kind="dictate", status=status, duration_ms=ms))
+    return alice
+
+
+def test_overview_numbers_match_usage_store(
+    client: TestClient, admin: tuple[User, dict[str, str]], seeded: User, usage: UsageStore
+) -> None:
+    totals = usage.overview(time.time())["totals"]
+    assert (totals["dictations_24h"], totals["dictations_7d"], totals["dictations_30d"]) == (3, 4, 5)
+    html = client.get("/admin/", headers=admin[1]).text
+    labels = re.findall(r'<div class="label">([^<]+)</div>\s*<div class="value">([^<]*)</div>', html)
+    values = {k.strip(): v.strip() for k, v in labels}
+    assert (values["Dictations 24h"], values["Dictations 7d"], values["Dictations 30d"]) == (
+        "3",
+        "4",
+        "5",
+    )
+    assert values["Errors 24h"] == "1"
+    assert values["p50 latency 24h"] == "200 ms"
+    assert "alice" in html
+
+
+def test_user_detail_and_usage_pages(
+    client: TestClient, admin: tuple[User, dict[str, str]], seeded: User
+) -> None:
+    detail = client.get(f"/admin/users/{seeded.id}", headers=admin[1])
+    assert detail.status_code == 200 and "alice" in detail.text
+    assert client.get("/admin/users/9999", headers=admin[1]).status_code == 404
+
+    page = client.get("/admin/usage", params={"status": 500}, headers=admin[1])
+    assert page.status_code == 200 and page.text.count("<td>500</td>") == 1
+
+    resp = client.get("/admin/usage.csv", params={"user_id": seeded.id}, headers=admin[1])
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    assert len(rows) == 5 and {r["user_label"] for r in rows} == {"alice"}

@@ -16,26 +16,30 @@ Source: `server/src/wispralt/routes/admin_ui.py` +
 ## When to use it
 
 - Onboarding a new employee: mint a token, text it to them.
-- Off-boarding: revoke the user; their dictation gets 401 within 60 seconds.
+- Off-boarding: revoke the user; their next request gets 401.
 - Spot-checking usage: who's been active, what error rates look like, which
   requests failed and when.
 - Auditing for billing or CRM tie-in (see [Future hooks](#future-hooks-crm)).
 
-Everything the admin UI does is also reachable via raw SQL against the
-`wispralt` schema — the UI is a thin convenience over `wispralt.users` +
-`wispralt.usage_events`.
+Everything the admin UI does reads or writes the host's local SQLite DB
+(`DATA_DIR/wispralt.db`) through `AccountStore` (`users` + `api_keys`) and
+`UsageStore` (`usage_events`).
 
 ## Who should have admin role
 
 Exactly one human (the operator). Employees get `role='employee'`. The
 schema enforces `role IN ('admin', 'employee')` via a `CHECK` constraint
-(`server/migrations/2026-04-27-v1-wispralt-schema.sql`); future roles
-require a migration.
+(`server/src/wispralt/migrations/0001_initial.sql`); future roles require a
+migration.
 
-The first admin is auto-seeded from the `WISPRALT_API_KEY` env var on the
-first server boot if `wispralt.users` is empty (see
-`main.py:_seed_admin_if_empty`). Rotate it from
-`/admin/users/<id>/mint` once a real label is in place.
+The first admin is created once, in a terminal, by
+`python -m wispralt.bootstrap --label owner` (run from `server/`;
+`setup-server.sh` step 7 does this). It prints the client config — server URL
+and the one-time admin token — and refuses to run if an enabled admin already
+exists or stdout is not a terminal. Lost the admin key?
+`python -m wispralt.bootstrap --rotate-admin` (add `--user-id N` when there
+are several admins) revokes the old key and prints a new one. There is no env
+admin key and no break-glass path.
 
 ---
 
@@ -51,15 +55,15 @@ Host: transcribe.example.com
 Authorization: Bearer <admin-token>
 ```
 
-The bearer is sha256-hashed, looked up in the in-process `TokenCache`
-(60s TTL), then in `wispralt.users` via the asyncpg pool.
+The bearer is sha256-hashed and looked up in `api_keys ⋈ users` on every
+request (no cache).
 
 ### Session cookie (browser)
 
 1. Visit `https://transcribe.<your-domain>/admin/login`.
 2. Paste your token, submit. **Both admin and employee tokens are
    accepted** — the server routes by role.
-3. The server validates the token (cache → Postgres → break-glass), then
+3. The server validates the token (`auth.resolve_token`, the same lookup), then
    sets a `wispralt_admin_token` cookie with `HttpOnly`, `Secure`,
    `SameSite=Strict`, `max_age=8h`.
 4. **Role-based redirect on success:**
@@ -94,7 +98,7 @@ Single-CTE dashboard (`_OVERVIEW_SQL` in `routes/admin_ui.py`). Tiles:
 
 ### `GET /admin/users` — Users
 
-Lists every row in `wispralt.users` (most-recently-created first). The
+Lists every employee-kind user, including revoked ones (most-recently-created first). The
 displayed identifier is `display_name (label)` when both are populated
 (e.g. `Alice (alice@example.com)`), or just `label` when
 `display_name IS NULL`. Admins can **optionally pre-set** the
@@ -109,17 +113,16 @@ self-service.
 
 Per-row controls:
 
-- **Mint** — `POST /admin/users/{id}/mint` rotates the user's token in
-  place: same id / label / role, new sha256 hash. The page redirects to
+- **Mint** — `POST /admin/users/{id}/mint` revokes the user's active keys
+  and issues one new key (same id / label / role); it also re-enables a
+  revoked user. The page renders
   `token_minted.html.j2` which shows the new plaintext **once**. Copy it,
   text it to the employee, close the tab.
-- **Revoke** — `POST /admin/users/{id}/revoke` sets
-  `wispralt.users.revoked_at = now()` and invalidates the cache entry by
-  hash. Their next dictation hits Postgres, finds `revoked_at IS NOT NULL`,
-  and returns 401.
+- **Revoke** — `POST /admin/users/{id}/revoke` sets `users.disabled_at`;
+  none of the user's keys authenticate from their next request (401).
 
-`last_seen_at` is **derived** from `MAX(usage_events.ts)` per user — we
-don't write it on every request (would contend with the usage drainer).
+`last_seen_at` is **derived** from `MAX(usage_events.ts)` per user — it is
+not written on every request.
 
 ### `GET /admin/users/{id}` — User detail
 
@@ -267,8 +270,8 @@ id,user_id,user_label,ts,kind,status,duration_ms,chars,bytes_in,bytes_out,error_
    `/admin/users` with a non-null `last_seen_at`.
 
 The route handlers live at `routes/admin_ui.py:users_add_form` (GET) and
-`users_add_submit` (POST). Both are gated by `require_admin` +
-`_require_db_pool`; the latter calls `users_store.mint` and renders
+`users_add_submit` (POST). Both are gated by `require_admin`; the latter
+calls `accounts.service.create_user` and renders
 `employee_added.html.j2` with the install one-liner composed from
 `settings.server_url`.
 
@@ -277,7 +280,7 @@ The route handlers live at `routes/admin_ui.py:users_add_form` (GET) and
 Integration keys are tokens minted for **third-party programs** (Buzz,
 MacWhisper, Bazarr, Open WebUI, an internal Python script, etc.) — as
 opposed to **employee** tokens, which are minted for humans using the
-macOS client. Both live in `wispralt.users` as rows; the distinction is
+macOS client. Both are `users` rows with an `api_keys` credential; the distinction is
 the `kind` column (`'employee'` or `'integration'`).
 
 ### What integration keys are
@@ -320,15 +323,15 @@ for employees). Rows: label, created_at, last_seen_at, revoked status.
 
 ### Rotating an integration key
 
-`/admin/keys/{id}/rotate` rotates in place: same id / label / kind, new
-sha256 hash. The page redirects to a one-shot plaintext page. Update
-the program's env var, restart the program. Old token stops working
-within 60 s (cache TTL).
+`/admin/keys/{id}/rotate` revokes the key and issues a new one: same id /
+label / kind. The page shows the new plaintext once. Update the program's
+env var, restart the program. The old token stops working on its next
+request.
 
 ### Revoking an integration key
 
-`/admin/keys/{id}/revoke` sets `revoked_at = now()` and invalidates the
-cache entry. Their next `/v1` request returns **401**.
+`/admin/keys/{id}/revoke` disables the key's user (`users.disabled_at`).
+Its next `/v1` request returns **401**.
 
 ### What integration keys can / can't access
 
@@ -348,36 +351,10 @@ formats — lives in [OPENAI-COMPAT.md](OPENAI-COMPAT.md).
 ## Revoking an employee
 
 1. `/admin/users` → find the row → click **Revoke**.
-2. The route sets `revoked_at = now()` and calls `token_cache.invalidate`
-   on their hash.
-3. Within 60 seconds (the `TokenCache._TTL_S`), every cache hit for that
-   token expires. The next request goes back to Postgres, finds the row
-   excluded by the partial index `users_idx_token_hash WHERE revoked_at
-   IS NULL`, returns 401.
-
-If you need an instant lockout (no 60s wait), restart the server — the
-cache is in-process only.
-
----
-
-## Break-glass admin (Postgres degraded)
-
-If Supabase is unreachable at server startup, `lifespan` logs a WARNING
-and continues with `app.state.db_pool = None`. In that mode:
-
-- Every authenticated route except the admin UI still works for whoever
-  holds the env-var `WISPRALT_API_KEY`. Their requests resolve via the
-  break-glass branch in `auth.py:require_api_key` and get a synthetic
-  `User(id=-1, label="break-glass-admin", role="admin")`.
-- The admin UI returns 503 ("Admin UI unavailable: Postgres degraded.")
-  because every page issues a query.
-- Usage events with `user_id == -1` are skipped at the middleware so the
-  drainer doesn't hit FK violations once Postgres comes back.
-
-`POST /admin/rotate-key` (`routes/admin.py`) is intentionally retained
-as the last-resort tool for rotating the env-var token while Postgres is
-down — once the multi-token system is fully migrated, all rotation
-should happen via the admin UI's mint flow.
+2. The route sets `users.disabled_at`. Auth looks the key up on every
+   request (there is no token cache), so the employee's next request gets
+   401 — no wait, no restart.
+3. **Mint** on the same row later issues a fresh key and re-enables them.
 
 ---
 
@@ -388,8 +365,7 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 
 | Variable | Required | Notes |
 |---|---|---|
-| `WISPRALT_API_KEY` | Yes | First-boot break-glass admin token; seeds the initial admin row in `wispralt.users` if the table is empty. |
-| `SUPABASE_DATABASE_URL` | Yes (multi-tenant) | Postgres connection string for the `wispralt` schema. Without it, multi-token auth and usage events both fall back to break-glass mode. |
+| `DATA_DIR` | Yes | Absolute path of the data directory (`wispralt.db`, outputs, staging). `setup-server.sh` writes `$HOME/Library/Application Support/WisprAlt`. |
 | `MEETING_JOB_RETENTION_DAYS` | No | Default 90 (0 disables). Daily sweep deletes finished (done/failed) file job rows (the variable keeps its meeting-era name) and their `<id>.{txt,srt,vtt,json}` output files older than this. Pending/running jobs are never deleted. |
 | `SERVER_LOG_PATH` / `SERVER_LOG_MAX_BYTES` / `SERVER_LOG_BACKUP_COUNT` | No | Rotating application log (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). `/admin/server-log` reads it. launchd's `server.log` / `server.err.log` hold crash output only. |
 | `OPENROUTER_API_KEY` | No | Enables weekly insights. When unset, the insights cron is a no-op. (Server smart formatting was removed in Part 4.) Get a key at https://openrouter.ai/keys. |
@@ -427,18 +403,18 @@ should count toward "their usage" for billing/quota conversations.
 Two TEXT discriminators in the schema are pre-positioned for CRM
 expansion without further migrations:
 
-- `wispralt.users.role` — currently `'admin' | 'employee'`. Adding
-  `'contractor'`, `'paid'`, `'free'`, etc. is `ALTER TABLE wispralt.users
-  DROP CONSTRAINT ...` + a new CHECK. The auth middleware already returns
+- `users.role` — currently `'admin' | 'employee'`. Adding
+  `'contractor'`, `'paid'`, `'free'`, etc. is a new numbered migration
+  (SQLite rebuilds the table to change a CHECK). The auth middleware already returns
   the `role` string verbatim; the only place that gates on it today is
   `auth.require_admin`.
-- `wispralt.usage_events.kind` — currently `'dictate' | 'file' | 'v1_dictate' | …` (older rows may carry `'meeting'`). New
+- `usage_events.kind` — currently `'dictate' | 'file' | 'v1_dictate' | …` (older rows may carry `'meeting'`). New
   event types (`'export'`, `'login'`, `'crm_sync'`, …) just enqueue with
   a new string; no schema change needed.
 
 The `usage_events` table is the analytics goldmine for CRM tie-in: every
 authenticated, tracked request produces one row with `(user_id, ts, kind,
 status, duration_ms, bytes_in, bytes_out, request_id)`. Joining
-`wispralt.users` against an external CRM by `users.label` (typically the
-employee's email) is straightforward; the `usage_events.id` `BIGSERIAL`
-gives you a stable cursor for incremental sync.
+`users` against an external CRM by `users.label` (typically the
+employee's email) is straightforward; the `usage_events.id` `INTEGER PRIMARY
+KEY` gives you a stable cursor for incremental sync.

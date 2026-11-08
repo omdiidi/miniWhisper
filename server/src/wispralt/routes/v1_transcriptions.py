@@ -42,7 +42,7 @@ from wispralt.dictate.v1_response_builders import (
     build_vtt,
 )
 from wispralt.ratelimit_per_token import rate_limit_v1_per_token
-from wispralt.users.store import User
+from wispralt.accounts.store import User
 
 logger = logging.getLogger(__name__)
 

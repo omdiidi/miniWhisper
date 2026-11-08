@@ -27,8 +27,6 @@ dependencies = [
     "huggingface_hub>=1.12.0,<1.13",
     # OOM guard (v3 delta)
     "psutil>=6.0",
-    # Postgres (Supabase) — multi-tenant auth + usage events
-    "asyncpg>=0.29,<0.31",
     # Server-rendered admin UI templates
     "jinja2>=3.1,<4",
 ]
