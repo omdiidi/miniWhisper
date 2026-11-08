@@ -247,6 +247,17 @@ struct SettingsView: View {
         }
     }
 
+    /// `MenuBarController.localFileJobActiveOrSaved` (the invite guard's
+    /// predicate): changing the Local server URL or key now would point that
+    /// job at another server and strand its transcript. Re-read on every
+    /// render; `localUploadPhase` / `activeJobID` publish its changes.
+    private var localServerConfigLocked: Bool {
+        MenuBarController.shared?.localFileJobActiveOrSaved ?? false
+    }
+
+    private static let localServerConfigLockedCaption =
+        "Locked while a Local file transcription is running or waiting to resume."
+
     private var serverSection: some View {
         Section("Server") {
             VStack(alignment: .leading, spacing: 4) {
@@ -254,7 +265,13 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(commitServerURL)
                     .autocorrectionDisabled()
+                    .disabled(localServerConfigLocked)
 
+                if localServerConfigLocked {
+                    Text(Self.localServerConfigLockedCaption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if let err = serverURLError {
                     Text(err)
                         .font(.caption)
@@ -270,6 +287,12 @@ struct SettingsView: View {
             SecureField("Paste API key…", text: $apiKeyText)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(commitAPIKey)
+                .disabled(localServerConfigLocked)
+            if localServerConfigLocked {
+                Text(Self.localServerConfigLockedCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Text("Stored securely in your macOS Keychain.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -632,6 +655,7 @@ struct SettingsView: View {
     }
 
     private func commitServerURL() {
+        guard !localServerConfigLocked else { return }
         serverURLError = nil
         let trimmed = serverURLText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -677,6 +701,7 @@ struct SettingsView: View {
     }
 
     private func commitAPIKey() {
+        guard !localServerConfigLocked else { return }
         let trimmed = apiKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
