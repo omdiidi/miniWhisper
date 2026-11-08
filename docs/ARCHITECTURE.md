@@ -794,7 +794,8 @@ prints the counts and the owner proposal.
 `jobs` rows (`source='files'`, `status='done'`, `mode='file'`, `wav_path=''`, with
 `estimated=1` when the time is a file mtime); see
 [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#importing-old-transcript-files-part-7).
-Each group's files are copied to `.import-<id><ext>.part` temps in `outputs/` and
+Each group's files are copied to `.import-<id><ext>.part` temps in `outputs/` (each tracked
+before its copy starts, so a copy that fails midway leaves no `.part`) and
 renamed to `<id><ext>` (fresh uuid names) *before* the batch and its checkpoint
 commit, so a committed row always has its outputs; a duplicate, a row error, a
 failed rename or an uncommitted batch removes only those copies. A crash between

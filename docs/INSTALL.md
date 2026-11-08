@@ -50,7 +50,7 @@ in. `wispralt doctor` says so and checks everything else in this table.
   admin label to `owner`.
 - The first admin key is printed only to a terminal. Without one, pass
   `--token-file PATH`: a **new** file created 0600 (an existing file is
-  refused). Without either, setup stops with exit 2 before it downloads or
+  refused; a failed write removes it). Without either, setup stops with exit 2 before it downloads or
   creates anything. Delete the file once the key is stored.
 - Homebrew's own installer needs a password, so a non-interactive run on a Mac
   without Homebrew stops (exit 2) and says how to install it.
@@ -127,7 +127,7 @@ Global flags work before or after the command: `--json`, `--non-interactive`,
 | `retention show` / `retention set DAYS` | `set` prints what the next purge would delete and asks first (`--yes` in scripts) |
 | `backup [--dest DIR]` / `backup list` | offline backup: the service stops briefly and restarts |
 | `restore BACKUP_DIR` | replaces the host data with a backup; the current data is kept at `<data dir>.pre-restore-<time>` |
-| `update [--no-pull] [--no-backup] [--client]` | `git pull --ff-only` in the clone (refused when it has local changes), backup, reinstall, restart, health check; `--client` also rebuilds the app |
+| `update [--no-pull] [--no-backup] [--client]` | `git pull --ff-only` in the clone (refused when it has local changes), backup, reinstall, restart, health check (if the backup or reinstall fails, the old service is started again); `--client` also rebuilds the app |
 | `uninstall [--client] [--purge-data] [--no-backup]` | see section 10 |
 
 ## 7. Where things live
