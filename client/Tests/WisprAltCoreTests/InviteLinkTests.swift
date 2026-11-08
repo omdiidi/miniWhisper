@@ -8,6 +8,16 @@ import WisprAltCore
 
     private func parse(_ s: String) -> InviteLink? { URL(string: s).flatMap(InviteLink.parse) }
 
+    /// Any Local file job (in progress, polled, or saved for resume) refuses the invite.
+    @Test func refusedWhileALocalFileJobExists() {
+        #expect(!InviteLink.refusedForLocalJob(phase: .none, pollerRunning: false, hasSavedJobID: false))
+        for phase in [LocalUploadPhase.converting, .uploading, .polling] {
+            #expect(InviteLink.refusedForLocalJob(phase: phase, pollerRunning: false, hasSavedJobID: false))
+        }
+        #expect(InviteLink.refusedForLocalJob(phase: .none, pollerRunning: true, hasSavedJobID: false))
+        #expect(InviteLink.refusedForLocalJob(phase: .none, pollerRunning: false, hasSavedJobID: true))
+    }
+
     @Test func parsesTheServerLink() {
         let l = parse(link)
         #expect(l?.host.absoluteString == "https://wispralt.example.com")

@@ -9,6 +9,26 @@ import WisprAltCore
         #expect(FileJobContract.cancelledByUserReason == "cancelled by user")
     }
 
+    // MARK: Local job outputs
+
+    @Test func formatsToDownload_sortedOrAllFour() {
+        #expect(FileJobContract.formatsToDownload(["txt", "json", "srt"]) == ["json", "srt", "txt"])
+        #expect(FileJobContract.formatsToDownload([]) == ["json", "srt", "vtt", "txt"])
+    }
+
+    /// Restart recovery reads back exactly where the job's outputs belong.
+    @Test func savedJobOutput_roundTripsAndRejectsJunk() throws {
+        let out = SavedJobOutput(outputDirectory: URL(fileURLWithPath: "/tmp/Custom Transcriptions/talk__1"),
+                                 stem: "talk")
+        let back = try #require(SavedJobOutput.decode(try out.encoded()))
+        #expect(back == out)
+        #expect(back.directoryURL.appendingPathComponent(back.stem).appendingPathExtension("srt").path
+                == "/tmp/Custom Transcriptions/talk__1/talk.srt")
+        #expect(SavedJobOutput.decode(nil) == nil)
+        #expect(SavedJobOutput.decode(Data("not json".utf8)) == nil)
+        #expect(SavedJobOutput.decode(Data(#"{"outputDirectory":"","stem":"x"}"#.utf8)) == nil)
+    }
+
     // MARK: Online JSON
 
     @Test func onlineJSON_shape() throws {

@@ -166,6 +166,10 @@ final class MenuBarController: NSObject {
     /// `resumeInFlightJobIfNeeded()` on app launch so a process restart can
     /// re-attach to a server-side job that's still running.
     static let activeJobIDDefaultsKey = "wispralt.activeJobID"
+    /// UserDefaults key for that job's `SavedJobOutput` (output folder + stem),
+    /// so restart recovery downloads the outputs to the same place. Always
+    /// written and removed together with `activeJobIDDefaultsKey`.
+    static let activeJobOutputDefaultsKey = "wispralt.activeJobOutput"
 
     // MARK: - Init
 
@@ -230,6 +234,14 @@ final class MenuBarController: NSObject {
                              pollerRunning: activeJobTask != nil,
                              onlineJobRunning: onlineJobTask != nil,
                              meFetchedThisLaunch: meFetchedThisLaunch)
+    }
+
+    /// Whether a Local file job exists (converting, uploading, polled, or its
+    /// id saved for resume). An invite is refused while this is true.
+    @MainActor var refusesInviteForLocalJob: Bool {
+        let saved = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey)
+        return InviteLink.refusedForLocalJob(phase: localUploadPhase, pollerRunning: activeJobTask != nil,
+                                             hasSavedJobID: saved?.isEmpty == false)
     }
 
     /// Runs the launch / mode-switch decision. Called by `AppDelegate` at

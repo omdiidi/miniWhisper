@@ -40,12 +40,16 @@ enum SpoolFiles {
 
 /// The last-dictation record (`last.json`), read by "Copy last dictation".
 enum LastTextStore {
-    static func save(_ result: DictationResult, mode: TranscriptionMode) {
+    /// - Returns: false when `last.json` could not be written (logged here).
+    @discardableResult
+    static func save(_ result: DictationResult, mode: TranscriptionMode) -> Bool {
         do {
             try LastText(text: result.text, at: Date(), mode: mode, modelUsed: result.modelUsed)
                 .save(to: SpoolFiles.lastTextURL)
+            return true
         } catch {
             Log.warning("last-text save failed: \(ErrorLog.describe(error))", category: "dictation")
+            return false
         }
     }
 
@@ -90,11 +94,15 @@ actor SpoolStore {
     }
 
     /// Launch: every spooled id from the last session with audio > 0 s goes to
-    /// `retry/`; the rest (and orphan sidecars) are deleted. Nothing is sent.
+    /// `retry/`; a sidecar whose audio already reached `retry/` (its move failed
+    /// last time) follows it; the rest (and orphan sidecars) are deleted.
+    /// Nothing is sent.
     /// - Returns: how many recordings were saved.
     func recover(_ ids: [String]) -> Int {
         for id in ids {
-            if Self.duration(SpoolFiles.audioURL(id)) > 0 { _ = moveToRetry(id) } else { delete(id) }
+            if Self.duration(SpoolFiles.audioURL(id)) > 0 { _ = moveToRetry(id) }
+            else if retryAudio(id) != nil { moveSidecar(id) }
+            else { delete(id) }
         }
         prune()
         return ids.filter { retryAudio($0) != nil }.count
@@ -151,10 +159,11 @@ actor SpoolStore {
         }
     }
 
-    /// After a Retry's text is on the clipboard and in `last.json`: drop the
-    /// entry unless the server did not save it or the transcript was empty.
-    func retryDelivered(_ id: String, _ result: DictationResult) {
-        if RetryEntries.dropAfterRetry(result) { discard(id) }
+    /// After a Retry's text is on the clipboard: drop the entry unless the
+    /// `last.json` save failed, the server did not save it, or the transcript
+    /// was empty.
+    func retryDelivered(_ id: String, _ result: DictationResult, textSaved: Bool) {
+        if RetryEntries.dropAfterRetry(result, textSaved: textSaved) { discard(id) }
     }
 
     // MARK: - Private
@@ -181,11 +190,25 @@ actor SpoolStore {
                 return false
             }
         }
-        let sidecarDest = SpoolFiles.sidecarURL(id, in: SpoolFiles.retryDir)
-        try? fm.removeItem(at: sidecarDest)
-        try? fm.moveItem(at: SpoolFiles.sidecarURL(id), to: sidecarDest)
-        delete(id)
+        // Only the spool audio goes here; a sidecar whose move failed stays in
+        // `spool/`, and the next launch's `recover` moves it after its audio.
+        moveSidecar(id)
+        try? fm.removeItem(at: src)
         return true
+    }
+
+    /// Moves `spool/<id>.json` to `retry/`. On failure the original stays.
+    private func moveSidecar(_ id: String) {
+        let src = SpoolFiles.sidecarURL(id)
+        guard fm.fileExists(atPath: src.path) else { return }
+        let dest = SpoolFiles.sidecarURL(id, in: SpoolFiles.retryDir)
+        do {
+            try? fm.removeItem(at: dest)
+            try fm.moveItem(at: src, to: dest)
+        } catch {
+            Log.warning("retry: could not move the sidecar (\(ErrorLog.describe(error))); left in the spool.",
+                        category: "dictation")
+        }
     }
 
     /// Applies `RetryEntries.plan` to `retry/`. Returns the entries dropped for space.
@@ -265,15 +288,18 @@ extension MenuBarController {
         Task { @MainActor in
             do {
                 let result = await MercuryStep.apply(try await SpoolStore.shared.retry(id, mode: mode))
+                var textSaved = false
                 if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     recordingState.retryStatus = "No speech detected; kept under Retry."
                 } else {
-                    LastTextStore.save(result, mode: mode)
+                    textSaved = LastTextStore.save(result, mode: mode)
                     ClipboardInjector.copyOnly(result.text)
-                    recordingState.retryStatus = "Copied — \(result.text.count.formatted(.number)) chars"
-                        + (result.serverSaved ? "" : ". The server did not save it; kept under Retry.")
+                    let kept = !textSaved ? ". Could not save it as the last dictation; kept under Retry."
+                        : !result.serverSaved ? ". The server did not save it; kept under Retry." : ""
+                    recordingState.retryStatus = "Copied — \(result.text.count.formatted(.number)) chars" + kept
                 }
-                await SpoolStore.shared.retryDelivered(id, result)   // only after the text is saved
+                // Only after the text is saved; a failed save keeps the recording.
+                await SpoolStore.shared.retryDelivered(id, result, textSaved: textSaved)
             } catch {
                 Log.warning("retry failed: \(ErrorLog.describe(error))", category: "dictation")
                 let outcome = ErrorLog.outcome(error)

@@ -51,6 +51,20 @@ public struct InviteLink: Equatable, Sendable {
         enum CodingKeys: String, CodingKey { case token, userLabel = "user_label" }
     }
 
+    /// Redeeming replaces the Local key and server URL. A Local file job that
+    /// is converting, uploading, being polled, or saved for resume would then
+    /// poll the new server, get a 404 and lose its transcript, so the invite
+    /// is refused until no such job exists.
+    public static func refusedForLocalJob(phase: LocalUploadPhase, pollerRunning: Bool,
+                                          hasSavedJobID: Bool) -> Bool {
+        phase != .none || pollerRunning || hasSavedJobID
+    }
+
+    public static let localJobBusyTitle = "Finish the file transcription first."
+    public static let localJobBusyMessage = "A Local file transcription is still running or waiting to resume. "
+        + "Joining a new server now would lose its transcript. Let it finish (or cancel it in Local mode), "
+        + "then open the invite link again."
+
     public static func decodeRedeem(status: Int, body: Data) throws -> Redeemed {
         switch status {
         case 200:
