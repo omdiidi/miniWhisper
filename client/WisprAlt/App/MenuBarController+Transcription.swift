@@ -208,7 +208,8 @@ extension MenuBarController {
         // Make the job id observable + persistent so a process restart can
         // resume polling and the UI can render Cancel + View-server-log.
         recordingState.activeJobID = jobID.raw
-        UserDefaults.standard.set(jobID.raw, forKey: Self.activeJobIDDefaultsKey)
+        let output = SavedJobOutput(outputDirectory: outputDirectory, stem: stem)
+        Self.saveActiveJob(jobID, output: output)
 
         // --- Processing ---
         localUploadPhase = .polling
@@ -238,7 +239,7 @@ extension MenuBarController {
                 // Timeout / transport errors keep it for the next launch.
                 if mayWrite(gen) {
                     recordingState.activeJobID = nil
-                    UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+                    Self.clearSavedActiveJob()
                 }
                 throw FileJobError.serverFailed(reason)
             case .pending:
@@ -270,17 +271,7 @@ extension MenuBarController {
         }
 
         // --- Download all formats ---
-        let formatsToDownload: [String]
-        if !outputFormats.isEmpty {
-            formatsToDownload = outputFormats.sorted()
-        } else {
-            formatsToDownload = ["json", "srt", "vtt", "txt"]
-        }
-        let baseURL = outputDirectory.appendingPathComponent(stem)
-        for fmt in formatsToDownload {
-            let data = try await FileJobAPI.download(jobID, format: fmt)
-            try data.write(to: baseURL.appendingPathExtension(fmt), options: .atomic)
-        }
+        try await Self.downloadJobOutputs(jobID, formats: FileJobContract.formatsToDownload(outputFormats), to: output)
 
         // --- Cleanup ---
         // Outputs are saved locally; the job is done from the user's point of
@@ -288,12 +279,35 @@ extension MenuBarController {
         // for the retention sweep) and must not turn success into failure.
         if mayWrite(gen) {
             recordingState.activeJobID = nil
-            UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+            Self.clearSavedActiveJob()
         }
         do {
             try await FileJobAPI.delete(jobID)
         } catch {
             Log.warning("FileJobAPI.delete(\(jobID)) failed after download: \(ErrorLog.describe(error))", category: "transcribe")
+        }
+    }
+
+    /// Saves a Local job for restart recovery: its id and where its outputs go.
+    static func saveActiveJob(_ jobID: JobID, output: SavedJobOutput) {
+        UserDefaults.standard.set(try? output.encoded(), forKey: activeJobOutputDefaultsKey)
+        UserDefaults.standard.set(jobID.raw, forKey: activeJobIDDefaultsKey)
+    }
+
+    /// Forgets the saved Local job (id and output location together).
+    static func clearSavedActiveJob() {
+        UserDefaults.standard.removeObject(forKey: activeJobIDDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: activeJobOutputDefaultsKey)
+    }
+
+    /// Downloads a done job's outputs to `<outputDirectory>/<stem>.<fmt>`.
+    /// Shared by the normal completion path and restart recovery.
+    static func downloadJobOutputs(_ jobID: JobID, formats: [String], to output: SavedJobOutput) async throws {
+        try FileManager.default.createDirectory(at: output.directoryURL, withIntermediateDirectories: true)
+        let baseURL = output.directoryURL.appendingPathComponent(output.stem)
+        for fmt in formats {
+            let data = try await FileJobAPI.download(jobID, format: fmt)
+            try data.write(to: baseURL.appendingPathExtension(fmt), options: .atomic)
         }
     }
 
@@ -433,7 +447,7 @@ extension MenuBarController {
         //    in flight can never clear the state of a job started after it.
         let cancelledRaw = recordingState.activeJobID
         recordingState.activeJobID = nil
-        UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+        Self.clearSavedActiveJob()
         recordingState.phase = nil
         recordingState.phaseLabel = nil
         recordingState.chunkIndex = nil
@@ -504,17 +518,12 @@ extension MenuBarController {
         }
     }
 
-    /// Drain a recovered job. Polls until done/failed and writes a synthetic
-    /// "resumed" notification on completion. No download is performed —
-    /// recovery is best-effort; the user can manually open the transcripts
-    /// folder if outputs were written elsewhere.
-    ///
-    /// Note: a resumed job has lost its caller-known `outputDirectory` and
-    /// `stem`. We surface completion to the user but the actual downloads
-    /// stay on the server until the user triggers a fresh transcription
-    /// (or until the server's GC sweeps them). This is intentional — the
-    /// recovery path is for visibility, not for completing the original
-    /// transaction.
+    /// Drain a recovered job. Polls until done/failed; on done it downloads
+    /// the outputs exactly like the normal completion path (to the saved
+    /// `SavedJobOutput`, or a new "Recovered transcription" job folder when
+    /// the id was saved by an older build), and only then clears the saved
+    /// id and deletes the server job. A failed download keeps the id (unless
+    /// the server answered 404), so the next launch tries again.
     @MainActor
     func resumePollingForJob(_ jobID: JobID, gen: Int) async {
         let deadlineSeconds: TimeInterval = 6 * 3600
@@ -529,15 +538,29 @@ extension MenuBarController {
                 let status = try await pollWithBackoff(jobID)
                 guard mayWrite(gen) else { return }
                 switch status {
-                case .done:
-                    AppNotifications.notify(
-                        title: "Transcription Recovered",
-                        body: "A job that was running when WisprAlt restarted has completed. Re-run the transcription to download outputs."
-                    )
+                case .done(let outputs):
+                    let output = try savedOrRecoveryOutput()
+                    try await Self.downloadJobOutputs(jobID, formats: FileJobContract.formatsToDownload(Array(outputs.keys)),
+                                                      to: output)
+                    // A cancel during the download already reset everything.
+                    guard mayWrite(gen) else { return }
                     recordingState.activeJobID = nil
                     recordingState.serverFinishingJobID = nil
-                    UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+                    recordingState.phase = nil
+                    recordingState.phaseLabel = nil
+                    recordingState.chunkIndex = nil
+                    recordingState.totalChunks = nil
+                    Self.clearSavedActiveJob()
                     localUploadPhase = .none
+                    Log.info("Resumed job done; outputs downloaded.", category: "transcribe")
+                    NotificationCenter.default.post(name: .wisprAltTranscriptWritten, object: nil)
+                    AppNotifications.notify(title: "Transcription Recovered", body: output.stem)
+                    do {
+                        try await FileJobAPI.delete(jobID)
+                    } catch {
+                        Log.warning("FileJobAPI.delete after recovery failed: \(ErrorLog.describe(error))",
+                                    category: "transcribe")
+                    }
                     return
                 case .failed(let reason):
                     // "cancelled by user" is a silent end; anything else is
@@ -547,7 +570,7 @@ extension MenuBarController {
                     }
                     recordingState.activeJobID = nil
                     recordingState.serverFinishingJobID = nil
-                    UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+                    Self.clearSavedActiveJob()
                     localUploadPhase = .none
                     return
                 case .pending:
@@ -572,7 +595,7 @@ extension MenuBarController {
             )
             if mayWrite(gen), case ServerError.server(status: 404, _) = error {
                 // The server no longer knows the job: never resume it again.
-                UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+                Self.clearSavedActiveJob()
             }
         }
         // Timed out or polling failed: stop presenting the job as processing
@@ -583,6 +606,21 @@ extension MenuBarController {
         localUploadPhase = .none
         recordingState.activeJobID = nil
         recordingState.serverFinishingJobID = nil
+    }
+
+    /// The saved output location of the resumed job, or (for an id saved by
+    /// an older build, which kept none) a new job folder for it, saved so a
+    /// retry after a failed download reuses that folder.
+    @MainActor
+    func savedOrRecoveryOutput() throws -> SavedJobOutput {
+        if let saved = SavedJobOutput.decode(UserDefaults.standard.data(forKey: Self.activeJobOutputDefaultsKey)) {
+            return saved
+        }
+        let stem = "Recovered transcription"
+        let output = SavedJobOutput(outputDirectory: try CustomTranscriptionsStore.makeJobDirectory(forStem: stem),
+                                    stem: stem)
+        UserDefaults.standard.set(try? output.encoded(), forKey: Self.activeJobOutputDefaultsKey)
+        return output
     }
 
     /// Map a thrown upload error to a user-readable banner string. Switches

@@ -7,6 +7,13 @@ public enum FileJobContract {
     /// A job that fails with exactly this reason is a silent end, not an error.
     public static let cancelledByUserReason = "cancelled by user"
 
+    /// Formats fetched when a Local job is done: the server's `outputs` keys,
+    /// sorted, or all four when it listed none. Used by the normal completion
+    /// path and by restart recovery alike.
+    public static func formatsToDownload(_ outputs: [String]) -> [String] {
+        outputs.isEmpty ? ["json", "srt", "vtt", "txt"] : outputs.sorted()
+    }
+
     /// Moves staged output files into a folder that `makeDirectory` creates,
     /// all or nothing: if any step throws, the new folder is removed and the
     /// error rethrown, so a failure never leaves a half-written job folder.
@@ -21,6 +28,32 @@ public enum FileJobContract {
             throw error
         }
         return dir
+    }
+}
+
+// MARK: - Saved Local job output
+
+/// Where a Local file job's outputs go (`<outputDirectory>/<stem>.<fmt>`),
+/// saved beside its job id so restart recovery downloads them to the same
+/// place. Stored on this Mac only (UserDefaults), never logged.
+public struct SavedJobOutput: Codable, Equatable, Sendable {
+    public let outputDirectory: String
+    public let stem: String
+
+    public init(outputDirectory: URL, stem: String) {
+        self.outputDirectory = outputDirectory.path
+        self.stem = stem
+    }
+
+    public var directoryURL: URL { URL(fileURLWithPath: outputDirectory, isDirectory: true) }
+
+    public func encoded() throws -> Data { try JSONEncoder().encode(self) }
+
+    /// nil for missing or unreadable data (e.g. an id saved by an older build).
+    public static func decode(_ data: Data?) -> SavedJobOutput? {
+        guard let data, let out = try? JSONDecoder().decode(SavedJobOutput.self, from: data),
+              !out.outputDirectory.isEmpty, !out.stem.isEmpty else { return nil }
+        return out
     }
 }
 

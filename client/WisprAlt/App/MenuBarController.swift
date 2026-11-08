@@ -166,6 +166,10 @@ final class MenuBarController: NSObject {
     /// `resumeInFlightJobIfNeeded()` on app launch so a process restart can
     /// re-attach to a server-side job that's still running.
     static let activeJobIDDefaultsKey = "wispralt.activeJobID"
+    /// UserDefaults key for that job's `SavedJobOutput` (output folder + stem),
+    /// so restart recovery downloads the outputs to the same place. Always
+    /// written and removed together with `activeJobIDDefaultsKey`.
+    static let activeJobOutputDefaultsKey = "wispralt.activeJobOutput"
 
     // MARK: - Init
 
