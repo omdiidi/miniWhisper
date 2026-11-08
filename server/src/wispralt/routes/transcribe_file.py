@@ -25,9 +25,9 @@ caller is an admin. A job owned by someone else looks exactly like a missing
 one (404 on GET, 204 on DELETE), so existence never leaks.
 
 Auth: ``Bearer`` via ``Depends(require_bearer)``.
-Usage telemetry: route-key ``transcribe/file`` is registered in
-``main.TRACKED_ROUTES`` + ``_KIND_MAP``; the middleware emits the usage_events
-row, the route does not call any recorder.
+Usage telemetry: ``usage.events.kind_for_path`` maps the submit and the
+chunked finalize to ``file`` and the chunked init / pieces to ``file_chunk``;
+the middleware emits the usage_events row, the route does not call any recorder.
 
 Resource gates (Phase 2):
 - Disk: free < content_length × 2 → 507 + Retry-After 300.

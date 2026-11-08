@@ -19,7 +19,7 @@ from wispralt.observability import percentile
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
 
     from wispralt.database import Database
     from wispralt.usage.events import UsageEvent
@@ -219,11 +219,17 @@ class UsageStore:
         }
 
     def latency_error_summary(
-        self, since: float, until: float | None = None, *, user_id: int | None = None
+        self,
+        since: float,
+        until: float | None = None,
+        *,
+        user_id: int | None = None,
+        kinds: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Over ``[since, until)``: per-kind ``{count, p50_ms, p95_ms}``, total requests, 5xx
         count and rate, 4xx+5xx error rate. Usage rows are request telemetry (a streamed
-        dictation is several rows), so this feeds latency and error rates only."""
+        dictation is its chunk rows plus one finalize row), so this feeds latency and error
+        rates only. *kinds* limits every number to those kinds (e.g. whole requests)."""
         clauses, params = ["ts >= ?"], [since]
         if until is not None:
             clauses.append("ts < ?")
@@ -231,6 +237,9 @@ class UsageStore:
         if user_id is not None:
             clauses.append("user_id = ?")
             params.append(user_id)
+        if kinds is not None:
+            clauses.append(f"kind IN ({', '.join('?' * len(kinds)) or 'NULL'})")
+            params.extend(kinds)
         by_kind: dict[str, list[float]] = {}
         total = errors = server_errors = 0
         with self.db.read() as con:

@@ -84,7 +84,7 @@ from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
 from wispralt.settings_store import SettingsStore
-from wispralt.usage.events import UsageEvent
+from wispralt.usage.events import UsageEvent, kind_for_path
 from wispralt.usage.store import UsageStore
 
 logging.basicConfig(
@@ -433,30 +433,6 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
 # ── application factory ───────────────────────────────────────────────────────
 
 
-# Track only request-creating endpoints, NOT status-poll GETs that the
-# client may hammer every few seconds.  /transcribe/file POST creates a
-# job; the per-job GET is the poll path — exclude it by also filtering on
-# request.method.
-TRACKED_ROUTES = frozenset([
-    "transcribe/dictate",
-    "transcribe/file",
-    "v1/audio",
-    "v1/models",  # OpenAI-compat model-list probes
-    "v1/audio/translations",  # unsupported-endpoint stub probes (still want visibility)
-])
-TRACKED_METHODS = frozenset({"POST"})
-
-# Map a tracked route key to the canonical ``kind`` recorded on usage_events.
-# Keeps "v1/audio" from emitting an unhelpful "audio" kind via the default split.
-_KIND_MAP = {
-    "transcribe/dictate": "dictate",
-    "transcribe/file": "file",
-    "v1/audio": "v1_dictate",
-    "v1/models": "v1_models",
-    "v1/audio/translations": "v1_translations",
-}
-
-
 class _ObservabilityMiddleware(BaseHTTPMiddleware):
     """Times each request and records it in the observability singletons (G4).
 
@@ -484,15 +460,16 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
             observability.error_counter.increment(route_key, response.status_code)
         observability.latency_histogram.record(route_key, latency_ms)
 
-        # Record a usage row when auth resolved a user, the route is tracked,
-        # the method creates work (skip GET polls), and it was not a replay.
+        # Record a usage row when auth resolved a user, the request is a tracked
+        # work-creating POST (``kind_for_path``: chunks get their own kinds, GET
+        # polls none), and it was not a replay.
         user = getattr(request.state, "user", None)
         usage: UsageStore | None = getattr(request.app.state, "usage", None)
+        kind = kind_for_path(request.method, request.url.path)
         if (
             user is not None
             and usage is not None
-            and route_key in TRACKED_ROUTES
-            and request.method in TRACKED_METHODS
+            and kind is not None
             and not getattr(request.state, "dedup_replay", False)
         ):
             try:
@@ -503,7 +480,7 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
                 user_id=user.id,
                 key_id=user.key_id,
                 ts=time.time(),
-                kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
+                kind=kind,
                 status=response.status_code,
                 duration_ms=latency_ms,
                 bytes_in=bytes_in,

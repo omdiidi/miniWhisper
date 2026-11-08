@@ -70,6 +70,43 @@ def seeded(job_store: JobStore, make_user: MakeUser, usage: UsageStore) -> User:
     return alice
 
 
+def test_chunk_rows_do_not_skew_dictation_latency_or_error_rate(
+    job_store: JobStore, usage: UsageStore, seeded: User
+) -> None:
+    """Streamed-dictation chunks (and chunked-upload pieces) are their own kinds."""
+    for kind in ("dictate_chunk", "file_chunk"):
+        for _ in range(5):
+            usage.record(UsageEvent(user_id=seeded.id, ts=NOW - 3600, kind=kind, status=503,
+                                    duration_ms=5.0))
+    m = measured.compute(job_store, usage, user_id=seeded.id, since=_ts(2026, 11, 2, 0, 0),
+                         until=NOW, now=NOW, tz_name=TZ)
+    assert (m["latency_p50_ms"], m["latency_p95_ms"]) == (300.0, pytest.approx(480.0))
+    assert m["requests"] == 3 and m["error_rate"] == pytest.approx(1 / 3)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "kind"),
+    [
+        ("POST", "/transcribe/dictate", "dictate"),
+        ("POST", "/transcribe/dictate/stream/abc/finalize", "dictate"),
+        ("POST", "/transcribe/dictate/stream/abc/chunk/3", "dictate_chunk"),
+        ("POST", "/transcribe/file", "file"),
+        ("POST", "/transcribe/file/chunked/init", "file_chunk"),
+        ("POST", "/transcribe/file/chunked/AAAA/0", "file_chunk"),
+        ("POST", "/transcribe/file/chunked/AAAA/finalize", "file"),
+        ("POST", "/v1/audio/transcriptions", "v1_dictate"),
+        ("POST", "/v1/audio/translations", "v1_translations"),
+        ("GET", "/transcribe/file/some-job", None),
+        ("DELETE", "/transcribe/file/some-job", None),
+        ("POST", "/me/history/dictation/1/restore", None),
+    ],
+)
+def test_usage_kind_for_path(method: str, path: str, kind: str | None) -> None:
+    from wispralt.usage.events import kind_for_path
+
+    assert kind_for_path(method, path) == kind
+
+
 def test_fillers_regex() -> None:
     assert measured.count_fillers(["Um, so like, you know, uh", "UMM uhh unlike umbrella"]) == {
         "um": 2, "uh": 2, "like": 1, "you know": 1, "total": 6,
