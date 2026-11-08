@@ -339,7 +339,7 @@ request.
 
 ### Revoking an integration key
 
-`POST /admin/integrations/{id}/revoke` disables the key's user (`users.disabled_at`).
+`POST /admin/integrations/{id}/revoke` disables the key's user (`users.disabled_at`). Both integration routes only act on integration-kind users: a person or admin id is a 404 (yourself a 400); people are disabled or rotated from their own page.
 Its next `/v1` request returns **401**.
 
 ### What integration keys can / can't access

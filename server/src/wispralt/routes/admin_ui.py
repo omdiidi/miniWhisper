@@ -541,11 +541,22 @@ async def integrations_add_submit(
     )
 
 
+async def _require_integration(request: Request, user_id: int) -> None:
+    """404 unless ``user_id`` is an integration-kind user: the integration routes must not
+    disable or rotate a person (or an admin) — people have their own guarded routes."""
+    target = await asyncio.to_thread(_accounts(request).get_user, user_id)
+    if target is None or target.kind != "integration":
+        raise HTTPException(status_code=404, detail="Integration not found")
+
+
 @authed_router.post("/integrations/{user_id}/revoke")
 async def integrations_revoke(
-    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+    request: Request, user_id: int, admin: User = Depends(require_admin_csrf)
 ) -> RedirectResponse:
     """Revoke an integration (disables its user; applies to the next request)."""
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="You cannot disable yourself")
+    await _require_integration(request, user_id)
     await asyncio.to_thread(_accounts(request).disable_user, user_id)
     return RedirectResponse("/admin/integrations", status_code=303)
 
@@ -555,6 +566,7 @@ async def integrations_rotate(
     request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
 ) -> HTMLResponse:
     """Rotate an integration key in place; show the new key once."""
+    await _require_integration(request, user_id)
     new_plaintext = await _rotate_or_404(request, user_id)
     profile = await asyncio.to_thread(_accounts(request).profile, user_id)
     return templates.TemplateResponse(

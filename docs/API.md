@@ -975,7 +975,7 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 | GET/POST | `/admin/invites` | admin (+ CSRF on POST) | Invites list / create (new person `label`+`role`, or `user_id` = add device); link + code shown once (`no-store`). |
 | POST | `/admin/invites/{id}/revoke` | admin + CSRF | Expire a pending invite; 303 → `/admin/invites`. |
 | GET/POST | `/admin/integrations`, `/admin/integrations/new` | admin (+ CSRF on POST) | Integration keys list / create (key + OpenAI env snippet shown once, `no-store`). |
-| POST | `/admin/integrations/{id}/rotate`, `/admin/integrations/{id}/revoke` | admin + CSRF | Rotate (new key once) / revoke (disable) an integration. |
+| POST | `/admin/integrations/{id}/rotate`, `/admin/integrations/{id}/revoke` | admin + CSRF | Rotate (new key once) / revoke (disable) an integration. A non-integration user id → 404 (yourself → 400). |
 | GET | `/admin/usage` | admin | Drill-down HTML, paginated 100/page. Filters: `kind`, `status`, `user_id`, `since`, `until`, `offset`. |
 | GET | `/admin/usage.csv` | admin | `text/csv` stream (max 10000 rows) |
 | GET | `/admin/records`, `/admin/records/{kind}/{id}` | admin | Team records search/list and one record. |

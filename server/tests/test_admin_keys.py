@@ -104,6 +104,21 @@ def test_rotate_unknown_user_is_404(client: TestClient, admin_headers: dict[str,
     assert client.post("/admin/integrations/9999/rotate", headers=admin_headers).status_code == 404
 
 
+@pytest.mark.parametrize("action", ["revoke", "rotate"])
+def test_integration_routes_refuse_people_and_admins(
+    client: TestClient, make_user: MakeUser, accounts: AccountStore, action: str
+) -> None:
+    admin, admin_token = make_user(role="admin", label="dana")
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    person, person_token = make_user(label="alice")
+    for target, token in ((admin, admin_token), (person, person_token)):
+        resp = client.post(f"/admin/integrations/{target.id}/{action}", headers=headers,
+                           follow_redirects=False)
+        assert resp.status_code in (400, 404), (target.label, resp.status_code)
+        assert accounts.lookup_key(hash_token(token)) is not None  # still works, still enabled
+    assert client.post(f"/admin/integrations/9999/{action}", headers=headers).status_code == 404
+
+
 def test_overview_shows_integration_count(
     client: TestClient, admin_headers: dict[str, str], make_user: MakeUser
 ) -> None:
