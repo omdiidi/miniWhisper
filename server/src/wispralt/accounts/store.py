@@ -20,6 +20,7 @@ from wispralt._errors import AlreadyBootstrapped, InviteInvalid
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Callable
 
     from wispralt.database import Database
 
@@ -320,11 +321,14 @@ class AccountStore:
                 token_hash=token_hash,
             )
 
-    def rotate_user_key(self, user_id: int, token_hash: str) -> User:
+    def rotate_user_key(
+        self, user_id: int, token_hash: str, *, before_commit: Callable[[], None] | None = None
+    ) -> User:
         """Revoke every active key of the user, add one new key and re-enable the user.
 
-        One transaction: on any failure the old keys stay valid.
-        ``sqlite3.IntegrityError`` if the user does not exist.
+        One transaction: on any failure the old keys stay valid. *before_commit* runs
+        inside it, last (the CLI writes the new key to its file there), so if it raises
+        the rotation rolls back. ``sqlite3.IntegrityError`` if the user does not exist.
         """
         now = time.time()
         with self.db.write() as con:
@@ -340,6 +344,8 @@ class AccountStore:
             r = con.execute(
                 "SELECT id, label, role, kind FROM users WHERE id = ?", (user_id,)
             ).fetchone()
+            if before_commit is not None:
+                before_commit()
         return _user(r, key_id)
 
     def revoke_key(self, key_id: int) -> bool:

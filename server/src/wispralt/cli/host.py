@@ -8,9 +8,11 @@ when the cached models verify (sha256 against the Hub's LFS metadata at the
 resolved commit), never creates a second admin or rotates a key, and asks the
 retention question once.
 
-Every key the CLI mints leaves through ``emit_secret``: printed only to a
-terminal, else written to a new 0600 ``--token-file`` (``O_EXCL``), else the
-command refuses (exit 2) *before* anything is minted. A key never reaches a log,
+Every key the CLI mints leaves through ``secret_sink`` + ``announce_secret``:
+printed only to a terminal, else written to a new 0600 ``--token-file``
+(``O_EXCL``, created before anything is minted; a rotation writes it inside its
+transaction, so a failed write leaves the old key working), else the command
+refuses (exit 2) *before* anything is minted. A key never reaches a log,
 an argv or a non-terminal stdout. Accounts and retention are the server's own
 functions (``accounts.service``, ``AccountStore``, ``JobStore``).
 """
@@ -24,6 +26,7 @@ import json
 import os
 import re
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -49,6 +52,7 @@ _LOOPBACK_URL = re.compile(r"^http://(127\.0\.0\.1|localhost):\d+/?$")
 
 if TYPE_CHECKING:
     import argparse
+    from collections.abc import Callable, Iterator
     from datetime import datetime
 
     from wispralt.accounts.store import User
@@ -151,8 +155,13 @@ def bootstrap_admin(data_dir: Path, label: str) -> tuple[User, str]:
     return service.bootstrap_first_admin(AccountStore(prepare_db(data_dir)), label)
 
 
-def rotate_admin(data_dir: Path, user_id: int | None = None) -> tuple[User, str]:
-    """A new key for an enabled admin (the only one, or *user_id*); old keys stop working."""
+def rotate_admin(
+    data_dir: Path, user_id: int | None = None, *, deliver: Callable[[str], None] | None = None
+) -> tuple[User, str]:
+    """A new key for an enabled admin (the only one, or *user_id*); old keys stop working.
+
+    *deliver* gets the key inside the rotation's transaction (see ``secret_sink``).
+    """
     accounts = AccountStore(prepare_db(data_dir))
     admins = accounts.list_enabled_admins()
     if not admins:
@@ -167,7 +176,7 @@ def rotate_admin(data_dir: Path, user_id: int | None = None) -> tuple[User, str]
         user_id = admins[0].id
     elif user_id not in {a.id for a in admins}:
         raise CliError(1, f"User {user_id} is not an enabled admin.")
-    return service.rotate_user_key(accounts, user_id)
+    return service.rotate_user_key(accounts, user_id, deliver=deliver)
 
 
 # ── the one way a key leaves the CLI ─────────────────────────────────────────
@@ -185,12 +194,38 @@ def check_secret_sink(ctx: Ctx, token_file: Path | None) -> None:
         raise CliError(2, f"{token_file.parent} does not exist")
 
 
-def emit_secret(ctx: Ctx, token: str, token_file: Path | None, *, heading: str) -> None:
+@contextmanager
+def secret_sink(ctx: Ctx, token_file: Path | None) -> Iterator[Callable[[str], None] | None]:
+    """Create ``--token-file`` (0600, ``O_EXCL``) *before* a key is minted; yield its writer.
+
+    Mint inside the block and hand the writer to the mint: a rotation calls it inside
+    its transaction, so a failed write rolls the rotation back and the old key keeps
+    working. Any failure in the block removes the file. Yields ``None`` for a terminal
+    (the key is printed by ``announce_secret`` once the mint has committed).
+    """
     check_secret_sink(ctx, token_file)
+    if token_file is None:
+        yield None
+        return
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+    f = os.fdopen(os.open(token_file, flags, 0o600), "w")
+
+    def write(token: str) -> None:
+        f.write(token + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    try:
+        with f:
+            yield write
+    except BaseException:
+        token_file.unlink(missing_ok=True)
+        raise
+
+
+def announce_secret(ctx: Ctx, token: str, token_file: Path | None, *, heading: str) -> None:
+    """Tell the operator where the key went (or print it, on a terminal)."""
     if token_file is not None:
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
-        with os.fdopen(os.open(token_file, flags, 0o600), "w") as f:
-            f.write(token + "\n")
         print(f"{heading} The key is in {token_file} (0600); delete it once it is in use.")
         return
     print(client_config_text(server_url(ctx), token, heading=heading))
@@ -236,9 +271,11 @@ def _emit_rows(ctx: Ctx, rows: list[dict[str, Any]], cols: list[str]) -> None:
 def _mint(ctx: Ctx, args: argparse.Namespace, accounts: AccountStore, user_id: int) -> int:
     if accounts.get_user(user_id) is None:
         raise CliError(1, f"no user {user_id}")
-    check_secret_sink(ctx, args.token_file)
-    user, token = service.rotate_user_key(accounts, user_id)
-    emit_secret(ctx, token, args.token_file, heading=f"New key for user {user.id} ({user.label}).")
+    with secret_sink(ctx, args.token_file) as deliver:
+        user, token = service.rotate_user_key(accounts, user_id, deliver=deliver)
+    announce_secret(
+        ctx, token, args.token_file, heading=f"New key for user {user.id} ({user.label})."
+    )
     return 0
 
 
@@ -269,9 +306,13 @@ def cmd_users_list(ctx: Ctx, _args: argparse.Namespace) -> int:
 
 def cmd_users_add(ctx: Ctx, args: argparse.Namespace) -> int:
     accounts = AccountStore(open_db(ctx))
-    check_secret_sink(ctx, args.token_file)
-    user, token = service.create_user(accounts, label=args.label, role=args.role, kind=args.kind)
-    emit_secret(ctx, token, args.token_file, heading=f"User {user.id} ({user.label}) added.")
+    with secret_sink(ctx, args.token_file) as deliver:
+        user, token = service.create_user(
+            accounts, label=args.label, role=args.role, kind=args.kind
+        )
+        if deliver is not None:  # a new user: a lost write is recovered with `keys rotate`
+            deliver(token)
+    announce_secret(ctx, token, args.token_file, heading=f"User {user.id} ({user.label}) added.")
     return 0
 
 
@@ -326,9 +367,9 @@ def cmd_keys_revoke(ctx: Ctx, args: argparse.Namespace) -> int:
 
 def cmd_keys_rotate_admin(ctx: Ctx, args: argparse.Namespace) -> int:
     open_db(ctx)
-    check_secret_sink(ctx, args.token_file)
-    user, token = rotate_admin(ctx.paths.data_dir, args.user_id)
-    emit_secret(ctx, token, args.token_file, heading=f"Admin key rotated for {user.label}.")
+    with secret_sink(ctx, args.token_file) as deliver:
+        user, token = rotate_admin(ctx.paths.data_dir, args.user_id, deliver=deliver)
+    announce_secret(ctx, token, args.token_file, heading=f"Admin key rotated for {user.label}.")
     return 0
 
 
@@ -603,8 +644,11 @@ def setup_host(ctx: Ctx, args: argparse.Namespace, state: InstallState) -> str |
     if AccountStore(db).has_enabled_admin():
         print("admin exists; use `wispralt keys rotate-admin` if its key is lost")
     else:
-        _user, token = bootstrap_admin(p.data_dir, label or "owner")
-        emit_secret(ctx, token, args.token_file, heading="First admin created.")
+        with secret_sink(ctx, args.token_file) as deliver:
+            _user, token = bootstrap_admin(p.data_dir, label or "owner")
+            if deliver is not None:  # a lost write is recovered with `keys rotate-admin`
+                deliver(token)
+        announce_secret(ctx, token, args.token_file, heading="First admin created.")
     _retention(ctx, state, args.retention_days, JobStore(db, p.data_dir))
     state.save(p.state_file)
 

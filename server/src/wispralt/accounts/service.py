@@ -16,6 +16,8 @@ import urllib.parse
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from wispralt.accounts.store import AccountStore, User
 
 logger = logging.getLogger(__name__)
@@ -56,10 +58,17 @@ def bootstrap_first_admin(accounts: AccountStore, label: str) -> tuple[User, str
     return user, plaintext
 
 
-def rotate_user_key(accounts: AccountStore, user_id: int) -> tuple[User, str]:
-    """Revoke the user's active keys, issue one new key and re-enable the user."""
+def rotate_user_key(
+    accounts: AccountStore, user_id: int, *, deliver: Callable[[str], None] | None = None
+) -> tuple[User, str]:
+    """Revoke the user's active keys, issue one new key and re-enable the user.
+
+    *deliver* (if given) receives the new key inside the rotation's transaction; if it
+    raises, nothing is rotated and the old keys keep working.
+    """
     plaintext, token_hash = _new_token()
-    user = accounts.rotate_user_key(user_id, token_hash)
+    before = None if deliver is None else (lambda: deliver(plaintext))
+    user = accounts.rotate_user_key(user_id, token_hash, before_commit=before)
     logger.info("key rotated user_id=%d key_id=%s", user.id, user.key_id)
     return user, plaintext
 
