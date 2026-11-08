@@ -12,7 +12,9 @@ a terminal: a launchd or CI log must never capture a credential. They create
 ``DATA_DIR`` (0700) if it is missing and migrate the DB first. ``--check``
 prints no secret and never creates anything. The ``wispralt`` CLI is the main
 entry point (``wispralt setup`` / ``wispralt keys rotate-admin``); this module
-stays as a thin shim over the same ``cli.host`` functions.
+stays as a thin shim over the same ``cli.host`` functions and the same printed
+text (``host.client_config_text``). The portal's ``/admin/setup`` is the only
+other first-admin path (web, setup-code gated).
 """
 
 from __future__ import annotations
@@ -48,16 +50,6 @@ def _load_settings() -> Settings | None:
         _err(f"Invalid server settings ({fields}); check server/.env (DATA_DIR must be absolute).")
         return None
     return settings
-
-
-def _print_client_config(server_url: str, token: str, *, heading: str) -> None:
-    server_url = server_url or "(not set yet: the https:// URL you set as SERVER_URL)"
-    print(
-        f"\n{heading}\n"
-        "Enter these in the WisprAlt client (Settings > Server). The key is shown ONCE:\n\n"
-        f"  Server URL: {server_url}\n"
-        f"  API key:    {token}\n"
-    )
 
 
 def _check(settings: Settings) -> int:
@@ -105,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         _err(exc.msg)
         return EXIT_FAIL
-    _print_client_config(settings.server_url, token, heading=heading)
+    print(host.client_config_text(settings.server_url, token, heading=heading))
     return EXIT_OK
 
 

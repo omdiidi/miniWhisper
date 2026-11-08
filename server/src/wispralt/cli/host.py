@@ -22,6 +22,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -38,10 +39,13 @@ from wispralt.cli.paths import (
     find_source,
     merge_missing,
     private_dir,
+    set_values,
 )
 from wispralt.cli.system import CliError, version
 from wispralt.database import Database
 from wispralt.jobs.store import JobStore
+
+_LOOPBACK_URL = re.compile(r"^http://(127\.0\.0\.1|localhost):\d+/?$")
 
 if TYPE_CHECKING:
     import argparse
@@ -189,9 +193,15 @@ def emit_secret(ctx: Ctx, token: str, token_file: Path | None, *, heading: str) 
             f.write(token + "\n")
         print(f"{heading} The key is in {token_file} (0600); delete it once it is in use.")
         return
-    print(
+    print(client_config_text(server_url(ctx), token, heading=heading))
+
+
+def client_config_text(url: str, token: str, *, heading: str) -> str:
+    """The one wording for handing over a key (the CLI and ``python -m wispralt.bootstrap``)."""
+    url = url or "(not set yet: the https:// URL you set as SERVER_URL)"
+    return (
         f"\n{heading}\nEnter these in the WisprAlt client (Settings > Server). The key is shown ONCE:\n\n"
-        f"  Server URL: {server_url(ctx)}\n"
+        f"  Server URL: {url}\n"
         f"  API key:    {token}\n"
     )
 
@@ -578,6 +588,12 @@ def setup_host(ctx: Ctx, args: argparse.Namespace, state: InstallState) -> str |
             "SERVER_LOG_PATH": str(p.logs_dir / "wispralt.log"),
         },
     )
+    # Defaults never clobber a value; an explicitly passed flag does.
+    url = env_value(p.env_file, "SERVER_URL") or ""
+    if args.server_url:
+        set_values(p.env_file, {"SERVER_URL": args.server_url})
+    elif args.port and _LOOPBACK_URL.match(url):  # a loopback URL follows a new --port
+        set_values(p.env_file, {"SERVER_URL": ctx.url})
     state.save(p.state_file)
     ensure_models(ctx, state)
     state.save(p.state_file)

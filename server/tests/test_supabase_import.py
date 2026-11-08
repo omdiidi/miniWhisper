@@ -155,8 +155,8 @@ def test_owner_mapping_required(
     assert report.tables["users"]["linked"] == 1
 
 
-def test_no_local_admin_refuses_until_bootstrap(db: Database, snap: Path) -> None:
-    with pytest.raises(OwnerMappingRequired, match="bootstrap"):
+def test_no_local_admin_refuses_until_setup(db: Database, snap: Path) -> None:
+    with pytest.raises(OwnerMappingRequired, match="wispralt setup --role host"):
         si.import_snapshot(db, snap, confirm=True)
 
 

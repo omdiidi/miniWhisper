@@ -118,7 +118,7 @@ Use a **project-scoped** OpenAI key (a project just for WisprAlt) with a **month
 
 After the permission wizard, the app is ready for server configuration (Local mode).
 
-1. Get the server URL and a key from the host: `wispralt setup` prints both for the first admin, and `wispralt users add NAME` makes a key for anyone else. On a Mac set up with `--role both`, both are filled in already.
+1. Get the server URL and a key from the host: `wispralt setup` prints both for the first admin, and `wispralt users add NAME` makes a key for anyone else. On a Mac set up with `--role both`, both are filled in already (the key's Keychain item trusts the installed app, so it reads it without a prompt; a build signed by another identity asks once: choose **Always Allow**).
 2. Click the WisprAlt menubar icon → toggle **Show advanced settings**.
    The advanced section reveals:
    - **Server URL** — paste the `https://` URL and press Return. Plain `http://` is accepted only for a server on this Mac (`127.0.0.1`, `::1`, `localhost`); any other host needs https ("Use https://, or http:// only for this Mac"). For a LAN or tailnet server, put https in front of it, e.g. `tailscale serve`. The app's ATS setting is `NSAllowsLocalNetworking` only. A dictation always finishes on the server URL that was set when you pressed FN, even if you change it mid-dictation.

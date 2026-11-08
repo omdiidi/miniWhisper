@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -50,3 +52,36 @@ def test_install_sh_never_calls_python() -> None:
 def test_install_sh_shellcheck() -> None:
     res = _REAL_RUN(["shellcheck", "install.sh"], cwd=_REPO, capture_output=True, text=True)
     assert res.returncode == 0, res.stdout
+
+
+def test_cloudflared_env_rewrite_is_never_world_readable(tmp_path: Path) -> None:
+    """Review fix: persist_env_var's temp copy of .env (it holds the API key) is 0600 from
+    the moment it exists, even under umask 000. A ``sed`` shim records the mode of the
+    file it is writing into, then runs the real sed."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    log = tmp_path / "modes"
+    real_sed = shutil.which("sed")
+    (shim / "sed").write_text(
+        "#!/bin/bash\n"
+        f"{sys.executable} -c 'import os, stat; print(oct(stat.S_IMODE(os.fstat(1).st_mode))[2:],"
+        f' file=open("{log}", "a"))\'\n'
+        f'exec {real_sed} "$@"\n'
+    )
+    (shim / "sed").chmod(0o755)
+    env_file = tmp_path / ".env"
+    env_file.write_text('API_KEY="secret"\nSERVER_URL="http://127.0.0.1:8000"\n')
+    env_file.chmod(0o600)
+    script = _REPO / "scripts" / "setup-cloudflared.sh"
+    res = _bash(
+        "-c",
+        "set -euo pipefail; umask 000;"
+        f" eval \"$(sed -n '/^persist_env_var()/,/^}}/p' {script})\";"
+        f" ENV_FILE={env_file}; PATH={shim}:$PATH;"
+        " persist_env_var SERVER_URL https://t.example.com",
+    )
+    assert res.returncode == 0, res.stderr
+    assert log.read_text().split() == ["600"]
+    assert env_file.read_text() == 'API_KEY="secret"\nSERVER_URL=https://t.example.com\n'
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".env.tmp")] == []

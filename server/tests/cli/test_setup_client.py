@@ -5,17 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pytest
+
 from wispralt.accounts.service import hash_token
 from wispralt.accounts.store import AccountStore
 from wispralt.cli import client
 from wispralt.cli.paths import Paths
+from wispralt.cli.system import CliError
 from wispralt.database import Database
 
 from .conftest import make_app
 
 if TYPE_CHECKING:
-    import pytest
-
     from .conftest import CliFn, FakeHub, FakeRunner
 
 
@@ -101,7 +102,11 @@ def test_both_points_the_app_at_the_host(
         "defaults", "write", client.DEFAULTS_DOMAIN, "serverURL", "-string", "http://127.0.0.1:8000"
     ] in runner.calls  # fmt: skip
     i = runner.calls.index(["security", "-i"])
-    assert runner.inputs[i] == f"add-generic-password -U -s co.wispralt -a default -w {token}\n"
+    app = Paths.resolve().app
+    assert runner.inputs[i] == (
+        f"add-generic-password -U -s co.wispralt -a default -T {app} -T /usr/bin/security"
+        f" -w {token}\n"
+    )  # review fix: the app is trusted, so reading the key raises no Keychain prompt
     assert token not in runner.argv_text()
     assert not any(
         c[:3] == ["defaults", "write", client.DEFAULTS_DOMAIN] and "mode" in c for c in runner.calls
@@ -116,3 +121,13 @@ def test_client_mode_local_is_explicit(cli: CliFn, runner: FakeRunner, clone: Pa
     assert _client(cli, "--source", str(clone), "--client-mode", "local")[0] == 0
     assert ["defaults", "write", client.DEFAULTS_DOMAIN, "mode", "-string", "local"] in runner.calls
     assert ["security", "-i"] not in runner.calls  # role client: no host key to hand over
+
+
+def test_security_word_quoting() -> None:
+    assert client._arg("/Applications/WisprAlt.app") == "/Applications/WisprAlt.app"
+    assert (
+        client._arg("/Users/a b/Applications/WisprAlt.app")
+        == '"/Users/a b/Applications/WisprAlt.app"'
+    )
+    with pytest.raises(CliError):
+        client._arg('/x"y')

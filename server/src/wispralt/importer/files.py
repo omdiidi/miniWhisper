@@ -11,8 +11,13 @@ importer/files.py — import transcript files (TXT/JSON/SRT/VTT) as ``jobs`` row
 * One ``jobs`` row per group (``status='done'``, ``mode='file'``, ``wav_path=''``).
   Every file in the group is **copied** (never moved) to ``outputs/<id><ext>``, the
   layout the download and retention code already use: first to a private
-  ``.import-*.part`` temp, renamed only after the row commits. The owner's source
-  folders are never modified; only our own temps are ever removed.
+  ``.import-*.part`` temp, then renamed into place (a fresh uuid name, never an
+  existing file) **before** the row and its checkpoint commit, so a committed row
+  always has its outputs. A row that fails, turns out a duplicate, or whose batch
+  does not commit gets its copies removed again. A crash between the rename and
+  the commit leaves only unreferenced ``<uuid>.*`` copies; the retry makes new
+  ones. The owner's source folders are never modified; only our own copies are
+  ever removed.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from wispralt._errors import ImportIntegrityError, OwnerMappingRequired
-from wispralt.ops.backup import server_lock
+from wispralt.importer.lock import offline
 from wispralt.importer.report import Report
 from wispralt.importer.runs import ImportRuns
 from wispralt.imports import insert_rows
@@ -170,6 +175,22 @@ def _drop(pairs: list[tuple[Path, Path]]) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _unplace(pairs: list[tuple[Path, Path]]) -> None:
+    for _, final in pairs:  # our own fresh-uuid copies only — never a source file
+        final.unlink(missing_ok=True)
+
+
+def _place(pairs: list[tuple[Path, Path]]) -> None:
+    """Rename every temp to its final name; on failure undo all of it and re-raise."""
+    try:
+        for tmp, final in pairs:
+            os.rename(tmp, final)  # fresh uuid name: never an existing file
+    except OSError:
+        _unplace(pairs)
+        _drop(pairs)
+        raise
+
+
 def import_files(
     db: Database,
     paths: Iterable[Path],
@@ -224,7 +245,7 @@ def _apply(
 ) -> dict[str, int]:
     outputs.mkdir(parents=True, exist_ok=True)
     runs = ImportRuns(db)
-    with server_lock(db.path.parent):
+    with offline(db.path.parent):
         run = runs.begin(SOURCE, origin)
         total = len(planned)
         sids = [row["source_id"] for row, _ in planned]
@@ -232,15 +253,17 @@ def _apply(
             planned = planned[sids.index(run.checkpoint) + 1 :]
         c = {"new": 0, "duplicate": 0, "errors": 0, **run.counts}
         for i in range(0, len(planned), BATCH):
-            staged: dict[str, list[tuple[Path, Path]]] = {}
+            placed: dict[str, list[tuple[Path, Path]]] = {}
             rows = []
             for row, g in planned[i : i + BATCH]:
                 try:
-                    staged[row["id"]] = _stage(g, row["id"], outputs)
+                    pairs = _stage(g, row["id"], outputs)
+                    _place(pairs)  # outputs exist before the row (and checkpoint) commit
                 except OSError as exc:
                     c["errors"] += 1
                     report.problems.append(f"{g.parent / g.stem}: copy failed ({exc})")
                     continue
+                placed[row["id"]] = pairs
                 rows.append(row)
             committed = False
             try:
@@ -256,15 +279,11 @@ def _apply(
                 committed = True
             finally:
                 if not committed:
-                    for pairs in staged.values():
-                        _drop(pairs)
+                    for pairs in placed.values():
+                        _unplace(pairs)
             for row in rows:
-                pairs = staged[row["id"]]
-                if res.ids.get(row["source_id"]) == row["id"]:  # this row was inserted
-                    for tmp, final in pairs:
-                        os.rename(tmp, final)  # fresh uuid name: never an existing file
-                else:
-                    _drop(pairs)
+                if res.ids.get(row["source_id"]) != row["id"]:  # duplicate or failed row
+                    _unplace(placed[row["id"]])
             report.problems += [f"files {e.source_id}: {e.error}" for e in res.errors]
         if c["new"] + c["duplicate"] + c["errors"] != total:
             runs.finish(run.id, "failed", c)

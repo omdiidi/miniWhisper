@@ -168,3 +168,60 @@ def test_imported_job_shows_in_history(
     fi.import_files(db, [src], owner_id=owner, outputs_dir=_data_dir / "outputs")
     rows = job_store.transcripts_in_range(owner, since_epoch=0, until_epoch=2e9)
     assert {r["kind"] for r in rows} == {"file"} and len(rows) == 3
+
+
+def test_outputs_are_in_place_before_the_row_commits(
+    db: Database, src: Path, owner: int, _data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review fix: a committed (checkpointed) row always has its outputs; never rename after."""
+    outputs = _data_dir / "outputs"
+    real = fi.ImportRuns.checkpoint
+    seen: list[set[str]] = []
+
+    def check(con, run_id, checkpoint, counts):  # noqa: ANN001, ANN202
+        ids = {r[0] for r in con.execute("SELECT id FROM jobs WHERE source = 'files'")}
+        assert all(list(outputs.glob(f"{i}.*")) for i in ids)  # in the same transaction
+        seen.append(ids)
+        return real(con, run_id, checkpoint, counts)
+
+    monkeypatch.setattr(fi.ImportRuns, "checkpoint", staticmethod(check))
+    fi.import_files(db, [src], owner_id=owner, outputs_dir=outputs)
+    assert seen and len(seen[-1]) == 3
+
+
+def test_rename_failure_keeps_that_row_out_and_leaves_nothing(
+    db: Database, src: Path, owner: int, _data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outputs = _data_dir / "outputs"
+    real = fi.os.rename
+
+    def flaky(a, b):  # noqa: ANN001, ANN202
+        if str(b).endswith(".srt"):  # only group a has an .srt: fail it mid-way
+            raise OSError("rename failed")
+        return real(a, b)
+
+    monkeypatch.setattr(fi.os, "rename", flaky)
+    report = fi.import_files(db, [src], owner_id=owner, outputs_dir=outputs)
+    assert report.tables["files"]["errors"] == 1 and report.tables["files"]["new"] == 2
+    assert "job-a" not in {r["source_id"] for r in _jobs(db)}
+    ids = {r["id"] for r in _jobs(db)}
+    assert {p.name.split(".")[0] for p in outputs.iterdir()} == ids  # no orphan, no temp
+    monkeypatch.setattr(fi.os, "rename", real)
+    again = fi.import_files(db, [src], owner_id=owner, outputs_dir=outputs)
+    assert again.tables["files"]["new"] == 1  # the retry imports it, with its outputs
+    a = next(r for r in _jobs(db) if r["source_id"] == "job-a")
+    assert len(list(outputs.glob(f"{a['id']}.*"))) == 4
+
+
+def test_failed_commit_removes_placed_outputs(
+    db: Database, src: Path, owner: int, _data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outputs = _data_dir / "outputs"
+
+    def boom(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        raise RuntimeError("db gone")
+
+    monkeypatch.setattr(fi, "insert_rows", boom)
+    with pytest.raises(RuntimeError):
+        fi.import_files(db, [src], owner_id=owner, outputs_dir=outputs)
+    assert list(outputs.iterdir()) == [] and _jobs(db) == []

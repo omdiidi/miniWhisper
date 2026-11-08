@@ -115,4 +115,5 @@ local user. It never moves or edits the source files.
 - Identity: JSON `job_id` when present, else the sha256 of the primary file plus the
   owner, so the same file found twice (or a re-run) is a `duplicate`, never a second row.
 - Every file in the group is copied to `outputs/<new job id>.<ext>` (the normal output
-  layout), so downloads work like any other file job.
+  layout), so downloads work like any other file job. The copies are in place before
+  the row commits, so an imported job never lacks its files.

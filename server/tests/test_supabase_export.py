@@ -66,37 +66,31 @@ def test_second_export_same_day_gets_suffix_and_leaves_first_untouched(tmp_path:
     assert _tree_hash(first) == before
 
 
-def test_paging_walks_id_after(tmp_path: Path) -> None:
+def test_all_tables_come_from_one_dump(tmp_path: Path) -> None:
+    """Review fix: one consistent snapshot for every table, not separately paged reads."""
     rows = supabase_rows()
     rows["usage_events"] = [dict(rows["usage_events"][0], id=i) for i in range(1, 2501)]
     src = FakeSource(rows)
     d = sx.export_snapshot(src, tmp_path, DAY)
-    assert src.calls.count(("page", "usage_events")) == 3
+    assert [c for c in src.calls if c[0] == "dump"] == [("dump", ",".join(sx.TABLES))]
     ids = [json.loads(x)["id"] for x in (d / "usage_events.jsonl").read_text().splitlines()]
     assert ids == list(range(1, 2501))
 
 
-class _Growing(FakeSource):
-    """Count changes on every call (``grow_for`` calls), as if someone were writing."""
+class _Short(FakeSource):
+    """The snapshot's count says one more row than it returned."""
 
-    def __init__(self, grow_for: int) -> None:
-        super().__init__()
-        self.grow_for = grow_for
-        self.n = 0
-
-    def count(self, table: str) -> tuple[int, int | None]:
-        if table == "usage_events" and self.n < self.grow_for:
-            self.n += 1
-            return 10 + self.n, None
-        return super().count(table)
+    def dump(self, plan: dict[str, list[str]]) -> dict[str, sx.TableDump]:
+        got = super().dump(plan)
+        u = got["usage_events"]
+        return {**got, "usage_events": sx.TableDump(u.count + 1, u.max_id, u.rows)}
 
 
-def test_count_change_retries_once_then_fails(tmp_path: Path) -> None:
+def test_count_mismatch_fails_and_writes_no_counts(tmp_path: Path) -> None:
     with pytest.raises(ImportIntegrityError):
-        sx.export_snapshot(_Growing(grow_for=99), tmp_path, DAY)
-    d = sx.export_snapshot(_Growing(grow_for=2), tmp_path, DAY)  # attempt 1 off, attempt 2 ok
-    assert json.loads((d / "counts.json").read_text())["usage_events"]["exported"] == 10
-    assert (d / "usage_events.jsonl.part1").exists()  # the failed attempt is kept, not deleted
+        sx.export_snapshot(_Short(), tmp_path, DAY)
+    (d,) = tmp_path.iterdir()
+    assert not (d / "counts.json").exists() and not (d / "usage_events.jsonl").exists()
 
 
 def test_absent_table_exports_empty(tmp_path: Path) -> None:
@@ -115,25 +109,30 @@ class _FakePsql:
         self.calls: list[dict[str, Any]] = []
         self.stderr, self.code = stderr, code
 
+    def _answer(self, sql: str) -> list[str]:
+        if "information_schema.columns" in sql:
+            t = re.search(r"table_name = '(\w+)'", sql)[1]
+            return [json.dumps(list(self.rows[t][0]))]
+        if "json_build_object" in sql:
+            t = re.search(r"FROM wispralt\.(\w+)", sql)[1]
+            rows = self.rows[t]
+            return [
+                json.dumps({"table": t, "count": len(rows), "max_id": max(r["id"] for r in rows)})
+            ]
+        m = re.search(r"\(SELECT (.+?) FROM wispralt\.(\w+)\) p ORDER BY p\.id$", sql)
+        cols = [c.strip('" ') for c in m[1].split(",")]
+        return [
+            json.dumps({c: r[c] for c in cols})
+            for r in sorted(self.rows[m[2]], key=lambda r: r["id"])
+        ]
+
     def __call__(self, args: list[str], **kw: Any) -> subprocess.CompletedProcess:
         self.calls.append({"args": args, **kw})
         if self.code:
             return subprocess.CompletedProcess(args, self.code, "", self.stderr)
-        sql = kw["input"]
-        if "information_schema.columns" in sql:
-            t = re.search(r"table_name = '(\w+)'", sql)[1]
-            out: Any = list(self.rows[t][0])
-        elif "json_build_object" in sql:
-            rows = self.rows[re.search(r"FROM wispralt\.(\w+)", sql)[1]]
-            out = {"count": len(rows), "max_id": max(r["id"] for r in rows)}
-        else:
-            m = re.search(
-                r"\(SELECT (.+?) FROM wispralt\.(\w+) WHERE id > (-?\d+) .*LIMIT (\d+)", sql
-            )
-            cols = [c.strip('" ') for c in m[1].split(",")]
-            got = [r for r in self.rows[m[2]] if r["id"] > int(m[3])][: int(m[4])]
-            out = [{c: r[c] for c in cols} for r in got]
-        return subprocess.CompletedProcess(args, 0, json.dumps(out) + "\n", "")
+        stmts = [x.strip() for x in kw["input"].split(";") if x.strip().startswith("SELECT")]
+        out = [line for q in stmts for line in self._answer(q)]
+        return subprocess.CompletedProcess(args, 0, "\n".join(out) + "\n", "")
 
 
 def test_psql_sends_only_read_only_selects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -141,11 +140,21 @@ def test_psql_sends_only_read_only_selects(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(sx.subprocess, "run", fake)
     d = sx.export_snapshot(sx.PsqlSource(URL), tmp_path, DAY)
     assert json.loads((d / "counts.json").read_text())["users"]["exported"] == 3
-    assert fake.calls
+    data_sessions = [c for c in fake.calls if "information_schema" not in c["input"]]
+    assert len(data_sessions) == 1  # every table's data from ONE psql session
+    snap_sql = data_sessions[0]["input"]
+    assert snap_sql.startswith(
+        "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSELECT "
+    )
+    assert snap_sql.count("BEGIN") == 1 and snap_sql.count("COMMIT") == 1
+    assert all(f"wispralt.{t}" in snap_sql for t in sx.TABLES)
     for call in fake.calls:
         sql = call["input"]
-        assert sql.startswith("BEGIN TRANSACTION READ ONLY;\nSELECT ")
-        assert sql.endswith(";\nCOMMIT;\n") and sql.count(";") == 3
+        begin, *stmts, commit, tail = sql.split(";")
+        assert begin.startswith("BEGIN TRANSACTION ") and commit.strip() == "COMMIT"
+        assert tail == "\n" and all(q.strip().startswith("SELECT ") for q in stmts)
+        if "information_schema" in sql:
+            assert begin == "BEGIN TRANSACTION READ ONLY" and len(stmts) == 1
         assert not WRITE_VERBS.search(sql), sql
         assert "token_hash" not in sql.split("information_schema")[0]
         args = call["args"]
@@ -159,14 +168,24 @@ def test_psql_sends_only_read_only_selects(tmp_path: Path, monkeypatch: pytest.M
         assert "WISPRALT_IMPORT_PG_URL" not in env
 
 
+def test_truncated_psql_stream_is_an_integrity_failure() -> None:
+    out = '{"table": "users", "count": 2, "max_id": 2}\n{"id": 1}\n'
+    with pytest.raises(ImportIntegrityError):
+        sx._parse_dump(out, ["users"])
+    with pytest.raises(ImportIntegrityError):
+        sx._parse_dump(out.replace('"count": 2', '"count": 1') + "extra\n", ["users"])
+
+
 def test_wrap_refuses_anything_but_a_select() -> None:
     for bad in ("DELETE FROM wispralt.users", "SELECT 1; DROP TABLE x", "SELECT * INTO t FROM u"):
         with pytest.raises(ValueError):
             sx._wrap(bad)
     with pytest.raises(ValueError):
-        sx.PsqlSource(URL).page("users", ["id", "label; drop"], 0, 10)
+        sx._snapshot_script(["SELECT 1", "UPDATE wispralt.users SET label = 'x'"])
     with pytest.raises(ValueError):
-        sx.PsqlSource(URL).count("api_keys")
+        sx.PsqlSource(URL).dump({"users": ["id", "label; drop"]})
+    with pytest.raises(ValueError):
+        sx.PsqlSource(URL).dump({"api_keys": ["id"]})
 
 
 @pytest.mark.parametrize(
@@ -211,7 +230,7 @@ def test_json_pages_source_round_trip(tmp_path: Path) -> None:
     pages.mkdir()
     for t, rows in supabase_rows().items():
         (pages / f"{t}.json").write_text(json.dumps(rows))
-    d = sx.export_snapshot(sx.JsonPagesSource(pages), tmp_path / "out", DAY, page_size=4)
+    d = sx.export_snapshot(sx.JsonPagesSource(pages), tmp_path / "out", DAY)
     ref = sx.export_snapshot(FakeSource(), tmp_path / "ref", DAY)
     for t in sx.TABLES:
         assert (d / f"{t}.jsonl").read_bytes() == (ref / f"{t}.jsonl").read_bytes()

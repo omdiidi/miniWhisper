@@ -28,6 +28,7 @@ from wispralt._errors import (
     ServerRunning,
 )
 from wispralt.database import Database
+from wispralt.importer.lock import offline
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -68,31 +69,38 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
-def _open_db(migrate: bool) -> Database:
+def _open_db() -> Database:
+    """The existing local DB, opened without migrating or writing anything."""
     from wispralt.config import settings  # needs DATA_DIR; export does not
 
     db = Database(settings.db_path)
     if not db.path.exists():
-        raise ExportUnavailable(f"{db.path} does not exist: run python -m wispralt.bootstrap first")
-    if migrate:
-        db.migrate()
+        raise ExportUnavailable(f"{db.path} does not exist: run `wispralt setup --role host` first")
     return db
 
 
 def _confirmed_run(args: argparse.Namespace, run: Callable[..., Report]) -> int:
-    """Dry run → print; else confirm (``--yes`` or a prompt after a dry run) → apply."""
+    """Dry run → print; else confirm (``--yes`` or a prompt after a dry run) → apply.
+
+    A dry run never migrates. A real run takes the offline server lock first and
+    holds it across the migration and the import (``ServerRunning`` → refused).
+    """
     if args.dry_run:
-        print(run(_open_db(migrate=False), dry_run=True).render())
+        print(run(_open_db(), dry_run=True).render())
         return OK
     if not args.yes:
         if not _interactive():
             print("refused: non-interactive run needs --yes (or --dry-run)", file=sys.stderr)
             return REFUSED
-        print(run(_open_db(migrate=False), dry_run=True).render())
+        print(run(_open_db(), dry_run=True).render())
         if input("Import now (stop the server first)? [y/N] ").strip().lower() != "y":
             print("nothing imported", file=sys.stderr)
             return REFUSED
-    print(run(_open_db(migrate=True), dry_run=False).render())
+    db = _open_db()
+    with offline(db.path.parent):
+        db.migrate()
+        report = run(db, dry_run=False)
+    print(report.render())
     return OK
 
 

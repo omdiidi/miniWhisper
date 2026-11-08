@@ -236,13 +236,17 @@ def env_value(path: Path, key: str) -> str | None:
     return dotenv_values(path).get(key) if path.exists() else None
 
 
+def _check_values(values: dict[str, str]) -> None:
+    for k, v in values.items():
+        if any(c in v for c in '"\\\n'):
+            raise CliError(2, f"{k} value may not contain quotes, backslashes or newlines")
+
+
 def merge_missing(path: Path, values: dict[str, str]) -> list[str]:
     """Append each key of *values* absent from *path*; returns the keys added. 0600."""
     present = env_keys(path)
     added = [k for k in values if k not in present]
-    for k in added:
-        if any(c in values[k] for c in '"\\\n'):
-            raise CliError(2, f"{k} value may not contain quotes, backslashes or newlines")
+    _check_values({k: values[k] for k in added})
     if not added and path.exists():
         path.chmod(0o600)  # untouched otherwise: a rerun changes no byte
         return added
@@ -250,3 +254,30 @@ def merge_missing(path: Path, values: dict[str, str]) -> list[str]:
     sep = "" if not old or old.endswith("\n") else "\n"
     write_private(path, old + sep + "".join(f'{k}="{values[k]}"\n' for k in added))
     return added
+
+
+def set_values(path: Path, values: dict[str, str]) -> list[str]:
+    """Set each key of *values* (an explicit flag wins): its assignment is replaced in
+    place, or appended. Other lines and comments stay; equal values change no byte.
+    Returns the keys whose value changed. 0600."""
+    _check_values(values)
+    current = dotenv_values(path) if path.exists() else {}
+    changed = [k for k, v in values.items() if current.get(k) != v]
+    if not changed:
+        return changed
+    out: list[str] = []
+    written: set[str] = set()
+    for line in path.read_text().splitlines(keepends=True) if path.exists() else []:
+        m = _KEY_RE.match(line)
+        key = m.group(1) if m else None
+        if key in changed:
+            if key not in written:  # a duplicate assignment of the same key is dropped
+                out.append(f'{key}="{values[key]}"\n')
+                written.add(key)
+            continue
+        out.append(line)
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    out += [f'{k}="{values[k]}"\n' for k in changed if k not in written]
+    write_private(path, "".join(out))
+    return changed

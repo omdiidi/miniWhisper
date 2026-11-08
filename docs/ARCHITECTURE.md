@@ -610,7 +610,7 @@ is rate-limited per client IP.
 - **Service.** A per-user LaunchAgent `co.wispralt.host` (`gui/$UID`) runs uvicorn from the tool venv on `127.0.0.1:<port>` with the config dir as its working directory; remote access goes through `tailscale serve` or the optional tunnel. `stop` is proven by taking `server_lock` (bootout returns before teardown ends); `restart` reloads only when the rendered plist changed. A mini-era `co.wispralt.server` agent is booted out and its plist moved to `config/legacy/`.
 - **Status and doctor.** `status` reports allocated sizes (`st_blocks`, so APFS clones are not double-counted), backups, `*.pre-restore-*` copies and retention. `doctor` is read-only (`mode=ro` integrity check, Keychain presence without reading secrets); only `--warmup` loads the dictation model, so a running host never pays its RAM twice.
 - **Offline operations.** `backup`, `restore` and `update` run inside `service_stopped`: boot the agent out, prove it stopped by taking `server_lock`, run the Part 4 function (`ops.backup.backup` / `restore`), and start the agent again in `finally` if it had been loaded. `restore` keeps the old tree at `<data_dir>.pre-restore-<ts>`; the CLI never deletes those or any backup.
-- **Update and uninstall.** `update` pulls (`--ff-only`, refusing a dirty clone), stops the service, backs up, reinstalls the tool and `execv`s its second phase in the new code, which re-verifies models, restarts the agent and waits for `/healthz` + `/readyz/db` (migrations run in the lifespan). `uninstall` removes only the recorded `artifacts` (and only under the install root or LaunchAgents), with `uv tool uninstall` last; `--purge-data` backs up first.
+- **Update and uninstall.** `update` pulls (`--ff-only`, refusing a dirty clone), stops the service, backs up, reinstalls the tool and `execv`s its second phase in the new code, which re-verifies models, restarts the agent and waits for `/healthz` + `/readyz/db` (migrations run in the lifespan). `uninstall` removes only the recorded `artifacts` (and only under the install root or LaunchAgents), with `uv tool uninstall` last; `--purge-data` backs up first (a files-only copy when there is no DB) and then deletes only what WisprAlt owns in the data dir (`wispralt.db*`, `setup-code`, `outputs/`, `staging/`; the dir only if then empty). A phase-2 failure still tries to start the service. Explicit `--server-url` / `--port` on a setup rerun update `SERVER_URL` (`paths.set_values`); defaults never clobber.
 - **Exit codes.** 0 ok, 1 failed, 2 usage error or missing non-interactive answer, 3 doctor failures. `--non-interactive` never prompts; `--json` is machine output.
 - The CLI never imports `wispralt.config` (its module-level `Settings()` needs a `.env`): it takes the data dir from `install-state.json`, and the service reads the config `.env` from its launchd `WorkingDirectory`.
 
@@ -733,25 +733,32 @@ it is inserted, a duplicate (its existing id is read in the same transaction), o
 a `RowError` naming the `source_id` and the failed constraint, while the rest of
 the batch commits. `link_existing` stamps an existing row (the owner's local admin)
 with a `(source, source_id)` once, idempotently. A real import holds the offline
-`<data_dir>.lock` via `ops.backup.server_lock`, so it refuses while the server runs.
+`<data_dir>.lock` via `ops.backup.server_lock` (through `importer/lock.py`'s
+re-entrant `offline`), so it refuses while the server runs; `python -m
+wispralt.importer` takes it *before* migrating and holds it through the import, and
+a dry run never migrates.
 
 **Supabase export (read-only).** `importer/supabase_export.py` copies the old
 Postgres history (`users` without `token_hash`, `usage_events`, `fallback_events`)
 into `~/WisprAlt-Backups/supabase-snapshot-YYYY-MM-DD[-N]/` (dir 0700, files 0600):
 one canonical-JSON line per row in `<table>.jsonl`, plus `counts.json` per table
 (`source_count`, `exported`, `columns`, `max_id`, `sha256` of the JSONL bytes,
-`exported_at`). Supabase is never written: `PsqlSource` only sends
-`BEGIN TRANSACTION READ ONLY; <one allowlisted SELECT>; COMMIT;` through
+`exported_at`). Supabase is never written: `PsqlSource` only sends allowlisted SELECTs through
 `psql -X -q -At -v ON_ERROR_STOP=1` with `PGOPTIONS=-c default_transaction_read_only=on`;
 table names are fixed, columns come from `information_schema` and are
-identifier-checked, and `_wrap` refuses any statement with a write verb. The
+identifier-checked, and `_check` refuses any statement with a write verb. Column
+discovery is a catalog read (`BEGIN TRANSACTION READ ONLY; <SELECT>; COMMIT;`); all
+**data** then comes from ONE psql session in ONE `BEGIN TRANSACTION ISOLATION LEVEL
+REPEATABLE READ READ ONLY` transaction, so every table is the same consistent
+snapshot. The
 connection string (env `WISPRALT_IMPORT_PG_URL`, else Keychain item
-`co.wispralt.import-pg`) reaches `psql` only as `PG*` env vars. Rows are paged by
-`id > after`; `count(*)`/`max(id)` are read before and after each table and must
-match the rows written, else the table is retried once and then fails. A fresh
-snapshot dir is created per run (`-2`, `-3`, … on the same day); files are created
-with `O_EXCL`, a failed attempt's `.partN` file is kept, and nothing is ever
-deleted or overwritten. An unreachable or paused project raises `ExportBlocked`
+`co.wispralt.import-pg`) reaches `psql` only as `PG*` env vars. Per table that session prints a
+`count(*)`/`max(id)` header line, then one `row_to_json` line per row; the parser
+demands exactly that shape and the rows must match the header, else
+`ImportIntegrityError` (no retry: a snapshot cannot drift). The output is held in
+memory, fine for this history's size. A fresh snapshot dir is created per run
+(`-2`, `-3`, … on the same day); files are created with `O_EXCL`, a failed write's
+`.part` file is kept, and nothing is ever deleted or overwritten. An unreachable or paused project raises `ExportBlocked`
 and leaves `BLOCKED.json`; nothing ever calls a Supabase management API or
 unpauses it. `JsonPagesSource(dir)` reads `<table>.json` arrays saved by hand from
 the same SELECTs (read-only MCP fallback).
@@ -779,9 +786,11 @@ prints the counts and the owner proposal.
 `jobs` rows (`source='files'`, `status='done'`, `mode='file'`, `wav_path=''`, with
 `estimated=1` when the time is a file mtime); see
 [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#importing-old-transcript-files-part-7).
-Each group's files are copied to `.import-<id><ext>.part` temps in `outputs/` before
-the batch commits and renamed to `<id><ext>` only for rows actually inserted; a
-duplicate, a row error or a failed write removes only those temps. The first-run
+Each group's files are copied to `.import-<id><ext>.part` temps in `outputs/` and
+renamed to `<id><ext>` (fresh uuid names) *before* the batch and its checkpoint
+commit, so a committed row always has its outputs; a duplicate, a row error, a
+failed rename or an uncommitted batch removes only those copies. A crash between
+rename and commit leaves unreferenced `<uuid>.*` copies; the retry makes new ones. The first-run
 duplicate abort does not apply here: the same file in two folders is an expected
 duplicate.
 

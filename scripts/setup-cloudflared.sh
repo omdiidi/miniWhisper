@@ -36,8 +36,15 @@ persist_env_var() {
     local KEY="$1"
     local VALUE="$2"
     if grep -q "^${KEY}=" "$ENV_FILE" 2>/dev/null; then
-        TMP_ENV="$(dirname "$ENV_FILE")/.env.tmp.$$"
-        sed "s@^${KEY}=.*@${KEY}=${VALUE}@" "$ENV_FILE" > "$TMP_ENV"
+        # The .env holds the API key: the temp copy is 0600 from creation (mkstemp
+        # under umask 077), never world-readable even for a moment.
+        local TMP_ENV
+        TMP_ENV="$(umask 077 && mktemp "$(dirname "$ENV_FILE")/.env.tmp.XXXXXX")"
+        chmod 600 "$TMP_ENV"
+        if ! sed "s@^${KEY}=.*@${KEY}=${VALUE}@" "$ENV_FILE" > "$TMP_ENV"; then
+            rm -f "$TMP_ENV"
+            return 1
+        fi
         mv "$TMP_ENV" "$ENV_FILE"
     else
         printf '\n%s=%s\n' "$KEY" "$VALUE" >> "$ENV_FILE"
