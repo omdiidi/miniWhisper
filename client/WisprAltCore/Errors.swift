@@ -41,6 +41,10 @@ public enum ProviderError: LogSafeError, Equatable {
     case emptyRecording
     case cancelled
     case http(status: Int, kind: OpenAIErrorKind)
+    /// Realtime socket failed to open, closed early, or its send buffer overflowed.
+    case notConnected
+    /// A Realtime `error` / `…transcription.failed` event; `type` is its sanitized code.
+    case realtime(type: String)
 
     public var logDescription: String {
         switch self {
@@ -49,6 +53,8 @@ public enum ProviderError: LogSafeError, Equatable {
         case .emptyRecording: return "emptyRecording"
         case .cancelled: return "cancelled"
         case .http(let status, let kind): return "http(status: \(status), kind: \(kind))"
+        case .notConnected: return "notConnected"
+        case .realtime(let type): return "realtime(type: \(type))"
         }
     }
 
@@ -59,6 +65,15 @@ public enum ProviderError: LogSafeError, Equatable {
         case .emptyRecording: return .empty
         case .cancelled: return .cancelled
         case .http(_, let kind): return .failed(kind.failureKind)
+        case .notConnected: return .failed(.network)
+        case .realtime(let type):
+            switch type {
+            case "invalid_api_key": return .failed(.auth)
+            case "insufficient_quota": return .failed(.quota)
+            case "model_not_found": return .failed(.modelNotFound)
+            case "server_error": return .failed(.server)
+            default: return .failed(.other)
+            }
         }
     }
 }

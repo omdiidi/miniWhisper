@@ -106,6 +106,15 @@ final class DictationRecorder {
     /// queue, preserving order, and only synchronize on stop().
     private let ioQueue = DispatchQueue(label: "co.wispralt.dictation.io", qos: .userInitiated)
 
+    /// Serial queue feeding a live (Realtime) frame sink: the tap copies each
+    /// buffer and dispatches here, so resampling and sending never block the
+    /// render thread. Drained and flushed by `stop()` before the spool closes.
+    private let frameQueue = DispatchQueue(label: "co.wispralt.dictation.frames", qos: .userInitiated)
+
+    /// The live sink and its per-dictation resampler (24 kHz mono); nil for
+    /// file and Local dictations. Only touched on `frameQueue` after `start()`.
+    private var liveFeed: (sink: LiveFrameSink, resampler: MonoResampler)?
+
     /// AVAudioFile for the in-progress recording (overwritten each call to start()).
     /// Only mutated on `ioQueue` (and on the main thread before start / after fence).
     private var audioFile: AVAudioFile?
@@ -335,11 +344,14 @@ final class DictationRecorder {
     ///     when this is non-nil, so an Online dictation never streams.
     ///   - maxSeconds: the dictation cap; audio past it is dropped and
     ///     `.dictationMaxDurationReached` is posted once.
+    ///   - frameSink: a live provider fed while FN is held (Realtime only);
+    ///     nil leaves the Local and file paths unchanged.
     /// - Returns: `true` when capture started; `false` while the previous
     ///   capture has not finished handing off (`stop()` before `slot.end()`).
     /// - Throws: `DictationError.engineStartFailed` if the audio engine cannot
     ///   start. Every throw happens before `slot.begin`, so the slot stays free.
-    func start(dictationId: String, endpoint: ServerEndpoint?, maxSeconds: Int) throws -> Bool {
+    func start(dictationId: String, endpoint: ServerEndpoint?, maxSeconds: Int,
+               frameSink: LiveFrameSink? = nil) throws -> Bool {
         guard !slot.isActive else { return false }
 
         // Always start with a clean swallow flag. If a previous session armed it
@@ -443,6 +455,11 @@ final class DictationRecorder {
             DictationStreamSession(endpoint: $0, dictationId: dictationId, speechStartedAt: Date())
         }
         isLocalCapture = endpoint != nil
+        let feed = frameSink.map {
+            (sink: $0, resampler: MonoResampler(inputRate: inputFormat.sampleRate,
+                                                channels: Int(inputFormat.channelCount),
+                                                outputRate: Double($0.inputSampleRate)))
+        }
 
         // Write directly in the input format. The server (soundfile + librosa)
         // resamples to 16 kHz internally, so we don't need to do it client-side.
@@ -632,6 +649,20 @@ final class DictationRecorder {
                 }
             }
 
+            // === Live models (Realtime only): copy, then resample + send off-thread.
+            if let feed, let chans = buffer.floatChannelData {
+                let frames = Int(buffer.frameLength)
+                let channels = Int(buffer.format.channelCount)
+                var interleaved = [Float](repeating: 0, count: frames * channels)
+                for f in 0..<frames {
+                    for ch in 0..<channels { interleaved[f * channels + ch] = chans[ch][f] }
+                }
+                self.frameQueue.async {
+                    let mono = feed.resampler.process(interleaved)
+                    if !mono.isEmpty { feed.sink.append(mono) }
+                }
+            }
+
             // === Streaming dictation (Local only). ==========================
             // Only emit chunks when this capture has a Local session.
             // The classify/append/cut sequence is intentionally inline on the
@@ -728,6 +759,7 @@ final class DictationRecorder {
         // full reasoning.
         sessionStartTime = Date().timeIntervalSinceReferenceDate
 
+        frameQueue.sync { liveFeed = feed }   // stop() flushes it; set only once capture is live
         _ = slot.begin(session)
         Log.info(
             "DictationRecorder: recording started (input: \(Int(inputFormat.sampleRate))Hz \(inputFormat.channelCount)ch).",
@@ -742,7 +774,8 @@ final class DictationRecorder {
     /// 1. Set `stopRequested` so the realtime tap callback drops new buffers.
     /// 2. `removeTap`, then `engine.stop()`.
     /// 3. Take `chunkLock` once (fences a tap callback already past the check).
-    /// 4. Drain `ioQueue`, then `chunkEncodeQueue` (late chunks registered).
+    /// 4. Drain `ioQueue`, then `frameQueue` (+ live resampler flush), then
+    ///    `chunkEncodeQueue` (late chunks registered).
     /// 5. Release `audioFile` (closes the WAV).
     /// 6. Copy EVERY per-dictation value into locals, then `slot.end()`.
     ///    From here on `start()` may run for the next dictation, so only the
@@ -765,6 +798,13 @@ final class DictationRecorder {
         chunkLock.lock()
         chunkLock.unlock()
         ioQueue.sync { /* drain in-flight file writes */ }
+        frameQueue.sync {   // drain live frames, then flush the resampler's tail
+            if let feed = liveFeed {
+                let tail = feed.resampler.flush()
+                if !tail.isEmpty { feed.sink.append(tail) }
+            }
+            liveFeed = nil
+        }
         chunkEncodeQueue.sync { /* drain chunk encodes + actor registrations */ }
         if let token = configChangeObserver {
             NotificationCenter.default.removeObserver(token)

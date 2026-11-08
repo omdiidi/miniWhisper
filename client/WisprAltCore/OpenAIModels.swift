@@ -51,6 +51,7 @@ public struct OpenAIModel: Identifiable, Equatable, Sendable {
 /// The OpenAI transcription catalog. `-diarize` is deliberately absent.
 public enum OpenAIModels {
     public static let defaultFileModelID = "gpt-transcribe"
+    public static let defaultLiveModelID = "gpt-live-transcribe"
     /// OpenAI's upload limit, taken as decimal megabytes (A11).
     public static let uploadLimitBytes = 25_000_000
     /// Hard ceiling for any dictation, every mode.
@@ -73,17 +74,15 @@ public enum OpenAIModels {
                     priceIsEstimate: true, retires: date(2027, 1, 20)),
         OpenAIModel(id: "whisper-1", kind: .file, pricePerMinute: Decimal(string: "0.006")!,
                     priceIsEstimate: false, retires: date(2027, 2, 26)),
+        // Live (Realtime API). gpt-realtime-whisper's 2,000 output tokens are
+        // documented (A1) → 420 s cap. realtimeCommitLimit: set only from P3/P3b.
+        OpenAIModel(id: "gpt-live-transcribe", kind: .live, pricePerMinute: Decimal(string: "0.017")!,
+                    priceIsEstimate: false, retires: nil),
+        OpenAIModel(id: "gpt-realtime-whisper", kind: .live, pricePerMinute: Decimal(string: "0.017")!,
+                    priceIsEstimate: false, retires: nil, supportsPrompt: false, maxOutputTokens: 2000),
     ]
 
     public static func model(id: String) -> OpenAIModel? { all.first { $0.id == id } }
-
-    /// The picker reset target after `model_not_found` for a model of `kind`.
-    public static func defaultID(for kind: OpenAIModel.Kind) -> String {
-        switch kind {
-        case .file: return defaultFileModelID
-        case .live: return defaultFileModelID   // Task 11 adds the live default.
-        }
-    }
 
     /// The stored model id, or the default when it is unknown or missing.
     public static func resolve(id: String?) -> OpenAIModel {

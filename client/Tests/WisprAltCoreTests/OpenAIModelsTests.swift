@@ -8,7 +8,7 @@ import WisprAltCore
     }
 
     @Test func everyDeprecatedModel_hasARetireDate() {
-        for m in OpenAIModels.all where m.id != OpenAIModels.defaultFileModelID {
+        for m in OpenAIModels.all where m.kind == .file && m.id != OpenAIModels.defaultFileModelID {
             #expect(m.retires != nil, "\(m.id)")
         }
         #expect(OpenAIModels.model(id: "gpt-4o-mini-transcribe-2025-03-20")?.retires == DateComponents(year: 2027, month: 1, day: 20))
@@ -48,7 +48,23 @@ import WisprAltCore
         #expect(OpenAIModels.model(id: "gpt-4o-mini-transcribe-2025-03-20")?.retireTag == "retires Jan 20, 2027")
     }
 
-    @Test func modelNotFound_resetsToTheKindDefault() {
-        #expect(OpenAIModels.defaultID(for: .file) == "gpt-transcribe")
+    @Test func exactlyOneDefaultPerKind() {
+        #expect(OpenAIModels.model(id: OpenAIModels.defaultFileModelID)?.kind == .file)
+        #expect(OpenAIModels.model(id: OpenAIModels.defaultLiveModelID)?.kind == .live)
+        #expect(OpenAIModels.defaultLiveModelID == "gpt-live-transcribe")
+        #expect(OpenAIModels.all.filter { $0.kind == .live }.map(\.id) == ["gpt-live-transcribe", "gpt-realtime-whisper"])
+        // A live pick never reaches the file endpoint: file jobs and Retry use the file default.
+        #expect(OpenAIModels.fileModel(for: "gpt-live-transcribe").id == "gpt-transcribe")
+    }
+
+    @Test func liveCaps_realtimeWhisper420_liveTranscribe600() {
+        let whisper = OpenAIModels.model(id: "gpt-realtime-whisper")!
+        #expect(whisper.maxOutputTokens == 2000)
+        #expect(whisper.dictationCapSeconds == 420)
+        #expect(!whisper.supportsPrompt)
+        let liveT = OpenAIModels.model(id: "gpt-live-transcribe")!
+        #expect(liveT.maxOutputTokens == nil)
+        #expect(liveT.dictationCapSeconds == 600)
+        #expect(liveT.displayPrice == "$0.017/min")
     }
 }

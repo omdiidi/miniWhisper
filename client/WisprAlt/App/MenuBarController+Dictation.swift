@@ -85,7 +85,8 @@ extension MenuBarController {
             let tNet = clock.now
             var result: DictationResult
             switch try s.route(local: out.local) {
-            case .openAIFile(let provider): result = try await provider.finish(out.recording)
+            case .openAIFile(let provider), .openAIRealtime(let provider):
+                result = try await provider.finish(out.recording)
             case .local(let capture, let endpoint):
                 result = try await LocalServerProvider(endpoint: endpoint, dictationId: s.snapshot.id)
                     .finish(capture: capture, durationSeconds: out.recording.durationSeconds)
@@ -128,9 +129,9 @@ extension MenuBarController {
             s.provider?.cancel()
             Log.error("dictation failed: \(ErrorLog.describe(error))", category: "dictation")
             outcome = DictationOutcome(ErrorLog.outcome(error))
-            if outcome == .failed(.modelNotFound), s.snapshot.mode == .online, let model = s.snapshot.model {
-                // Reset the picker so the next dictation works.
-                Settings.shared.openAIModel = OpenAIModels.defaultID(for: model.kind)
+            if outcome == .failed(.modelNotFound), s.snapshot.mode == .online {
+                // Reset the picker to the known-good file model so the next dictation works.
+                Settings.shared.openAIModel = OpenAIModels.defaultFileModelID
             }
         }
         if interrupted { showToast("Audio device changed — transcribed what was recorded") }
@@ -148,7 +149,7 @@ extension MenuBarController {
                 : "API key rejected. Re-paste your API key in Settings."
         case .quota: return "OpenAI quota exceeded. Check your OpenAI billing."
         case .modelNotFound:
-            return "That OpenAI model is not available. Switched to \(OpenAIModels.defaultID(for: .file))."
+            return "That OpenAI model is not available. Switched to \(OpenAIModels.defaultFileModelID)."
         case .network: return "Network error. Check your connection and try again."
         case .server: return "The transcription service returned an error. Try again."
         case .deadline: return "Transcription took too long and was stopped."
@@ -199,10 +200,11 @@ extension MenuBarController: FNKeyEventsDelegate {
         }
 
         let provider = ProviderFactory.make(snapshot)
+        let liveSink = provider as? LiveFrameSink
         let started: Bool
         do {
             started = try dictationRecorder.start(dictationId: snapshot.id, endpoint: snapshot.streamEndpoint,
-                                                  maxSeconds: snapshot.capSeconds)
+                                                  maxSeconds: snapshot.capSeconds, frameSink: liveSink)
         } catch {
             provider?.cancel()
             SpoolFiles.removeSidecarSync(snapshot.id)
@@ -215,6 +217,7 @@ extension MenuBarController: FNKeyEventsDelegate {
             showToast("Still saving the last dictation — press again")
             return
         }
+        liveSink?.start()   // opens the Realtime socket; frames stream while FN is held
         currentSession = DictationSession(snapshot: snapshot, provider: provider)
         Log.info("Dictation started (mode=\(mode.rawValue)).", category: "dictation")
     }

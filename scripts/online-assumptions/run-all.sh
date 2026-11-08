@@ -2,8 +2,10 @@
 # Real-API assumption gates for Online mode (OpenAI). Costs real money.
 #
 # Builds WisprAltProbe, then runs `preflight` (P5 Keychain read, P1 long-clip
-# report) and `suite-file` (every file model on a short clip + one direct m4a
-# upload). `suite-live` joins in Task 11.
+# report, P3 one 600 s gpt-live-transcribe commit (+ P3b at 210 s only on a
+# commit error), P4 live latency report), `suite-file` (every file model on a
+# short clip + one direct m4a upload) and `suite-live` (both live models on a
+# short clip + one recovery case).
 #
 # The key is read inside the probe from the Keychain (co.wispralt.openai);
 # this script never touches it. Every billable call is appended by the probe,
@@ -22,7 +24,7 @@ RUN="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 BIN="$(cd "$ROOT/client" && swift build --show-bin-path)/WisprAltProbe"
 
 final=0
-for step in preflight suite-file; do
+for step in preflight suite-file suite-live; do
   echo "== $step (run $RUN)"
   "$BIN" "$step" --ledger "$LEDGER" --run "$RUN" --fixture "$FIXTURE"
   rc=$?

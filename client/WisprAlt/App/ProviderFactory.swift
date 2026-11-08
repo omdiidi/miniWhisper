@@ -9,6 +9,12 @@ enum ProviderFactory {
         case .openAIFile:
             guard let model = snapshot.model else { return nil }
             return OpenAIFileProvider(model: model, keyProvider: { OpenAIKey.current() })
+        case .openAIRealtime:
+            guard let model = snapshot.model else { return nil }
+            // A recoverable live failure re-sends the same audio to gpt-transcribe.
+            let recovery = OpenAIFileProvider(model: OpenAIModels.fileModel(for: OpenAIModels.defaultFileModelID),
+                                              keyProvider: { OpenAIKey.current() })
+            return OpenAIRealtimeProvider(model: model, keyProvider: { OpenAIKey.current() }, fileRecovery: recovery)
         case .local, .needKey:
             return nil
         }
@@ -29,6 +35,9 @@ struct DictationSession {
         case .openAIFile:
             guard let provider else { throw ProviderError.keyMissing }
             return .openAIFile(provider)
+        case .openAIRealtime:
+            guard let provider else { throw ProviderError.keyMissing }
+            return .openAIRealtime(provider)
         case .local:
             guard let local, let endpoint = snapshot.endpoint else { throw ServerError.missingConfiguration }
             return .local(local, endpoint)
@@ -41,6 +50,8 @@ struct DictationSession {
 /// App-only route enum: `LocalCapture` never enters WisprAltCore.
 enum DictationRoute {
     case openAIFile(DictationProvider)
+    /// Live model: audio already streamed while FN was held; `finish` commits.
+    case openAIRealtime(DictationProvider)
     case local(LocalCapture, ServerEndpoint)
 }
 

@@ -43,6 +43,15 @@ public protocol DictationProvider: AnyObject {
     func cancel()
 }
 
+/// A provider that takes audio while FN is held (the Realtime live models).
+/// The recorder feeds `append` mono Float samples at `inputSampleRate` from
+/// one serial queue; `start()` is called once, right after capture starts.
+public protocol LiveFrameSink: AnyObject {
+    var inputSampleRate: Int { get }
+    func start()
+    func append(_ mono: [Float])
+}
+
 /// A transcript is possibly cut off only when the model has a verified
 /// output-token ceiling and the reply used all of it.
 public enum TruncationCheck {

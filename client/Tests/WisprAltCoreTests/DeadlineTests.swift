@@ -57,7 +57,8 @@ import Testing
                 return 1
             }
         }
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        // Cancel only once the timeout has fired (a fixed sleep raced a busy test pool).
+        for _ in 0..<500 where fired.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
         task.cancel()
         let result = await task.result
         #expect(throws: ProviderError.deadlineExceeded) { try result.get() }

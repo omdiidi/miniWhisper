@@ -12,7 +12,15 @@ All notable changes to WisprAlt are documented here.
   prompt per new app build. Without a key, FN shows a notice and opens the
   key field. Use a project-scoped key with a monthly budget cap.
 - Pick the model in Settings → Advanced; prices are shown beside each.
-  Dictation stops at 10 minutes.
+  Dictation stops at 10 minutes (7 with gpt-realtime-whisper).
+- Live models (gpt-live-transcribe, gpt-realtime-whisper) stream audio while
+  you hold FN and give the text at release, not while you speak. They cost
+  about 3.8× more; measured latency is in docs/TESTING.md. If a live session
+  fails at release, the same audio is re-sent to gpt-transcribe: for a
+  10-minute dictation that can take up to about 8 minutes and is charged a
+  second time.
+- Known limit: with gpt-realtime-whisper, if OpenAI reports no token count, a
+  cut-off transcript cannot be flagged; its 7-minute cap is the protection.
 - In Online mode nothing is sent to your Local server. A running Local file
   job pauses when you switch to Online; switching back resumes watching it,
   as after a relaunch (you get a completion notice and re-run it to download
@@ -26,8 +34,8 @@ All notable changes to WisprAlt are documented here.
   as is, and splits the rest. It saves TXT and JSON; subtitles need Local.
   Quitting mid-file loses that job; pick the file again.
 - Not in this part: join link and invites, plain-http LAN hosts (use
-  `tailscale serve`), a history list, text-while-you-speak, resuming Online
-  file jobs.
+  `tailscale serve`), a history list, text-while-you-speak (live deltas are
+  received but not shown), resuming Online file jobs.
 
 ### Added
 
@@ -37,6 +45,10 @@ All notable changes to WisprAlt are documented here.
 - **Online dictation**: 16 kHz mono WAV → `POST /v1/audio/transcriptions`,
   one retry on transient errors, a deadline that cancels the request. Model
   picker with $/min and retire dates (no diarize model).
+- **Live models over the Realtime API** (`gpt-live-transcribe`,
+  `gpt-realtime-whisper`): the socket opens at FN press, audio streams while
+  FN is held, commit at release; socket / deadline / server errors recover
+  once through `gpt-transcribe`.
 - **Online file jobs** (TXT + JSON): direct upload when possible, else
   audio extraction, decode and quiet-point chunking (≤ 10 min per chunk,
   previous chunk's tail as prompt); outputs written all or nothing.
@@ -45,7 +57,8 @@ All notable changes to WisprAlt are documented here.
 - **Spool + Retry list**, **last-text record** for "Copy last dictation".
 - `WisprAltCore` holds every testable decision; tests moved to Swift Testing
   (`scripts/test-client.sh`), plus a log-privacy gate and the real-API probe
-  (`scripts/online-assumptions/run-all.sh`, exit 0 PASS / 1 FAIL / 2 BLOCKED).
+  (`scripts/online-assumptions/run-all.sh`: pre-flight P1/P3/P4/P5,
+  `suite-file`, `suite-live`; exit 0 PASS / 1 FAIL / 2 BLOCKED).
 
 ### Changed
 

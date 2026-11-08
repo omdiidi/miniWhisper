@@ -1,8 +1,10 @@
 // WisprAltProbe — real-API assumption gates for Online mode (Part 3, Task 4).
 //
-//   WisprAltProbe preflight [--only P1|P5]   P5 Keychain read, P1 long-clip report
-//   WisprAltProbe suite-file                 every file model on a short clip + one direct m4a upload
-//   WisprAltProbe suite-live                 not built yet (Task 11): exits 2
+//   WisprAltProbe preflight [--only P1|P3|P4|P5]
+//       P5 Keychain read, P1 long-clip report, P3 one 600 s gpt-live-transcribe
+//       commit (P3b at 210 s only on a commit error), P4 live latency report
+//   WisprAltProbe suite-file   every file model on a short clip + one direct m4a upload
+//   WisprAltProbe suite-live   both live models on a short clip + one recovery case
 //
 // Options: --ledger PATH (spend ledger JSONL), --run ID (groups one run-all.sh
 // invocation), --fixture PATH (P1 speech text). run-all.sh passes all three.
@@ -244,19 +246,19 @@ final class CallCounter: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
 
 // MARK: - P1
 
+/// The spoken fixture body (comment lines dropped).
+func fixtureText() -> String? {
+    guard let text = try? String(contentsOf: fixtureURL, encoding: .utf8) else { return nil }
+    return text.split(separator: "\n", omittingEmptySubsequences: false)
+        .filter { !$0.hasPrefix("#") }.joined(separator: "\n")
+}
+
 let p1Window = 590.0...600.0
 
 func runP1() async {
     guard let key = requireKey("P1") else { return }
     let model = OpenAIModels.model(id: "gpt-transcribe")!
-    let spoken: String
-    do {
-        spoken = try String(contentsOf: fixtureURL, encoding: .utf8)
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { !$0.hasPrefix("#") }.joined(separator: "\n")
-    } catch {
-        return report("P1", .fail, "probe FAIL (fixture): unreadable fixture")
-    }
+    guard let spoken = fixtureText() else { return report("P1", .fail, "probe FAIL (fixture): unreadable fixture") }
     let audio: URL, seconds: Double
     do {
         audio = try speak(spoken, name: "p1")
@@ -280,8 +282,7 @@ func runP1() async {
         let r = try await sendOnce(request)
         let spokenCount = words(spoken).count
         let returned = normalizedWords(r.transcription.text)
-        let markerOK = returned.suffix(40).contains("zebra")
-        let marker = markerOK ? "OK" : "TRUNCATED(measured=\(returned.count))"
+        let marker = tailMarker(r.transcription.text)
         let tokens = r.transcription.outputTokens.map(String.init) ?? "n/a"
         report("P1", .pass, String(format: "report-only: clip=%.1f s wav=%d B spoken_words=%d returned_words=%d "
                                    + "output_tokens=%@ usage{%@} marker=%@ latency_ms=%d est_usd=%.4f",
@@ -392,10 +393,235 @@ func runSuiteFile() async {
     }
 }
 
+
+// MARK: - Live (Realtime) helpers
+
+/// `url` as 24 kHz mono Float, through the app's own `MonoResampler`.
+func liveSamples(_ url: URL) throws -> [Float] {
+    let file = try AVAudioFile(forReading: url)
+    let format = file.processingFormat
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(file.length)) else {
+        throw ToolFailed(tool: "AVAudioPCMBuffer", code: -1)
+    }
+    try file.read(into: buffer)
+    guard let chans = buffer.floatChannelData else { throw ToolFailed(tool: "floatChannelData", code: -1) }
+    let frames = Int(buffer.frameLength), channels = Int(format.channelCount)
+    var interleaved = [Float](repeating: 0, count: frames * channels)
+    for f in 0..<frames { for c in 0..<channels { interleaved[f * channels + c] = chans[c][f] } }
+    let r = MonoResampler(inputRate: format.sampleRate, channels: channels, outputRate: Double(RealtimeProtocol.sampleRate))
+    return r.process(interleaved) + r.flush()
+}
+
+struct LiveRun {
+    let result: Result<DictationResult, Error>
+    /// FN-up → text: `finish` (drain + commit → `completed`), after streaming.
+    let finishMs: Int
+}
+
+/// Streams `samples` into a fresh provider in 200 ms appends at `speed` × real
+/// time (1 = like a held FN key), then finishes it.
+func streamLive(_ provider: OpenAIRealtimeProvider, _ samples: [Float], recording: Recording, speed: Double) async -> LiveRun {
+    provider.start()
+    let step = OpenAIRealtimeProvider.samplesPerMessage
+    let pause = UInt64(Double(step) / Double(RealtimeProtocol.sampleRate) / speed * 1_000_000_000)
+    var i = 0
+    while i < samples.count {
+        provider.append(Array(samples[i..<min(i + step, samples.count)]))
+        i += step
+        try? await Task.sleep(nanoseconds: pause)
+    }
+    let start = Date()
+    let result: Result<DictationResult, Error>
+    do { result = .success(try await provider.finish(recording)) } catch { result = .failure(error) }
+    return LiveRun(result: result, finishMs: Int(Date().timeIntervalSince(start) * 1000))
+}
+
+func liveProvider(_ model: OpenAIModel, key: String, recovery: DictationProvider? = nil,
+                  makeTransport: (@Sendable (URLRequest) -> WebSocketTransport)? = nil) -> OpenAIRealtimeProvider {
+    OpenAIRealtimeProvider(model: model, keyProvider: { key }, fileRecovery: recovery, recoveryEnabled: recovery != nil,
+                           makeTransport: makeTransport ?? { URLSessionWebSocketTransport(request: $0) })
+}
+
+/// A socket that never opens: forces the shipped recovery path.
+final class DeadTransport: WebSocketTransport, @unchecked Sendable {
+    func send(_ text: String) async throws { throw ProviderError.notConnected }
+    func receive() async throws -> String { throw ProviderError.notConnected }
+    func close() {}
+}
+
+func tailMarker(_ text: String) -> String {
+    let returned = normalizedWords(text)
+    return returned.suffix(40).contains("zebra") ? "OK" : "TRUNCATED(measured=\(returned.count))"
+}
+
+// MARK: - P3 / P3b (A2: the Realtime per-commit limit)
+
+let p3Model = "gpt-live-transcribe"
+
+/// One commit of `limit` s (all of the fixture when nil), recovery off.
+/// Returns the realtime error type when the commit itself was refused.
+@discardableResult
+func runP3(name: String, limit: Double?) async -> String? {
+    guard let key = requireKey(name) else { return nil }
+    let model = OpenAIModels.model(id: p3Model)!
+    guard let spoken = fixtureText() else { report(name, .fail, "probe FAIL (fixture): unreadable fixture"); return nil }
+    let audio: URL, full: Double, all: [Float]
+    do {
+        audio = try speak(spoken, name: "p3")
+        full = try durationSeconds(audio)
+        all = try liveSamples(audio)
+    } catch {
+        report(name, .fail, "probe FAIL (fixture): \(ErrorLog.describe(error))"); return nil
+    }
+    if limit == nil, !p1Window.contains(full) {
+        report(name, .fail, String(format: "probe FAIL (fixture): clip is %.1f s, outside 590-600 s; no API call", full))
+        return nil
+    }
+    let seconds = min(limit ?? full, full)
+    let samples = Array(all.prefix(Int(seconds * Double(RealtimeProtocol.sampleRate))))
+    let est = Ledger.estimate(model, seconds: seconds)
+    if let why = Ledger.refusal(projected: est, scope: .preflight) { report(name, .blocked, why); return nil }
+    Ledger.record(probe: name, model: model.id, seconds: seconds, estUSD: est)
+    // 5× real time keeps the 10 s send queue far from full on a normal uplink.
+    let run = await streamLive(liveProvider(model, key: key), samples,
+                               recording: Recording(fileURL: audio, durationSeconds: seconds, interruptedByDeviceChange: false),
+                               speed: 5)
+    switch run.result {
+    case .success(let r):
+        let marker = limit == nil ? tailMarker(r.text) : "n/a (cut clip)"
+        report(name, .pass, String(format: "commit=%.1f s completed words=%d output_tokens=%@ marker=%@ finish_ms=%d est_usd=%.4f",
+                                   seconds, normalizedWords(r.text).count, r.outputTokens.map(String.init) ?? "n/a",
+                                   marker, run.finishMs, est))
+        return nil
+    case .failure(ProviderError.realtime(let type)):
+        report(name, .fail, String(format: "commit=%.1f s refused: realtime(type: %@) finish_ms=%d", seconds, type, run.finishMs))
+        return type
+    case .failure(let error):
+        report(name, .fail, String(format: "commit=%.1f s: %@ finish_ms=%d", seconds, ErrorLog.describe(error), run.finishMs))
+        return nil
+    }
+}
+
+@MainActor func runP3WithFallback() async {
+    let before = statuses.count
+    guard await runP3(name: "P3", limit: nil) != nil else { return }
+    // A commit error at 600 s: P3 is a finding, not a failure, if 210 s passes.
+    statuses.remove(at: before)
+    await runP3(name: "P3b", limit: 210)
+    if statuses.last == .pass { print("P3 result: realtimeCommitLimit = 210 (set it in OpenAIModels)") }
+}
+
+// MARK: - P4 (A10: live latency, report-only)
+
+func runP4() async {
+    guard let key = requireKey("P4") else { return }
+    guard let spoken = fixtureText() else { return report("P4", .fail, "probe FAIL (fixture): unreadable fixture") }
+    let text = words(spoken).prefix(105).joined(separator: " ")
+    let clip: URL, seconds: Double, samples: [Float]
+    do {
+        clip = try speak(text, name: "p4")
+        seconds = try durationSeconds(clip)
+        samples = try liveSamples(clip)
+    } catch {
+        return report("P4", .fail, "probe FAIL (fixture): \(ErrorLog.describe(error))")
+    }
+    guard (20.0...40.0).contains(seconds) else {
+        return report("P4", .fail, String(format: "probe FAIL (fixture): clip is %.1f s, outside 20-40 s", seconds))
+    }
+    let liveModels = OpenAIModels.all.filter { $0.kind == .live }
+    let file = OpenAIModels.model(id: OpenAIModels.defaultFileModelID)!
+    let est = liveModels.reduce(0) { $0 + Ledger.estimate($1, seconds: seconds) } + Ledger.estimate(file, seconds: seconds)
+    if let why = Ledger.refusal(projected: est, scope: .preflight) { return report("P4", .blocked, why) }
+    let recording = Recording(fileURL: clip, durationSeconds: seconds, interruptedByDeviceChange: false)
+    for model in liveModels {
+        let probe = "P4/\(model.id)"
+        Ledger.record(probe: probe, model: model.id, seconds: seconds, estUSD: Ledger.estimate(model, seconds: seconds))
+        let run = await streamLive(liveProvider(model, key: key), samples, recording: recording, speed: 1)
+        switch run.result {
+        case .success(let r):
+            report(probe, .pass, String(format: "report-only: clip=%.1f s FN-up→text (commit→completed) ms=%d words=%d output_tokens=%@",
+                                        seconds, run.finishMs, normalizedWords(r.text).count,
+                                        r.outputTokens.map(String.init) ?? "n/a"))
+        case .failure(let error):
+            report(probe, .fail, "\(ErrorLog.describe(error)) finish_ms=\(run.finishMs)")
+        }
+    }
+    let probe = "P4/\(file.id)"
+    do {
+        let wav = try Mono16kWAV.make(from: clip)
+        Ledger.record(probe: probe, model: file.id, seconds: seconds, estUSD: Ledger.estimate(file, seconds: seconds))
+        let r = try await sendOnce(OpenAIRequests.transcription(model: file, audio: wav, filename: "audio.wav",
+                                                                contentType: "audio/wav", prompt: nil,
+                                                                responseFormat: "json", key: key))
+        report(probe, .pass, String(format: "report-only: clip=%.1f s POST→response ms=%d words=%d",
+                                    seconds, r.ms, normalizedWords(r.transcription.text).count))
+    } catch {
+        report(probe, .fail, ErrorLog.describe(error))
+    }
+}
+
+// MARK: - suite-live
+
+func runSuiteLive() async {
+    guard let key = requireKey("suite-live") else { return }
+    let clip: URL, seconds: Double, samples: [Float]
+    do {
+        clip = try speak(suiteText, name: "live-clip")
+        seconds = try durationSeconds(clip)
+        samples = try liveSamples(clip)
+    } catch {
+        return report("suite-live", .fail, "clip generation failed: \(ErrorLog.describe(error))")
+    }
+    guard seconds > 0, seconds <= 10 else {
+        return report("suite-live", .fail, String(format: "clip is %.1f s, must be ≤ 10 s", seconds))
+    }
+    print(String(format: "suite-live clip: %.1f s", seconds))
+    let recording = Recording(fileURL: clip, durationSeconds: seconds, interruptedByDeviceChange: false)
+
+    // One session per live model (≤ 3 calls each), recovery off so a pass is the live path.
+    for model in OpenAIModels.all where model.kind == .live {
+        let probe = "suite-live/\(model.id)"
+        let est = Ledger.estimate(model, seconds: seconds)
+        if let why = Ledger.refusal(projected: est, scope: .suite) { report(probe, .blocked, why); continue }
+        Ledger.record(probe: probe, model: model.id, seconds: seconds, estUSD: est)
+        let run = await streamLive(liveProvider(model, key: key), samples, recording: recording, speed: 1)
+        switch run.result {
+        case .success(let r):
+            let ok = heardKeyword(r.text) && r.modelUsed == model.id
+            report(probe, ok ? .pass : .fail, "keyword=\(ok) model_used=\(r.modelUsed) output_tokens="
+                   + "\(r.outputTokens.map(String.init) ?? "n/a") finish_ms=\(run.finishMs)")
+        case .failure(let error):
+            report(probe, .fail, "\(ErrorLog.describe(error)) finish_ms=\(run.finishMs)")
+        }
+    }
+
+    // Recovery: a socket that never opens → the same audio through the shipped gpt-transcribe provider.
+    let probe = "suite-live/recovery"
+    let file = OpenAIModels.model(id: OpenAIModels.defaultFileModelID)!
+    let est = Ledger.estimate(file, seconds: seconds)
+    if let why = Ledger.refusal(projected: est * 2, scope: .suite) { return report(probe, .blocked, why) }
+    let counter = CallCounter()
+    let counted = URLSession(configuration: .ephemeral, delegate: counter, delegateQueue: nil)
+    defer { counted.finishTasksAndInvalidate() }
+    let recovery = OpenAIFileProvider(model: file, keyProvider: { key }, session: counted)
+    let live = liveProvider(OpenAIModels.model(id: OpenAIModels.defaultLiveModelID)!, key: key, recovery: recovery,
+                            makeTransport: { _ in DeadTransport() })
+    Ledger.record(probe: probe, model: file.id, seconds: seconds, estUSD: est)
+    let run = await streamLive(live, samples, recording: recording, speed: 4)
+    for _ in 1..<max(1, counter.count) { Ledger.record(probe: probe, model: file.id, seconds: seconds, estUSD: est) }
+    switch run.result {
+    case .success(let r):
+        let ok = heardKeyword(r.text) && r.modelUsed == file.id
+        report(probe, ok ? .pass : .fail, "socket never opened → model_used=\(r.modelUsed) calls=\(counter.count) keyword=\(ok)")
+    case .failure(let error):
+        report(probe, .fail, "calls=\(counter.count): \(ErrorLog.describe(error))")
+    }
+}
+
 // MARK: - Main
 
 func usage() -> Never {
-    FileHandle.standardError.write(Data("usage: WisprAltProbe preflight [--only P1|P5] | suite-file | suite-live\n".utf8))
+    FileHandle.standardError.write(Data("usage: WisprAltProbe preflight [--only P1|P3|P4|P5] | suite-file | suite-live\n".utf8))
     try? FileManager.default.removeItem(at: workDir)
     exit(64)
 }
@@ -406,16 +632,18 @@ case "preflight":
     case nil:
         runP5()
         await runP1()
+        await runP3WithFallback()
+        await runP4()
     case "P5": runP5()
     case "P1": await runP1()
+    case "P3": await runP3WithFallback()
+    case "P4": await runP4()
     default: usage()
     }
 case "suite-file":
     await runSuiteFile()
 case "suite-live":
-    print("suite-live: not built (Realtime live models arrive in Task 11)")
-    try? FileManager.default.removeItem(at: workDir)
-    exit(2)
+    await runSuiteLive()
 default:
     usage()
 }

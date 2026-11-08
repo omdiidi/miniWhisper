@@ -21,12 +21,14 @@ public struct ServerEndpoint: Sendable, Equatable {
 
 /// Which path a dictation takes, decided once at FN press.
 public enum RouteKind: Equatable, Sendable {
-    case needKey, openAIFile, local
+    case needKey, openAIFile, openAIRealtime, local
 
     public static func decide(mode: TranscriptionMode, modelKind: OpenAIModel.Kind, keyPresent: Bool) -> RouteKind {
         switch mode {
         case .local: return .local
-        case .online: return keyPresent ? .openAIFile : .needKey
+        case .online:
+            guard keyPresent else { return .needKey }
+            return modelKind == .live ? .openAIRealtime : .openAIFile
         }
     }
 }

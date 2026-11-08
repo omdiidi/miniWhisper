@@ -26,6 +26,21 @@ import WisprAltCore
         #expect(s.model == model)
     }
 
+    @Test func onlineLiveModel_routesRealtime_noStreamEndpoint() {
+        let live = OpenAIModels.model(id: "gpt-live-transcribe")!
+        #expect(RouteKind.decide(mode: .online, modelKind: .live, keyPresent: true) == .openAIRealtime)
+        #expect(RouteKind.decide(mode: .online, modelKind: .live, keyPresent: false) == .needKey)
+        #expect(RouteKind.decide(mode: .local, modelKind: .live, keyPresent: true) == .local)
+        let s = DictationSnapshot(mode: .online, model: live, keyPresent: true, endpoint: endpoint)
+        #expect(s.kind == .openAIRealtime)
+        #expect(s.streamEndpoint == nil)
+        #expect(s.endpoint == nil)
+        #expect(s.capSeconds == 600)
+        let whisper = DictationSnapshot(mode: .online, model: OpenAIModels.model(id: "gpt-realtime-whisper")!,
+                                        keyPresent: true, endpoint: nil)
+        #expect(whisper.capSeconds == 420)
+    }
+
     @Test func onlineWithoutKey_needsKey() {
         #expect(RouteKind.decide(mode: .online, modelKind: .file, keyPresent: false) == .needKey)
         let s = DictationSnapshot(mode: .online, model: model, keyPresent: false, endpoint: endpoint)

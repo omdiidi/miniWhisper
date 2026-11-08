@@ -43,5 +43,12 @@ private struct FakeBodyError: LogSafeError, LocalizedError {
         #expect(ErrorLog.outcome(ProviderError.keyMissing) == .failed(.keyMissing))
         #expect(ErrorLog.outcome(ProviderError.deadlineExceeded) == .failed(.deadline))
         #expect(ErrorLog.describe(ProviderError.http(status: 401, kind: .auth)) == "http(status: 401, kind: auth)")
+        #expect(ErrorLog.outcome(ProviderError.notConnected) == .failed(.network))
+        #expect(ErrorLog.describe(ProviderError.realtime(type: "server_error")) == "realtime(type: server_error)")
+        #expect(ErrorLog.outcome(ProviderError.realtime(type: "invalid_api_key")) == .failed(.auth))
+        #expect(ErrorLog.outcome(ProviderError.realtime(type: "insufficient_quota")) == .failed(.quota))
+        #expect(ErrorLog.outcome(ProviderError.realtime(type: "model_not_found")) == .failed(.modelNotFound))
+        #expect(ErrorLog.outcome(ProviderError.realtime(type: "server_error")) == .failed(.server))
+        #expect(ErrorLog.outcome(ProviderError.realtime(type: "invalid_value")) == .failed(.other))
     }
 }

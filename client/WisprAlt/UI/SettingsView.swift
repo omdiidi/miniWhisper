@@ -199,6 +199,10 @@ struct SettingsView: View {
                  + "\(OpenAIModels.resolve(id: settings.openAIModel).dictationCapSeconds / 60) min for this model.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Text("Live models stream audio while you hold FN and give the text when you release it "
+                 + "(no text while speaking). They cost about 3.8× gpt-transcribe.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
