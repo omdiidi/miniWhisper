@@ -28,7 +28,7 @@ No Hugging Face token is needed: both models (Parakeet for dictation, MLX Whispe
 
 `bash scripts/setup-server.sh`
 
-The script handles: ffmpeg install, `uv sync`, model downloads (~2.7GB, with retries and per-model progress), an absolute `DATA_DIR` in `server/.env`, the first-admin token (printed once, terminal only — `python -m wispralt.bootstrap`), Cloudflare Tunnel registration (token via stdin, never written to .env), launchd registration with `ExitTimeOut=15`, and a final `doctor.sh` health check.
+The script handles: ffmpeg install, `uv sync --extra host` (the MLX stack is the `[host]` extra), model downloads (~2.7GB, with retries and per-model progress), an absolute `DATA_DIR` in `server/.env`, the first-admin token (printed once, terminal only — `python -m wispralt.bootstrap`), Cloudflare Tunnel registration (token via stdin, never written to .env), launchd registration with `ExitTimeOut=15`, and a final `doctor.sh` health check.
 
 ## After completion
 

@@ -11,21 +11,23 @@ Key design decisions (from plan + v3 deltas):
   warmup pass so the first real request isn't penalised.
 - Recent inference durations (in ms) are tracked in a bounded deque for the
   /metrics endpoint.
+- MLX (``mlx``, ``parakeet_mlx``) is imported lazily inside ``_load_mlx`` /
+  ``_clear_mlx_cache``, so ``wispralt.main`` imports without the ``[host]``
+  extra. Tests inject ``ParakeetService(load_fn=…)``: ``load_fn(model_id)``
+  returns ``run(samples) -> result`` and the service never touches MLX.
 """
 
 from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import logging
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
-import mlx.core as mx
 import numpy as np
-
-from parakeet_mlx import from_pretrained, DecodingConfig  # type: ignore[import-untyped]
-from parakeet_mlx.audio import get_logmel  # type: ignore[import-untyped]
 
 from ..audio import decode_wav_bytes, safe_resample
 
@@ -47,6 +49,42 @@ MAX_SAMPLES = TARGET_SR * _settings.dictation_max_duration_s
 CACHE_CLEAR_MIN_SAMPLES = TARGET_SR * 30
 CACHE_CLEAR_EVERY_N = 20
 
+Runner = Callable[[np.ndarray], object]
+LoadFn = Callable[[str], Runner]
+
+
+def _clear_mlx_cache() -> None:
+    """Return MLX's unified-memory pool to the OS (a missing API never breaks dictation)."""
+    import mlx.core as mx
+
+    with contextlib.suppress(AttributeError):  # a moved MLX API must not break dictation
+        mx.metal.clear_cache()
+
+
+def _load_mlx(model_id: str) -> Runner:
+    """Load Parakeet on MLX, run a warmup pass (Metal JIT), return the runner."""
+    import mlx.core as mx
+    from parakeet_mlx import DecodingConfig, from_pretrained  # type: ignore[import-untyped]
+    from parakeet_mlx.audio import get_logmel  # type: ignore[import-untyped]
+
+    model = from_pretrained(model_id, dtype=mx.bfloat16)
+
+    def run(samples: np.ndarray) -> object:
+        audio_mlx = mx.array(samples, dtype=mx.float32)
+        mel = get_logmel(audio_mlx, model.preprocessor_config)
+        result = model.generate(mel, decoding_config=DecodingConfig())
+        mx.eval(result)
+        del mel, audio_mlx  # so a following cache clear can release them
+        return result
+
+    # Warmup forces Metal kernel compilation so the first real request is not
+    # penalised (300 ms-2 s). Then release the pool so the post-load baseline
+    # reflects only the persistent weights (~1.2 GB bf16).
+    logger.info("Running Parakeet warmup pass …")
+    run(np.zeros(TARGET_SR // 2, dtype=np.float32))
+    _clear_mlx_cache()
+    return run
+
 
 class ParakeetService:
     """Warm-loaded Parakeet transcription service.
@@ -58,8 +96,13 @@ class ParakeetService:
         text, ms = await service.transcribe(wav_bytes)
     """
 
-    def __init__(self) -> None:
-        self.model: object | None = None
+    def __init__(self, load_fn: LoadFn | None = None) -> None:
+        self.model_id: str = MODEL_ID
+        self._load_fn: LoadFn = load_fn or _load_mlx
+        self._clear_cache: Callable[[], None] = (
+            _clear_mlx_cache if load_fn is None else (lambda: None)
+        )
+        self._run: Runner | None = None
         self.ready: bool = False
         # Single-thread executor — MLX model is NOT thread-safe
         self._exec: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parakeet")
@@ -68,30 +111,13 @@ class ParakeetService:
         self._requests_since_clear: int = 0
 
     def load(self) -> None:
-        """Load model weights and run a warmup pass to trigger Metal JIT compilation.
+        """Load the model (default: Parakeet on MLX, with a warmup pass).
 
         Must be called from the main thread (or any single thread) before the
         first ``transcribe`` call.
         """
-        logger.info("Loading Parakeet model %s …", MODEL_ID)
-        self.model = from_pretrained(MODEL_ID, dtype=mx.bfloat16)
-
-        # Warmup — forces Metal kernel compilation so the first real request
-        # is not penalised by JIT overhead (300ms–2s on first call).
-        logger.info("Running Parakeet warmup pass …")
-        dummy = mx.zeros((TARGET_SR // 2,), dtype=mx.float32)
-        mel = get_logmel(dummy, self.model.preprocessor_config)  # type: ignore[union-attr]
-        result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
-        mx.eval(result)
-        # Drop warmup tensors and release the pool so the post-load baseline
-        # reflects only persistent model weights (~1.2 GB for Parakeet 0.6B
-        # bf16) — not whatever transient peaks the warmup pass needed.
-        del result, mel, dummy
-        try:
-            mx.metal.clear_cache()
-        except AttributeError:
-            pass
-
+        logger.info("Loading Parakeet model %s …", self.model_id)
+        self._run = self._load_fn(self.model_id)
         self.ready = True
         logger.info("Parakeet ready.")
 
@@ -147,18 +173,10 @@ class ParakeetService:
         return "", None
 
     def _run_model(self, samples: np.ndarray) -> object:
-        """Run the model on 16 kHz mono float32 *samples*; return the raw result.
-
-        Shared by both ``_sync_transcribe*`` entry points. Tensors are dropped
-        before returning so a following ``_maybe_clear_cache`` can actually
-        release their memory.
-        """
-        audio_mlx = mx.array(samples, dtype=mx.float32)
-        mel = get_logmel(audio_mlx, self.model.preprocessor_config)  # type: ignore[union-attr]
-        result = self.model.generate(mel, decoding_config=DecodingConfig())  # type: ignore[union-attr]
-        mx.eval(result)
-        del mel, audio_mlx
-        return result
+        """Run the loaded model on 16 kHz mono float32 *samples*; return the raw result."""
+        if self._run is None:
+            raise RuntimeError("ParakeetService.load() has not run")
+        return self._run(samples)
 
     def _maybe_clear_cache(self, n_samples: int) -> None:
         """Return MLX's unified-memory pool to the OS, but not on every request.
@@ -176,12 +194,7 @@ class ParakeetService:
         ):
             return
         self._requests_since_clear = 0
-        try:
-            mx.metal.clear_cache()
-        except AttributeError:
-            # Future MLX may move the API; don't crash dictation over a memory
-            # hygiene call.
-            pass
+        self._clear_cache()
 
     def _sync_transcribe(self, audio_bytes: bytes) -> tuple[str, float]:
         """Blocking inference — runs inside the single-thread executor.

@@ -2118,10 +2118,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "jinja2" },
     { name = "librosa" },
-    { name = "mlx" },
-    { name = "mlx-whisper" },
     { name = "numpy" },
-    { name = "parakeet-mlx" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -2138,6 +2135,11 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
+host = [
+    { name = "mlx" },
+    { name = "mlx-whisper" },
+    { name = "parakeet-mlx" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2146,10 +2148,10 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.12.0,<1.13" },
     { name = "jinja2", specifier = ">=3.1,<4" },
     { name = "librosa", specifier = ">=0.11.0,<0.12.0" },
-    { name = "mlx", specifier = ">=0.22.1,<0.32.0" },
-    { name = "mlx-whisper", specifier = "==0.4.2" },
+    { name = "mlx", marker = "extra == 'host'", specifier = ">=0.22.1,<0.32.0" },
+    { name = "mlx-whisper", marker = "extra == 'host'", specifier = "==0.4.2" },
     { name = "numpy", specifier = ">=2.0,<2.3" },
-    { name = "parakeet-mlx", specifier = "==0.5.1" },
+    { name = "parakeet-mlx", marker = "extra == 'host'", specifier = "==0.5.1" },
     { name = "psutil", specifier = ">=6.0" },
     { name = "pydantic", specifier = "==2.9" },
     { name = "pydantic-settings", specifier = "==2.5" },
@@ -2161,4 +2163,4 @@ requires-dist = [
     { name = "soundfile", specifier = "==0.12.1" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.30.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["host", "dev"]

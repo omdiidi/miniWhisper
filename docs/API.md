@@ -764,17 +764,18 @@ Stream a completed output file.
 
 **Auth:** Bearer required. Same ownership rule as the poll route.
 
-Cancel a pending or running job, or remove a finished one. The client calls it to cancel, and after it has downloaded all four formats.
+Cancel a pending or running job, or remove a finished job's output files. The client calls it to cancel, and after it has downloaded all four formats.
 
 | Job state | Response | Effect |
 |---|---|---|
 | Missing, or owned by someone else | **204** | Nothing (idempotent; no existence leak). |
-| `pending` or `running` | **202** | Cancel is requested. The status is then re-read: if the job finished in the meantime, its outputs and row are removed and the response is **204** instead. |
-| `done` or `failed` | **204** | Outputs (`{job_id}.{json,srt,vtt,txt}`) and the row are removed. |
-| `done` or `failed`, but an output file could not be removed | **500** `{"error"}` | The row is kept so a retried `DELETE` or the retention sweep can finish the cleanup. |
+| `pending` or `running`, or `failed` by the watchdog while the runner is still executing it | **202** | Cancel is requested. The status is then re-read: if the job finished in the meantime (and the runner no longer executes it), its outputs are removed and the response is **204** instead. |
+| `done` or `failed` | **204** | Outputs (`{job_id}.{json,srt,vtt,txt}`) are removed and `outputs_removed_at` is set. The row and its transcript text **stay** for `/me/history` and retention; on `/transcribe/file/*` the job is then invisible (poll and download 404, a repeat `DELETE` 204). |
+| `done` or `failed`, but an output file could not be removed | **500** `{"error"}` | The job stays visible so a retried `DELETE` or the retention purge can finish the cleanup. |
 
 **What a 202 means:**
 
+- A cancel that lands while the file is being decoded stops the job right after the decode, before the file model loads (`failed: cancelled by user`). A requested cancel also wins over a phase timeout or watchdog failure: the job reads `cancelled by user`.
 - A **pending** job never starts: the runner's conditional `set_running` refuses a cancelled row, deletes the staged source and marks the job `failed: cancelled by user`.
 - A **running** job cannot be interrupted mid-transcribe. Whisper transcribes the whole file in one call, so the job keeps the model and the single job slot until that call returns. Only then is the result discarded: `set_done` refuses a cancelled row, the outputs are removed, the job ends `failed: cancelled by user` and `transcript_text` stays NULL. A new submission during that window gets 429 `code=file_job_busy`.
 

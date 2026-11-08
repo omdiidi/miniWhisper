@@ -242,6 +242,12 @@ class FileJobRunner:
             and self.store.get_status(jid) == "running"
         )
 
+    def _fail(self, jid: str, reason: str) -> None:
+        """Fail *jid*; a requested cancel wins over any other reason (timeouts, watchdog, errors)."""
+        self.store.set_failed(
+            jid, _CANCELLED if self.store.check_cancel_requested(jid) else reason
+        )
+
     def _spawn(self, jid: str, src_path: Path) -> None:
         """Start a worker task for *jid* and track it until it finishes."""
         task = asyncio.create_task(self._run_source(jid, src_path))
@@ -358,10 +364,7 @@ class FileJobRunner:
                 # that did not finish.
                 remove_job_outputs(output_dir, jid)
             if current is None or current.status not in ("done", "failed"):
-                if self.store.check_cancel_requested(jid):
-                    self.store.set_failed(jid, _CANCELLED)
-                else:
-                    self.store.set_failed(jid, error_repr)
+                self._fail(jid, error_repr)
             logger.exception("[%s] File job failed: %s", jid, error_repr)
 
         finally:
@@ -460,6 +463,14 @@ class FileJobRunner:
                 self.store.update_after_transcode(jid, wav_path=wav_path)
                 src_path.unlink(missing_ok=True)
 
+                # A cancel that landed during the decode stops here, before
+                # the file model is ever loaded.
+                if self.store.check_cancel_requested(jid):
+                    self.store.set_failed(jid, _CANCELLED)
+                    staging.cleanup(wav_path)
+                    logger.info("[%s] File job cancelled after decode.", jid)
+                    return
+
                 # Spawn the watchdog before the big executor call. It will
                 # mark the row failed (advisory) if any in-pipeline phase
                 # exceeds 2× its budget. It does NOT release the semaphore.
@@ -490,7 +501,7 @@ class FileJobRunner:
                 error_repr = repr(exc)
                 current = self.store.get(jid)
                 if current is None or current.status not in ("done", "failed"):
-                    self.store.set_failed(jid, error_repr)
+                    self._fail(jid, error_repr)
                 logger.exception(
                     "[%s] File job failed: %s", jid, error_repr
                 )
@@ -547,9 +558,7 @@ class FileJobRunner:
                 "[%s] phase_timeout name=%s budget_s=%.1f",
                 jid, name, budget_resolved,
             )
-            self.store.set_failed(
-                jid, f"Phase '{name}' exceeded timeout {budget_resolved:.0f}s"
-            )
+            self._fail(jid, f"Phase '{name}' exceeded timeout {budget_resolved:.0f}s")
             raise
         logger.info(
             "[%s] phase_done name=%s duration_ms=%d",
@@ -567,7 +576,7 @@ class FileJobRunner:
         """Pipeline-side callback: persist phase change + chunk progress.
 
         Called from inside the executor thread (mlx-whisper's tqdm patch +
-        wall-clock fallback). NPE-guarded: a concurrent ``store.delete``
+        wall-clock fallback). NPE-guarded: a row that is gone (retention)
         leaves nothing to update.
         """
         job = self.store.get(jid)
@@ -620,8 +629,5 @@ class FileJobRunner:
                     " semaphore still held)",
                     jid, job.phase, elapsed, budget_s,
                 )
-                self.store.set_failed(
-                    jid,
-                    f"Phase '{job.phase}' watchdog timeout (advisory)",
-                )
+                self._fail(jid, f"Phase '{job.phase}' watchdog timeout (advisory)")
                 return

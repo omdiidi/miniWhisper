@@ -192,6 +192,8 @@ else
     if [[ "$DICTATION_OK" != "true" ]]; then
         fail "/readyz/dictation not ready within 60s"
         info "The Parakeet model may still be loading, or the server is in an error state."
+        info "No module named 'mlx' / 'parakeet_mlx' in the log? Install the MLX stack:"
+        info "  cd server && uv sync --extra host"
         info "Logs: tail -50 $HOME/Library/Logs/WisprAlt/server.err.log"
     fi
 fi

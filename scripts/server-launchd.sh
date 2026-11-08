@@ -39,7 +39,7 @@ is_loaded() {
 require_uvicorn() {
     if [[ ! -f "$UVICORN" ]]; then
         echo "ERROR: uvicorn not found at $UVICORN" >&2
-        echo "  Run setup-server.sh (or: cd server && uv venv && uv sync) first." >&2
+        echo "  Run setup-server.sh (or: cd server && uv venv && uv sync --extra host) first." >&2
         exit 1
     fi
 }

@@ -632,14 +632,16 @@ def _owned_job(request: Request, job_id: str) -> Job | None:
     """Return the job if the caller owns it or is an admin, else None.
 
     400 on a malformed job_id (server-issued UUIDs only; this also keeps
-    path-traversal shapes out of the output-path join). A missing job and a
-    job owned by someone else both return None so existence never leaks.
+    path-traversal shapes out of the output-path join). A missing job, a job
+    owned by someone else, and a job whose outputs were removed (DELETE after
+    download; the row stays for history) all return None so existence never
+    leaks.
     """
     if not _JOB_ID_RE.fullmatch(job_id):
         raise HTTPException(400, "Invalid job_id format")
     job = request.app.state.job_store.get(job_id)
     user = getattr(request.state, "user", None)
-    if job is None or user is None:
+    if job is None or user is None or job.outputs_removed_at is not None:
         return None
     if getattr(user, "role", None) == "admin":
         return job
@@ -743,15 +745,18 @@ def download_file_job(request: Request, job_id: str, fmt: str) -> StreamingRespo
     summary="Cancel a pending/running file job, or remove a finished one",
 )
 def delete_file_job(request: Request, job_id: str) -> Response:
-    """Cancel or remove a file job.
+    """Cancel a file job, or remove a finished job's outputs.
 
     Returns
     -------
-    202  The job was pending or running: cancel is requested and the runner
-         finishes it (``failed: cancelled by user``, outputs discarded).
+    202  The job is pending or running, or the runner is still executing it
+         (a watchdog-``failed`` row whose executor has not returned): cancel
+         is requested and the runner finishes it (``failed: cancelled by
+         user``, outputs discarded).
     204  Missing / not-visible job (idempotent, no leak), or a finished job
-         whose outputs and row are now removed. A job that finished between
-         the cancel request and the re-read is removed the same way.
+         whose outputs are now removed. The row and its transcript text stay
+         (``outputs_removed_at``) for ``/me/history`` and retention; on
+         ``/transcribe/file/*`` the job is then invisible (poll/download 404).
     400  Malformed job_id.
     """
     job = _owned_job(request, job_id)
@@ -759,7 +764,12 @@ def delete_file_job(request: Request, job_id: str) -> Response:
         return Response(status_code=204)
 
     store = request.app.state.job_store
-    if job.status in _ACTIVE_STATUSES:
+    runner = getattr(request.app.state, "file_runner", None)
+
+    def executing() -> bool:
+        return runner is not None and runner.active_job_id == job_id
+
+    if job.status in _ACTIVE_STATUSES or executing():
         store.set_cancel_requested(job_id)
         # Re-read: the runner may have finished between the GET above and
         # the cancel flag landing. The runner's conditional set_running /
@@ -768,18 +778,18 @@ def delete_file_job(request: Request, job_id: str) -> Response:
         job = store.get(job_id)
         if job is None:
             return Response(status_code=204)
-        if job.status in _ACTIVE_STATUSES:
+        if job.status in _ACTIVE_STATUSES or executing():
             logger.info("File job %s cancel requested.", job_id)
             return Response(status_code=202)
 
     if not remove_job_outputs(settings.outputs_dir, job_id):
-        # Keep the row: it is what lets a retried DELETE or the retention
-        # sweep find and remove the leftover transcript files.
-        logger.warning("File job %s: some outputs could not be removed; row kept.", job_id)
+        # Keep the row visible: a retried DELETE or the retention purge
+        # finds and removes the leftover transcript files.
+        logger.warning("File job %s: some outputs could not be removed; retry.", job_id)
         return JSONResponse(
             status_code=500,
             content={"error": "could not remove job outputs; retry the delete"},
         )
-    store.delete(job_id)
-    logger.info("File job %s deleted.", job_id)
+    store.mark_outputs_removed(job_id)
+    logger.info("File job %s outputs removed (row kept).", job_id)
     return Response(status_code=204)

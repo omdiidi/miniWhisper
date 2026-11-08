@@ -36,7 +36,7 @@ elif command -v hf >/dev/null 2>&1; then
     HF_CLI="$(command -v hf)"
 else
     echo "ERROR: 'hf' CLI not found." >&2
-    echo "  Run 'cd server && uv sync' first to install it into the venv." >&2
+    echo "  Run 'cd server && uv sync --extra host' first to install it into the venv." >&2
     exit 1
 fi
 echo "Using HF CLI: $HF_CLI"

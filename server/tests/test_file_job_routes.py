@@ -257,17 +257,42 @@ def test_delete_job_that_finishes_during_cancel_is_removed(
     monkeypatch.setattr(store, "set_cancel_requested", finish_then_cancel)
     resp = TestClient(make_app(OWNER)).delete(f"/transcribe/file/{jid}")
     assert resp.status_code == 204
-    assert store.get(jid) is None
+    assert store.get(jid).outputs_removed_at is not None
     assert not any((out_dir / f"{jid}.{fmt}").exists() for fmt in _FORMATS)
 
 
-def test_delete_done_job_removes_outputs_and_row(make_app, store, out_dir) -> None:
+def test_delete_after_download_keeps_history(make_app, store, out_dir) -> None:
+    """DELETE removes the outputs; the row + text stay for /me/history, hidden on /transcribe/file."""
+    from wispralt.routes.me import router as me_router
+
     jid = _done_job(store, out_dir, owner=OWNER.id)
     assert all((out_dir / f"{jid}.{fmt}").is_file() for fmt in _FORMATS)
-    resp = TestClient(make_app(OWNER)).delete(f"/transcribe/file/{jid}")
+    app = make_app(OWNER)
+    app.include_router(me_router)
+    client = TestClient(app)
+    assert client.get(f"/transcribe/file/{jid}/download/txt").status_code == 200
+    resp = client.delete(f"/transcribe/file/{jid}")
     assert resp.status_code == 204
-    assert store.get(jid) is None
     assert not any((out_dir / f"{jid}.{fmt}").exists() for fmt in _FORMATS)
+    job = store.get(jid)
+    assert job.outputs_removed_at is not None and job.transcript_text == "hello there"
+    assert client.get(f"/transcribe/file/{jid}").status_code == 404
+    assert client.get(f"/transcribe/file/{jid}/download/txt").status_code == 404
+    assert client.delete(f"/transcribe/file/{jid}").status_code == 204  # idempotent
+    history = client.get("/me/history?kind=file")
+    assert history.status_code == 200, history.text
+    assert "hello there" in history.text
+
+
+def test_delete_watchdog_failed_job_still_executing_is_202(make_app, store) -> None:
+    jid = store.create("/tmp/src.m4a", user_id=OWNER.id)
+    assert store.set_running(jid)
+    store.set_failed(jid, "Phase 'transcribe' watchdog timeout (advisory)")
+    runner = SimpleNamespace(active_job_id=jid)  # its executor thread has not returned
+    resp = TestClient(make_app(OWNER, runner=runner)).delete(f"/transcribe/file/{jid}")
+    assert resp.status_code == 202
+    job = store.get(jid)
+    assert job.cancel_requested and job.outputs_removed_at is None
 
 
 def test_delete_keeps_row_when_outputs_cannot_be_removed(
@@ -286,7 +311,7 @@ def test_delete_failed_job_removes_leftovers_from_default_root(make_app, store, 
     (out_dir / f"{jid}.txt").write_text("partial")
     resp = TestClient(make_app(OWNER)).delete(f"/transcribe/file/{jid}")
     assert resp.status_code == 204
-    assert store.get(jid) is None
+    assert store.get(jid).outputs_removed_at is not None
     assert not (out_dir / f"{jid}.txt").exists()
 
 

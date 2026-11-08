@@ -8,7 +8,7 @@
 #   1. macOS version check (≥ 13.0)
 #   2. Python 3.11 check
 #   3. Homebrew check + install ffmpeg
-#   4. uv venv + uv sync (server Python deps)
+#   4. uv venv + uv sync --extra host (server Python deps + the MLX stack)
 #   5. server/.env from .env.example if missing; absolute DATA_DIR
 #   6. download-models.sh
 #   7. First admin: python -m wispralt.bootstrap (prints the client config once)
@@ -92,7 +92,7 @@ fi
 
 cd "$REPO_ROOT/server"
 uv venv --python python3.11
-uv sync
+uv sync --extra host   # [host] = parakeet-mlx, mlx, mlx-whisper (Apple Silicon)
 cd "$REPO_ROOT"
 echo "Python environment ready."
 

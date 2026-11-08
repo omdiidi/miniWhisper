@@ -206,10 +206,13 @@ class JobStore:
                 (jid,),
             )
 
-    def delete(self, jid: str) -> None:
-        """Hard-delete a job row (the DELETE route, after its outputs are removed)."""
+    def mark_outputs_removed(self, jid: str) -> None:
+        """DELETE after download: outputs are gone, the row and its text stay for history."""
         with self.db.write() as con:
-            con.execute("DELETE FROM jobs WHERE id=?", (jid,))
+            con.execute(
+                "UPDATE jobs SET outputs_removed_at=? WHERE id=? AND outputs_removed_at IS NULL",
+                (time.time(), jid),
+            )
 
     def update_after_transcode(self, jid: str, *, wav_path: Path | str) -> None:
         """Persist the canonical WAV path (durability boundary before the source is unlinked)."""

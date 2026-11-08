@@ -380,6 +380,69 @@ def test_submit_429_body_carries_code(monkeypatch: pytest.MonkeyPatch, code: str
     assert list(settings.staging_dir.iterdir()) == []
 
 
+# (e2) cancel precedence ------------------------------------------------------
+
+
+async def test_cancel_during_decode_never_loads_the_model(
+    tmp_path: Path, out_dir: Path, store: JobStore, monkeypatch: pytest.MonkeyPatch,
+    staging_stubs: dict, owner: int,
+) -> None:
+    pipeline_calls: list[str] = []
+    monkeypatch.setattr(
+        files_pipeline, "transcribe_file", lambda *a, **kw: pipeline_calls.append("called")
+    )
+    src = _src(tmp_path, "c.m4a")
+    jid = store.create(src, user_id=owner)
+
+    def decode_while_user_cancels(src: Path, *, target_channels: int, cancel_cb=None) -> Path:
+        store.set_cancel_requested(jid)  # the decode itself does not notice
+        target = src.with_name(f"{src.stem}_canonical.wav")
+        shutil.copyfile(src, target)
+        return target
+
+    monkeypatch.setattr(staging, "transcode_to_canonical_wav", decode_while_user_cancels)
+    await _runner(store)._run_source(jid, src)
+
+    job = store.get(jid)
+    assert job.status == "failed" and job.error == "cancelled by user"
+    assert pipeline_calls == []
+    assert not job.wav_path.exists() and not src.exists()
+    assert _no_outputs(out_dir, jid)
+
+
+async def test_phase_timeout_with_cancel_requested_reports_cancelled(
+    store: JobStore, owner: int
+) -> None:
+    jid = store.create("/tmp/x.m4a", user_id=owner)
+    assert store.set_running(jid)
+    store.set_cancel_requested(jid)
+    release = threading.Event()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await _runner(store)._phase(jid, "ffprobe", 0.05, release.wait, 5)
+    finally:
+        release.set()  # the executor thread is not cancellable
+    assert store.get(jid).error == "cancelled by user"
+
+
+async def test_watchdog_with_cancel_requested_reports_cancelled(
+    store: JobStore, owner: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jid = store.create("/tmp/x.m4a", user_id=owner)
+    assert store.set_running(jid)
+    store.update_phase(jid, "transcribe")
+    with store.db.write() as con:  # the phase started long ago
+        con.execute("UPDATE jobs SET phase_started_at=? WHERE id=?", (time.time() - 1e6, jid))
+    store.set_cancel_requested(jid)
+
+    async def no_wait(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_mod.asyncio, "sleep", no_wait)
+    await asyncio.wait_for(_runner(store)._phase_watchdog(jid, 1.0), 5)
+    assert store.get(jid).error == "cancelled by user"
+
+
 # (f) shutdown keeps inputs ---------------------------------------------------
 
 

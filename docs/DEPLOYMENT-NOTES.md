@@ -55,7 +55,7 @@ Versioned deploy script for the mini. Contract:
 
 1. Reads server code from the dev box, tarballs it (excludes `__pycache__`, `.venv`, `*.log`), transfers to the mini via the `/macmini paste` skill's gist-transport mechanism.
 2. On the mini: creates `.wf-deploy-backup-<epoch>/` (using `mkdir -p` first — BSD `cp -r src1 src2 dst` requires `dst` to be an existing dir), then `cp -r server scripts "$BACKUP/"`, then overwrites with the new tree.
-3. Runs `uv sync` to install/upgrade pinned deps.
+3. Runs `pip install -e '.[host]'` to install/upgrade pinned deps (the MLX stack is the `[host]` extra).
 4. Runs `server/scripts/prefetch-mlx-whisper.sh` (idempotent).
 5. `launchctl kickstart -k gui/$UID/co.wispralt.server` — or, when the installed plist still names an old module path (the pre-rename package), `scripts/server-launchd.sh install` to regenerate it.
 6. Polls `/healthz` for up to 60 s.
