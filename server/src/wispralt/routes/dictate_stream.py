@@ -11,7 +11,7 @@ Two POSTs under ``/transcribe/dictate/stream/{session_id}/...``:
   a hard timeout), joins partial transcripts, persists one idempotent dictation row, and
   returns the final transcript.
 
-Auth: same ``require_api_key`` dep as ``/transcribe/dictate``; session
+Auth: same ``require_bearer`` (Bearer only) dep as ``/transcribe/dictate``; session
 ownership is enforced by the authenticated user's id.
 
 Dedup (``dedup.py``, Locked Decision 7): both routes require
@@ -45,7 +45,7 @@ from .. import dedup, observability
 from .._errors import CorruptAudioError
 from ..accounts.store import User
 from ..audio import wav_header_duration_ms
-from ..auth import require_api_key
+from ..auth import require_bearer
 from ..config import settings
 from ..dictate.parakeet import MODEL_ID
 from ..dictate.streaming_session import (
@@ -70,7 +70,7 @@ async def stream_chunk(
     index: int,
     request: Request,
     file: UploadFile,
-    user: User = Depends(require_api_key),
+    user: User = Depends(require_bearer),
 ) -> JSONResponse:
     if not dedup.is_uuid(session_id) or index < 0:
         raise HTTPException(422, "Invalid session_id or index")
@@ -160,7 +160,7 @@ async def stream_finalize(
     file: UploadFile,
     speech_started_at: float = Form(...),
     client_dedup_id: str | None = Form(None),
-    user: User = Depends(require_api_key),
+    user: User = Depends(require_bearer),
 ) -> JSONResponse:
     if not dedup.is_uuid(session_id):
         raise HTTPException(422, "Invalid session_id")

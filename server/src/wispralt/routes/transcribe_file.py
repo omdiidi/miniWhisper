@@ -24,7 +24,7 @@ Ownership: the caller sees a job only if ``job.user_id == user.id`` or the
 caller is an admin. A job owned by someone else looks exactly like a missing
 one (404 on GET, 204 on DELETE), so existence never leaks.
 
-Auth: ``Bearer`` via ``Depends(require_api_key)``.
+Auth: ``Bearer`` via ``Depends(require_bearer)``.
 Usage telemetry: route-key ``transcribe/file`` is registered in
 ``main.TRACKED_ROUTES`` + ``_KIND_MAP``; the middleware emits the usage_events
 row, the route does not call any recorder.
@@ -59,7 +59,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .._errors import FileJobInProgressError
-from ..auth import require_api_key
+from ..auth import require_bearer
 from ..config import settings
 from ..files.output import remove_job_outputs
 from ..jobs.runner import PHASE_LABELS, FileJobRunner
@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/transcribe/file",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_bearer)],
 )
 
 _4GiB = 4 * 1024**3

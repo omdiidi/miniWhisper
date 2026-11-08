@@ -7,7 +7,7 @@ expected model IDs unblocks their "test connection" flows.
 `gpt-4o-transcribe-diarize` is intentionally EXCLUDED — we 404 on it at the
 /v1/audio/transcriptions route. Listing-but-rejecting confuses probers.
 
-Auth required (Bearer only via require_api_key_v1). No rate limit — cheap read.
+Auth required (Bearer only via require_bearer). No rate limit — cheap read.
 Cache-Control: no-cache so future model-list changes propagate immediately.
 
 Spec reference:
@@ -21,7 +21,7 @@ import logging
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from wispralt.auth import require_api_key_v1
+from wispralt.auth import require_bearer
 from wispralt.constants import (
     OPENAI_COMPAT_VERSION,
     OPENAI_KNOWN_MODELS,
@@ -67,7 +67,7 @@ def _openai_404(request: Request, message: str) -> JSONResponse:
 @router.get("/models")
 async def list_models(
     request: Request,
-    user: User = Depends(require_api_key_v1),
+    user: User = Depends(require_bearer),
 ) -> JSONResponse:
     """List models advertised by this WisprAlt instance.
 
@@ -85,7 +85,7 @@ async def list_models(
 async def get_model(
     model_id: str,
     request: Request,
-    user: User = Depends(require_api_key_v1),
+    user: User = Depends(require_bearer),
 ) -> JSONResponse:
     """Get a single model object by ID. 404s for any model not in the static list."""
     if model_id not in OPENAI_KNOWN_MODELS:

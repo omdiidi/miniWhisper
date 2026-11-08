@@ -28,7 +28,7 @@ The bearer is sha256-hashed and looked up in the local SQLite DB (`api_keys ⋈ 
 These are intentionally open so Kubernetes-style probes, Cloudflare health checks, and external monitoring can poll them without API credentials. The probes expose only ready-flag booleans + free RAM in MB — no user data, no audio, no model output.
 
 **Bearer required:**
-- `POST /transcribe/dictate`, `POST /transcribe/file` (+ chunked), `GET /transcribe/file/{id}`, `GET /transcribe/file/{id}/download/{fmt}`, `DELETE /transcribe/file/{id}`
+- `POST /transcribe/dictate` (+ streaming), `POST /transcribe/file` (+ chunked), `GET /transcribe/file/{id}`, `GET /transcribe/file/{id}/download/{fmt}`, `DELETE /transcribe/file/{id}` — **Bearer only** (`auth.require_bearer`): the session cookie is refused (401), so a browser carrying the portal cookie can never drive them and they need no CSRF token
 - `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/models/{id}` (OpenAI-compatible drop-in surface — see [OPENAI-COMPAT.md](OPENAI-COMPAT.md))
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
@@ -296,7 +296,7 @@ canonical reference: **[OPENAI-COMPAT.md](OPENAI-COMPAT.md)**.
 
 **Key constraints that matter at the API contract level:**
 
-- **Bearer-only auth on `/v1/*`** — the `wispralt_admin_token` session
+- **Bearer-only auth on `/v1/*`** (`auth.require_bearer`, shared with `/transcribe/*`) — the `wispralt_admin_token` session
   cookie is NOT consulted, even if the browser carries it. Programs use
   Bearer; humans use cookies; the two surfaces stay separate.
 - **Per-token rate limit** (60 req/min/token), independent of the

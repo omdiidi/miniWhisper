@@ -27,7 +27,7 @@ from starlette.testclient import TestClient
 
 from wispralt._errors import FileJobInProgressError
 from wispralt.accounts.store import User
-from wispralt.auth import require_api_key
+from wispralt.auth import require_bearer
 from wispralt.config import settings
 from wispralt.files import output as files_output
 from wispralt.files import pipeline as files_pipeline
@@ -363,7 +363,7 @@ def test_submit_429_body_carries_code(monkeypatch: pytest.MonkeyPatch, code: str
         request.state.user = user
         return user
 
-    app.dependency_overrides[require_api_key] = _auth
+    app.dependency_overrides[require_bearer] = _auth
     app.state.file_runner = _RaisingRunner(code)
 
     with TestClient(app) as client:

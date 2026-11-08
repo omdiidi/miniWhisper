@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Request
 from starlette.testclient import TestClient
 
 from wispralt.accounts.store import AccountStore, User
-from wispralt.auth import SESSION_COOKIE_NAME, require_api_key, require_api_key_v1
+from wispralt.auth import SESSION_COOKIE_NAME, require_api_key, require_bearer
 from wispralt.database import Database
 from wispralt.routes import admin_ui
 
@@ -32,7 +32,7 @@ def client(wire: Wire) -> TestClient:
         return {"id": user.id, "role": user.role, "via": request.state.auth_via}
 
     @app.get("/v1/whoami")
-    async def _v1(user: User = Depends(require_api_key_v1)) -> dict:
+    async def _v1(user: User = Depends(require_bearer)) -> dict:
         return {"id": user.id}
 
     app.include_router(admin_ui.authed_router)
@@ -114,3 +114,33 @@ def test_disable_then_mint_gives_a_working_key(
     assert client.get("/whoami", headers=_bearer(new)).json()["id"] == emp.id
     assert client.get("/whoami", headers=_bearer(old)).status_code == 401
     assert not any(new in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/transcribe/dictate"),
+        ("POST", "/transcribe/dictate/stream/s1/chunk/0"),
+        ("POST", "/transcribe/dictate/stream/s1/finalize"),
+        ("POST", "/transcribe/file"),
+        ("POST", "/transcribe/file/chunked/init"),
+        ("POST", "/transcribe/file/chunked/" + "A" * 22 + "/0"),
+        ("POST", "/transcribe/file/chunked/" + "A" * 22 + "/finalize"),
+        ("DELETE", "/transcribe/file/some-job"),
+        ("GET", "/transcribe/file/some-job"),
+    ],
+)
+def test_transcribe_routes_refuse_the_session_cookie(
+    wire: Wire, make_user: MakeUser, method: str, path: str
+) -> None:
+    """The portal cookie must never drive dictation / file uploads (they skip CSRF)."""
+    from wispralt.routes import dictate, dictate_stream, transcribe_file
+
+    app = FastAPI()
+    for module in (dictate, dictate_stream, transcribe_file):
+        app.include_router(module.router)
+    client = TestClient(wire(app))
+    _user, token = make_user()
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    resp = client.request(method, path, headers={"X-Client-Dedup-Id": "d" * 8})
+    assert resp.status_code == 401, resp.text

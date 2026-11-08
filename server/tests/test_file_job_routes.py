@@ -31,7 +31,7 @@ from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 
 from wispralt.accounts.store import User
-from wispralt.auth import require_api_key
+from wispralt.auth import require_api_key, require_bearer
 from wispralt.config import settings
 from wispralt.files import output as files_output
 from wispralt.files import pipeline as files_pipeline
@@ -109,7 +109,8 @@ def make_app(store: JobStore) -> Callable[..., FastAPI]:
     def _make(user: User | None = OWNER, runner: object | None = None) -> FastAPI:
         app = FastAPI()
         app.include_router(transcribe_file_routes.router)
-        app.dependency_overrides[require_api_key] = _as(user)
+        app.dependency_overrides[require_bearer] = _as(user)
+        app.dependency_overrides[require_api_key] = _as(user)  # /me routes some tests mount
         app.state.job_store = store
         app.state.file_runner = runner if runner is not None else FileJobRunner(store, app.state)
         return app

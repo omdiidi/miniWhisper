@@ -45,7 +45,7 @@ def _extract_bearer(request: Request) -> str | None:
     accept session-cookie auth (the admin UI surface via
     :func:`require_api_key`) layer the cookie lookup on top. Callers that
     must be Bearer-only (the OpenAI-compat /v1 surface via
-    :func:`require_api_key_v1`) get the right behavior for free by using
+    :func:`require_bearer`) get the right behavior for free by using
     this helper directly.
 
     Raises
@@ -112,8 +112,8 @@ async def require_api_key(request: Request) -> User:
         # Cookie fallback: admin UI browser navigations can't attach
         # Authorization headers, so /admin/login sets ``wispralt_admin_token``
         # as a session cookie and we accept it here. Bearer-only surfaces
-        # (i.e. /v1/*) use :func:`require_api_key_v1` which deliberately
-        # skips this fallback.
+        # (/v1/*, /transcribe/*) use :func:`require_bearer` which deliberately
+        # skips this fallback; cookie mutations take :func:`require_csrf`.
         bearer = request.cookies.get(SESSION_COOKIE_NAME) or None
         via = "cookie"
     if not bearer:
@@ -122,14 +122,13 @@ async def require_api_key(request: Request) -> User:
     return await _resolve_token_user(request, bearer, via)
 
 
-async def require_api_key_v1(request: Request) -> User:
-    """/v1/* only: Bearer required, cookie ignored.
+async def require_bearer(request: Request) -> User:
+    """Bearer required, cookie ignored: ``/v1/*`` and ``/transcribe/*``.
 
-    Third-party API surface — programs sending the admin session cookie
-    by accident should NOT be auth'd through this dep. Browser-based
-    OpenAI clients send Bearer too (the OpenAI SDK sets the
-    ``Authorization`` header explicitly), so we lose nothing by refusing
-    the cookie path here.
+    These are API surfaces (the Mac client, OpenAI SDKs) that always send
+    ``Authorization: Bearer``. Refusing the session cookie means a browser
+    carrying the portal cookie can never drive them, so they need no CSRF
+    token (the portal itself never calls them).
     """
     plaintext = _extract_bearer(request)
     if not plaintext:
@@ -150,7 +149,7 @@ async def forbid_integration_kind(
     access to dictation history or other per-user data — those are
     human-only surfaces.
 
-    NOTE: do NOT chain this after :func:`require_api_key_v1` — /v1 is
+    NOTE: do NOT chain this after :func:`require_bearer` — /v1 is
     precisely the surface that integration keys are FOR.
     """
     if user.kind == "integration":

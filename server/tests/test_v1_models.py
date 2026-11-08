@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.testclient import TestClient
 
-from wispralt.auth import require_api_key_v1
+from wispralt.auth import require_bearer
 from wispralt.middleware import openai_errors
 from wispralt.routes.v1_models import router as v1_models_router
 from wispralt.accounts.store import User
@@ -55,7 +55,7 @@ def _build_app(*, override_auth: bool = True) -> FastAPI:
                 kind="integration",
             )
 
-        app.dependency_overrides[require_api_key_v1] = _fake
+        app.dependency_overrides[require_bearer] = _fake
     return app
 
 
@@ -144,7 +144,7 @@ def test_response_has_openai_version_header() -> None:
 
 
 def test_requires_bearer_auth() -> None:
-    # Let the real require_api_key_v1 run — no auth headers means 401.
+    # Let the real require_bearer run — no auth headers means 401.
     app = _build_app(override_auth=False)
     with TestClient(app) as client:
         resp = client.get("/v1/models")
@@ -152,7 +152,7 @@ def test_requires_bearer_auth() -> None:
 
 
 def test_cookie_only_auth_rejected() -> None:
-    # /v1/models uses require_api_key_v1 which IGNORES cookies. Setting the
+    # /v1/models uses require_bearer which IGNORES cookies. Setting the
     # admin cookie without a Bearer header MUST 401.
     app = _build_app(override_auth=False)
     with TestClient(app) as client:

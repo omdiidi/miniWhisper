@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse
 from .. import dedup
 from ..accounts.store import User
 from ..audio import CorruptAudioError
-from ..auth import require_api_key
+from ..auth import require_bearer
 from ..config import settings
 from ..dictate.parakeet import MODEL_ID
 from ..jobs.store import JobStore
@@ -46,7 +46,7 @@ router = APIRouter()
 async def transcribe_dictate(
     request: Request,
     file: UploadFile,
-    user: User = Depends(require_api_key),
+    user: User = Depends(require_bearer),
 ) -> JSONResponse:
     """Transcribe an audio file using the warm Parakeet model.
 
