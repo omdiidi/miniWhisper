@@ -1,7 +1,0 @@
-{% import "_ui.html.j2" as ui %}
-<div class="tiles">
-  {{ ui.tile("Dictations", stats.get('dictation_count', 0) if stats else 0) }}
-  {{ ui.tile("File transcriptions", stats.get('file_count', 0) if stats else 0) }}
-  {{ ui.tile("Total words", stats.get('total_words', 0) if stats else 0) }}
-  {{ ui.tile("Time saved (hrs)", stats.get('time_saved_hours', 0) if stats else 0, hint="estimate, 40 wpm typing baseline") }}
-</div>

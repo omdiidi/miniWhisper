@@ -24,6 +24,7 @@ import json
 import logging
 import secrets
 import string
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -42,6 +43,7 @@ from wispralt.auth import (
 )
 from wispralt.config import settings
 from wispralt.constants import MAX_DISPLAY_NAME_LEN
+from wispralt.insights import measured
 from wispralt.insights.timewindow import (
     epoch_for_range,
     last_full_iso_week,
@@ -253,19 +255,26 @@ async def me_insights(
 
     """
 
-    iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
+    tz = settings.insights_timezone
+    iso_year, iso_week = last_full_iso_week(tz)
     job_store: JobStore = request.app.state.job_store
     insight = job_store.get_weekly_insight_person(user.id, iso_year, iso_week)
-    since = epoch_for_range(range, settings.insights_timezone)
-    stats = await asyncio.to_thread(
-        job_store.compute_user_stats, user.id, since_epoch=since,
+    now = time.time()
+    since = epoch_for_range(range, tz)
+    m = await asyncio.to_thread(
+        lambda: measured.compute(
+            job_store, request.app.state.usage,
+            user_id=user.id, since=since, until=now, now=now, tz_name=tz,
+        )
     )
 
     ctx = {
         "request": request,
         "user": user,
         "insight": insight,
-        "stats": stats,
+        "m": m,
+        "link_base": "/me/history",
+        "link_params": {},
         "range": range,
         "iso_year": iso_year,
         "iso_week": iso_week,

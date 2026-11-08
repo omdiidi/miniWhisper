@@ -33,6 +33,7 @@ from wispralt.ops.staging import validate_wav_completeness
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Iterator
 
     from wispralt.database import Database
 
@@ -603,26 +604,6 @@ class JobStore:
                 is not None
             )
 
-    def list_filler_counts_for_week(self, iso_year: int, iso_week: int) -> list[tuple[int, int]]:
-        """``[(user_id, filler_word_count)]`` of the week's person rows, highest first."""
-        out: list[tuple[int, int]] = []
-        with self.db.read() as con:
-            rows = con.execute(
-                "SELECT user_id, insight_json FROM weekly_insights"
-                " WHERE user_id IS NOT NULL AND iso_year=? AND iso_week=?",
-                (iso_year, iso_week),
-            ).fetchall()
-        for r in rows:
-            try:
-                n = json.loads(r["insight_json"]).get("filler_word_count")
-            except (TypeError, ValueError, AttributeError):
-                logger.warning("malformed insight_json for user_id=%s W%02d", r["user_id"], iso_week)
-                continue
-            if isinstance(n, int):
-                out.append((int(r["user_id"]), n))
-        out.sort(key=lambda t: t[1], reverse=True)
-        return out
-
     def rolling_insights_cost_usd(self, days: int = 30) -> float:
         with self.db.read() as con:
             return float(
@@ -641,6 +622,66 @@ class JobStore:
                 _ACTIVITY_SQL + " WHERE user_id = ?", (since_epoch, since_epoch, user_id)
             ).fetchone()
         return _stats(r if r is not None and r["user_id"] is not None else None)
+
+    # ── measured stats (Part 6): computed from rows, never from the LLM ───────
+
+    @staticmethod
+    def _scope(alias: str, user_id: int | None) -> str:
+        return f" AND {alias}.user_id = :uid" if user_id is not None else ""
+
+    def measured_window(
+        self, user_id: int | None, since: float, until: float
+    ) -> dict[str, int | float]:
+        """One grouped query over ``[since, until)``: dictation/file counts, words, file audio
+        seconds and dictation inference ms. ``user_id=None`` = the whole team (admin pages)."""
+        sql = (
+            "SELECT COALESCE(SUM(kind = 'dictation'), 0) AS dictation_count,"
+            " COALESCE(SUM(kind = 'file'), 0) AS file_count,"
+            " COALESCE(SUM(word_count), 0) AS words,"
+            " COALESCE(SUM(audio_s), 0) AS file_audio_s,"
+            " COALESCE(SUM(infer_ms), 0) AS dictation_inference_ms FROM ("
+            " SELECT 'dictation' AS kind, d.word_count, NULL AS audio_s, d.duration_ms AS infer_ms"
+            " FROM dictations d WHERE d.deleted_at IS NULL"
+            " AND d.created_at >= :s AND d.created_at < :u" + self._scope("d", user_id) +
+            " UNION ALL"
+            " SELECT 'file', j.word_count, j.audio_duration_s, NULL FROM jobs j"
+            " WHERE j.deleted_at IS NULL AND j.transcript_text IS NOT NULL"
+            " AND j.created_at >= :s AND j.created_at < :u" + self._scope("j", user_id) + ")"
+        )
+        with self.db.read() as con:
+            r = con.execute(sql, {"s": since, "u": until, "uid": user_id}).fetchone()
+        return {k: (float(v) if k == "file_audio_s" else int(v)) for k, v in dict(r).items()}
+
+    def activity_points(
+        self, user_id: int | None, since: float, until: float
+    ) -> list[tuple[float, int]]:
+        """``(created_at, word_count)`` of every non-deleted record in the window (trend,
+        hour-of-day histogram and active days are bucketed in Python, in a timezone)."""
+        sql = (
+            "SELECT d.created_at, COALESCE(d.word_count, 0) FROM dictations d"
+            " WHERE d.deleted_at IS NULL AND d.created_at >= :s AND d.created_at < :u"
+            + self._scope("d", user_id) +
+            " UNION ALL SELECT j.created_at, COALESCE(j.word_count, 0) FROM jobs j"
+            " WHERE j.deleted_at IS NULL AND j.transcript_text IS NOT NULL"
+            " AND j.created_at >= :s AND j.created_at < :u" + self._scope("j", user_id)
+        )
+        with self.db.read() as con:
+            return [(r[0], r[1]) for r in con.execute(sql, {"s": since, "u": until, "uid": user_id})]
+
+    def iter_dictation_texts(
+        self, user_id: int | None, since: float, until: float
+    ) -> Iterator[tuple[int, str]]:
+        """``(user_id, text)`` of non-deleted dictations in the window (filler counting).
+        Consume it in one thread."""
+        with self.db.read() as con:
+            yield from (
+                (r[0], r[1])
+                for r in con.execute(
+                    "SELECT d.user_id, d.text FROM dictations d WHERE d.deleted_at IS NULL"
+                    " AND d.created_at >= :s AND d.created_at < :u" + self._scope("d", user_id),
+                    {"s": since, "u": until, "uid": user_id},
+                )
+            )
 
     def stats_by_user(self, since_epoch: float) -> dict[int, dict[str, int | float]]:
         """``compute_user_stats`` for every user with activity, in one grouped query."""

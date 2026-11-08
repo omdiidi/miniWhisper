@@ -17,6 +17,7 @@ import asyncio
 import html
 import logging
 import secrets
+import time
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
@@ -24,6 +25,7 @@ from fastapi.responses import HTMLResponse
 
 from ..auth import require_admin, set_csrf_cookie, verify_csrf
 from ..config import settings
+from ..insights import measured
 from ..insights.cron import run_weekly_insights
 from ..insights.timewindow import epoch_for_range, last_full_iso_week
 from ..web import records
@@ -51,77 +53,44 @@ async def admin_data(
     user_id: int | None = None,
 ):
     """Admin Data tab — team overview, leaderboards, drill-down by ?user_id."""
-    iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
+    tz = settings.insights_timezone
+    iso_year, iso_week = last_full_iso_week(tz)
     job_store: JobStore = request.app.state.job_store
     accounts: AccountStore = request.app.state.accounts
-    since = epoch_for_range(range, settings.insights_timezone)
+    usage = request.app.state.usage
+    now = time.time()
+    since = epoch_for_range(range, tz)
 
     team_insight = job_store.get_weekly_insight_team(iso_year, iso_week)
-
-    per_user_stats: dict[int, dict[str, Any]] | None = None
-    per_user_fillers: list[dict[str, Any]] = []
-
+    m = await asyncio.to_thread(
+        lambda: measured.compute(
+            job_store, usage, user_id=user_id, since=since, until=now, now=now, tz_name=tz
+        )
+    )
+    leaderboard: list[dict[str, Any]] = []
     if user_id is not None:
-        # Drill-down to one user.
-        person_insight = job_store.get_weekly_insight_person(
-            user_id, iso_year, iso_week
-        )
-        stats = await asyncio.to_thread(
-            job_store.compute_user_stats, user_id, since_epoch=since,
-        )
-        profile = await asyncio.to_thread(accounts.profile, user_id)
-        users = [profile] if profile is not None else []
-        target_user = profile
+        person_insight = job_store.get_weekly_insight_person(user_id, iso_year, iso_week)
+        target_user = await asyncio.to_thread(accounts.profile, user_id)
+        users = [target_user] if target_user is not None else []
     else:
         person_insight = None
         target_user = None
-        users = sorted(
-            await asyncio.to_thread(accounts.list_people, active=True), key=lambda u: u.id
-        )
-        # Per-user stats for the leaderboard: one grouped query (no N+1).
+        users = await asyncio.to_thread(accounts.list_people, active=True)
+        # Per-person table: one grouped stats query + one pass over dictation text (no N+1).
         activity = await asyncio.to_thread(job_store.stats_by_user, since)
-        empty = job_store.compute_user_stats(-1, since_epoch=since)  # all-zero shape
-        per_user_stats = {u.id: activity.get(u.id, empty) for u in users}
-        # Top-tile aggregate for team view — sum the per-user stats we already
-        # computed instead of leaving the tiles at 0. Time-saved is re-derived
-        # from total_words (40 WPM baseline) so the rounding matches the
-        # per-user tile rather than summing already-rounded fractions.
-        _total_words = sum(
-            s.get("total_words", 0) for s in per_user_stats.values()
-        )
-        stats = {
-            "dictation_count": sum(
-                s.get("dictation_count", 0) for s in per_user_stats.values()
-            ),
-            "file_count": sum(
-                s.get("file_count", 0) for s in per_user_stats.values()
-            ),
-            "total_words": _total_words,
-            "total_inference_ms": sum(
-                s.get("total_inference_ms", 0) for s in per_user_stats.values()
-            ),
-            "time_saved_hours": round(_total_words / 40.0 / 60.0, 2),
-        }
-
-        # Filler leaderboard for team view: pull every person row for this
-        # week via JobStore, then resolve user_id →
-        # display_name so the UI reads "Alice: 42 fillers" instead of an opaque
-        # numeric id.
-        users_by_id: dict[int, str] = {
-            u.id: (u.display_name or u.label) for u in users
-        }
-        for filler_user_id, n in job_store.list_filler_counts_for_week(
-            iso_year, iso_week,
-        ):
-            per_user_fillers.append(
-                {
-                    "user_id": filler_user_id,
-                    "name": users_by_id.get(
-                        filler_user_id, f"#{filler_user_id} (unknown)"
-                    ),
-                    "filler_word_count": n,
-                }
-            )
+        fillers = await asyncio.to_thread(measured.fillers_by_user, job_store, since, now)
+        for u in users:
+            a = activity.get(u.id, {})
+            leaderboard.append({
+                "id": u.id,
+                "name": u.display_name or u.label,
+                "dictations": a.get("dictation_count", 0),
+                "files": a.get("file_count", 0),
+                "words": a.get("total_words", 0),
+                "fillers": fillers.get(u.id, 0),
+                "time_saved_hours": measured.time_saved_hours(int(a.get("total_words", 0))),
+            })
+        leaderboard.sort(key=lambda r: (-r["words"], r["name"]))
 
     # Lock state drives the button's enabled/disabled paint on first render.
     # The lock is the same one `run_weekly_insights` holds for the duration of
@@ -141,9 +110,10 @@ async def admin_data(
         "user_id": user_id,
         "target_user": target_user,
         "person_insight": person_insight,
-        "stats": stats,
-        "per_user_stats": per_user_stats,
-        "per_user_fillers": per_user_fillers,
+        "m": m,
+        "link_base": "/admin/records",
+        "link_params": {"user_id": user_id} if user_id is not None else {},
+        "leaderboard": leaderboard,
         "weekly_insights_running": weekly_insights_running,
     }
 
