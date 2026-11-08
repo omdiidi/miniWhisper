@@ -25,9 +25,10 @@ from fastapi.responses import HTMLResponse
 
 from ..auth import require_admin, set_csrf_cookie, verify_csrf
 from ..config import settings
-from ..insights import measured
+from ..insights import measured, sources
 from ..insights.cron import run_weekly_insights
-from ..insights.timewindow import epoch_for_range, last_full_iso_week
+from ..insights.settings import ai_enabled
+from ..insights.timewindow import epoch_for_range, iso_week_epoch_bounds, last_full_iso_week
 from ..web import records
 from ..web.htmx import is_htmx
 from ..web.templates_env import templates
@@ -61,19 +62,24 @@ async def admin_data(
     now = time.time()
     since = epoch_for_range(range, tz)
 
-    team_insight = job_store.get_weekly_insight_team(iso_year, iso_week)
+    bounds = iso_week_epoch_bounds(iso_year, iso_week, tz)
     m = await asyncio.to_thread(
         lambda: measured.compute(
             job_store, usage, user_id=user_id, since=since, until=now, now=now, tz_name=tz
         )
     )
     leaderboard: list[dict[str, Any]] = []
+    row = job_store.weekly_insight(user_id, iso_year, iso_week)
+    ai = await asyncio.to_thread(
+        lambda: sources.build_view(
+            job_store, row, viewer_id=user.id, is_admin=True, scope_user_id=user_id,
+            bounds=bounds, iso_week=(iso_year, iso_week), link_base="/admin/records",
+        )
+    )
     if user_id is not None:
-        person_insight = job_store.get_weekly_insight_person(user_id, iso_year, iso_week)
         target_user = await asyncio.to_thread(accounts.profile, user_id)
         users = [target_user] if target_user is not None else []
     else:
-        person_insight = None
         target_user = None
         users = await asyncio.to_thread(accounts.list_people, active=True)
         # Per-person table: one grouped stats query + one pass over dictation text (no N+1).
@@ -105,11 +111,13 @@ async def admin_data(
         "range": range,
         "iso_year": iso_year,
         "iso_week": iso_week,
-        "team_insight": team_insight,
+        "ai": ai,
+        "ai_enabled": await ai_enabled(request.app),
+        "ai_team": user_id is None,
+        "viewer_is_admin": True,
         "users": users,
         "user_id": user_id,
         "target_user": target_user,
-        "person_insight": person_insight,
         "m": m,
         "link_base": "/admin/records",
         "link_params": {"user_id": user_id} if user_id is not None else {},

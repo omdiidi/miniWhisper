@@ -11,6 +11,7 @@ text is HTML-escaped FIRST, then the ``\\x02…\\x03`` match sentinels become
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi.templating import Jinja2Templates
@@ -36,4 +37,12 @@ def highlight(snippet: str | None) -> Markup:
     return Markup(escaped.replace("\x02", "<mark>").replace("\x03", "</mark>"))
 
 
+def ts_utc(ts: float | None) -> str:
+    """Unix seconds → ``YYYY-MM-DD HH:MM UTC`` (``—`` for None)."""
+    if ts is None:
+        return "—"
+    return datetime.fromtimestamp(float(ts), UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
 templates.env.filters["highlight"] = highlight
+templates.env.filters["ts"] = ts_utc

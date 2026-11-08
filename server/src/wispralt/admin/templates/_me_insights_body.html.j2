@@ -1,12 +1,3 @@
-{% from "_insight_cards.html.j2" import card_action_items, card_decisions, card_blockers, card_weekly_digest, card_quotable_line %}
-{# HTMX swap target for /me/insights: measured stats, then the AI panel. #}
+{# HTMX swap target for /me/insights: measured stats, then the separate AI panel. #}
 {% include "_measured.html.j2" %}
-
-{% if insight %}
-  <p class="muted small">AI-generated insights — may be inaccurate.</p>
-  {{ card_weekly_digest(insight.get('digest', [])) }}
-  {{ card_action_items(insight.get('action_items', [])) }}
-  {{ card_decisions(insight.get('decisions', [])) }}
-  {{ card_blockers(insight.get('blockers', [])) }}
-  {{ card_quotable_line(insight.get('quotable_line', '')) }}
-{% endif %}
+{% include "_ai_panel.html.j2" %}

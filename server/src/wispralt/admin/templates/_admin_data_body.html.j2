@@ -1,20 +1,7 @@
-{% from "_insight_cards.html.j2" import card_action_items, card_project_pie, card_decisions, card_blockers, card_weekly_digest, card_quotable_line, card_team_themes, card_knowledge_gaps, card_tool_mentions %}
-{# HTMX swap target for /admin/data: measured stats, then the AI panel, then (team view)
-   the per-person table. #}
+{# HTMX swap target for /admin/data: measured stats, the separate AI panel, then (team
+   view) the per-person table. #}
 {% include "_measured.html.j2" %}
-
-{% if user_id and person_insight %}
-  <p class="muted small">AI-generated insights — may be inaccurate.</p>
-  {{ card_weekly_digest(person_insight.get('digest', [])) }}
-  {{ card_action_items(person_insight.get('action_items', [])) }}
-  {{ card_decisions(person_insight.get('decisions', [])) }}
-  {{ card_blockers(person_insight.get('blockers', [])) }}
-  {{ card_quotable_line(person_insight.get('quotable_line', '')) }}
-{% elif not user_id and team_insight %}
-  <p class="muted small">AI-generated team insights — may be inaccurate.</p>
-  {{ card_team_themes(team_insight.get('themes', [])) }}
-  {{ card_knowledge_gaps(team_insight.get('knowledge_gaps', [])) }}
-{% endif %}
+{% include "_ai_panel.html.j2" %}
 
 {% if user_id %}
   <p><a href="/admin/data?range={{ range }}">Back to team</a></p>

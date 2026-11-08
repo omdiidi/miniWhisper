@@ -6,6 +6,7 @@ test_insights_cron.py — the weekly insights cron on the local DB, with a stub
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -31,7 +32,9 @@ class _StubClient:
 
     async def analyze(self, *, system_prompt: str, user_prompt: str, **_: Any) -> InsightsResponse:
         self.prompts.append(user_prompt)
-        body = {"digest": "d", "action_items": [], "decisions": [], "blockers": []}
+        refs = re.findall(r"\[([df]:[^\]]+)\]", user_prompt) or re.findall(r'"([df]:[^"]+)"', user_prompt)
+        item = {"text": "worked on it", "sources": refs[:1]}
+        body = {"digest": [item], "themes": [{"label": "shipping", "sources": refs[:1]}]}
         return InsightsResponse(
             content=json.dumps(body), input_tokens=10, output_tokens=5, cost_usd=0.01
         )

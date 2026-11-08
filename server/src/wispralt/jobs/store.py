@@ -25,6 +25,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -604,6 +605,100 @@ class JobStore:
                 is not None
             )
 
+    def weekly_insight(
+        self, user_id: int | None, iso_year: int, iso_week: int
+    ) -> dict[str, Any] | None:
+        """The stored row for one scope and week (``user_id=None`` = team) with its metadata:
+        ``insight`` (parsed JSON), ``model``, ``generated_at``, ``cost_usd``."""
+        scope_key = "team" if user_id is None else f"user:{user_id}"
+        with self.db.read() as con:
+            r = con.execute(
+                "SELECT insight_json, model, generated_at, cost_usd FROM weekly_insights"
+                " WHERE iso_year=? AND iso_week=? AND scope_key=?",
+                (iso_year, iso_week, scope_key),
+            ).fetchone()
+        if r is None:
+            return None
+        try:
+            insight = json.loads(r["insight_json"])
+        except ValueError:
+            insight = None
+        return {"insight": insight, "model": r["model"], "generated_at": r["generated_at"],
+                "cost_usd": r["cost_usd"]}
+
+    def refs_exist(self, refs: set[str], *, viewer_id: int, is_admin: bool) -> set[str]:
+        """The subset of insight refs (``d:<id>`` / ``f:<job id>``) whose record still exists
+        (not deleted) AND that the viewer may open (own rows; any row for an admin)."""
+        dict_ids = sorted({r[2:] for r in refs if r.startswith("d:") and r[2:].isdigit()})
+        job_ids = sorted({r[2:] for r in refs if r.startswith("f:") and r[2:]})
+        found: set[str] = set()
+        scope = "" if is_admin else " AND user_id = ?"
+        extra = () if is_admin else (viewer_id,)
+        with self.db.read() as con:
+            for i in range(0, len(dict_ids), 500):
+                batch = [int(x) for x in dict_ids[i : i + 500]]
+                found.update(
+                    f"d:{r[0]}"
+                    for r in con.execute(
+                        f"SELECT id FROM dictations WHERE deleted_at IS NULL{scope}"
+                        f" AND id IN ({','.join('?' * len(batch))})",
+                        (*extra, *batch),
+                    )
+                )
+            for i in range(0, len(job_ids), 500):
+                batch = job_ids[i : i + 500]
+                found.update(
+                    f"f:{r[0]}"
+                    for r in con.execute(
+                        "SELECT id FROM jobs WHERE deleted_at IS NULL AND transcript_text IS NOT NULL"
+                        f"{scope} AND id IN ({','.join('?' * len(batch))})",
+                        (*extra, *batch),
+                    )
+                )
+        return found
+
+    def count_records_after(
+        self, user_id: int | None, since: float, until: float, generated_at: float
+    ) -> int:
+        """Records in ``[since, until)`` created after an insight was generated (stale badge)."""
+        lo = max(since, generated_at)
+        if lo >= until:
+            return 0
+        window = self.measured_window(user_id, lo, until)
+        return int(window["dictation_count"]) + int(window["file_count"])
+
+    def recent_topic_labels(
+        self, user_id: int | None, iso_year: int, iso_week: int, *, weeks: int = 4
+    ) -> dict[str, int]:
+        """Casefolded topic/theme label → how many of the previous *weeks* stored insights
+        (same scope) mention it. Computed, not asked of the LLM."""
+        monday = date.fromisocalendar(iso_year, iso_week, 1)
+        prior = [(monday - timedelta(weeks=k)).isocalendar()[:2] for k in range(1, weeks + 1)]
+        scope_key = "team" if user_id is None else f"user:{user_id}"
+        counts: dict[str, int] = {}
+        with self.db.read() as con:
+            for y, w in prior:
+                r = con.execute(
+                    "SELECT insight_json FROM weekly_insights"
+                    " WHERE iso_year=? AND iso_week=? AND scope_key=?",
+                    (y, w, scope_key),
+                ).fetchone()
+                if r is None:
+                    continue
+                try:
+                    insight = json.loads(r[0])
+                except ValueError:
+                    continue
+                labels = {
+                    str(t.get("label", "")).casefold()
+                    for key in ("topics", "themes")
+                    for t in (insight.get(key) or [])
+                    if isinstance(t, dict) and t.get("label")
+                }
+                for label in labels:
+                    counts[label] = counts.get(label, 0) + 1
+        return counts
+
     def rolling_insights_cost_usd(self, days: int = 30) -> float:
         with self.db.read() as con:
             return float(
@@ -692,17 +787,18 @@ class JobStore:
     def transcripts_in_range(
         self, user_id: int, *, since_epoch: float, until_epoch: float
     ) -> list[dict[str, Any]]:
-        """``{created_at, text, kind}`` (kind ``dictation`` | ``file``), newest first."""
+        """``{created_at, text, kind, row_id}`` (kind ``dictation`` | ``file``), newest first."""
         with self.db.read() as con:
             rows = con.execute(
-                "SELECT created_at, text, kind FROM ("
-                " SELECT created_at, text, 'dictation' AS kind FROM dictations"
+                "SELECT created_at, text, kind, row_id FROM ("
+                " SELECT created_at, text, 'dictation' AS kind, CAST(id AS TEXT) AS row_id"
+                "  FROM dictations"
                 "  WHERE user_id = ? AND created_at >= ? AND created_at < ? AND deleted_at IS NULL"
                 " UNION ALL"
-                " SELECT created_at, transcript_text AS text, 'file' AS kind FROM jobs"
+                " SELECT created_at, transcript_text AS text, 'file' AS kind, id AS row_id FROM jobs"
                 "  WHERE user_id = ? AND transcript_text IS NOT NULL AND deleted_at IS NULL"
                 "  AND created_at >= ? AND created_at < ?"
-                ") ORDER BY created_at DESC",
+                ") ORDER BY created_at DESC, row_id",
                 (user_id, since_epoch, until_epoch, user_id, since_epoch, until_epoch),
             )
             return [dict(r) for r in rows]

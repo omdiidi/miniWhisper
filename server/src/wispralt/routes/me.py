@@ -43,9 +43,11 @@ from wispralt.auth import (
 )
 from wispralt.config import settings
 from wispralt.constants import MAX_DISPLAY_NAME_LEN
-from wispralt.insights import measured
+from wispralt.insights import measured, sources
+from wispralt.insights.settings import ai_enabled
 from wispralt.insights.timewindow import (
     epoch_for_range,
+    iso_week_epoch_bounds,
     last_full_iso_week,
 )
 from wispralt.web import records
@@ -258,7 +260,14 @@ async def me_insights(
     tz = settings.insights_timezone
     iso_year, iso_week = last_full_iso_week(tz)
     job_store: JobStore = request.app.state.job_store
-    insight = job_store.get_weekly_insight_person(user.id, iso_year, iso_week)
+    row = job_store.weekly_insight(user.id, iso_year, iso_week)
+    ai = await asyncio.to_thread(
+        lambda: sources.build_view(
+            job_store, row, viewer_id=user.id, is_admin=False, scope_user_id=user.id,
+            bounds=iso_week_epoch_bounds(iso_year, iso_week, tz), iso_week=(iso_year, iso_week),
+            link_base="/me/history",
+        )
+    )
     now = time.time()
     since = epoch_for_range(range, tz)
     m = await asyncio.to_thread(
@@ -271,7 +280,10 @@ async def me_insights(
     ctx = {
         "request": request,
         "user": user,
-        "insight": insight,
+        "ai": ai,
+        "ai_enabled": await ai_enabled(request.app),
+        "ai_team": False,
+        "viewer_is_admin": user.role == "admin",
         "m": m,
         "link_base": "/me/history",
         "link_params": {},

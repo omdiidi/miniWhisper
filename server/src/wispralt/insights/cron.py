@@ -30,10 +30,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from wispralt.config import settings
+from wispralt.insights import sources
 from wispralt.insights.client import (
     InsightsClient,  # noqa: F401 — re-exported for `__main__` smoke
     InsightsError,
@@ -96,12 +99,23 @@ async def run_weekly_insights(
         )
 
 
+@dataclass
+class RunOutcome:
+    """What one run did. ``failures`` holds ``{user_id, error_class}`` only (never text)."""
+
+    people_total: int = 0
+    people_done: int = 0
+    failures: list[dict[str, Any]] = field(default_factory=list)
+    cost_usd: float = 0.0
+    aborted: str | None = None  # 'rate_limit' | 'budget'
+
+
 async def _run_weekly_insights_inner(
     app,
     iso_override: tuple[int, int] | None = None,
     *,
     force: bool = False,
-) -> None:
+) -> RunOutcome | None:
     """Body of :func:`run_weekly_insights`. See its docstring."""
     insights_client: InsightsClient | None = getattr(
         app.state, "insights_client", None
@@ -110,13 +124,12 @@ async def _run_weekly_insights_inner(
         logger.info(
             "Weekly insights skipped — no InsightsClient (OPENROUTER_API_KEY unset)"
         )
-        return
+        return None
 
     job_store = app.state.job_store
     accounts = app.state.accounts
+    outcome = RunOutcome()
 
-    # Snapshot budget config at the top so a hot-reload mid-run doesn't change
-    # the cap underneath the loop.
     BUDGET = float(settings.insights_max_30d_cost_usd)
     INPUT_WORD_CAP = int(settings.insights_input_word_cap)
     PER_PERSON_MIN_DICTATIONS = int(settings.insights_per_person_min_dictations)
@@ -125,17 +138,13 @@ async def _run_weekly_insights_inner(
     spent_30d = job_store.rolling_insights_cost_usd(days=30)
     if spent_30d > BUDGET:
         logger.warning(
-            "Weekly insights skipped — rolling 30d spend $%.2f > $%.2f cap",
-            spent_30d,
-            BUDGET,
+            "Weekly insights skipped — rolling 30d spend $%.2f > $%.2f cap", spent_30d, BUDGET
         )
-        return
+        outcome.aborted = "budget"
+        return outcome
 
-    # 2. Target week — last full ISO week by default. Shared math via
-    #    timewindow.py so the routes/me.py + routes/admin_data.py pages always
-    #    agree with the cron about which week was just summarized.
-    #    ``iso_override`` (operator-only) lets ``--week`` backfill or smoke-test
-    #    against a specific ISO week without waiting for it to be "last full".
+    # 2. Target week — last full ISO week by default (timewindow.py is the one source
+    #    of week math, shared with the pages).
     if iso_override is not None:
         iso_year, iso_week = iso_override
     else:
@@ -144,47 +153,19 @@ async def _run_weekly_insights_inner(
         iso_year, iso_week, settings.insights_timezone,
     )
 
-    # 3. Per-person pass
+    # 3. Per-person pass. Each person's records go into the prompt behind their refs;
+    #    the answer is parsed (pydantic) and cleaned (sources.validate_person).
     users = await asyncio.to_thread(accounts.list_people, active=True)
-
-    person_digests: list[tuple[int, str, dict]] = []  # (user_id, name, digest)
-    # Snapshot baseline BEFORE the loop. Per-person upserts persist, so a fresh
-    # rolling_insights_cost_usd(30) call mid-loop would include the rows we
-    # just wrote — double-counting prior iterations. Use snapshot+accumulated.
+    person_insights: list[tuple[str, dict]] = []  # (name, validated insight)
     baseline_30d_cost = job_store.rolling_insights_cost_usd(30)
-    accumulated_run_cost = 0.0
-    total_cost = 0.0  # accumulated across BOTH per-person and team passes
-
-    # Per-failure-cause counters (Monday-morning operator signal).
-    person_failures: dict[str, int] = {
-        "rate_limit": 0,
-        "openrouter_error": 0,
-        "json_decode": 0,
-    }
 
     for user in users:
-        # Mid-loop budget re-check using snapshot+accumulated, NOT fresh 30d read.
-        if baseline_30d_cost + accumulated_run_cost >= BUDGET:
-            logger.warning(
-                "Per-user budget cap hit mid-run at user_id=%s; stopping cron",
-                user.id,
-            )
+        if baseline_30d_cost + outcome.cost_usd >= BUDGET:
+            logger.warning("Insights budget cap hit mid-run at user_id=%s; stopping", user.id)
+            outcome.aborted = "budget"
             break
-
-        # Skip if this person already has a row for this ISO week — re-run
-        # idempotency (don't double-charge OpenRouter on Sunday-night restart).
-        # `force=True` (admin manual button) bypasses this so re-clicks produce
-        # fresh insights via UPSERT; the lock + 30d budget guard still apply.
-        if not force and (
-            job_store.get_weekly_insight_person(user.id, iso_year, iso_week)
-            is not None
-        ):
-            logger.info(
-                "Person insight already exists for user_id=%s W%02d — skipping",
-                user.id,
-                iso_week,
-            )
-            continue
+        if not force and job_store.get_weekly_insight_person(user.id, iso_year, iso_week):
+            continue  # restart-safe: never pay twice for the same person and week
 
         transcripts = await asyncio.to_thread(
             job_store.transcripts_in_range,
@@ -192,68 +173,54 @@ async def _run_weekly_insights_inner(
             since_epoch=week_start_epoch,
             until_epoch=week_end_epoch,
         )
-        if not transcripts:
-            continue
-
-        # Activity gate: >=N dictations OR >=1 file transcription
         dictations = [t for t in transcripts if t["kind"] == "dictation"]
         files = [t for t in transcripts if t["kind"] == "file"]
-        if len(dictations) < PER_PERSON_MIN_DICTATIONS and len(files) < 1:
-            continue
+        if len(dictations) < PER_PERSON_MIN_DICTATIONS and not files:
+            continue  # activity gate: >= N dictations or >= 1 file transcription
+        outcome.people_total += 1
 
-        # Build prompt, capped to INPUT_WORD_CAP
-        blob, total_words = _assemble_blob(transcripts, cap=INPUT_WORD_CAP)
+        assembled = sources.assemble(transcripts, cap=INPUT_WORD_CAP)
         user_prompt = PERSON_USER_PROMPT_TEMPLATE.format(
             display_name=user.display_name or user.label,
-            user_id=user.id,
             iso_year=iso_year,
             iso_week=iso_week,
-            total_words=total_words,
+            total_words=assembled.total_words,
             dictation_count=len(dictations),
             file_count=len(files),
             input_word_cap=INPUT_WORD_CAP,
-            transcript_blob=blob,
+            transcript_blob=assembled.blob,
         )
 
         try:
             resp = await insights_client.analyze(
-                system_prompt=PERSON_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                max_tokens=2000,
+                system_prompt=PERSON_SYSTEM_PROMPT, user_prompt=user_prompt, max_tokens=2000,
             )
         except RateLimitedError:
-            # 429: abort entire run — burning through every employee just to
-            # hit the same rate-limit ten times in a row produces zero
-            # insights with worse signal than retrying next week.
-            person_failures["rate_limit"] += 1
-            logger.warning(
-                "OpenRouter 429 — aborting cron run; will retry next schedule"
-            )
-            return
+            # 429: abort the whole run; hammering every person into the same limit
+            # produces nothing.
+            outcome.failures.append({"user_id": user.id, "error_class": "rate_limit"})
+            outcome.aborted = "rate_limit"
+            logger.warning("OpenRouter 429 — aborting the insights run")
+            return outcome
         except InsightsError as exc:
-            person_failures["openrouter_error"] += 1
+            outcome.failures.append({"user_id": user.id, "error_class": "openrouter_error"})
             logger.warning(
                 "Person insights failed for user_id=%s: %s status=%s",
-                user.id,
-                type(exc).__name__,
-                exc.status_code,
+                user.id, type(exc).__name__, exc.status_code,
             )
             continue
+        outcome.cost_usd += resp.cost_usd  # billed even if the answer is unusable
 
         try:
-            insight = json.loads(resp.content)
-        except json.JSONDecodeError:
-            person_failures["json_decode"] += 1
+            insight = sources.validate_person(json.loads(resp.content), assembled)
+        except (json.JSONDecodeError, sources.InsightShapeError) as exc:
+            error_class = "json_decode" if isinstance(exc, json.JSONDecodeError) else "schema"
+            outcome.failures.append({"user_id": user.id, "error_class": error_class})
             logger.warning(
-                "Person insights returned non-JSON for user_id=%s (%d chars)",
-                user.id,
-                len(resp.content),
+                "Person insights unusable for user_id=%s: %s (%d chars)",
+                user.id, error_class, len(resp.content),
             )
             continue
-
-        # Citation guard before persist — drop any action_items / quotable_line
-        # whose text does NOT appear in the input transcripts.
-        insight = _scrub_hallucinations(insight, transcript_blob=blob)
 
         job_store.upsert_weekly_insight(
             iso_year=iso_year,
@@ -265,166 +232,58 @@ async def _run_weekly_insights_inner(
             cost_usd=resp.cost_usd,
             model=insights_client.model,
         )
-        person_digests.append(
-            (user.id, user.display_name or user.label, insight)
-        )
-        accumulated_run_cost += resp.cost_usd
-        total_cost += resp.cost_usd
+        outcome.people_done += 1
+        person_insights.append((user.display_name or user.label, insight))
 
-    # 4. Team pass — fires whenever at least 1 person was insighted this run.
-    # Threshold was >=2 historically (a "team" implies multiple people) but on
-    # single-active-user deployments that gate left team-scope rows empty
-    # forever, and the /admin/data team-aggregate card stayed "pending" even
-    # after a successful per-user pass. >=1 is the right floor: the team
-    # template handles N=1 cleanly (themes = the one person's themes, etc.).
-    if len(person_digests) >= 1:
+    # 4. Team pass over this run's person insights. Team items may cite only refs those
+    #    person insights cite.
+    if person_insights and outcome.aborted is None:
+        allowed = set().union(*(sources.refs_in(i) for _, i in person_insights))
         digests_jsonl = "\n".join(
-            json.dumps(
-                {"employee": dn, "user_id": kid, "insight": d}
-            )
-            for kid, dn, d in person_digests
+            json.dumps({"person": name, "insight": i}) for name, i in person_insights
         )
         user_prompt = TEAM_USER_PROMPT_TEMPLATE.format(
-            iso_year=iso_year,
-            iso_week=iso_week,
-            digests_jsonl=digests_jsonl,
+            iso_year=iso_year, iso_week=iso_week, digests_jsonl=digests_jsonl,
         )
-        team_resp = None
-        try:
-            team_resp = await insights_client.analyze(
-                system_prompt=TEAM_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                max_tokens=2500,
-            )
-        except InsightsError as exc:
-            logger.warning(
-                "Team insights failed: %s status=%s", type(exc).__name__, exc.status_code
-            )
-
-        if team_resp is not None:
+        team_insight = None
+        for temperature in (0.2, 0.0):  # one retry at 0.0 when the JSON is unusable
             try:
-                team_insight = json.loads(team_resp.content)
-            except json.JSONDecodeError:
+                team_resp = await insights_client.analyze(
+                    system_prompt=TEAM_SYSTEM_PROMPT, user_prompt=user_prompt,
+                    max_tokens=2500, temperature=temperature,
+                )
+            except InsightsError as exc:
                 logger.warning(
-                    "Team insights returned non-JSON (%d chars) — retrying once at"
-                    " temperature=0.0",
-                    len(team_resp.content),
+                    "Team insights failed: %s status=%s", type(exc).__name__, exc.status_code
                 )
-                team_insight = None
-                try:
-                    team_resp = await insights_client.analyze(
-                        system_prompt=TEAM_SYSTEM_PROMPT,
-                        user_prompt=user_prompt,
-                        max_tokens=2500,
-                        temperature=0.0,
-                    )
-                    team_insight = json.loads(team_resp.content)
-                except InsightsError as exc:
-                    logger.warning(
-                        "Team insights retry failed at temperature=0.0: %s status=%s",
-                        type(exc).__name__,
-                        exc.status_code,
-                    )
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Team insights still non-JSON after retry (%d chars)",
-                        len(team_resp.content) if team_resp else 0,
-                    )
-            if team_insight is not None:
-                job_store.upsert_weekly_insight(
-                    iso_year=iso_year,
-                    iso_week=iso_week,
-                    user_id=None,
-                    insight=team_insight,
-                    input_tokens=team_resp.input_tokens,
-                    output_tokens=team_resp.output_tokens,
-                    cost_usd=team_resp.cost_usd,
-                    model=insights_client.model,
+                break
+            outcome.cost_usd += team_resp.cost_usd
+            try:
+                team_insight = sources.validate_team(json.loads(team_resp.content), allowed)
+                break
+            except (json.JSONDecodeError, sources.InsightShapeError):
+                logger.warning(
+                    "Team insights unusable at temperature=%.1f (%d chars)",
+                    temperature, len(team_resp.content),
                 )
-                total_cost += team_resp.cost_usd
+        if team_insight is not None:
+            job_store.upsert_weekly_insight(
+                iso_year=iso_year,
+                iso_week=iso_week,
+                user_id=None,
+                insight=team_insight,
+                input_tokens=team_resp.input_tokens,
+                output_tokens=team_resp.output_tokens,
+                cost_usd=team_resp.cost_usd,
+                model=insights_client.model,
+            )
 
     logger.info(
-        "Weekly insights complete — %d people, total cost $%.4f"
-        " (30d rolling: $%.2f) failures=%s",
-        len(person_digests),
-        total_cost,
-        job_store.rolling_insights_cost_usd(30),
-        person_failures,
+        "Weekly insights complete — %d/%d people, cost $%.4f, failures=%s",
+        outcome.people_done, outcome.people_total, outcome.cost_usd,
+        [f["error_class"] for f in outcome.failures],
     )
-
-
-def _assemble_blob(transcripts: list[dict], *, cap: int) -> tuple[str, int]:
-    """Newest-first concatenation, truncated to *cap* words.
-
-    Returns ``(blob, total_word_count_before_truncation)``.
-    """
-    chunks: list[str] = []
-    total = 0
-    used = 0
-    for t in transcripts:
-        text = t["text"] or ""
-        n = len(text.split())
-        total += n
-        if used + n > cap:
-            # Truncate this one to fit
-            remaining = cap - used
-            if remaining > 0:
-                chunks.append(" ".join(text.split()[:remaining]))
-                used += remaining
-            break
-        chunks.append(text)
-        used += n
-    return ("\n---\n".join(chunks), total)
-
-
-def _scrub_hallucinations(insight: dict, *, transcript_blob: str) -> dict:
-    """Two-tier hallucination guard:
-
-    1. ``quotable_line``: EXACT full-string substring match (case-insensitive).
-       The UI displays this verbatim with quotes, so any hallucination is
-       immediate harm. Strict.
-    2. ``action_items`` / ``decisions`` / ``blockers``: 8-char sliding-window
-       match. Looser because these get paraphrased a little; trade-off
-       documented:
-       - false negatives (legit short items dropped) — annoying but safe.
-       - false positives (invented items kept because they share 8 chars
-         with the blob) — exists; mitigated by displaying "AI-generated,
-         may be inaccurate" disclaimer in the UI.
-
-    Keeps untouched: ``digest`` (paraphrase is intentional), ``topics``,
-    ``projects``, ``filler_word_count`` (aggregations).
-
-    Sets ``insight["_hallucination_scrubbed"] = True`` sentinel so downstream
-    consumers can assert this pass actually ran.
-    """
-    blob_lower = transcript_blob.lower()
-
-    def loose_supported(text: str) -> bool:
-        if not text:
-            return False
-        t = text.lower()
-        # Slide an 8-char window; any hit counts as "grounded enough".
-        return any(t[i : i + 8] in blob_lower for i in range(0, max(1, len(t) - 7)))
-
-    insight["action_items"] = [
-        a
-        for a in insight.get("action_items", [])
-        if loose_supported(a.get("text", "") if isinstance(a, dict) else str(a))
-    ]
-    insight["decisions"] = [
-        d for d in insight.get("decisions", []) if loose_supported(d)
-    ]
-    insight["blockers"] = [
-        b for b in insight.get("blockers", []) if loose_supported(b)
-    ]
-
-    # quotable_line — strict exact-substring match (verbatim UI display)
-    q = (insight.get("quotable_line") or "").lower()
-    if q and q not in blob_lower:
-        insight["quotable_line"] = ""
-
-    insight["_hallucination_scrubbed"] = True
-    return insight
+    return outcome
 
 
 def _seconds_until_next_fire(
