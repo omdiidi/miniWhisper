@@ -562,7 +562,7 @@ def setup_host(ctx: Ctx, args: argparse.Namespace, state: InstallState) -> str |
     if source:
         state.source_dir = str(source)
     state.paths = {"data_dir": str(p.data_dir), "backup_dir": str(p.backup_dir)}
-    state.add("artifacts", p.plist, p.models_dir, p.logs_dir, UV_TOOL)
+    state.add("artifacts", p.plist, p.models_dir, p.logs_dir)
     state.add("data", p.data_dir, p.env_file, p.backup_dir)
 
     has_admin = p.db_path.exists() and AccountStore(prepare_db(p.data_dir)).has_enabled_admin()
@@ -620,6 +620,7 @@ def cmd_setup(ctx: Ctx, args: argparse.Namespace) -> int:
     if state.role and role != state.role:
         print(f"note: changing role {state.role} -> {role}")
     state.role = role
+    state.add("artifacts", UV_TOOL)
     state.version = version()
     state.label = ctx.paths.label
     state.port = args.port or state.port

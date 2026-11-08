@@ -23,8 +23,11 @@ if TYPE_CHECKING:
     Handler = Callable[[Ctx, argparse.Namespace], int]
 
 
-def _todo(_ctx: Ctx, args: argparse.Namespace) -> int:
-    raise CliError(EXIT_USAGE, f"`{args.command}` is not implemented yet")
+def _group(_ctx: Ctx, args: argparse.Namespace) -> int:
+    """Command groups (``users``, ``keys``, ``retention``) always dispatch to an action."""
+    raise CliError(
+        EXIT_USAGE, f"`{args.command}` needs an action; see `wispralt {args.command} -h`"
+    )
 
 
 def _common() -> argparse.ArgumentParser:
@@ -85,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmd("stop", launchd.cmd_stop, "stop the host service")
     cmd("restart", launchd.cmd_restart, "restart the host service (re-renders its plist)")
 
-    users = cmd("users", _todo, "list, add, disable or enable users")
+    users = cmd("users", _group, "list, add, disable or enable users")
     us = users.add_subparsers(dest="action", required=True, metavar="ACTION")
     cmd("list", host.cmd_users_list, "list users", us)
     p = cmd("add", host.cmd_users_add, "add a user and print its key once", us)
@@ -99,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("user_id", type=int)
     token_file(p)
 
-    keys = cmd("keys", _todo, "list, rotate or revoke keys")
+    keys = cmd("keys", _group, "list, rotate or revoke keys")
     ks = keys.add_subparsers(dest="action", required=True, metavar="ACTION")
     p = cmd("list", host.cmd_keys_list, "list keys", ks)
     p.add_argument("--user", type=int, dest="user_id")
@@ -112,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-id", type=int, help="the admin, when several exist")
     token_file(p)
 
-    ret = cmd("retention", _todo, "show or set transcript retention")
+    ret = cmd("retention", _group, "show or set transcript retention")
     rs = ret.add_subparsers(dest="action", required=True, metavar="ACTION")
     cmd("show", host.cmd_retention_show, "current setting and what it would purge", rs)
     p = cmd("set", host.cmd_retention_set, "set retention in days (0 keeps forever)", rs)
@@ -125,13 +128,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("restore", ops.cmd_restore, "replace the host data with a backup (old data kept aside)")
     p.add_argument("backup", type=Path)
 
-    p = cmd("update", _todo, "pull, back up, reinstall and restart")
+    p = cmd("update", ops.cmd_update, "pull, back up, reinstall and restart")
     p.add_argument("--no-pull", action="store_true")
     p.add_argument("--no-backup", action="store_true")
     p.add_argument("--client", action="store_true", help="also rebuild and reinstall the app")
     p.add_argument("--_phase2", action="store_true", dest="phase2", help=argparse.SUPPRESS)
+    p.add_argument("--_backup", type=Path, dest="backup", help=argparse.SUPPRESS)
 
-    p = cmd("uninstall", _todo, "remove what setup installed (data kept unless --purge-data)")
+    p = cmd(
+        "uninstall",
+        ops.cmd_uninstall,
+        "remove what setup installed (data kept unless --purge-data)",
+    )
     p.add_argument("--client", action="store_true", help="move the app to the Trash")
     p.add_argument("--purge-data", action="store_true", help="back up, then delete host data")
     p.add_argument("--no-backup", action="store_true", help="with --purge-data: skip the backup")

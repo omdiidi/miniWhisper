@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 import sqlite3
 import stat
 import sys
@@ -25,15 +26,19 @@ from wispralt._errors import BackupRefused, InsufficientSpace, RestoreRefused, S
 from wispralt.accounts.store import AccountStore
 from wispralt.cli import client, launchd
 from wispralt.cli.host import (
+    UV_TOOL,
     Check,
     describe_retention,
+    ensure_models,
+    exec_self,
     human,
     platform_checks,
+    reinstall_cli,
     server_url,
     verdict,
     warmup,
 )
-from wispralt.cli.paths import LEGACY_LABEL, env_value, private_dir
+from wispralt.cli.paths import LEGACY_LABEL, env_value, find_source, private_dir
 from wispralt.cli.system import EXIT_DOCTOR, CliError, version
 from wispralt.database import Database
 from wispralt.jobs.store import JobStore
@@ -459,4 +464,128 @@ def cmd_restore(ctx: Ctx, args: argparse.Namespace) -> int:
     print(f"restored {src}")
     if aside is not None:
         print(f"previous data kept at {aside} (delete it once you are sure)")
+    return 0
+
+
+# ── update ───────────────────────────────────────────────────────────────────
+
+
+def cmd_update(ctx: Ctx, args: argparse.Namespace) -> int:
+    """Phase 1: pull, stop, back up, reinstall, ``execv`` phase 2 (the new code) to restart."""
+    state = ctx.need_state()
+    if args.phase2:
+        return _update_phase2(ctx, args)
+    source = find_source(ctx, None)
+    if source is None:
+        raise CliError(1, "no source clone recorded; rerun ./install.sh from a WisprAlt clone")
+    r = ctx.runner
+    if r.run(["git", "-C", str(source), "status", "--porcelain"]).stdout.strip():
+        raise CliError(1, f"{source} has local changes; commit or discard them, then update")
+    if not args.no_pull:
+        r.run(["git", "-C", str(source), "pull", "--ff-only"])
+    is_host = state.role in {"host", "both"}
+    backup_path: Path | None = None
+    was_loaded = launchd.stop(ctx) if is_host else False
+    try:
+        try:
+            if is_host and not args.no_backup:
+                backup_path = offline.backup(ctx.paths.data_dir, new_backup_dest(ctx))
+                print(f"backup written: {backup_path}")
+            reinstall_cli(ctx, source, extra=is_host, reinstall=True)
+        except _OFFLINE_ERRORS as exc:
+            raise CliError(1, f"{type(exc).__name__}: {exc}") from exc
+    except CliError:
+        if was_loaded:  # nothing changed in the venv yet, or the install failed: bring it back
+            launchd.start(ctx)
+        raise
+    extra = ["--_backup", str(backup_path)] if backup_path else []
+    exec_self(ctx, "--_phase2", *extra)
+    return 0  # only reached when execv is faked
+
+
+def _update_phase2(ctx: Ctx, args: argparse.Namespace) -> int:
+    """Runs in the freshly installed code: re-verify models, restart, wait for health."""
+    state = ctx.need_state()
+    source = find_source(ctx, None)
+    if state.role in {"host", "both"}:
+        ensure_models(ctx, state)
+        state.version = version()
+        state.save(ctx.paths.state_file)
+        launchd.restart(ctx)
+        healthy = (
+            launchd.wait_healthy(ctx) and ctx.deps.http_get(f"{ctx.url}/readyz/db", 3.0) == 200
+        )
+        if not healthy:
+            hint = f"; to roll back the data: wispralt restore {args.backup}" if args.backup else ""
+            raise CliError(
+                1, f"the updated service is not healthy (see {ctx.paths.logs_dir}){hint}"
+            )
+        print(f"host updated to {version()} and healthy at {ctx.url}")
+    if (args.client or state.role == "client") and source is not None:
+        client.build_and_install(ctx, source, rebuild=True)
+        ctx.runner.run(["open", str(ctx.paths.app)], check=False)
+    return 0
+
+
+# ── uninstall ────────────────────────────────────────────────────────────────
+
+
+def _removable(ctx: Ctx, path: Path) -> bool:
+    """Only paths under the install root or LaunchAgents (a tampered state file deletes nothing else)."""
+    p = ctx.paths
+    return path not in {p.root, p.home} and (
+        path.is_relative_to(p.root) or path.is_relative_to(p.launch_agents)
+    )
+
+
+def _delete(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def cmd_uninstall(ctx: Ctx, args: argparse.Namespace) -> int:
+    p = ctx.paths
+    state = ctx.state
+    if args.purge_data:
+        if state is None:
+            raise CliError(2, f"no {p.state_file}; refusing to purge data it does not describe")
+        if not args.no_backup and p.backup_dir.resolve().is_relative_to(p.data_dir.resolve()):
+            raise CliError(
+                2, f"the backup dir {p.backup_dir} is inside {p.data_dir}; move it first"
+            )
+    if args.client:
+        app = p.app
+        client.quit_app(ctx)
+        if app.exists():
+            ctx.runner.run(
+                ["osascript", "-e", f'tell application "Finder" to delete POSIX file "{app}"']
+            )
+            print(f"moved {app} to the Trash (transcripts and Keychain items are untouched)")
+    if state is None:
+        return 0
+    launchd.remove(ctx)
+    launchd.wait_stopped(ctx)
+    if args.purge_data and not args.no_backup and p.db_path.exists():
+        dest = offline.backup(p.data_dir, new_backup_dest(ctx))
+        print(f"backup written: {dest}")
+    for item in state.artifacts:
+        if item == UV_TOOL:
+            continue
+        path = Path(item)
+        if _removable(ctx, path):
+            _delete(path)
+        else:
+            print(f"skipped {path}: outside {p.root}", file=sys.stderr)
+    if args.purge_data:
+        for path in (p.data_dir, p.env_file, offline.lock_path(p.data_dir), p.state_file):
+            _delete(path)
+        print(f"deleted {p.data_dir} and {p.env_file}; backups stay in {p.backup_dir}")
+    else:
+        state.artifacts = [a for a in state.artifacts if a == UV_TOOL]
+        state.save(p.state_file)
+        print(f"removed the service, models and logs; data kept in {p.data_dir}")
+    if UV_TOOL in state.artifacts or args.purge_data:
+        ctx.runner.run(["uv", "tool", "uninstall", "wispralt"], check=False)  # last: it is us
     return 0
