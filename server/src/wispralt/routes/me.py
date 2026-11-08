@@ -183,7 +183,7 @@ async def me_login_form(request: Request) -> HTMLResponse:
             "next": _safe_next(request.query_params.get("next")),
         },
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -204,7 +204,7 @@ def _render_me_login_error(
         },
         status_code=status_code,
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -246,7 +246,7 @@ async def me_login_submit(
     resp = RedirectResponse(url=next_url, status_code=303)
     # Same cookie name as admin — auth.py:_extract_bearer falls back to it.
     # path="/" so it scopes across /admin/* AND /me/*.
-    set_session_cookie(resp, token)
+    set_session_cookie(resp, token, request)
     return resp
 
 
@@ -395,7 +395,7 @@ async def me_history(
     else:
         template_name = "me_history.html.j2"
 
-    csrf = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32) if template_name == "me_history.html.j2" else csrf_token_for(request)
     ctx = {
         "request": request,
         "user": user,
@@ -415,7 +415,7 @@ async def me_history(
         "csrf_token": csrf,
     }
     response = templates.TemplateResponse(request, template_name, ctx)
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -455,7 +455,7 @@ async def me_history_row(
         "admin_view": False,
     }
     response = templates.TemplateResponse(request, template_name, ctx)
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -515,7 +515,7 @@ async def me_history_restore(
     decorated["kind"] = kind
     decorated["row_id"] = row_id
 
-    csrf = secrets.token_urlsafe(32)
+    csrf = csrf_token_for(request)
     ctx = {
         "request": request,
         "row": decorated,
@@ -523,7 +523,7 @@ async def me_history_restore(
         "csrf_token": csrf,
     }
     response = templates.TemplateResponse(request, "_me_history_row.html.j2", ctx)
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
