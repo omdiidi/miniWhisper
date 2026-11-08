@@ -565,6 +565,16 @@ render escaped, closing the stored-XSS hole on the admin UI.
 
 ---
 
+## Operating the host (`wispralt` CLI)
+
+`wispralt` (console script `wispralt.cli.main:main`, installed by `uv tool install <clone>/server`) installs, runs and maintains a host and/or client; [INSTALL.md](INSTALL.md) is the command reference. It wraps the server's own functions (accounts, retention, `ops.backup`) and never re-implements them.
+
+- **Layout.** `cli/main.py` (argparse + dispatch), `paths.py` (`Paths`, `InstallState`, `Ctx`, `.env` merge), `system.py` (`Runner`, `http_get`, `Deps` — the only `subprocess`/`execv` seam), `launchd.py`, `host.py`, `client.py`, `ops.py`.
+- **Paths.** `WISPRALT_ROOT` (default `$HOME`) re-roots the config dir `~/.config/wispralt/` (`.env` and `install-state.json`, both 0600), the data dir `~/Library/Application Support/WisprAlt/host`, `HF_HOME` `…/WisprAlt/models`, logs `~/Library/Logs/WisprAlt/` and backups `~/WisprAlt-Backups/`. `--data-dir`/`--backup-dir` override and are recorded. The LaunchAgent plist always goes in `$HOME/Library/LaunchAgents`; `WISPRALT_LABEL` overrides its label (tests, Part 8 E2E).
+- **State.** `install-state.json` records `{version, source_dir, role, label, port, paths, models, artifacts, data, retention_prompted, last_run}`, written atomically. `artifacts` are what a plain `uninstall` removes; `data` only goes with `--purge-data`; backups are never removed by the CLI.
+- **Exit codes.** 0 ok, 1 failed, 2 usage error or missing non-interactive answer, 3 doctor failures. `--non-interactive` never prompts; `--json` is machine output.
+- The CLI never imports `wispralt.config` (its module-level `Settings()` needs a `.env`): it takes the data dir from `install-state.json`, and the service reads the config `.env` from its launchd `WorkingDirectory`.
+
 ## Background maintenance and logging
 
 `ops/background.py` hosts the lifespan's daemon loops. `daily_sweep_loop` runs every 24 h (in a worker thread): stale staging WAVs (>24 h, excluding WAVs of active jobs), stale chunked-upload dirs (>1 h), stale file-job output `.tmp` files, and `run_retention` (see "Retention" below). The staging sweeps and `run_retention` also run once at startup.
