@@ -94,8 +94,7 @@ public enum LocalRequests {
 
     private static func post(_ endpoint: ServerEndpoint, _ path: String, _ dedupId: String,
                              _ clientVersion: String, _ form: Multipart) -> URLRequest {
-        let url = URL(string: path, relativeTo: endpoint.baseURL)?.absoluteURL
-            ?? endpoint.baseURL.appendingPathComponent(path)
+        let url = LocalURLPolicy.url(endpoint.baseURL, path: path) ?? endpoint.baseURL.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         if let key = endpoint.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }

@@ -41,6 +41,12 @@ extension StubURLSuites {
             #expect(sent.allSatisfy { $0.httpMethod == "POST" })
         }
 
+        @Test func basePathPrefix_isKept() {
+            let ep = ServerEndpoint(baseURL: URL(string: "https://host.example.com/wispralt")!, apiKey: nil)
+            let r = LocalRequests.wholeFile(endpoint: ep, dedupId: dedup, wav: Data(), clientVersion: "1")
+            #expect(r.url?.absoluteString == "https://host.example.com/wispralt/transcribe/dictate")
+        }
+
         @Test func allThree_carryAuthVersionAndLowercaseDedup() async throws {
             for r in try await send(all()) {
                 #expect(r.value(forHTTPHeaderField: "X-Smart-Format") == nil)

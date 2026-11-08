@@ -984,8 +984,7 @@ private struct QuickActionsSection: View {
     @ViewBuilder
     private var serverLinks: some View {
         Button("Open Portal", systemImage: "safari") {
-            guard let base = settings.serverURL else { return }
-            let url = base.appendingPathComponent("admin/login")
+            guard let base = settings.serverURL, let url = LocalURLPolicy.url(base, path: "/admin/login") else { return }
             NSWorkspace.shared.open(url)
             Log.info("Opened portal.", category: "settings")
         }
@@ -1000,11 +999,8 @@ private struct QuickActionsSection: View {
         // v0.5.0: deep-link through /me/login?next=/me/history so first-time users
         // land directly on their history after auth.
         Button("Open My Dictations", systemImage: "list.bullet.rectangle") {
-            guard let base = settings.serverURL else { return }
-            var comps = URLComponents(url: base.appendingPathComponent("me/login"),
-                                      resolvingAgainstBaseURL: false)
-            comps?.queryItems = [URLQueryItem(name: "next", value: "/me/history")]
-            guard let url = comps?.url else { return }
+            guard let base = settings.serverURL,
+                  let url = LocalURLPolicy.url(base, path: "/me/login?next=/me/history") else { return }
             NSWorkspace.shared.open(url)
             Log.info("Opened /me/login?next=/me/history.", category: "settings")
         }

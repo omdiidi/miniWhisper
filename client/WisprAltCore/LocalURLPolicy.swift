@@ -16,6 +16,23 @@ public enum LocalURLPolicy {
         }
     }
 
+    /// The one way to build a server URL: `base` + `path` ("/x", may carry
+    /// "?query"), keeping any path prefix of `base`
+    /// (`https://host/wispralt` + `/healthz` → `https://host/wispralt/healthz`).
+    /// `URL(string:relativeTo:)` would drop the prefix.
+    public static func url(_ base: URL, path: String) -> URL? {
+        guard var c = URLComponents(url: base, resolvingAgainstBaseURL: true),
+              c.host?.isEmpty == false else { return nil }
+        let parts = path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        var prefix = c.path
+        while prefix.hasSuffix("/") { prefix.removeLast() }
+        let tail = String(parts[0])
+        c.path = prefix + (tail.hasPrefix("/") ? tail : "/" + tail)
+        c.query = parts.count > 1 ? String(parts[1]) : nil
+        c.fragment = nil
+        return c.url
+    }
+
     static func isLoopback(_ host: String) -> Bool {
         let h = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         if h == "localhost" || h == "::1" { return true }
