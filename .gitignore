@@ -41,20 +41,14 @@ server/.env
 
 # Logs
 *.log
-CLAUDE.local*.md
+CLAUDE.local*
 
-# Local secrets / setup state (never commit)
-tmp/credentials.txt
-tmp/client-config.txt
-
-# /supabase-audit reports — operational signal, keep local-only
-tmp/db-audit/
-
-# Local debug screenshots (not part of the project)
-tmp/mac-mini-screen-*.png
+# Scratch space: plans, notes, screenshots, local secrets/setup state. Files
+# already tracked under tmp/ stay tracked; nothing new is picked up.
+tmp/
 
 # Swift Package build artifacts and resolved deps
-client/.build/
+.build/
 client/Package.resolved
 
 # Claude Code internal state — narrow ignores so .claude/commands/*.md
@@ -69,5 +63,3 @@ MISSION.*.log
 MISSION.*.banner
 .mission-backups/
 
-# mission test harness venv
-tmp/mission/part2/.venv-ci/
