@@ -99,7 +99,7 @@ final class ServerClient {
         additionalHeaders: [String: String] = [:]
     ) throws -> URLRequest {
         guard LocalURLPolicy.isAllowed(endpoint.baseURL),
-              let url = URL(string: path, relativeTo: endpoint.baseURL)?.absoluteURL
+              let url = LocalURLPolicy.url(endpoint.baseURL, path: path)
         else {
             throw ServerError.invalidServerURL
         }

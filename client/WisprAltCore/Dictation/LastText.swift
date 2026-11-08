@@ -55,3 +55,18 @@ public enum PrivateFile {
         }
     }
 }
+
+/// Copies a file over `dest` atomically: a temp copy beside `dest`, then
+/// `rename(2)`, so a failed copy never removes an existing `dest`.
+public enum AtomicFile {
+    public static func copy(_ src: URL, to dest: URL) throws {
+        let tmp = dest.deletingLastPathComponent()
+            .appendingPathComponent(".\(dest.lastPathComponent).\(UUID().uuidString).tmp")
+        try FileManager.default.copyItem(at: src, to: tmp)
+        guard rename(tmp.path, dest.path) == 0 else {
+            let code = errno
+            try? FileManager.default.removeItem(at: tmp)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+    }
+}

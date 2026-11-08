@@ -25,6 +25,12 @@ public enum RetryEntries {
     public static let maxEntries = 2
     public static let maxAge: TimeInterval = 7 * 24 * 3600
 
+    /// After a successful Retry whose text was saved: drop the entry only when
+    /// the server stored it and words came back (empty or `saved: false` keep it).
+    public static func dropAfterRetry(_ result: DictationResult) -> Bool {
+        result.serverSaved && !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// One id found in `retry/` (audio and/or sidecar).
     public struct Entry: Equatable, Sendable {
         public let id: String

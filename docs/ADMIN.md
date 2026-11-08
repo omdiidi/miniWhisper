@@ -159,10 +159,13 @@ The result page shows, once and with `Cache-Control: no-store`:
 - the join link `wispralt://join?host=<SERVER_URL>&invite=<token>`, and
 - the raw invite code.
 
-**The macOS app does not handle join links or invite codes yet**, so for now onboard
-people with **Add employee** (below). Any client can redeem an invite through the API:
-it calls with `POST /invites/redeem` (see [API.md](API.md#post-invitesredeem)),
-which creates the person (new invites) or adds a key (add device) atomically. The list
+Send the join link to the person. Clicking it on a Mac with WisprAlt installed asks
+"Join the WisprAlt server?"; on **Join** the app calls `POST /invites/redeem` (see
+[API.md](API.md#post-invitesredeem)), saves the returned key in the Keychain, sets the
+server URL and switches to Local mode. The redeem creates the person (new invites) or
+adds a key (add device) atomically. The server address in the link must be `https://`
+(plain `http://` only for a server on that same Mac), or the app refuses the link.
+The raw invite code is for other clients that call the API themselves. The list
 shows each invite as pending, expired or redeemed; **Revoke** expires a pending one.
 An invite also stops working when the admin who made it is disabled.
 

@@ -667,7 +667,7 @@ Client log messages are `.private` in release builds, so Console.app and `log st
 
 **Symptom:** "Dictation Failed … Audio saved under Retry." or "N saved recordings from last session — see Retry".
 
-**What happened:** the audio of a failed (or possibly cut-off) dictation is kept in `~/Library/Application Support/WisprAlt/retry/` (newest 2, 7 days, 16 kHz mono). A crash or quit mid-dictation leaves it in `spool/`, and the next launch moves it to Retry. Nothing is re-sent automatically.
+**What happened:** the audio of a failed, possibly cut-off, or "No speech detected" dictation is kept in `~/Library/Application Support/WisprAlt/retry/` (newest 2, 7 days, 16 kHz mono). A crash or quit mid-dictation leaves it in `spool/`, and the next launch moves it to Retry. Nothing is re-sent automatically.
 
 **Fix:** open the popover → **Retry N**. **Retry** re-sends it in the mode it was recorded in and puts the text on the clipboard (and in **Copy last dictation**). A recording from the other mode shows "Switch to Local to retry" (or Online). **Export…** saves the audio file; **Discard** deletes it. A Local server that answers 410 `dictation_deleted` or 409 `dedup_conflict` refuses that dictation for good: its recording is discarded.
 

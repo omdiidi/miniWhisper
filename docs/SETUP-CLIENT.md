@@ -54,7 +54,7 @@ Your friend installs only the client — they connect to your existing host. The
 Send your friend:
 - The DMG (they run `wispralt setup --role client --dmg …`), or have them clone and run `./install.sh --role client`.
 - Your host's URL (your `tailscale serve` or tunnel URL).
-- A key of their own, made with `wispralt users add THEIR-NAME` on the host, over a private channel (see [Moving your API key](#moving-your-api-key)). They paste it into Settings → API Key.
+- A join link from the portal (**Invites** → invite them; see [Server Configuration](#server-configuration)), or a key of their own made with `wispralt users add THEIR-NAME` on the host, over a private channel (see [Moving your API key](#moving-your-api-key)), which they paste into Settings → API Key.
 
 Your friend will see the same Gatekeeper prompt and the same permission wizard described above.
 
@@ -100,7 +100,7 @@ Under the picker a status line shows `Online · gpt-transcribe · key saved` (or
 
 **Live models.** `gpt-live-transcribe` and `gpt-realtime-whisper` ($0.017/min, about 3.8× `gpt-transcribe`) stream your audio to OpenAI while you hold FN and give the text when you release it; no text appears while you speak. If the live session fails at release (network drop, socket error, timeout or an OpenAI server error), the same audio is re-sent to `gpt-transcribe` automatically: for a 10-minute dictation that can take up to about 8 minutes and is charged a second time. A key, quota or unknown-model error is not re-sent; the audio goes to Retry. Known limit: if `gpt-realtime-whisper` reports no token count, a cut-off transcript cannot be flagged; its 7-minute cap is the protection.
 
-In Online mode nothing is sent to your Local server, and the server-only rows are hidden (Connection / Test Connection, Server URL, API Key and its backup, Your name, Open Portal, Open My Dictations, the job Log button). **Transcribe file…** works in Online too (TXT + JSON only; see below). **Copy last dictation** works in both modes: it copies the last dictation's text, kept on this Mac for 7 days. If a dictation fails (or might be cut off) its audio is kept under **Retry** in the popover (last 2, 7 days, 16 kHz) with Retry, Export… and Discard. Both rely on FileVault for protection at rest. Switching to Online while a Local file job is being watched stops watching it without cancelling it on the server; switching back resumes watching it.
+In Online mode nothing is sent to your Local server, and the server-only rows are hidden (Connection / Test Connection, Server URL, API Key and its backup, Your name, Open Portal, Open My Dictations, the job Log button). **Transcribe file…** works in Online too (TXT + JSON only; see below). **Copy last dictation** works in both modes: it copies the last dictation's text, kept on this Mac for 7 days. If a dictation fails, might be cut off, or comes back with no words, its audio is kept under **Retry** in the popover (last 2, 7 days, 16 kHz) with Retry, Export… and Discard. Both rely on FileVault for protection at rest. Switching to Online while a Local file job is being watched stops watching it without cancelling it on the server; switching back resumes watching it.
 
 ### OpenAI API key
 
@@ -117,6 +117,8 @@ Use a **project-scoped** OpenAI key (a project just for WisprAlt) with a **month
 ## Server Configuration
 
 After the permission wizard, the app is ready for server configuration (Local mode).
+
+**Join link (easiest).** If your admin sent a `wispralt://join?…` link from the portal (**Invites**), click it. WisprAlt asks "Join the WisprAlt server?" and shows the server's address; click **Join**. The app redeems the invite, saves your key in the Keychain (`co.wispralt`), sets the Server URL and switches to Local mode. A link is single use and expires after 10 minutes; an expired or used one says "This invite has expired or was already used". A link whose server is plain `http://` to another machine is refused. The token and key are never logged. Otherwise set things up by hand:
 
 1. Get the server URL and a key from the host: `wispralt setup` prints both for the first admin, and `wispralt users add NAME` makes a key for anyone else. On a Mac set up with `--role both`, both are filled in already (the key's Keychain item trusts the installed app, so it reads it without a prompt; a build signed by another identity asks once: choose **Always Allow**).
 2. Click the WisprAlt menubar icon → toggle **Show advanced settings**.

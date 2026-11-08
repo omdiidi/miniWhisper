@@ -31,4 +31,16 @@ import WisprAltCore
         #expect(!allowed("file:///tmp/x"))
         #expect(!allowed("ws://localhost"))
     }
+
+    @Test func url_keepsTheBasePathPrefix() {
+        func u(_ base: String, _ path: String) -> String? { LocalURLPolicy.url(URL(string: base)!, path: path)?.absoluteString }
+        #expect(u("https://host", "/healthz") == "https://host/healthz")
+        #expect(u("https://host/", "/healthz") == "https://host/healthz")
+        #expect(u("https://host/wispralt", "/healthz") == "https://host/wispralt/healthz")
+        #expect(u("https://host/wispralt/", "/transcribe/file/abc/download/txt") == "https://host/wispralt/transcribe/file/abc/download/txt")
+        #expect(u("http://127.0.0.1:8000", "readyz/db") == "http://127.0.0.1:8000/readyz/db")
+        #expect(u("https://host/wispralt", "/me/login?next=/me/history") == "https://host/wispralt/me/login?next=/me/history")
+        #expect(u("https://host/wispralt?x=1#f", "/me") == "https://host/wispralt/me")
+        #expect(LocalURLPolicy.url(URL(string: "file:///tmp")!, path: "/x") == nil)
+    }
 }

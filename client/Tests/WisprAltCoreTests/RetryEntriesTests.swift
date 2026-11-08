@@ -44,6 +44,12 @@ import WisprAltCore
         #expect(RetryEntries.actions(sidecar: online, currentMode: .local) == ([.export, .discard], "Switch to Online to retry"))
     }
 
+    @Test func dropAfterRetry_onlyWhenSavedWithWords() {
+        #expect(RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m")))
+        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: " \n", modelUsed: "m")))
+        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m", serverSaved: false)))
+    }
+
     @Test func sidecar_roundTrip() throws {
         let s = SpoolSidecar(mode: .local, model: "local")
         #expect(SpoolSidecar.decode(try s.encoded()) == s)

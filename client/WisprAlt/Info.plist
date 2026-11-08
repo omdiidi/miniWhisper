@@ -18,6 +18,17 @@
 	<string>0.5.0</string>
 	<key>CFBundleVersion</key>
 	<string>0.5.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>co.wispralt.join</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>wispralt</string>
+			</array>
+		</dict>
+	</array>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSAppTransportSecurity</key>

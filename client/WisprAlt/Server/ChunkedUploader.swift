@@ -1,4 +1,5 @@
 import Foundation
+import WisprAltCore
 
 /// Three-step chunked upload client for files >50 MB.
 ///
@@ -123,7 +124,7 @@ enum ChunkedUploader {
         do {
             initResp = try await postJSON(
                 session: session,
-                url: baseURL.appendingPathComponent("/transcribe/file/chunked/init"),
+                url: try endpoint(baseURL, "/transcribe/file/chunked/init"),
                 apiKey: apiKey,
                 body: InitRequest(
                     total_bytes: fileSize,
@@ -197,7 +198,7 @@ enum ChunkedUploader {
         do {
             finalResp = try await postJSON(
                 session: session,
-                url: baseURL.appendingPathComponent("/transcribe/file/chunked/\(uploadID)/finalize"),
+                url: try endpoint(baseURL, "/transcribe/file/chunked/\(uploadID)/finalize"),
                 apiKey: apiKey,
                 body: EmptyBody(),
                 decode: FinalizeResponse.self
@@ -228,7 +229,8 @@ enum ChunkedUploader {
         chunkIndex: Int,
         data: Data
     ) async throws {
-        let url = baseURL.appendingPathComponent(
+        let url = try endpoint(
+            baseURL,
             "/transcribe/file/chunked/\(uploadID)/\(chunkIndex)"
         )
         var request = URLRequest(url: url)
@@ -288,6 +290,11 @@ enum ChunkedUploader {
 
     /// Compute how many chunks an upload of *fileSize* bytes will be split
     /// into given the agreed-on *chunkSize* (ceil division).
+    private static func endpoint(_ base: URL, _ path: String) throws -> URL {
+        guard let url = LocalURLPolicy.url(base, path: path) else { throw ServerError.invalidServerURL }
+        return url
+    }
+
     private static func chunkCount(for fileSize: Int64, chunkSize: Int) -> Int {
         let cs = Int64(chunkSize)
         return Int((fileSize + cs - 1) / cs)

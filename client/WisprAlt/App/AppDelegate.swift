@@ -18,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sparkleController: SparkleController!
     /// Retains the CGEvent tap for the entire app lifetime.
     private var fnKeyMonitor: FNKeyMonitor!
+    /// A `wispralt://join` link delivered before launch finished.
+    private var pendingInviteURL: URL?
 
     // MARK: - NSApplicationDelegate
 
@@ -112,6 +114,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // v0.5.0: poll GitHub Releases 60s after launch to surface available updates
         // via the menubar dot + Settings → Updates section.
         UpdateChecker.shared.checkSoon()
+
+        if let url = pendingInviteURL {
+            pendingInviteURL = nil
+            DispatchQueue.main.async { self.handleInvite(url) }
+        }
+    }
+
+    // MARK: - Invite links (wispralt://join, issued by the portal)
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme?.lowercased() == InviteLink.scheme {
+            if menuBarController == nil { pendingInviteURL = url } else { handleInvite(url) }
+        }
+    }
+
+    /// Confirm → `POST /invites/redeem` → key into Keychain `co.wispralt`,
+    /// server URL saved, Local mode. The token and key are never logged.
+    @MainActor private func handleInvite(_ url: URL) {
+        guard let link = InviteLink.parse(url) else {
+            Log.warning("Invite link rejected (malformed, or the server address is not allowed).", category: "app")
+            return showAlert("This invite link is not valid.", info: LocalURLPolicy.hint)
+        }
+        let confirm = NSAlert()
+        confirm.messageText = "Join the WisprAlt server?"
+        confirm.informativeText = "Server: \(link.host.host ?? "")\n\nThis Mac will dictate through this server "
+            + "in Local mode. It replaces the current server URL and API key."
+        confirm.addButton(withTitle: "Join")
+        confirm.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        Task { @MainActor in
+            do {
+                let request = link.redeemRequest(deviceLabel: Host.current().localizedName)
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let redeemed = try InviteLink.decodeRedeem(status: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                                                           body: data)
+                try KeychainHelper.setAPIKey(redeemed.token)
+                Settings.shared.serverURL = link.host
+                menuBarController.applyModeSwitch(to: .local)
+                Log.info("Invite redeemed; server and key saved.", category: "app")
+                menuBarController.showToast(Settings.shared.mode == .local
+                    ? "Joined. Local mode is on."
+                    : "Joined. Switch to Local once the current upload finishes.")
+            } catch {
+                Log.warning("invite redeem failed: \(ErrorLog.describe(error))", category: "app")
+                showAlert("Could not join the server.",
+                          info: (error as? InviteError)?.message ?? "Check your connection and try again.")
+            }
+        }
+    }
+
+    @MainActor private func showAlert(_ message: String, info: String) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = info
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

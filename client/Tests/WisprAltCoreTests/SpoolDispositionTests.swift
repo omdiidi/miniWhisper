@@ -32,9 +32,9 @@ import WisprAltCore
         #expect(d(.text(truncated: false, serverSaved: true), nil) == SpoolDecision(keep: true))
     }
 
-    @Test func empty_deletesSilently() {
+    @Test func emptyRecording_deletesSilently_emptyText_keeps() {
         for i in all + [nil] {
-            #expect(d(.emptyText, i) == SpoolDecision(keep: false))
+            #expect(d(.emptyText, i) == SpoolDecision(keep: true, toasts: [.noSpeech]))
             #expect(d(.emptyRecording, i) == SpoolDecision(keep: false))
         }
         #expect(DictationOutcome(.empty) == .emptyRecording)

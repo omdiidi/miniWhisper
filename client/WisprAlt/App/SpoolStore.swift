@@ -118,15 +118,15 @@ actor SpoolStore {
 
     func export(_ id: String, to dest: URL) throws {
         guard let audio = retryAudio(id) else { throw CocoaError(.fileNoSuchFile) }
-        if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
-        try fm.copyItem(at: audio, to: dest)
+        try AtomicFile.copy(audio, to: dest)
     }
 
     /// Re-sends a saved recording on the route its sidecar names (only when
     /// that is the current mode). Online → `OpenAIFileProvider` with the
     /// sidecar's file model; Local → whole file to the current host with
-    /// `X-Client-Dedup-Id: <id>`. The entry is deleted on success (kept on a
-    /// Local `saved: false`) and on a terminal 410/409; any other error keeps it.
+    /// `X-Client-Dedup-Id: <id>`. A terminal 410/409 deletes the entry; any
+    /// other error keeps it. On success the entry stays until the caller has
+    /// saved the text and calls `retryDelivered`.
     func retry(_ id: String, mode: TranscriptionMode) async throws -> DictationResult {
         let sidecarData = try? Data(contentsOf: SpoolFiles.sidecarURL(id, in: SpoolFiles.retryDir))
         guard RetryEntries.actions(sidecar: sidecarData, currentMode: mode).actions.contains(.retry),
@@ -144,7 +144,6 @@ actor SpoolStore {
                 result = try await LocalServerProvider(endpoint: ServerClient.shared.currentEndpoint(), dictationId: id)
                     .retry(wav: wav, durationSeconds: recording.durationSeconds)
             }
-            if result.serverSaved { discard(id) }
             return result
         } catch {
             if ErrorLog.outcome(error) == .failed(.rejected) { discard(id) }
@@ -152,27 +151,41 @@ actor SpoolStore {
         }
     }
 
+    /// After a Retry's text is on the clipboard and in `last.json`: drop the
+    /// entry unless the server did not save it or the transcript was empty.
+    func retryDelivered(_ id: String, _ result: DictationResult) {
+        if RetryEntries.dropAfterRetry(result) { discard(id) }
+    }
+
     // MARK: - Private
 
+    /// The spool copy is deleted only once a copy exists in `retry/`; when
+    /// both the conversion and the raw move fail it stays in `spool/`, so the
+    /// next launch tries again.
     private func moveToRetry(_ id: String) -> Bool {
         let src = SpoolFiles.audioURL(id)
-        var kept = false
-        if fm.fileExists(atPath: src.path) {
+        guard fm.fileExists(atPath: src.path) else { delete(id); return false }
+        do {
+            try PrivateFile.write(try Mono16kWAV.make(from: src),
+                                  to: SpoolFiles.retryDir.appendingPathComponent("\(id).wav"))
+        } catch {
+            Log.warning("retry: 16 kHz conversion failed (\(ErrorLog.describe(error))); keeping the raw file.",
+                        category: "dictation")
             do {
-                try PrivateFile.write(try Mono16kWAV.make(from: src),
-                                      to: SpoolFiles.retryDir.appendingPathComponent("\(id).wav"))
-                kept = true
+                try fm.createDirectory(at: SpoolFiles.retryDir, withIntermediateDirectories: true,
+                                       attributes: [.posixPermissions: 0o700])
+                try fm.moveItem(at: src, to: SpoolFiles.retryDir.appendingPathComponent("\(id).caf"))
             } catch {
-                Log.warning("retry: 16 kHz conversion failed (\(ErrorLog.describe(error))); keeping the raw file.",
-                            category: "dictation")
-                kept = (try? fm.moveItem(at: src, to: SpoolFiles.retryDir.appendingPathComponent("\(id).caf"))) != nil
+                Log.error("retry: could not save the recording (\(ErrorLog.describe(error))); left in the spool.",
+                          category: "dictation")
+                return false
             }
         }
         let sidecarDest = SpoolFiles.sidecarURL(id, in: SpoolFiles.retryDir)
         try? fm.removeItem(at: sidecarDest)
         try? fm.moveItem(at: SpoolFiles.sidecarURL(id), to: sidecarDest)
         delete(id)
-        return kept
+        return true
     }
 
     /// Applies `RetryEntries.plan` to `retry/`. Returns the entries dropped for space.
@@ -224,6 +237,7 @@ extension MenuBarController {
         case .copiedNotPasted: showToast("No app to paste into — the text is on the clipboard.")
         case .possiblyTruncated: showToast("The transcript may be cut off.\(saved)")
         case .notSavedOnServer: showToast("The server did not save this dictation.\(saved)")
+        case .noSpeech: showToast("No speech detected.\(saved)")
         case .failed(let kind):
             AppNotifications.notify(title: "Dictation Failed", body: Self.failureMessage(kind, mode: mode) + saved)
         }
@@ -251,10 +265,15 @@ extension MenuBarController {
         Task { @MainActor in
             do {
                 let result = await MercuryStep.apply(try await SpoolStore.shared.retry(id, mode: mode))
-                LastTextStore.save(result, mode: mode)
-                ClipboardInjector.copyOnly(result.text)
-                recordingState.retryStatus = "Copied — \(result.text.count.formatted(.number)) chars"
-                    + (result.serverSaved ? "" : ". The server did not save it; kept under Retry.")
+                if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    recordingState.retryStatus = "No speech detected; kept under Retry."
+                } else {
+                    LastTextStore.save(result, mode: mode)
+                    ClipboardInjector.copyOnly(result.text)
+                    recordingState.retryStatus = "Copied — \(result.text.count.formatted(.number)) chars"
+                        + (result.serverSaved ? "" : ". The server did not save it; kept under Retry.")
+                }
+                await SpoolStore.shared.retryDelivered(id, result)   // only after the text is saved
             } catch {
                 Log.warning("retry failed: \(ErrorLog.describe(error))", category: "dictation")
                 let outcome = ErrorLog.outcome(error)

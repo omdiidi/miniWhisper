@@ -156,8 +156,23 @@ import WisprAltCore
         p.append(samples(4_800))
         let r = try await p.finish(recording)
         #expect(r.modelUsed == "gpt-transcribe")
-        #expect(t.sent.last == RealtimeProtocol.commit)
+        #expect(!t.sent.contains(RealtimeProtocol.commit))     // no ack was ever read
         #expect(t.closeCount >= 1)
+    }
+
+    /// The error answering `session.update` always wins: commit waits for the ack.
+    @Test func noCommitUntilTheSessionAck() async throws {
+        let t = FakeTransport(acksSession: false, reply: Self.happyReply)
+        let p = provider(t)
+        p.start()
+        p.append(samples(4_800))
+        async let result = p.finish(recording)
+        await waitUntil { t.sent.count == 2 }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        #expect(!t.sent.contains(RealtimeProtocol.commit))
+        t.deliver(#"{"type":"session.updated","session":{}}"#)
+        #expect(try await result.text == "hello there")
+        #expect(t.sent.last == RealtimeProtocol.commit)
     }
 
     @Test func under100ms_isEmptyRecording_noCommit_noRecovery() async {

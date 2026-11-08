@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import WisprAltCore
 
 // MARK: - Value types
 
@@ -130,7 +131,7 @@ enum FileJobAPI {
         guard let baseURL = Settings.shared.serverURL else {
             throw ServerError.missingConfiguration
         }
-        guard let url = URL(string: "/transcribe/file", relativeTo: baseURL)?.absoluteURL else {
+        guard let url = LocalURLPolicy.url(baseURL, path: "/transcribe/file") else {
             throw ServerError.invalidServerURL
         }
 
