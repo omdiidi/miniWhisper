@@ -3,7 +3,9 @@ import os
 import Testing
 @testable import WisprAltCore
 
-@Suite struct DeadlineTests {
+/// Serialized: each test blocks a cooperative thread on purpose; in parallel with
+/// itself on a small CI runner that starved the deadline timer.
+@Suite(.serialized) struct DeadlineTests {
     private final class Counter: @unchecked Sendable {
         private let n = OSAllocatedUnfairLock(initialState: 0)
         func bump() { n.withLock { $0 += 1 } }
@@ -53,12 +55,12 @@ import Testing
         let fired = Counter()
         let task = Task {
             try await withDeadline(seconds: 0.1, onTimeout: { fired.bump() }) { () -> Int in
-                Thread.sleep(forTimeInterval: 1.0)
+                Thread.sleep(forTimeInterval: 4.0)   // long enough for the 0.1 s timer even on a busy runner
                 return 1
             }
         }
         // Cancel only once the timeout has fired (a fixed sleep raced a busy test pool).
-        for _ in 0..<500 where fired.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<1000 where fired.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
         task.cancel()
         let result = await task.result
         #expect(throws: ProviderError.deadlineExceeded) { try result.get() }

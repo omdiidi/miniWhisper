@@ -2,7 +2,7 @@ name: Lint installer and scripts
 
 # Fail-closed guard for install.sh. It runs on a fresh Mac under macOS's frozen
 # bash 3.2 with `set -u` (an empty-array expansion once crashed the old installer
-# there) and before any Python exists. macos-14 gives a free bash-3.2 runner:
+# there) and before any Python exists. every macOS runner ships the frozen bash 3.2 as /bin/bash:
 # source the file (its guard stops main) and call the functions directly.
 
 on:
@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   lint:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
