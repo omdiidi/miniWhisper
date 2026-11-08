@@ -171,7 +171,9 @@ client`, and in the app's Settings enter the server URL and a key made with
 `wispralt update` is the whole update: it pulls the clone (fast-forward only),
 backs up, reinstalls the CLI, restarts the service and waits for it to be
 healthy. If the new version does not come up healthy it exits 1 and prints the
-`wispralt restore` command for the backup it just took. Add `--client` to
+`wispralt restore` command for the backup it just took. If a step after the
+reinstall fails (e.g. model verification), it still starts the service and says
+whether it came back. Add `--client` to
 rebuild and reinstall the app. (The app's own **Update** button still points at
 the retired release installer; use `wispralt update --client` until it is
 retargeted.)
@@ -180,8 +182,11 @@ retargeted.)
 models and the logs, and finally the CLI itself. Your data, `.env` and backups
 stay.
 
-- `--purge-data` also deletes the data directory and `.env`, after taking a
-  backup (skip it with `--no-backup`). It refuses when there is no
+- `--purge-data` also deletes WisprAlt's data (`wispralt.db*`, `outputs/`,
+  `staging/`, `setup-code`) and `.env`, after taking a backup (skip it with
+  `--no-backup`; with no database it copies the files to
+  `wispralt-<ts>-files`). Other files in the data directory are kept, and the
+  directory goes only if it is then empty. It refuses when there is no
   `install-state.json` or when the backup directory is inside the data
   directory.
 - `--client` moves the app to the Trash. It never deletes your transcripts

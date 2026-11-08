@@ -181,7 +181,7 @@ the server on failure.
   `postgresql`), no connection string (env `WISPRALT_IMPORT_PG_URL` or Keychain
   `co.wispralt.import-pg`), or Postgres refused the query (e.g. permissions).
 - **Exit 4 integrity failure** — a `.jsonl` file no longer matches `counts.json`
-  (edited or truncated), the row count changed during the export twice in a row, a
+  (edited or truncated), the export's psql output did not match its own counts, a
   first import found rows already present, or not every planned row was written.
   Nothing from the failing batch was written; export a fresh snapshot rather than
   editing one.
