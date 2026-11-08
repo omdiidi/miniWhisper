@@ -8,6 +8,12 @@ import WisprAltCore
 // MARK: - File transcription: upload, poll, cancel, resume
 
 extension MenuBarController {
+    /// Poll generation fence: a Local job wrapper / poller task that captured
+    /// `gen` may write state only while it is live and `gen` is current.
+    @MainActor func mayWrite(_ gen: Int) -> Bool {
+        PollFence.mayWrite(isCancelled: Task.isCancelled, captured: gen, current: pollGeneration)
+    }
+
     /// Probe a source file's audio duration via AVAsset. Returns nil if the
     /// container is unreadable or has no audio track. Used to size the
     /// poll deadline in `runFileTranscriptionJob`.
@@ -39,7 +45,8 @@ extension MenuBarController {
     func runFileTranscriptionJob(
         sourceURL: URL,
         outputDirectory: URL,
-        stem: String
+        stem: String,
+        gen: Int
     ) async throws {
         // --- Step 0: extract audio if the source is a video container ---
         // A 200 MB MP4 typically becomes a ~15 MB .m4a — often dropping below
@@ -91,6 +98,8 @@ extension MenuBarController {
         }
 
         // --- Upload ---
+        // A cancel during extraction already reset the UI; never start an upload for it.
+        guard mayWrite(gen) else { throw CancellationError() }
         // Reset stall-watchdog state before bytes start flowing and arm the
         // 30-second no-progress abort.
         recordingState.uploadError = nil
@@ -121,7 +130,7 @@ extension MenuBarController {
                     fileURL: uploadURL,
                     progress: { [weak self] fraction in
                         Task { @MainActor [weak self] in
-                            guard let self else { return }
+                            guard let self, self.mayWrite(gen) else { return }
                             self.recordingState.uploadFraction = fraction
                             self.recordingState.lastUploadProgressAt = Date()
                         }
@@ -133,7 +142,7 @@ extension MenuBarController {
                     },
                     phaseHandler: { [weak self] phase in
                         Task { @MainActor [weak self] in
-                            guard let self else { return }
+                            guard let self, self.mayWrite(gen) else { return }
                             switch phase {
                             case .initRequest, .chunk:
                                 self.recordingState.isFinalizing = false
@@ -147,7 +156,7 @@ extension MenuBarController {
                 jobID = try await FileJobAPI.submitFile(
                     uploadURL,
                     progress: { [weak self] fraction in
-                        guard let self else { return }
+                        guard let self, self.mayWrite(gen) else { return }
                         self.recordingState.uploadFraction = fraction
                         self.recordingState.lastUploadProgressAt = Date()
                     },
@@ -162,6 +171,8 @@ extension MenuBarController {
                 )
             }
         } catch {
+            // A cancel already tore everything down; a stale wrapper writes nothing.
+            guard mayWrite(gen) else { throw error }
             // Tear down watchdog + session refs before surfacing the error so
             // the stall watchdog doesn't fire on a torn-down upload.
             uploadWatchdogTask?.cancel()
@@ -178,6 +189,15 @@ extension MenuBarController {
             }
             throw error
         }
+        // A cancel that landed while the upload was completing already reset
+        // local state; cancel the job the server just created and end silently
+        // instead of re-publishing it as active.
+        if !mayWrite(gen) {
+            // A new unstructured Task does not inherit this Task's cancelled
+            // state, so the cancel request is actually sent.
+            await Task { _ = try? await FileJobAPI.cancel(jobID) }.value
+            throw CancellationError()
+        }
         // Upload finished cleanly — drop the session reference + watchdog.
         // Cancel paths also clear these in `cancelActiveTranscription()`.
         uploadWatchdogTask?.cancel()
@@ -185,23 +205,14 @@ extension MenuBarController {
         activeUploadSession = nil
         recordingState.lastUploadProgressAt = nil
         recordingState.isFinalizing = false
-        // A cancel that landed while the upload was completing already reset
-        // local state; cancel the job the server just created and end silently
-        // instead of re-publishing it as active.
-        if Task.isCancelled {
-            // A new unstructured Task does not inherit this Task's cancelled
-            // state, so the cancel request is actually sent.
-            await Task { _ = try? await FileJobAPI.cancel(jobID) }.value
-            throw CancellationError()
-        }
         // Make the job id observable + persistent so a process restart can
         // resume polling and the UI can render Cancel + View-server-log.
         recordingState.activeJobID = jobID.raw
         UserDefaults.standard.set(jobID.raw, forKey: Self.activeJobIDDefaultsKey)
 
         // --- Processing ---
-        self.mode = .processing
-        self.recordingState.uploadFraction = 0  // clear so "Uploading 100%" stops showing
+        localUploadPhase = .polling
+        recordingState.uploadFraction = 0  // clear so "Uploading 100%" stops showing
         Log.info("File uploaded — job_id: \(jobID), polling for completion.", category: "transcribe")
 
         let pollDeadline = Date(timeIntervalSinceNow: deadlineSeconds)
@@ -225,12 +236,15 @@ extension MenuBarController {
                 }
                 // A server failure is final: never resume this job id.
                 // Timeout / transport errors keep it for the next launch.
-                recordingState.activeJobID = nil
-                UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+                if mayWrite(gen) {
+                    recordingState.activeJobID = nil
+                    UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+                }
                 throw FileJobError.serverFailed(reason)
             case .pending:
                 continue
             case .running(let progress, let serverFinishing):
+                guard mayWrite(gen) else { continue }
                 recordingState.phase = progress?.phase
                 recordingState.phaseLabel = progress?.phaseLabel
                 recordingState.chunkIndex = progress?.chunkIndex
@@ -248,10 +262,12 @@ extension MenuBarController {
         }
         // Job completed cleanly — clear per-job UI state. The download +
         // delete steps below are quick and don't need progress fields.
-        recordingState.phase = nil
-        recordingState.phaseLabel = nil
-        recordingState.chunkIndex = nil
-        recordingState.totalChunks = nil
+        if mayWrite(gen) {
+            recordingState.phase = nil
+            recordingState.phaseLabel = nil
+            recordingState.chunkIndex = nil
+            recordingState.totalChunks = nil
+        }
 
         // --- Download all formats ---
         let formatsToDownload: [String]
@@ -270,12 +286,14 @@ extension MenuBarController {
         // Outputs are saved locally; the job is done from the user's point of
         // view. Server cleanup is best-effort (a failed DELETE keeps the row
         // for the retention sweep) and must not turn success into failure.
-        recordingState.activeJobID = nil
-        UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+        if mayWrite(gen) {
+            recordingState.activeJobID = nil
+            UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
+        }
         do {
             try await FileJobAPI.delete(jobID)
         } catch {
-            Log.warning("FileJobAPI.delete(\(jobID)) failed after download: \(error.localizedDescription)", category: "transcribe")
+            Log.warning("FileJobAPI.delete(\(jobID)) failed after download: \(ErrorLog.describe(error))", category: "transcribe")
         }
     }
 
@@ -314,7 +332,7 @@ extension MenuBarController {
     // MARK: - Upload stall watchdog
 
     /// Poll `recordingState.lastUploadProgressAt` every 5s; if it hasn't
-    /// advanced in 120s while an upload is in-flight (`mode == .uploading`
+    /// advanced in 120s while an upload is in-flight (`localUploadPhase == .uploading`
     /// and `uploadFraction < 1.0`), abort the upload via
     /// `cancelActiveTranscription()` and surface a user-visible error on
     /// `recordingState.uploadError`. The watchdog self-terminates after
@@ -335,7 +353,7 @@ extension MenuBarController {
                 guard let lastProgress = self.recordingState.lastUploadProgressAt else { continue }
                 let stalledFor = Date().timeIntervalSince(lastProgress)
                 let stillUploading = self.recordingState.uploadFraction < 1.0
-                    && self.mode == .uploading
+                    && self.localUploadPhase == .uploading
                     && self.activeUploadSession != nil
                 if stalledFor > 120, stillUploading {
                     Log.warning(
@@ -386,8 +404,10 @@ extension MenuBarController {
     func cancelActiveTranscription() async {
         Log.info("Cancel requested — tearing down active transcription.", category: "transcribe")
 
-        // 1) Cancel the in-process Task — stops the poll loop on the next
-        //    cooperative yield point.
+        // 1) Fence first: the cancelled task's generation goes stale, so none
+        //    of its later writes land. Then cancel it — stops the poll loop on
+        //    the next cooperative yield point.
+        pollGeneration += 1
         activeJobTask?.cancel()
         activeJobTask = nil
 
@@ -413,9 +433,10 @@ extension MenuBarController {
         recordingState.phaseElapsedS = nil
         recordingState.uploadFraction = 0
         recordingState.isFinalizing = false
-        // Leave the processing icon now, not after the network round trip.
-        // A dictation that started meanwhile keeps its icon.
-        if mode != .dictating { mode = .idle }
+        // Leave the job icon now, not after the network round trip. A
+        // dictation that started meanwhile keeps its icon (it is derived).
+        localUploadPhase = .none
+        localDoneFlash = false
 
         // 5) Tell the server. 202 = cancel accepted (the server finishes the
         //    cancel itself); 204 = already finished or gone. Either way the
@@ -437,33 +458,41 @@ extension MenuBarController {
                 }
             } catch {
                 Log.warning(
-                    "FileJobAPI.cancel(\(raw)) failed: \(error.localizedDescription)",
+                    "FileJobAPI.cancel(\(raw)) failed: \(ErrorLog.describe(error))",
                     category: "transcribe"
                 )
             }
         }
     }
 
-    /// On app launch: if UserDefaults remembers an in-flight job id, set it
-    /// on `recordingState` so the popover renders Cancel + View-server-log,
-    /// and spawn a polling Task that drains the job to completion (or
-    /// surfaces `serverFinishingJobID` if it's still grinding).
+    /// If UserDefaults remembers an in-flight Local job id, set it on
+    /// `recordingState` so the popover renders Cancel + View-server-log, and
+    /// spawn a polling Task that drains the job to completion (or surfaces
+    /// `serverFinishingJobID` if it's still grinding).
     ///
-    /// Called from `AppDelegate.applicationDidFinishLaunching` after
-    /// `MenuBarController` is constructed. Safe to call when no id is stored
-    /// — early-returns silently.
+    /// Run only through `LaunchActions` (Local mode: at launch, on a switch to
+    /// Local, after an Online job ends). Safe to call when no id is stored or
+    /// a poller already runs — returns silently.
     @MainActor
     func resumeInFlightJobIfNeeded() {
-        guard let raw = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey),
+        guard activeJobTask == nil,
+              let raw = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey),
               !raw.isEmpty else { return }
         Log.info("Resuming polling for in-flight job: \(raw)", category: "transcribe")
+        pollGeneration += 1
+        let gen = pollGeneration
         recordingState.activeJobID = raw
-        self.mode = .processing
-        self.recordingState.uploadFraction = 0  // clear so "Uploading 100%" stops showing
+        localUploadPhase = .polling
+        recordingState.uploadFraction = 0  // clear so "Uploading 100%" stops showing
         fileJobsInFlight += 1
         activeJobTask = Task { @MainActor [weak self] in
-            defer { self?.fileJobsInFlight -= 1 }
-            await self?.resumePollingForJob(JobID(raw: raw))
+            defer {
+                if let self {
+                    self.fileJobsInFlight -= 1
+                    if gen == self.pollGeneration { self.activeJobTask = nil }
+                }
+            }
+            await self?.resumePollingForJob(JobID(raw: raw), gen: gen)
         }
     }
 
@@ -479,7 +508,7 @@ extension MenuBarController {
     /// recovery path is for visibility, not for completing the original
     /// transaction.
     @MainActor
-    func resumePollingForJob(_ jobID: JobID) async {
+    func resumePollingForJob(_ jobID: JobID, gen: Int) async {
         let deadlineSeconds: TimeInterval = 6 * 3600
         let pollDeadline = Date(timeIntervalSinceNow: deadlineSeconds)
         do {
@@ -490,6 +519,7 @@ extension MenuBarController {
                 }
                 try await Task.sleep(nanoseconds: 5_000_000_000)
                 let status = try await pollWithBackoff(jobID)
+                guard mayWrite(gen) else { return }
                 switch status {
                 case .done:
                     AppNotifications.notify(
@@ -499,7 +529,7 @@ extension MenuBarController {
                     recordingState.activeJobID = nil
                     recordingState.serverFinishingJobID = nil
                     UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
-                    self.mode = .idle
+                    localUploadPhase = .none
                     return
                 case .failed(let reason):
                     // "cancelled by user" is a silent end; anything else is
@@ -510,7 +540,7 @@ extension MenuBarController {
                     recordingState.activeJobID = nil
                     recordingState.serverFinishingJobID = nil
                     UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
-                    self.mode = .idle
+                    localUploadPhase = .none
                     return
                 case .pending:
                     continue
@@ -529,10 +559,10 @@ extension MenuBarController {
             }
         } catch {
             Log.warning(
-                "Resumed-job polling aborted: \(error.localizedDescription)",
+                "Resumed-job polling aborted: \(ErrorLog.describe(error))",
                 category: "transcribe"
             )
-            if case ServerError.server(status: 404, _) = error {
+            if mayWrite(gen), case ServerError.server(status: 404, _) = error {
                 // The server no longer knows the job: never resume it again.
                 UserDefaults.standard.removeObject(forKey: Self.activeJobIDDefaultsKey)
             }
@@ -540,8 +570,9 @@ extension MenuBarController {
         // Timed out or polling failed: stop presenting the job as processing
         // (that would keep `isBusy` true and block updates forever). Unless the
         // server said 404, the job id stays in UserDefaults so the next launch
-        // resumes polling it.
-        if mode == .processing { mode = .idle }
+        // resumes polling it. A cancelled or superseded poller writes nothing.
+        guard mayWrite(gen) else { return }
+        localUploadPhase = .none
         recordingState.activeJobID = nil
         recordingState.serverFinishingJobID = nil
     }
@@ -611,6 +642,9 @@ extension MenuBarController {
     /// hands off to the async pipeline.
     @MainActor
     func transcribePickedFile() {
+        // Online file transcription is not wired yet, and Online never
+        // contacts the Local host (the popover disables the button too).
+        guard Settings.shared.mode == .local else { return }
         // One file job at a time: a second Task would overwrite `activeJobTask`
         // and the shared job state, so Cancel could no longer reach the first.
         guard fileJobsInFlight == 0 else {
@@ -641,19 +675,28 @@ extension MenuBarController {
         // held in `activeJobTask` so `cancelActiveTranscription()` stops its
         // upload/poll loop.
         fileJobsInFlight += 1
+        pollGeneration += 1
+        let gen = pollGeneration
         activeJobTask = Task { @MainActor [weak self] in
-            defer { self?.fileJobsInFlight -= 1 }
-            await self?.handlePickedFile(picked)
+            defer {
+                if let self {
+                    self.fileJobsInFlight -= 1
+                    if gen == self.pollGeneration { self.activeJobTask = nil }
+                }
+            }
+            await self?.handlePickedFile(picked, gen: gen)
         }
     }
 
-    /// Drives transcode → upload for a picked audio/video file. Sets `mode`
-    /// transitions and surfaces any failure as a notification.
+    /// Drives transcode → upload for a picked audio/video file. Sets
+    /// `localUploadPhase` and surfaces any failure as a notification; every
+    /// write is fenced on `gen`.
     @MainActor
-    func handlePickedFile(_ picked: URL) async {
+    func handlePickedFile(_ picked: URL, gen: Int) async {
         let stem = picked.deletingPathExtension().lastPathComponent
 
-        mode = .converting
+        guard mayWrite(gen) else { return }
+        localUploadPhase = .converting
 
         let subdir: URL
         do {
@@ -661,8 +704,9 @@ extension MenuBarController {
         } catch {
             let message = formatTranscriptionError(error)
             Log.error("Custom transcription: makeJobDirectory failed: \(message)", category: "transcribe")
+            guard mayWrite(gen) else { return }
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)
-            mode = .idle
+            localUploadPhase = .none
             return
         }
 
@@ -674,16 +718,18 @@ extension MenuBarController {
         } catch {
             let message = formatTranscriptionError(error)
             Log.error("Custom transcription: copy source file failed: \(message)", category: "transcribe")
-            AppNotifications.notify(title: "Custom Transcription Failed", body: message)
             try? FileManager.default.removeItem(at: subdir)
-            mode = .idle
+            guard mayWrite(gen) else { return }
+            AppNotifications.notify(title: "Custom Transcription Failed", body: message)
+            localUploadPhase = .none
             return
         }
 
         await processCustomTranscriptionUpload(
             sourceURL: originalDestination,
             outputDirectory: subdir,
-            stem: stem
+            stem: stem,
+            gen: gen
         )
     }
 
@@ -695,26 +741,32 @@ extension MenuBarController {
     func processCustomTranscriptionUpload(
         sourceURL: URL,
         outputDirectory: URL,
-        stem: String
+        stem: String,
+        gen: Int
     ) async {
-        mode = .uploading
+        guard mayWrite(gen) else { return }
+        localUploadPhase = .uploading
         recordingState.uploadFraction = 0
 
         do {
             try await runFileTranscriptionJob(
                 sourceURL: sourceURL,
                 outputDirectory: outputDirectory,
-                stem: stem
+                stem: stem,
+                gen: gen
             )
+            Log.info("Custom transcription complete — \(stem)", category: "transcribe")
+            guard mayWrite(gen) else { return }
 
             NotificationCenter.default.post(name: .wisprAltTranscriptWritten, object: nil)
-
             AppNotifications.notify(title: "Custom Transcription Complete", body: stem)
-            Log.info("Custom transcription complete — \(stem)", category: "transcribe")
 
-            mode = .done
+            // Both done-flash writes are fenced: a cancel during the 3 s
+            // sleep writes nothing (the canceller already cleared the flash).
+            localUploadPhase = .none
+            localDoneFlash = true
             try? await Task.sleep(nanoseconds: 3_000_000_000)
-            mode = .idle
+            if mayWrite(gen) { localDoneFlash = false }
         } catch {
             if Self.isCancellation(error) {
                 // User cancelled; cancelActiveTranscription() already reset state.
@@ -723,8 +775,9 @@ extension MenuBarController {
             }
             let message = formatTranscriptionError(error)
             Log.error("Custom transcription failed: \(message)", category: "transcribe")
+            guard mayWrite(gen) else { return }
             AppNotifications.notify(title: "Custom Transcription Failed", body: message)
-            mode = .idle
+            localUploadPhase = .none
         }
     }
 }
@@ -742,6 +795,24 @@ enum FileJobError: Error, LocalizedError {
             return "Server-side processing failed: \(reason)"
         case .pollTimedOut:
             return "Server didn't respond in time; check /metrics for job status."
+        }
+    }
+}
+
+/// Never logs the server's failure reason (it stays on the value for the
+/// user-facing notification only).
+extension FileJobError: LogSafeError {
+    var logDescription: String {
+        switch self {
+        case .serverFailed: return "serverFailed"
+        case .pollTimedOut: return "pollTimedOut"
+        }
+    }
+
+    var outcomeKind: ErrorOutcome {
+        switch self {
+        case .serverFailed: return .failed(.server)
+        case .pollTimedOut: return .failed(.deadline)
         }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import WisprAltCore
 
 /// Typed errors from the WisprAlt server. Each case maps to a distinct HTTP condition
 /// or transport failure so callers can handle them specifically.
@@ -66,6 +67,35 @@ enum ServerError: Error, LocalizedError {
             return "Could not parse the server response: \(underlying.localizedDescription)"
         case .transport(let underlying):
             return "Network error: \(underlying.localizedDescription)"
+        }
+    }
+}
+
+/// Log text never includes the response body; only the status or error kind.
+extension ServerError: LogSafeError {
+    var logDescription: String {
+        switch self {
+        case .missingConfiguration: return "missingConfiguration"
+        case .invalidServerURL: return "invalidServerURL"
+        case .unauthorized: return "server(status: 401)"
+        case .rateLimited: return "server(status: 429)"
+        case .fileJobInProgress: return "fileJobInProgress"
+        case .uploadTooLarge: return "server(status: 413)"
+        case .uploadTruncated: return "server(status: 422)"
+        case .server(let status, _): return "server(status: \(status))"
+        case .decoding: return "decoding"
+        case .transport(let underlying): return "transport(\(ErrorLog.describe(underlying)))"
+        }
+    }
+
+    var outcomeKind: ErrorOutcome {
+        switch self {
+        case .unauthorized: return .failed(.auth)
+        case .transport(let underlying):
+            if let url = underlying as? URLError, url.code == .cancelled { return .cancelled }
+            return .failed(.network)
+        case .rateLimited, .fileJobInProgress, .server, .decoding: return .failed(.server)
+        case .missingConfiguration, .invalidServerURL, .uploadTooLarge, .uploadTruncated: return .failed(.other)
         }
     }
 }

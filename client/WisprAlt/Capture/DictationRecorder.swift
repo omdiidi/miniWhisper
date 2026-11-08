@@ -3,6 +3,7 @@ import AudioToolbox
 import CoreAudio
 import Foundation
 import os.lock
+import WisprAltCore
 
 extension Notification.Name {
     /// Posted when AVAudioEngine's input configuration changes mid-recording
@@ -11,25 +12,23 @@ extension Notification.Name {
     /// return the UI to idle — the engine has already invalidated the tap by
     /// the time this fires.
     static let dictationConfigChanged = Notification.Name("co.wispralt.dictationConfigChanged")
-    /// Posted once when a dictation reaches `DictationRecorder.maxDictationSeconds`.
-    /// The recorder stops buffering audio at that point; the UI layer should
-    /// treat it like an FN release (stop + submit).
+    /// Posted once when a dictation reaches the `maxSeconds` given to `start`.
+    /// `userInfo["seconds"]` carries that cap (Int). The recorder stops
+    /// buffering audio at that point; the UI layer treats it like an FN release.
     static let dictationMaxDurationReached = Notification.Name("co.wispralt.dictationMaxDurationReached")
 }
 
 // MARK: - DictationRecorder
 
-/// Records microphone audio via `AVAudioEngine` and produces a native-rate
-/// **16-bit PCM** WAV (typically 48 kHz, native channel count) suitable for
-/// the `/transcribe/dictate` endpoint. Server (`audio.py`) handles the
-/// resample to 16 kHz and the multi-channel → mono downmix via `np.mean`.
+/// Records microphone audio via `AVAudioEngine` into a native-rate Float32
+/// WAV and hands it over from `stop()` as a `RecorderOutput`: the recording on
+/// disk (the Online provider converts it to 16 kHz mono with `Mono16kWAV`)
+/// and, for a Local capture only, a `LocalCapture` holding the streaming
+/// session plus **16-bit PCM** WAVs at the native rate / channel count (the
+/// server resamples to 16 kHz and averages channels).
 ///
-/// On-disk capture is Float32 PCM (see "Why Float32 + native rate" below);
-/// the Float→Int16 downcast happens AFTER the file is written, in user code
-/// (see `Int16WAVEncoder`), entirely outside AVAudioFile's writer path. This
-/// halves the upload payload (~50% smaller) with zero perceptual quality
-/// loss — Parakeet is trained on 16-bit audio and the server resamples to
-/// 16 kHz, so any precision above the 16-bit noise floor is dropped anyway.
+/// The Float→Int16 downcast for Local happens AFTER the file is written, in
+/// user code (`Int16WAVEncoder`), entirely outside AVAudioFile's writer path.
 ///
 /// ## Why Float32 + native rate (zero client conversion)
 /// Two prior approaches both failed:
@@ -71,6 +70,8 @@ final class DictationRecorder {
         case notRecording
         case writeFailed(Error)
         case emptyRecording
+        /// The Float32 → Int16 re-encode for a Local upload failed.
+        case encodeFailed
 
         var errorDescription: String? {
             switch self {
@@ -82,7 +83,16 @@ final class DictationRecorder {
                 return "Audio file write failed: \(err.localizedDescription)"
             case .emptyRecording:
                 return "Recording was empty — no audio captured."
+            case .encodeFailed:
+                return "Could not encode the recording for upload."
             }
+        }
+
+        /// The config-change observer records a mid-recording device change as
+        /// `engineStartFailed(NSError code -11)`.
+        static func isDeviceChange(_ error: Error?) -> Bool {
+            guard case .engineStartFailed(let inner)? = error as? DictationError else { return false }
+            return (inner as NSError).code == -11
         }
     }
 
@@ -129,7 +139,14 @@ final class DictationRecorder {
     /// "AVAudioFile clipped on Int16 conversion". Logged in stop().
     private let floatPeak = OSAllocatedUnfairLock<Float>(initialState: 0)
 
-    private var isRecording = false
+    /// "A capture is running" plus the Local streaming session it owns.
+    /// `begin` is the last step of `start()`; `stop()` copies every
+    /// per-dictation value before `end()`, after which `start()` may run.
+    private let slot = CaptureSlot<DictationStreamSession>()
+
+    /// True when this capture was started with a Local endpoint (snapshot at
+    /// `start()`); only then does `stop()` build a `LocalCapture`.
+    private var isLocalCapture = false
 
     /// Observer token for AVAudioEngineConfigurationChange notifications.
     private var configChangeObserver: NSObjectProtocol?
@@ -222,12 +239,6 @@ final class DictationRecorder {
     /// the 270 s server-side cumulative cap.
     private var cumulativeChunkAudioMs: Double = 0
 
-    /// The streaming session for the in-progress recording, or nil when
-    /// streaming is disabled for this session. Surfaced read-only so
-    /// `DictationAPI.transcribe(_:recorder:)` can call `finalize(...)` and
-    /// later `abort()`.
-    private(set) var streamSession: DictationStreamSession?
-
     /// Off the realtime render thread, sequenced via this serial queue.
     /// Encodes Float32 frames → Int16 WAV and registers the chunk with the
     /// streaming session via a tiny Task wrapper + DispatchGroup.wait()
@@ -238,23 +249,12 @@ final class DictationRecorder {
         qos: .userInitiated
     )
 
-    /// Flips true once the first chunk has been registered with the actor.
-    /// Read by `DictationAPI.transcribe(_:recorder:)` as the "streaming has
-    /// actually engaged" gate — sub-8 s dictations never set this and so
-    /// silently take the existing non-streaming ladder.
-    /// Maximum dictation length. Server cap is 900 s; stay well under.
-    static let maxDictationSeconds: Double = 600
     private let maxDurationNotified = OSAllocatedUnfairLock<Bool>(initialState: false)
 
+    /// Flips true once the first chunk has been registered with the actor:
+    /// "streaming has actually engaged". Sub-8 s dictations never set it and
+    /// take the whole-file upload (`LocalFinalizeRoute`).
     private let streamingArmedAtomic = OSAllocatedUnfairLock<Bool>(initialState: false)
-
-    /// SNAPSHOT of the streaming-enabled decision made at `start()` time.
-    /// Read by `DictationAPI.transcribe(_:recorder:)` so a mid-recording
-    /// toggle by the user cannot orphan an already-open server session.
-    private(set) var streamingEnabledForThisSession: Bool = false
-
-    /// Public accessor for the streamingArmed flag. Reads under the lock.
-    var streamingArmed: Bool { streamingArmedAtomic.withLock { $0 } }
 
     /// One latency reading captured by MenuBarController after paste
     /// completes. Phase 4.4 reads `~/Library/Caches/WisprAlt/latency.json`
@@ -313,14 +313,11 @@ final class DictationRecorder {
         try? FileManager.default.moveItem(at: tmp, to: target)
     }
 
-    /// Trailing-audio frames not yet shipped as a chunk. Encoded into the
-    /// `/finalize` request's `file` part by `DictationAPI.transcribe`.
-    ///
-    /// CONSUMING: hands the samples to the caller and releases the recorder's
+    /// Trailing-audio frames not yet shipped as a chunk (the `/finalize`
+    /// tail). CONSUMING: hands the samples over and releases the recorder's
     /// copy (`= []`, not keepingCapacity) so a long dictation's audio does not
-    /// stay resident while idle. The only caller is `DictationAPI.transcribe`,
-    /// which runs after `stop()` returns and calls this at most once.
-    func tailFrames() -> [Float] {
+    /// stay resident while idle. Called once by `stop()` before `slot.end()`.
+    private func takeChunkBuffer() -> [Float] {
         chunkLock.lock()
         defer { chunkLock.unlock() }
         let tail = chunkBuffer
@@ -332,11 +329,18 @@ final class DictationRecorder {
 
     /// Starts microphone capture.
     ///
-    /// - Returns: `true` on success (or if already recording).
-    /// - Throws: `DictationError.engineStartFailed` if the audio engine cannot start.
-    @discardableResult
-    func start() throws -> Bool {
-        guard !isRecording else { return true }
+    /// - Parameters:
+    ///   - dictationId: the dictation's id (names the temp recording).
+    ///   - endpoint: the Local server, or nil. Local streaming is armed only
+    ///     when this is non-nil, so an Online dictation never streams.
+    ///   - maxSeconds: the dictation cap; audio past it is dropped and
+    ///     `.dictationMaxDurationReached` is posted once.
+    /// - Returns: `true` when capture started; `false` while the previous
+    ///   capture has not finished handing off (`stop()` before `slot.end()`).
+    /// - Throws: `DictationError.engineStartFailed` if the audio engine cannot
+    ///   start. Every throw happens before `slot.begin`, so the slot stays free.
+    func start(dictationId: String, endpoint: ServerEndpoint?, maxSeconds: Int) throws -> Bool {
+        guard !slot.isActive else { return false }
 
         // Always start with a clean swallow flag. If a previous session armed it
         // and the synthetic configChange never fired (or fired before the observer
@@ -349,7 +353,7 @@ final class DictationRecorder {
         // (see the property's doc-comment for why). Until then, leave whatever
         // value was there — if a configChange somehow fires before we stamp the
         // new value, `elapsed = now - stale` is huge and the event is treated as
-        // a real device change (safe-abort default), which is correct behavior
+        // a real device change (safe default: end the recording), which is correct behavior
         // for any change that fires before the engine is even running.
 
         let inputNode = engine.inputNode
@@ -357,7 +361,7 @@ final class DictationRecorder {
         // === Apply preferred input device BEFORE format read & observer install.
         // The format read MUST happen on the new device — switching device changes
         // sample rate / channel count. The configChange observer installed below
-        // would also catch our override and abort the recording, so we do this
+        // would also catch our override and end the recording, so we do this
         // before the observer is wired up. ===
         if let preferredUID = Settings.shared.preferredInputDeviceUID,
            let deviceID = MicEnumerator.audioDeviceID(forUID: preferredUID),
@@ -379,11 +383,11 @@ final class DictationRecorder {
             } else {
                 // macOS fires AVAudioEngineConfigurationChange async on the main
                 // queue after this property change settles. The observer below
-                // would catch it and abort the recording. Set the swallow flag
+                // would catch it and end the recording. Set the swallow flag
                 // BEFORE the observer is installed, AND record when so the
                 // observer only swallows within `overrideSwallowWindow`. If the
                 // synthetic callback is lost or never fires, the flag self-times-
-                // out and a later real device change correctly aborts the session.
+                // out and a later real device change correctly ends the session.
                 pendingDeviceOverride = true
                 pendingDeviceOverrideSetAt = Date().timeIntervalSinceReferenceDate
                 Log.info(
@@ -432,24 +436,11 @@ final class DictationRecorder {
         nextLocalIndex = 0
         cumulativeChunkAudioMs = 0
         streamingArmedAtomic.withLock { $0 = false }
-        // v0.4.6: streaming is ALWAYS on. The user-facing toggle was removed.
-        // There is no Settings flag for this any more. Streaming-then-fallback always wins over a single-POST given
-        // the safety-buffer + dedup-id design, so there's no reason to gate it.
-        streamingEnabledForThisSession = true
-        if streamingEnabledForThisSession {
-            // Defensive: a leftover session from a rapid double-tap-FN race
-            // gets aborted here. The Task is fire-and-forget on purpose —
-            // start() is sync (callers expect it), and the rare residual
-            // race (old session POST lands on server before its cancellation
-            // completes) is bounded by the server's per-user single-session
-            // cap which silently falls back on the next recording.
-            if let old = streamSession {
-                Task { await old.abort() }
-            }
-            streamSession = DictationStreamSession(speechStartedAt: Date())
-        } else {
-            streamSession = nil
-        }
+        // Local streaming is armed only for a Local endpoint. The session's
+        // init does no I/O, so a throw below simply drops it. A previous
+        // dictation's session is never touched here: `stop()` handed it off.
+        let session = endpoint.map { _ in DictationStreamSession(speechStartedAt: Date()) }
+        isLocalCapture = endpoint != nil
 
         // Write directly in the input format. The server (soundfile + librosa)
         // resamples to 16 kHz internally, so we don't need to do it client-side.
@@ -463,7 +454,7 @@ final class DictationRecorder {
         // channels without averaging — that bug is exactly what produced the
         // peak=3.974 floats we just removed.
         let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("wispralt_dictation_\(UUID().uuidString).wav")
+            .appendingPathComponent("wispralt_dictation_\(dictationId).wav")
         audioFileURL = tempURL
 
         // Write a Float32 WAV that EXACTLY matches the tap's native format
@@ -515,7 +506,7 @@ final class DictationRecorder {
             // real device-change event. BUT only within `overrideSwallowWindow`
             // of when we set pendingDeviceOverride; if the synthetic callback
             // never arrives in time, the flag self-times-out and a later real
-            // device change correctly aborts (better to abort one recording
+            // device change correctly ends it (better to end one recording
             // than to silently capture from a disconnected device).
             if self.pendingDeviceOverride {
                 let sinceOverride = Date().timeIntervalSinceReferenceDate - self.pendingDeviceOverrideSetAt
@@ -538,7 +529,7 @@ final class DictationRecorder {
             // Settling window: ignore configChange notifications that arrive
             // within `configChangeSettleWindow` of session start. Late callbacks
             // from a previous session's device override sometimes land here
-            // even after stop() — without this guard they'd abort the new
+            // even after stop() — without this guard they'd end the new
             // session as if a real mid-recording device change happened.
             let elapsed = Date().timeIntervalSinceReferenceDate - self.sessionStartTime
             if elapsed < Self.configChangeSettleWindow {
@@ -562,7 +553,7 @@ final class DictationRecorder {
                     )
                 }
             }
-            // Notify the UI layer so the menubar state machine can abort the
+            // Notify the UI layer so it can stop and submit the
             // recording session — without this, the menubar shows "recording"
             // forever (FN release won't fire stop() because the engine has
             // already invalidated the tap).
@@ -575,6 +566,7 @@ final class DictationRecorder {
         // bufferSize 4096 frames ≈ 85ms @ 48kHz, ≈ 93ms @ 44.1kHz — large enough
         // to amortize file-system writes, small enough that stop() doesn't
         // block on a final flush past one buffer's worth of data.
+        let capFrames = UInt32(min(inputFormat.sampleRate * Double(maxSeconds), Double(UInt32.max)))
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
             // Stop fence: drop any buffers that race in after stop() began.
@@ -583,12 +575,12 @@ final class DictationRecorder {
             // Hard duration cap (missed FN-up / runaway recording). Drop all
             // further audio so file, chunk buffer and the later WAV encode
             // stay bounded; notify once so the UI can stop + submit.
-            let capFrames = UInt32(min(self.inputSampleRate * Self.maxDictationSeconds, Double(UInt32.max)))
             if self.frameCounter.withLock({ $0 }) >= capFrames {
                 if self.maxDurationNotified.withLock({ let was = $0; $0 = true; return !was }) {
                     Log.warning("DictationRecorder: max dictation duration reached; dropping further audio.", category: "capture")
                     DispatchQueue.main.async {
-                        NotificationCenter.default.post(name: .dictationMaxDurationReached, object: nil)
+                        NotificationCenter.default.post(name: .dictationMaxDurationReached, object: nil,
+                                                        userInfo: ["seconds": maxSeconds])
                     }
                 }
                 return
@@ -636,13 +628,13 @@ final class DictationRecorder {
                 }
             }
 
-            // === Streaming dictation (opt-in, Phase 2). =====================
-            // Only emit chunks when streaming was enabled at session start.
+            // === Streaming dictation (Local only). ==========================
+            // Only emit chunks when this capture has a Local session.
             // The classify/append/cut sequence is intentionally inline on the
             // tap thread — none of it blocks (no I/O, no locks held across
             // boundaries) so realtime safety is preserved. WAV encoding and
             // network registration happen on chunkEncodeQueue (off-thread).
-            if let session = self.streamSession, self.streamingEnabledForThisSession {
+            if let session {
                 self.chunkLock.lock()
                 defer { self.chunkLock.unlock() }
                 if self.stopRequested.withLock({ $0 }) { return }
@@ -732,7 +724,7 @@ final class DictationRecorder {
         // full reasoning.
         sessionStartTime = Date().timeIntervalSinceReferenceDate
 
-        isRecording = true
+        _ = slot.begin(session)
         Log.info(
             "DictationRecorder: recording started (input: \(Int(inputFormat.sampleRate))Hz \(inputFormat.channelCount)ch).",
             category: "capture"
@@ -740,182 +732,90 @@ final class DictationRecorder {
         return true
     }
 
-    /// Stops capture and returns the encoded WAV bytes.
+    /// Stops capture and hands the recording over.
     ///
-    /// Output WAV format: native sample rate (typically 48 kHz on macOS),
-    /// native channel count, **16-bit signed PCM** (interleaved). On disk the
-    /// tap writes Float32 (the only known-safe AVAudioFile writer path); the
-    /// returned bytes are Int16, downcast in `Int16WAVEncoder.encode` after
-    /// the file is closed. See class doc-comment for the full rationale.
-    ///
-    /// Teardown order (matters for thread-safety):
+    /// Teardown order (the contract):
     /// 1. Set `stopRequested` so the realtime tap callback drops new buffers.
-    /// 2. `removeTap` — no further tap callbacks will be scheduled.
-    /// 3. `engine.stop()` — flushes the audio graph.
-    /// 4. `ioQueue.sync { }` — barrier; waits for any tap-dispatched writes
-    ///    that already enqueued before stopRequested was set.
-    /// 5. Release `audioFile` — flushes Int16 conversion + closes the WAV.
-    /// 6. Read `frameCounter` and `writeError` — single-threaded read after
-    ///    queue drain, no further mutation possible.
+    /// 2. `removeTap`, then `engine.stop()`.
+    /// 3. Take `chunkLock` once (fences a tap callback already past the check).
+    /// 4. Drain `ioQueue`, then `chunkEncodeQueue` (late chunks registered).
+    /// 5. Release `audioFile` (closes the WAV).
+    /// 6. Copy EVERY per-dictation value into locals, then `slot.end()`.
+    ///    From here on `start()` may run for the next dictation, so only the
+    ///    locals are used below.
     ///
-    /// - Returns: Int16 PCM WAV `Data` at native sample rate / channel count.
-    /// - Throws:
-    ///   - `DictationError.notRecording` if `start()` was never called.
-    ///   - `DictationError.writeFailed(_)` if any tap-side `AVAudioFile.write`
-    ///     failed (disk full, ENOSPC, EBUSY, etc.) — these are no longer
-    ///     swallowed.
-    ///   - `DictationError.emptyRecording` if too few frames were captured
-    ///     (e.g. user released FN within 50ms of pressing it, or mic permission
-    ///     was revoked mid-recording).
-    func stop() async throws -> Data {
-        guard isRecording else {
-            throw DictationError.notRecording
-        }
+    /// - Returns: the native-rate Float32 recording on disk (the caller deletes
+    ///   it) and, for a Local capture, the `LocalCapture` (Int16 WAVs, session).
+    /// - Throws: `notRecording`; `writeFailed(_)` for a tap write error or a
+    ///   device change; `emptyRecording` under ~50 ms; `encodeFailed` when the
+    ///   Local re-encode fails. On any throw the taken session is aborted and
+    ///   the temp file deleted.
+    func stop() async throws -> RecorderOutput {
+        guard slot.isActive else { throw DictationError.notRecording }
 
-        // Set isRecording=false as the LAST mutation so a re-entrant start()
-        // can't observe partial cleanup. Also clear the device-override swallow
-        // flag and its timestamp — if either is still armed at stop() time the
-        // synthetic configChange never fired; leaving them set would leak into
-        // the next session.
-        defer {
-            pendingDeviceOverride = false
-            pendingDeviceOverrideSetAt = 0
-            isRecording = false
-        }
-
-        // (1) Fence: tap callback checks this and drops in-flight buffers.
         stopRequested.withLock { $0 = true }
-
-        // (2) Remove tap before stopping the engine. Already-fired tap callbacks
-        // may still be running on the audio render thread; the dispatch onto
-        // ioQueue.async means their writes are queued, not synchronous.
         engine.inputNode.removeTap(onBus: 0)
-
-        // (3) Stop the engine. Does not synchronously wait for tap callbacks.
         engine.stop()
-
-        // (3b) Fence in-flight tap callbacks: any callback that passed the
-        // stopRequested check before it was set either finished already or
-        // holds chunkLock; taking it here waits for it. Later callbacks
-        // re-check stopRequested under the lock and bail.
         chunkLock.lock()
         chunkLock.unlock()
-
-        // (4) Drain ioQueue: blocks until every previously-enqueued tap write
-        // has completed. The stopRequested fence in the tap means no NEW
-        // writes will be enqueued. After this barrier returns, audioFile is
-        // safe to release.
-        ioQueue.sync { /* barrier — drain any in-flight writes */ }
-
-        // (4b) Drain chunkEncodeQueue: blocks until every pending Float32 →
-        // Int16 WAV encode + actor registration has completed. Without this,
-        // DictationAPI.transcribe(_:recorder:) could call session.finalize()
-        // before a late chunk has been registered with the actor, dropping
-        // it from the in-flight wait-set.
-        chunkEncodeQueue.sync { /* drain pending chunk encodes + actor registrations */ }
-
-        // The tap is gone and the encode queue is drained. If streaming never
-        // armed, nothing will call tailFrames() to consume the buffer, so
-        // release it now. When armed, tailFrames() releases it after use.
-        if !streamingArmed {
-            chunkLock.lock()
-            chunkBuffer = []
-            chunkLock.unlock()
-        }
-
-        // Tear down the configuration-change observer.
+        ioQueue.sync { /* drain in-flight file writes */ }
+        chunkEncodeQueue.sync { /* drain chunk encodes + actor registrations */ }
         if let token = configChangeObserver {
             NotificationCenter.default.removeObserver(token)
             configChangeObserver = nil
         }
-
-        // (5) Releasing the AVAudioFile flushes Int16 conversion and closes
-        // the WAV header. After ioQueue drain this is race-free.
         audioFile = nil
 
-        // (6) Read final state. No further mutation; queue is drained.
-        let frames = frameCounter.withLock { $0 }
-        let writeFailure = writeError.withLock { $0 }
-        let preClampPeak = floatPeak.withLock { $0 }
+        // ── every per-dictation value is copied BEFORE end() ──
         let url = audioFileURL
         audioFileURL = nil
-        let sampleRate = inputSampleRate
+        let frames = frameCounter.withLock { $0 }
+        let failure = writeError.withLock { $0 }
+        let preClampPeak = floatPeak.withLock { $0 }
+        let rate = inputSampleRate
         let channels = inputChannelCount
+        let isLocal = isLocalCapture
+        let armed = streamingArmedAtomic.withLock { $0 }
+        let tail = takeChunkBuffer()            // also releases the buffer when not armed
+        pendingDeviceOverride = false
+        pendingDeviceOverrideSetAt = 0
+        let session = slot.end()                // start() may run from here on; locals only below
 
         let clampNote = preClampPeak > 0.95 ? " (CLAMP ENGAGED — mic delivered out-of-range floats)" : ""
         Log.info(
-            "DictationRecorder: stopped, \(frames) frames at \(Int(sampleRate))Hz \(channels)ch. " +
+            "DictationRecorder: stopped, \(frames) frames at \(Int(rate))Hz \(channels)ch. " +
             "peak=\(String(format: "%.3f", preClampPeak))\(clampNote)",
             category: "capture"
         )
 
-        // Surface any tap-side write error first — it explains why the WAV
-        // may be short or zero-length.
-        if let writeFailure {
-            if let url { try? FileManager.default.removeItem(at: url) }
-            throw DictationError.writeFailed(writeFailure)
-        }
-
-        // Empty-recording detection. Threshold ≈ 50ms at the native rate.
-        // If the user tapped FN without speaking, or the mic was unavailable,
-        // we'd otherwise ship a 44-byte header-only WAV that the server
-        // returns empty text for and the user gets no feedback.
-        let minFrames = AVAudioFrameCount(max(sampleRate * 0.05, 1))
-        if frames < minFrames {
-            if let url { try? FileManager.default.removeItem(at: url) }
-            throw DictationError.emptyRecording
-        }
-
-        guard let url else {
-            // Internal-state inconsistency — should be impossible after the
-            // happy path, but reuse notRecording rather than fabricating a
-            // start-path error.
-            throw DictationError.notRecording
-        }
-
-        return try await Task.detached(priority: .userInitiated) {
-            defer { try? FileManager.default.removeItem(at: url) }
-
-            // Read the Float32 WAV off disk, then downcast to a 16-bit PCM
-            // WAV in-memory at the same sample rate and channel count. The
-            // downcast halves the upload payload with zero perceptual quality
-            // loss for speech — Parakeet is trained on 16-bit audio and the
-            // server resamples to 16 kHz anyway, so any signal we'd preserve
-            // in Float32 above the 16-bit noise floor is dropped server-side.
-            //
-            // The conversion happens entirely in user code (clamp + scale by
-            // 32767 + cast to Int16 + hand-built WAV header). We do NOT use
-            // AVAudioFile's writer to perform the Float→Int16 step — see the
-            // class doc-comment on DictationRecorder for the long history of
-            // failures with that path.
-            let data: Data
-            do {
-                data = try Int16WAVEncoder.encode(fromFloat32WAVAt: url)
-            } catch {
-                Log.error(
-                    "DictationRecorder: Int16 re-encode failed (\(error)); falling back to Float32 WAV bytes.",
-                    category: "capture"
-                )
-                // If the re-encode fails for any reason, ship the original
-                // Float32 WAV rather than failing the dictation. Quality is
-                // the priority — server accepts both Float32 and Int16 WAVs.
-                data = try Data(contentsOf: url)
+        let interrupted = DictationError.isDeviceChange(failure)
+        do {
+            if let failure { throw DictationError.writeFailed(failure) }
+            // ≈ 50 ms at the native rate: an FN tap without speech, or no mic.
+            guard let url, frames >= AVAudioFrameCount(max(rate * 0.05, 1)) else {
+                throw DictationError.emptyRecording
             }
-
-            Log.debug(
-                "DictationRecorder: WAV bytes=\(data.count) (16-bit PCM)",
-                category: "capture"
+            var local: LocalCapture? = nil
+            if isLocal {
+                local = try await LocalCapture.make(url: url, rate: rate, channels: Int(channels),
+                                                    armed: armed, tail: tail, session: session)
+            }
+            return RecorderOutput(
+                recording: Recording(fileURL: url, durationSeconds: Double(frames) / rate,
+                                     interruptedByDeviceChange: interrupted),
+                local: local
             )
+        } catch {
+            abortTakenSession(session)
+            if let url { try? FileManager.default.removeItem(at: url) }
+            throw error
+        }
+    }
 
-            // DEBUG-only diagnostic copy. Production builds NEVER write user
-            // audio outside the upload path. Originally this leaked every
-            // dictation to /tmp/wispralt-last-dictation.wav unconditionally.
-            #if DEBUG
-            try? data.write(to: URL(fileURLWithPath: "/tmp/wispralt-last-dictation.wav"))
-            #endif
-
-            return data
-        }.value
+    /// Aborts a session `stop()` took from the slot but will not hand on.
+    private func abortTakenSession(_ session: DictationStreamSession?) {
+        guard let session else { return }
+        Task { await session.abort() }
     }
 
     // MARK: - Streaming helpers (Phase 2)
@@ -1026,7 +926,7 @@ final class DictationRecorder {
         // Belt-and-suspenders: if the recorder is deallocated while still
         // running (controller swap, app teardown), drop the engine and clear
         // the observer so we don't leak threads or notification subscriptions.
-        if isRecording {
+        if slot.isActive {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
@@ -1038,4 +938,64 @@ final class DictationRecorder {
         }
     }
 
+}
+
+// MARK: - Recorder output (app only; never enters WisprAltCore)
+
+/// What a Local dictation needs after FN-up: the streaming session (if one
+/// was armed at `start`), whether a chunk went out, and the Int16 WAVs.
+struct LocalCapture {
+    let session: DictationStreamSession?
+    /// At least one chunk was registered with `session`.
+    let armed: Bool
+    /// Native-rate Int16 WAV of the audio not yet sent as a chunk (finalize tail).
+    let tailWAV: Data
+    /// Native-rate Int16 WAV of the whole recording (whole-file upload / fallback).
+    let wholeWAV: Data
+
+    /// Re-encodes off the caller's actor. The server resamples and downmixes,
+    /// so the Local upload stays native-rate (no client conversion).
+    static func make(url: URL, rate: Double, channels: Int, armed: Bool, tail: [Float],
+                     session: DictationStreamSession?) async throws -> LocalCapture {
+        try await Task.detached(priority: .userInitiated) {
+            let whole: Data
+            do {
+                whole = try Int16WAVEncoder.encode(fromFloat32WAVAt: url)
+            } catch {
+                Log.error("DictationRecorder: Int16 re-encode failed: \(ErrorLog.describe(error))", category: "capture")
+                throw DictationRecorder.DictationError.encodeFailed
+            }
+            let tailWAV = armed
+                ? Int16WAVEncoder.encodeFloat32Frames(tail, sampleRate: rate, channels: channels)
+                : Data()
+            return LocalCapture(session: session, armed: armed, tailWAV: tailWAV, wholeWAV: whole)
+        }.value
+    }
+}
+
+struct RecorderOutput {
+    let recording: Recording
+    /// Non-nil only for a capture started with a Local endpoint.
+    let local: LocalCapture?
+}
+
+extension DictationRecorder.DictationError: LogSafeError {
+    var logDescription: String {
+        switch self {
+        case .engineStartFailed(let e): return "engineStartFailed(\(ErrorLog.describe(e)))"
+        case .notRecording: return "notRecording"
+        case .writeFailed(let e): return "writeFailed(\(ErrorLog.describe(e)))"
+        case .emptyRecording: return "emptyRecording"
+        case .encodeFailed: return "encodeFailed"
+        }
+    }
+
+    var outcomeKind: ErrorOutcome {
+        switch self {
+        case .emptyRecording: return .empty
+        case .writeFailed(let e): return Self.isDeviceChange(e) ? .failed(.deviceChanged) : .failed(.writeFailed)
+        case .encodeFailed: return .failed(.encodeFailed)
+        case .engineStartFailed, .notRecording: return .failed(.other)
+        }
+    }
 }

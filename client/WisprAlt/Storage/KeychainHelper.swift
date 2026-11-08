@@ -1,20 +1,14 @@
 import Foundation
-import Security
+import os
+import WisprAltCore
 
-/// Typed errors for Keychain operations.
+/// Errors from the Local key export/import file format.
 enum KeychainError: Error, LocalizedError {
-    case unexpectedStatus(OSStatus)
-    case encodingFailed
     case itemNotFound
     case invalidExportFormat
 
     var errorDescription: String? {
         switch self {
-        case .unexpectedStatus(let status):
-            let msg = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error"
-            return "Keychain error (\(status)): \(msg)"
-        case .encodingFailed:
-            return "Failed to encode API key as UTF-8 data."
         case .itemNotFound:
             return "Keychain item not found."
         case .invalidExportFormat:
@@ -23,145 +17,26 @@ enum KeychainError: Error, LocalizedError {
     }
 }
 
-/// Manages the WisprAlt API key in the macOS Keychain.
+/// Façade over the app's three Keychain items (Core `KeychainItem`):
+/// the Local server key (`co.wispralt`), the OpenRouter key
+/// (`co.wispralt.openrouter`, Mercury) and the OpenAI key (`co.wispralt.openai`).
 ///
-/// The API key is NEVER stored in UserDefaults or any plain-text file.
-/// All operations use kSecClassGenericPassword with a stable service identifier.
+/// Keys are NEVER stored in UserDefaults or any plain-text file.
 enum KeychainHelper {
-    // MARK: - Constants
+    static let server = KeychainItem(service: "co.wispralt")
+    static let openRouter = KeychainItem(service: "co.wispralt.openrouter")
+    static let openAI = KeychainItem(service: "co.wispralt.openai")
 
-    static let service = "co.wispralt"
-    private static let account = "default"
+    // MARK: - Local server key
 
-    /// Service identifier for the OpenRouter API key, kept as the Mercury
-    /// smart formatting key (consumed in Part 3). Stored in a separate
-    /// Keychain item so rotating it doesn't touch the WisprAlt bearer.
-    private static let openRouterService = "co.wispralt.openrouter"
+    static func setAPIKey(_ key: String) throws { try server.set(key) }
+    static func getAPIKey() throws -> String? { try server.get() }
+    static func deleteAPIKey() throws { try server.delete() }
 
-    // MARK: - Public API
+    // MARK: - OpenRouter key (Mercury smart formatting; uncalled until Mercury moves client-side)
 
-    /// Stores (or updates) the API key in the Keychain.
-    static func setAPIKey(_ key: String) throws {
-        guard let data = key.data(using: .utf8) else {
-            throw KeychainError.encodingFailed
-        }
-
-        // Try to update an existing item first.
-        let query = baseQuery()
-        let attributes: [CFString: Any] = [
-            kSecValueData: data
-        ]
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-
-        switch updateStatus {
-        case errSecSuccess:
-            Log.debug("API key updated in Keychain.", category: "keychain")
-        case errSecItemNotFound:
-            // Item doesn't exist yet; add it.
-            var addQuery = baseQuery() as [CFString: Any]
-            addQuery[kSecValueData] = data
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                throw KeychainError.unexpectedStatus(addStatus)
-            }
-            Log.debug("API key added to Keychain.", category: "keychain")
-        default:
-            throw KeychainError.unexpectedStatus(updateStatus)
-        }
-    }
-
-    /// Retrieves the API key from the Keychain. Returns nil if not set.
-    static func getAPIKey() throws -> String? {
-        var query = baseQuery() as [CFString: Any]
-        query[kSecReturnData] = kCFBooleanTrue
-        query[kSecMatchLimit] = kSecMatchLimitOne
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        switch status {
-        case errSecSuccess:
-            guard let data = result as? Data,
-                  let key = String(data: data, encoding: .utf8)
-            else {
-                Log.error("Keychain returned data that could not be decoded as UTF-8.", category: "keychain")
-                return nil
-            }
-            return key
-        case errSecItemNotFound:
-            return nil
-        default:
-            throw KeychainError.unexpectedStatus(status)
-        }
-    }
-
-    /// Deletes the stored API key from the Keychain (e.g. on uninstall or key rotation).
-    static func deleteAPIKey() throws {
-        let query = baseQuery()
-        let status = SecItemDelete(query as CFDictionary)
-        switch status {
-        case errSecSuccess, errSecItemNotFound:
-            Log.debug("API key deleted from Keychain (or was already absent).", category: "keychain")
-        default:
-            throw KeychainError.unexpectedStatus(status)
-        }
-    }
-
-    // MARK: - OpenRouter API key (Mercury smart formatting key)
-
-    /// Stores (or updates) the OpenRouter API key used as the Mercury smart
-    /// formatting key. Optional.
-    static func setOpenRouterAPIKey(_ key: String) throws {
-        guard let data = key.data(using: .utf8) else { throw KeychainError.encodingFailed }
-
-        let query = openRouterBaseQuery()
-        let attributes: [CFString: Any] = [kSecValueData: data]
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-
-        switch updateStatus {
-        case errSecSuccess:
-            Log.debug("OpenRouter API key updated in Keychain.", category: "keychain")
-        case errSecItemNotFound:
-            var addQuery = openRouterBaseQuery() as [CFString: Any]
-            addQuery[kSecValueData] = data
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            guard addStatus == errSecSuccess else { throw KeychainError.unexpectedStatus(addStatus) }
-            Log.debug("OpenRouter API key added to Keychain.", category: "keychain")
-        default:
-            throw KeychainError.unexpectedStatus(updateStatus)
-        }
-    }
-
-    /// Retrieves the OpenRouter API key (Mercury smart formatting key).
-    /// Returns nil when not set.
-    static func getOpenRouterAPIKey() throws -> String? {
-        var query = openRouterBaseQuery() as [CFString: Any]
-        query[kSecReturnData] = kCFBooleanTrue
-        query[kSecMatchLimit] = kSecMatchLimitOne
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        switch status {
-        case errSecSuccess:
-            guard let data = result as? Data,
-                  let key = String(data: data, encoding: .utf8)
-            else { return nil }
-            return key
-        case errSecItemNotFound:
-            return nil
-        default:
-            throw KeychainError.unexpectedStatus(status)
-        }
-    }
-
-    private static func openRouterBaseQuery() -> [CFString: Any] {
-        [
-            kSecClass:       kSecClassGenericPassword,
-            kSecAttrService: openRouterService,
-            kSecAttrAccount: account,
-        ]
-    }
+    static func setOpenRouterAPIKey(_ key: String) throws { try openRouter.set(key) }
+    static func getOpenRouterAPIKey() throws -> String? { try openRouter.get() }
 
     // MARK: - Export / Import
 
@@ -226,14 +101,36 @@ enum KeychainHelper {
 
         try setAPIKey(key)
     }
+}
 
-    // MARK: - Private helpers
+/// The OpenAI key, cached in memory. `current()` returns the cache, else
+/// re-reads the Keychain, so a key added from Terminal while the app runs is
+/// picked up on the next FN press. Warmed at launch; updated on Save/Remove.
+/// Safe from any thread.
+enum OpenAIKey {
+    private static let cache = OSAllocatedUnfairLock<String?>(initialState: nil)
 
-    private static func baseQuery() -> [CFString: Any] {
-        [
-            kSecClass:       kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: account
-        ]
+    static func current() -> String? {
+        if let key = cache.withLock({ $0 }) { return key }
+        let stored: String?
+        do {
+            stored = try KeychainHelper.openAI.get()
+        } catch {
+            Log.warning("OpenAI key read failed: \(ErrorLog.describe(error))", category: "keychain")
+            return nil
+        }
+        guard let key = stored?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { return nil }
+        cache.withLock { $0 = key }
+        return key
+    }
+
+    static func save(_ key: String) throws {
+        try KeychainHelper.openAI.set(key)
+        cache.withLock { $0 = key }
+    }
+
+    static func remove() throws {
+        try KeychainHelper.openAI.delete()
+        cache.withLock { $0 = nil }
     }
 }

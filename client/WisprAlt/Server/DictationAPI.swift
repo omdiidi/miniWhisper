@@ -1,4 +1,5 @@
 import Foundation
+import WisprAltCore
 
 /// Namespace for the dictation transcription endpoint.
 ///
@@ -27,63 +28,36 @@ enum DictationAPI {
 
     // MARK: - Public API
 
-    /// Sends PCM WAV data to `POST /transcribe/dictate` and returns the
-    /// transcribed text.
+    /// Transcribes a finished Local capture and returns the text.
     ///
-    /// Phase 2 streaming dictation
-    /// ---------------------------
-    /// When the caller passes a recorder whose `streamingEnabledForThisSession`
-    /// snapshot is true AND the recorder reports `streamingArmed == true`
-    /// (i.e. at least one chunk has been registered with the actor), this
-    /// finalizes the in-flight streaming session by POSTing the tail audio
-    /// to `/transcribe/dictate/stream/{sessionId}/finalize` and awaiting all
-    /// pending chunk POSTs.
+    /// `LocalFinalizeRoute` picks the path: when at least one chunk went out
+    /// (`armed`) the streaming session is finalized by POSTing the tail WAV to
+    /// `/transcribe/dictate/stream/{sessionId}/finalize`, after awaiting every
+    /// pending chunk POST. Otherwise the whole WAV goes to `/transcribe/dictate`.
     ///
     /// If the streaming finalize fails for ANY reason (chunk POST error,
-    /// finalize 5xx, timeout, decode error, abort) the session is aborted
-    /// and we fall through to the origin retry path (origin, wait,
-    /// origin), threading the streaming session's `clientDedupId` so the
-    /// retry row collides with any already-persisted streaming row on
-    /// the server-side partial unique index — exactly one `dictations` row
-    /// per logical dictation regardless of which path won.
-    ///
-    /// The settings snapshot lives on the recorder (not Settings.shared) so
-    /// a mid-recording user toggle cannot orphan a server-side session.
-    static func transcribe(
-        _ wavData: Data,
-        recorder: DictationRecorder? = nil
-    ) async throws -> String {
-        let streamingEnabled = recorder?.streamingEnabledForThisSession ?? false
-        if streamingEnabled,
-           let recorder,
-           recorder.streamingArmed,
-           let session = recorder.streamSession
-        {
-            let dedupId = session.clientDedupId
-            do {
-                let tailWav = Int16WAVEncoder.encodeFloat32Frames(
-                    recorder.tailFrames(),
-                    sampleRate: recorder.inputSampleRate,
-                    channels: Int(recorder.inputChannelCount)
-                )
-                return try await session.finalize(
-                    tail: tailWav,
-                    smartFormat: Settings.shared.smartFormatting
-                )
-            } catch {
-                Log.warning(
-                    "DictationAPI: streaming failed (\(error)); falling back with dedup=\(dedupId).",
-                    category: "dictation"
-                )
-                await session.abort()
-                // Thread the same dedup id through the origin retry path so the
-                // ON CONFLICT(client_dedup_id) DO NOTHING index collapses a
-                // potential duplicate at server-side ingest.
-                return try await runExistingPath(wavData: wavData, clientDedupId: dedupId)
-            }
+    /// finalize 5xx, timeout, decode error, abort) the session is aborted and
+    /// the whole WAV takes the origin retry path (origin, wait, origin) with
+    /// the session's `clientDedupId`, so the retry row collides with any
+    /// already-persisted streaming row on the server's partial unique index:
+    /// exactly one `dictations` row per logical dictation.
+    static func transcribe(capture: LocalCapture) async throws -> String {
+        guard LocalFinalizeRoute.decide(armed: capture.armed, hasSession: capture.session != nil) == .streamFinalize,
+              let session = capture.session
+        else {
+            return try await runExistingPath(wavData: capture.wholeWAV, clientDedupId: nil)
         }
-        // Non-streaming path: bit-identical to today (no dedup id header).
-        return try await runExistingPath(wavData: wavData, clientDedupId: nil)
+        let dedupId = session.clientDedupId
+        do {
+            return try await session.finalize(tail: capture.tailWAV, smartFormat: Settings.shared.smartFormatting)
+        } catch {
+            Log.warning(
+                "DictationAPI: streaming failed (\(ErrorLog.describe(error))); falling back with dedup=\(dedupId).",
+                category: "dictation"
+            )
+            await session.abort()
+            return try await runExistingPath(wavData: capture.wholeWAV, clientDedupId: dedupId)
+        }
     }
 
     /// Non-streaming path: origin attempt, wait, origin retry. Threads

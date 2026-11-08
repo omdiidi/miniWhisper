@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import WisprAltCore
 
 // MARK: - RecordingState
 
@@ -49,6 +50,15 @@ final class RecordingState: ObservableObject {
     /// label with an indeterminate "Finalizing" progress bar so the UI doesn't
     /// lie about progress during the concat window (can be 1-10s on big files).
     @Published var isFinalizing: Bool = false
+
+    /// Mirror of `MenuBarController.localUploadPhase` (written only by its
+    /// `didSet`). Locks the mode picker while a Local upload has no job id yet.
+    @Published var localUploadPhase: LocalUploadPhase = .none
+
+    /// Set by `MenuBarController.openKeyEntry()` (FN pressed in Online with no
+    /// key). The popover reveals Advanced, focuses the OpenAI key field and
+    /// clears it.
+    @Published var keyEntryRequested: Bool = false
 
     /// Reset every per-job field. Caller is responsible for also clearing
     /// the UserDefaults `activeJobID` key — `reset()` only touches in-memory

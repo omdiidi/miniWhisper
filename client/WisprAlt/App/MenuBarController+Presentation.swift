@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import WisprAltCore
 
 // MARK: - Status item, popover, icon and windows
 
@@ -168,19 +169,24 @@ extension MenuBarController {
     @objc func handleStatusItemClick(_ sender: NSStatusBarButton) {
         if popover.isShown {
             popover.performClose(sender)
-        } else if let button = statusItem.button {
-            // Build the hosting controller on open (released on close) so
-            // SwiftUI state (scroll position, expanded sections, focus)
-            // starts from its initial values on every open.
-            popover.contentViewController = makePopoverRootViewController()
-            popover.show(
-                relativeTo: button.bounds,
-                of: button,
-                preferredEdge: .minY
-            )
-            // Bring app to front so the popover keyboard-focuses correctly.
-            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            showPopover()
         }
+    }
+
+    func showPopover() {
+        guard let button = statusItem.button else { return }
+        // Build the hosting controller on open (released on close) so
+        // SwiftUI state (scroll position, expanded sections, focus)
+        // starts from its initial values on every open.
+        popover.contentViewController = makePopoverRootViewController()
+        popover.show(
+            relativeTo: button.bounds,
+            of: button,
+            preferredEdge: .minY
+        )
+        // Bring app to front so the popover keyboard-focuses correctly.
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 

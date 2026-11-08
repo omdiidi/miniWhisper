@@ -1,6 +1,7 @@
 import SwiftUI
 import ServiceManagement
 import AppKit
+import WisprAltCore
 
 /// Lightweight Apple-glass card used for the active-job indicator and other
 /// emphasis surfaces inside the popover. Kept private + inline because the
@@ -25,13 +26,17 @@ private struct GlassCard<Content: View>: View {
 /// Main settings panel hosted in the menubar popover.
 ///
 /// Layout is user-priority ordered:
-///   1. Quick Actions — file transcription, admin portal + transcripts folder shortcuts
-///   2. Connection status with a working Test button
-///   3. Hotkey timing + launch-at-login (frequently-tweaked)
-///   4. Transcripts folder picker
-///   5. Advanced (collapsed) — server URL, API key, key export/import
+///   1. Mode picker — Online (OpenAI) / Local server
+///   2. Quick Actions — file transcription, admin portal + transcripts folder shortcuts
+///   3. Connection status with a working Test button (Local)
+///   4. Hotkey timing + launch-at-login (frequently-tweaked)
+///   5. Transcripts folder picker
+///   6. Advanced (collapsed) — OpenAI key; server URL, API key, key export/import (Local)
+///
+/// In Online every server-only row is hidden behind one `isLocal` predicate.
 struct SettingsView: View {
     @EnvironmentObject private var settings: Settings
+    @EnvironmentObject private var recordingState: RecordingState
 
     // MARK: - Local ephemeral state
 
@@ -72,6 +77,16 @@ struct SettingsView: View {
     @State private var savingName: Bool = false
     @State private var nameError: String?
 
+    // OpenAI key entry (Advanced). The field never shows the stored key.
+    @State private var openAIKeyText: String = ""
+    @State private var hasOpenAIKey: Bool = false
+    @State private var openAIKeyError: String?
+    @FocusState private var openAIKeyFocused: Bool
+
+    /// Server-only rows (connection, server, API key, identity, portal links,
+    /// server log) exist only in Local mode.
+    private var isLocal: Bool { settings.mode == .local }
+
     private enum ConnectionFeedbackKind {
         case neutral, success, warning, error
     }
@@ -80,33 +95,96 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            modeSection
             quickActionsSection
-            connectionSection
+            if isLocal {
+                connectionSection
+            }
             inputMicSection
             smartFormattingSection
-            // v0.4.6: streamingDictationSection removed — streaming is always on.
-            // The DictationRecorder hardcodes `streamingEnabledForThisSession = true`
-            // at start(), so no user-facing toggle. No
-            // Settings flag exists (the old streamingDictation property was removed).
+            // No streaming toggle: Local dictation always streams; Online never does.
             hotkeySection
             launchAtLoginSection
             transcriptsFolderSection
             advancedToggleSection
             if showAdvanced {
                 updateSection
-                serverSection
-                apiKeySection
-                apiKeyExportImportSection
+                openAIKeySection
+                if isLocal {
+                    serverSection
+                    apiKeySection
+                    apiKeyExportImportSection
+                }
                 aboutAndQuitSection
             }
-            identitySection
+            if isLocal {
+                identitySection
+            }
         }
         .formStyle(.grouped)
         .frame(width: 360)
-        .onAppear(perform: loadCurrentValues)
+        .onAppear {
+            loadCurrentValues()
+            handleKeyEntryRequest()
+        }
+        .onChange(of: recordingState.keyEntryRequested) { _, _ in handleKeyEntryRequest() }
     }
 
     // MARK: - Sections
+
+    /// Online (OpenAI) / Local server. A change applies to the next dictation;
+    /// locked while a Local upload has no server job id yet.
+    private var modeSection: some View {
+        Section {
+            Picker("Mode", selection: Binding(
+                get: { settings.mode },
+                set: { MenuBarController.shared?.applyModeSwitch(to: $0) }
+            )) {
+                Text("Online (OpenAI)").tag(TranscriptionMode.online)
+                Text("Local server").tag(TranscriptionMode.local)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(recordingState.localUploadPhase.locksModePicker)
+            if recordingState.localUploadPhase.locksModePicker {
+                Text("Finish or cancel the upload first")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// OpenAI key (Keychain `co.wispralt.openai` / `default`). Saved via the
+    /// field or from Terminal; either works while the app runs.
+    private var openAIKeySection: some View {
+        Section("OpenAI API Key") {
+            HStack {
+                SecureField(hasOpenAIKey ? "Key saved — paste to replace" : "Paste OpenAI API key…",
+                            text: $openAIKeyText)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($openAIKeyFocused)
+                    .onSubmit(saveOpenAIKey)
+                Button("Save", action: saveOpenAIKey)
+                    .disabled(openAIKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Remove", role: .destructive, action: removeOpenAIKey)
+                    .disabled(!hasOpenAIKey)
+            }
+            Text(hasOpenAIKey ? "Key saved" : "Key missing")
+                .font(.caption)
+                .foregroundStyle(hasOpenAIKey ? .green : .orange)
+            Text("Or from Terminal:")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("security add-generic-password -U -s co.wispralt.openai -a default -w")
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            if let err = openAIKeyError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
 
     /// Top of the popover: the actions a daily user actually reaches for.
     /// Delegates to `QuickActionsSection` so the file-watcher view-models can
@@ -492,7 +570,10 @@ struct SettingsView: View {
     // MARK: - Actions
 
     private func loadCurrentValues() {
+        hasOpenAIKey = OpenAIKey.current() != nil
         serverURLText = settings.serverURL?.absoluteString ?? ""
+        // The Local key is read only in Local mode (its rows are hidden in Online).
+        guard isLocal else { return }
         // Load API key from Keychain (not from Settings).
         do {
             apiKeyText = (try KeychainHelper.getAPIKey()) ?? ""
@@ -500,6 +581,41 @@ struct SettingsView: View {
             Log.error("Failed to read API key from Keychain: \(error)", category: "settings")
         }
         hasStoredAPIKey = ((try? KeychainHelper.getAPIKey()) ?? nil)?.isEmpty == false
+    }
+
+    /// FN pressed in Online with no key: reveal Advanced and focus the key field.
+    private func handleKeyEntryRequest() {
+        guard recordingState.keyEntryRequested else { return }
+        recordingState.keyEntryRequested = false
+        showAdvanced = true
+        DispatchQueue.main.async { openAIKeyFocused = true }
+    }
+
+    private func saveOpenAIKey() {
+        let trimmed = openAIKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try OpenAIKey.save(trimmed)
+            openAIKeyText = ""
+            openAIKeyError = nil
+            hasOpenAIKey = true
+            Log.info("OpenAI key saved to Keychain.", category: "settings")
+        } catch {
+            Log.error("OpenAI key save failed: \(ErrorLog.describe(error))", category: "settings")
+            openAIKeyError = "Could not save the key to the Keychain."
+        }
+    }
+
+    private func removeOpenAIKey() {
+        do {
+            try OpenAIKey.remove()
+            openAIKeyError = nil
+            hasOpenAIKey = false
+            Log.info("OpenAI key removed from Keychain.", category: "settings")
+        } catch {
+            Log.error("OpenAI key remove failed: \(ErrorLog.describe(error))", category: "settings")
+            openAIKeyError = "Could not remove the key from the Keychain."
+        }
     }
 
     private func commitServerURL() {
@@ -732,15 +848,22 @@ private struct QuickActionsSection: View {
     /// fired so the toast renders directly beneath the right one.
     @State private var copyToast: (button: String, message: String)?
 
+    /// Server-only rows are hidden (or disabled) in Online.
+    private var isLocal: Bool { settings.mode == .local }
+
     var body: some View {
         Section {
             // v0.5.0: surface most-recent server-persisted dictation so the
             // user can re-paste it without rummaging through the portal.
+            // Reads the Local server, so it is disabled in Online.
             Button("Copy last dictation", systemImage: "doc.on.clipboard") {
                 performLastDictationCopy()
             }
             .buttonStyle(.bordered)
-            .help("Copies the text of your most recent persisted dictation. May lag your current dictation by a second or two while it finalizes server-side.")
+            .disabled(!isLocal)
+            .help(isLocal
+                  ? "Copies the text of your most recent persisted dictation. May lag your current dictation by a second or two while it finalizes server-side."
+                  : "Available in Local mode only for now.")
 
             if let toast = copyToast, toast.button == "last-dictation" {
                 Text(toast.message)
@@ -762,12 +885,17 @@ private struct QuickActionsSection: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.accentColor)
-            .disabled(recordingState.serverFinishingJobID != nil)
+            .disabled(!isLocal || recordingState.serverFinishingJobID != nil)
             .help(
                 recordingState.serverFinishingJobID != nil
                     ? "A previous transcription is still finishing on the server. New uploads are blocked until it completes."
                     : "Pick any audio or video file. WisprAlt extracts the audio locally and the server transcribes it."
             )
+            if !isLocal {
+                Text("File transcription in Online arrives with this mission's file step — switch to Local")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             // Last-custom copy + age on one row.
             HStack(spacing: 6) {
@@ -813,38 +941,9 @@ private struct QuickActionsSection: View {
             .buttonStyle(.bordered)
             .help("Opens \(settings.meetingsPath.path) in Finder.")
 
-            Button("Open Portal", systemImage: "safari") {
-                guard let base = settings.serverURL else { return }
-                let url = base.appendingPathComponent("admin/login")
-                NSWorkspace.shared.open(url)
-                Log.info("Opened portal: \(url.absoluteString)", category: "settings")
+            if isLocal {
+                serverLinks
             }
-            .buttonStyle(.bordered)
-            .disabled(settings.serverURL == nil)
-            .help(
-                settings.serverURL == nil
-                    ? "Set a Server URL under Advanced first."
-                    : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
-            )
-
-            // v0.5.0: deep-link through /me/login?next=/me/history so first-time users
-            // land directly on their history after auth.
-            Button("Open My Dictations", systemImage: "list.bullet.rectangle") {
-                guard let base = settings.serverURL else { return }
-                var comps = URLComponents(url: base.appendingPathComponent("me/login"),
-                                          resolvingAgainstBaseURL: false)
-                comps?.queryItems = [URLQueryItem(name: "next", value: "/me/history")]
-                guard let url = comps?.url else { return }
-                NSWorkspace.shared.open(url)
-                Log.info("Opened /me/login?next=/me/history: \(url.absoluteString)", category: "settings")
-            }
-            .buttonStyle(.bordered)
-            .disabled(settings.serverURL == nil)
-            .help(
-                settings.serverURL == nil
-                    ? "Set a Server URL under Advanced first."
-                    : "Opens your personal dictation + transcription history in the browser."
-            )
         }
         .onAppear {
             customViewModel.start()
@@ -855,6 +954,43 @@ private struct QuickActionsSection: View {
         .sheet(isPresented: $showingServerLogSheet) {
             ServerLogSheet(jobIDProvider: { serverLogJobID })
         }
+    }
+
+    /// Open Portal + Open My Dictations (Local only).
+    @ViewBuilder
+    private var serverLinks: some View {
+        Button("Open Portal", systemImage: "safari") {
+            guard let base = settings.serverURL else { return }
+            let url = base.appendingPathComponent("admin/login")
+            NSWorkspace.shared.open(url)
+            Log.info("Opened portal: \(url.absoluteString)", category: "settings")
+        }
+        .buttonStyle(.bordered)
+        .disabled(settings.serverURL == nil)
+        .help(
+            settings.serverURL == nil
+                ? "Set a Server URL under Advanced first."
+                : "Opens your portal in the browser. Admins land on the global dashboard, employees on their own usage page."
+        )
+
+        // v0.5.0: deep-link through /me/login?next=/me/history so first-time users
+        // land directly on their history after auth.
+        Button("Open My Dictations", systemImage: "list.bullet.rectangle") {
+            guard let base = settings.serverURL else { return }
+            var comps = URLComponents(url: base.appendingPathComponent("me/login"),
+                                      resolvingAgainstBaseURL: false)
+            comps?.queryItems = [URLQueryItem(name: "next", value: "/me/history")]
+            guard let url = comps?.url else { return }
+            NSWorkspace.shared.open(url)
+            Log.info("Opened /me/login?next=/me/history: \(url.absoluteString)", category: "settings")
+        }
+        .buttonStyle(.bordered)
+        .disabled(settings.serverURL == nil)
+        .help(
+            settings.serverURL == nil
+                ? "Set a Server URL under Advanced first."
+                : "Opens your personal dictation + transcription history in the browser."
+        )
     }
 
     /// Active-job glass card: animated headline, real progress (chunked
@@ -977,14 +1113,16 @@ private struct QuickActionsSection: View {
                             : "Cancel the upload (clean) or the in-flight transcription (advisory — server may keep running)."
                     )
 
-                    Button {
-                        showingServerLogSheet = true
-                    } label: {
-                        Label("Log", systemImage: "doc.text.magnifyingglass")
+                    if isLocal {
+                        Button {
+                            showingServerLogSheet = true
+                        } label: {
+                            Label("Log", systemImage: "doc.text.magnifyingglass")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(serverLogJobID == nil)
+                        .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(serverLogJobID == nil)
-                    .help("Fetch the server-log slice for this job from /admin/server-log/<id>.")
                 }
             }
     }

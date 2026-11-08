@@ -72,36 +72,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Instantiate the menubar controller first so the status item is visible immediately.
         menuBarController = MenuBarController()
 
-        // If the last process exit left a transcription in flight on the
-        // server, resume polling it. No-op when no `activeJobID` key is
-        // present in UserDefaults.
+        // Warm the OpenAI key cache (at most one Keychain prompt per signed build).
+        _ = OpenAIKey.current()
+
+        // Launch decision (Local mode only): resume polling a Local file job
+        // the last process left in flight, and GET /me once to mirror
+        // display_name and maybe ask for a name. Online contacts neither.
         Task { @MainActor in
-            menuBarController.resumeInFlightJobIfNeeded()
+            menuBarController.applyModeEvent(.launch)
         }
 
         // Sparkle auto-update controller (honours the isBusy update gate).
         sparkleController = SparkleController()
         sparkleController.menuBarController = menuBarController
-
-        // Best-effort first-launch check: if the user is already configured
-        // (server URL set + API key in Keychain), GET /me to mirror display_name
-        // locally and possibly present the "What should we call you?" dialog.
-        // Skipped silently for fresh installs to avoid a noisy 401.
-        //
-        // KeychainHelper.getAPIKey() is `throws -> String?` — `try?` produces String??
-        // where outer-nil = function threw, inner-nil = no key stored. We .flatMap
-        // to collapse to a single Optional so a missing key short-circuits cleanly.
-        Task { @MainActor in
-            guard Settings.shared.serverURL != nil,
-                  let _ = (try? KeychainHelper.getAPIKey()).flatMap({ $0 }) else { return }
-            do {
-                let me = try await MeAPI.get()
-                Settings.shared.displayName = me.display_name
-                FirstLaunchCoordinator.shared.maybePresentNameSheet(serverDisplayName: me.display_name)
-            } catch {
-                Log.debug("display_name check skipped: \(error)", category: "lifecycle")
-            }
-        }
 
         // Run the sequential 3-permission wizard asynchronously so the menubar item
         // appears before the first TCC dialog.

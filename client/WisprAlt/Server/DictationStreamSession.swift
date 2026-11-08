@@ -14,9 +14,10 @@ enum StreamingFailure: Error {
 
 /// Per-recording streaming dictation session: an actor wrapping the
 /// chunk-by-chunk POST loop. Constructed by `DictationRecorder` at `start()`
-/// when streaming is enabled for the session; spilled to the recorder's tap
+/// only for a Local capture (a Local endpoint was given); handed off by
+/// `stop()` inside `LocalCapture`; spilled to the recorder's tap
 /// callback which calls `enqueueChunk(_:index:)` once per VAD-cut segment;
-/// finally drained by `DictationAPI.transcribe(_:recorder:)` via
+/// finally drained by `DictationAPI.transcribe(capture:)` via
 /// `finalize(tail:smartFormat:)` which awaits all in-flight chunk POSTs and
 /// then POSTs the trailing audio to the finalize endpoint.
 ///

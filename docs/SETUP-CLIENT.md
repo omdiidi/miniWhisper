@@ -83,9 +83,25 @@ Required for AVAudioEngine dictation recording.
 
 ---
 
+## Mode: Online (OpenAI) or Local server
+
+The top of the popover has a **Mode** picker: **Online (OpenAI)** sends dictation audio straight to OpenAI (`gpt-transcribe` by default) using your own OpenAI key; **Local server** uses your self-hosted WisprAlt server (configured below). The default is still **Local** until Online file transcription lands. A change applies to the next dictation; a dictation already recording finishes on the mode it started in. The picker is locked only while a Local file is converting or uploading ("Finish or cancel the upload first").
+
+In Online mode nothing is sent to your Local server, and the server-only rows are hidden (Connection / Test Connection, Server URL, API Key and its backup, Your name, Open Portal, Open My Dictations, the job Log button). **Transcribe file…** and **Copy last dictation** are disabled in Online for now. Switching to Online while a Local file job is being watched stops watching it without cancelling it on the server; switching back resumes watching it.
+
+### OpenAI API key
+
+Enter it in **Show advanced settings → OpenAI API Key** (Save / Remove), or from Terminal (works while the app runs; the next FN press picks it up):
+
+```
+security add-generic-password -U -s co.wispralt.openai -a default -w
+```
+
+The key lives only in the Keychain (service `co.wispralt.openai`, account `default`), in memory, and in the `Authorization: Bearer` header sent to `api.openai.com`. A key created from Terminal trusts Terminal, so each newly signed build asks once for Keychain access; choose **Always Allow**. With Online selected and no key, holding FN does not record: a notice appears and the popover opens at the key field.
+
 ## Server Configuration
 
-After the permission wizard, the app is ready for server configuration.
+After the permission wizard, the app is ready for server configuration (Local mode).
 
 1. On your Mac mini, the `setup-server.sh` script prints a one-liner at the end:
    ```
@@ -221,9 +237,10 @@ Once you have moved the file to the destination Mac (e.g. via AirDrop or a USB d
 ## Dictation Usage
 
 1. Hold the **FN** key (Globe key on M-series Macs). The menubar icon turns to a filled mic.
-2. Speak. Release FN to send audio to the server.
+2. Speak. Release FN to send the audio: in Online to OpenAI (16 kHz mono WAV, one request), in Local to your server (long dictations stream in chunks while you speak).
 3. Transcribed text is injected at the cursor (AXUIElement primary; clipboard + Cmd+V fallback for Electron apps).
-4. Round-trip latency: ~250–400ms p50.
+4. Round-trip latency (Local): ~250–400ms p50. A dictation stops and sends at 10 minutes.
+5. If you press FN while the previous dictation is still being saved, a notice says "Still saving the last dictation — press again".
 
 **Note:** an update relaunch is refused while a dictation (or its in-flight upload) or a file job is running, so an update never kills your work.
 
@@ -231,7 +248,7 @@ Once you have moved the file to the destination Mac (e.g. via AirDrop or a USB d
 
 ## File Transcription Usage
 
-1. Click the WisprAlt menubar icon → **Transcribe file…** and pick any audio or video file (m4a, mp3, mp4, mov, wav, aac, flac, opus, ogg, webm, m4v, caf, aiff).
+1. (Local mode.) Click the WisprAlt menubar icon → **Transcribe file…** and pick any audio or video file (m4a, mp3, mp4, mov, wav, aac, flac, opus, ogg, webm, m4v, caf, aiff).
 2. The file is copied into its own folder under `Custom Transcriptions` and uploaded as-is (large files go up in chunks). The UI moves through **Uploading (with %)** → **Processing** → **Done**.
 3. The server transcribes it with MLX Whisper (one mono stream, no speaker labels). The model loads on the first file job, so the first one after an idle spell takes longer.
 4. `.json`, `.srt`, `.vtt` and `.txt` are downloaded next to the source file (see [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md)), then the server copy is deleted. **Copy last custom transcription** puts the newest TXT on the clipboard.

@@ -30,6 +30,8 @@ final class Settings: ObservableObject {
         static let displayName = "displayName"  // mirror of server-side display_name; source of truth is server
         static let updateAvailable = "updateAvailable"
         static let lastUpdateCheck = "lastUpdateCheck"
+        static let mode = "mode"
+        static let openAIModel = "openAIModel"
     }
 
     // MARK: - Published properties
@@ -53,6 +55,19 @@ final class Settings: ObservableObject {
                 defaults.removeObject(forKey: Key.serverURL)
             }
         }
+    }
+
+    /// Online (OpenAI) or Local (self-hosted server). Absent → `TranscriptionMode.default`.
+    /// Write through `MenuBarController.applyModeSwitch(to:)` so the Local job
+    /// poller follows the switch; a change applies to the next dictation.
+    @Published var mode: TranscriptionMode {
+        didSet { defaults.set(mode.rawValue, forKey: Key.mode) }
+    }
+
+    /// OpenAI model id for Online dictation. An unknown stored id reads back
+    /// as the default (`OpenAIModels.resolve`).
+    @Published var openAIModel: String {
+        didSet { defaults.set(openAIModel, forKey: Key.openAIModel) }
     }
 
     /// Local directory where completed file transcripts are saved
@@ -161,6 +176,9 @@ final class Settings: ObservableObject {
         let storedName = suite.string(forKey: Key.displayName)
         let storedUpdate = suite.string(forKey: Key.updateAvailable)
         let storedLastEpoch = suite.object(forKey: Key.lastUpdateCheck) as? Double
+        let storedMode = suite.string(forKey: Key.mode).flatMap(TranscriptionMode.init(rawValue:))
+            ?? TranscriptionMode.default
+        let storedModel = OpenAIModels.resolve(id: suite.string(forKey: Key.openAIModel)).id
 
         // Drop stale updateAvailable if persisted value is no longer newer
         // than the bundled version (e.g., user just installed the version
@@ -176,6 +194,8 @@ final class Settings: ObservableObject {
 
         // @Published properties must be set before the object is fully initialised;
         // assign directly via stored property (bypasses didSet observers).
+        self._mode = Published(initialValue: storedMode)
+        self._openAIModel = Published(initialValue: storedModel)
         self._meetingsPath = Published(initialValue: storedMeetingsPath)
         self._holdMinDuration = Published(initialValue: storedHold)
         self._preferredInputDeviceUID = Published(initialValue: storedPreferredInputUID)

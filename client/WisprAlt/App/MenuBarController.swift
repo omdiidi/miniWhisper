@@ -3,44 +3,77 @@ import AVFoundation
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import WisprAltCore
 
 // MARK: - MenuBarController
 
-/// Controls the menubar status item, popover, and the app's recording mode state machine.
+/// Controls the menubar status item, popover, dictation and file-job state.
 ///
 /// This class is intentionally NSObject only — not ObservableObject — because it
 /// drives AppKit directly. SwiftUI views that need state observe Settings or
 /// other ObservableObjects injected from AppDelegate.
 final class MenuBarController: NSObject {
-    // MARK: - Mode state machine
+    // MARK: - Activity state (main thread only)
 
-    /// Represents all valid UI states for the menubar icon and popover.
-    enum Mode {
-        case idle
-        case dictating
-        case converting
-        case uploading
-        case processing
-        case done
+    /// The menubar icon's states (Core `ActivityIcon`).
+    typealias Mode = ActivityIcon
+
+    /// The icon, derived from state. It is never written and never branched
+    /// on: dictation and job logic read `currentSession`, `localUploadPhase`
+    /// and `onlineJobTask` directly.
+    var mode: Mode {
+        ActivityState.icon(dictating: currentSession != nil, local: localUploadPhase,
+                           onlineJob: onlineJobTask != nil, doneFlash: localDoneFlash)
     }
 
-    var mode: Mode = .idle {
+    /// The dictation being recorded. Set in `dictationStart` only after
+    /// `recorder.start` returned true; cleared by `beginRun` (FN-up, cap,
+    /// device change). The only "dictation in progress" check. A mode switch
+    /// never touches it, so a recording finishes on its FN-press route.
+    var currentSession: DictationSession? = nil {
         didSet { updateIcon() }
     }
+
+    /// Phase of the Local file job. Mirrored to `recordingState` for the
+    /// popover (mode-picker lock).
+    var localUploadPhase: LocalUploadPhase = .none {
+        didSet {
+            recordingState.localUploadPhase = localUploadPhase
+            updateIcon()
+        }
+    }
+
+    /// The 3 s "done" icon after a Local file job completes.
+    var localDoneFlash: Bool = false {
+        didSet { updateIcon() }
+    }
+
+    /// The Online file job (Online file transcription assigns it). No mode
+    /// switch ever cancels it.
+    var onlineJobTask: Task<Void, Never>? = nil {
+        didSet { updateIcon() }
+    }
+
+    /// Poll generation fence. Bumped on every Local job/poller start and every
+    /// cancel; the job wrapper and the resume poller write state only while
+    /// `PollFence.mayWrite` holds for the generation they captured.
+    var pollGeneration: Int = 0
+
+    /// `/me` runs at most once per launch (Local only).
+    var meFetchedThisLaunch: Bool = false
 
     // MARK: - Busy signal (update gate)
 
     /// Number of dictation transcription Tasks still running after the FN key
-    /// was released. `dictationStop()` increments it BEFORE setting
-    /// `mode = .idle` and the spawned Task's first statement is
-    /// `defer { dictationsInFlight -= 1 }`, so there is no main-actor turn in
-    /// which a finishing dictation reads as not-busy. Main-thread only.
+    /// was released. `beginRun` increments it in the same main-actor turn that
+    /// clears `currentSession`, and the spawned Task's first statement is
+    /// `defer { dictationsInFlight -= 1 }`, so there is no turn in which a
+    /// finishing dictation reads as not-busy. Main-thread only.
     var dictationsInFlight: Int = 0
 
     /// Number of file-transcription Tasks (pick → upload → poll → download)
     /// still running. Incremented before the Task is created and decremented
-    /// by the Task's own `defer`, so it cannot be fooled by the shared `mode`
-    /// (a hold-FN dictation rewrites `mode` mid-job). Main-thread only.
+    /// by the Task's own `defer`. Main-thread only.
     var fileJobsInFlight: Int = 0
 
     /// True while a dictation is recording or still transcribing/injecting, or
@@ -48,9 +81,7 @@ final class MenuBarController: NSObject {
     /// `SparkleController` refuse to relaunch the app while this is true, so an
     /// update can never kill a dictation or an in-flight file job.
     var isBusy: Bool {
-        [.dictating, .converting, .uploading, .processing].contains(mode)
-            || dictationsInFlight > 0
-            || fileJobsInFlight > 0
+        currentSession != nil || dictationsInFlight > 0 || fileJobsInFlight > 0
     }
 
     // MARK: - Sparkle update error
@@ -109,9 +140,10 @@ final class MenuBarController: NSObject {
 
     // MARK: - Active-job task handles
 
-    /// Strong handle to the currently-running `runFileTranscriptionJob` task.
-    /// `cancelActiveTranscription()` calls `.cancel()` on this to abort the
-    /// poll loop. Nil between jobs.
+    /// Strong handle to the running Local job task (pick → upload → poll, or a
+    /// resumed poller). `cancelActiveTranscription()` and a switch to Online
+    /// cancel it. The task's `defer` clears it only while its generation is
+    /// current, so `activeJobTask != nil` means "a Local poller is running".
     var activeJobTask: Task<Void, Error>? = nil
     /// Strong handle to the URLSession used for the in-flight upload. We hold
     /// it so `cancelActiveTranscription()` can call `invalidateAndCancel()` to
@@ -176,5 +208,73 @@ final class MenuBarController: NSObject {
     func showToast(_ message: String) {
         Log.warning(message, category: "ui")
         AppNotifications.notify(title: "WisprAlt", body: message)
+    }
+
+    // MARK: - Mode switch / launch
+
+    /// Inputs for `LaunchActions.decide`. The Local key is read only in Local
+    /// mode (Online never needs it).
+    @MainActor var localJobState: LocalJobState {
+        let mode = Settings.shared.mode
+        let hasServerConfig = mode == .local && Settings.shared.serverURL != nil
+            && ((try? KeychainHelper.getAPIKey()) ?? nil)?.isEmpty == false
+        let saved = UserDefaults.standard.string(forKey: Self.activeJobIDDefaultsKey)
+        return LocalJobState(mode: mode, hasServerConfig: hasServerConfig,
+                             hasSavedJobID: saved?.isEmpty == false,
+                             pollerRunning: activeJobTask != nil,
+                             onlineJobRunning: onlineJobTask != nil,
+                             meFetchedThisLaunch: meFetchedThisLaunch)
+    }
+
+    /// Runs the launch / mode-switch decision. Called by `AppDelegate` at
+    /// launch and by `applyModeSwitch(to:)`.
+    @MainActor func applyModeEvent(_ event: ModeEvent) {
+        let actions = LaunchActions.decide(event, localJobState)
+        if actions.cancelLocalPoll { pauseLocalPoll() }
+        if actions.resumeLocalJob { resumeInFlightJobIfNeeded() }
+        if actions.fetchMe {
+            meFetchedThisLaunch = true
+            Task { @MainActor in await fetchMeAndMaybeAskName() }
+        }
+    }
+
+    /// The popover's mode picker. Refused while a Local upload has no job id
+    /// yet (the picker is disabled then too). Never touches `currentSession`
+    /// or `onlineJobTask`.
+    @MainActor func applyModeSwitch(to mode: TranscriptionMode) {
+        guard Settings.shared.mode != mode, !localUploadPhase.locksModePicker else { return }
+        Settings.shared.mode = mode
+        Log.info("Mode switched to \(mode.rawValue).", category: "app")
+        applyModeEvent(.switched(to: mode))
+    }
+
+    /// Switch to Online: stop watching the Local job without cancelling it on
+    /// the server. The saved `activeJobID` stays, so a switch back (or the
+    /// next launch in Local) resumes polling it.
+    @MainActor func pauseLocalPoll() {
+        pollGeneration += 1
+        activeJobTask?.cancel()
+        activeJobTask = nil
+        recordingState.reset()
+        localUploadPhase = .none
+        localDoneFlash = false
+    }
+
+    /// `GET /me` (Local only, once per launch): mirror `display_name` and
+    /// maybe ask for a name.
+    @MainActor func fetchMeAndMaybeAskName() async {
+        do {
+            let me = try await MeAPI.get()
+            Settings.shared.displayName = me.display_name
+            FirstLaunchCoordinator.shared.maybePresentNameSheet(serverDisplayName: me.display_name)
+        } catch {
+            Log.debug("display_name check skipped: \(ErrorLog.describe(error))", category: "lifecycle")
+        }
+    }
+
+    /// Online FN press with no key: open the popover at the OpenAI key field.
+    @MainActor func openKeyEntry() {
+        recordingState.keyEntryRequested = true
+        if !popover.isShown { showPopover() }
     }
 }
