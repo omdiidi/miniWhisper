@@ -41,7 +41,7 @@ enum SpoolFiles {
 /// The last-dictation record (`last.json`), read by "Copy last dictation".
 enum LastTextStore {
     /// - Returns: false when `last.json` could not be written (logged here).
-    @discardableResult
+    ///   Every caller must act on it: a failed save keeps the recording.
     static func save(_ result: DictationResult, mode: TranscriptionMode) -> Bool {
         do {
             try LastText(text: result.text, at: Date(), mode: mode, modelUsed: result.modelUsed)
@@ -260,6 +260,7 @@ extension MenuBarController {
         case .copiedNotPasted: showToast("No app to paste into — the text is on the clipboard.")
         case .possiblyTruncated: showToast("The transcript may be cut off.\(saved)")
         case .notSavedOnServer: showToast("The server did not save this dictation.\(saved)")
+        case .lastTextNotSaved: showToast("Could not save this as the last dictation.\(saved)")
         case .noSpeech: showToast("No speech detected.\(saved)")
         case .failed(let kind):
             AppNotifications.notify(title: "Dictation Failed", body: Self.failureMessage(kind, mode: mode) + saved)

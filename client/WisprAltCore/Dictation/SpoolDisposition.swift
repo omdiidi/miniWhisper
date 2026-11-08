@@ -2,8 +2,9 @@ import Foundation
 
 /// How a dictation ended, as far as its spooled audio is concerned.
 public enum DictationOutcome: Equatable, Sendable {
-    /// Text came back. `serverSaved == false` is a Local 200 with `"saved": false`.
-    case text(truncated: Bool, serverSaved: Bool)
+    /// Text came back. `serverSaved == false` is a Local 200 with `"saved": false`;
+    /// `textSaved == false` means `last.json` could not be written.
+    case text(truncated: Bool, serverSaved: Bool, textSaved: Bool)
     case emptyText, emptyRecording
     case failed(FailureKind)
 
@@ -30,7 +31,7 @@ public enum InjectOutcome: Equatable, Sendable {
 }
 
 public enum SpoolToast: Equatable, Sendable {
-    case copiedNotPasted, possiblyTruncated, notSavedOnServer, noSpeech
+    case copiedNotPasted, possiblyTruncated, notSavedOnServer, lastTextNotSaved, noSpeech
     case failed(FailureKind)
 }
 
@@ -47,6 +48,14 @@ public struct SpoolDecision: Equatable, Sendable {
 
 /// Keep or delete the spooled audio once text exists and delivery was tried.
 public enum SpoolDisposition {
+    /// The one keep rule for a recording whose text came back, shared by the
+    /// normal dictation path (`decide`) and Retry (`RetryEntries.dropAfterRetry`):
+    /// keep it while the text may be cut off, the server did not store it, or
+    /// `last.json` could not be written (the clipboard alone is not a copy).
+    public static func keepsAudio(truncated: Bool, serverSaved: Bool, textSaved: Bool) -> Bool {
+        truncated || !serverSaved || !textSaved
+    }
+
     public static func decide(_ outcome: DictationOutcome, delivery: InjectOutcome?) -> SpoolDecision {
         switch outcome {
         case .emptyRecording:
@@ -59,13 +68,15 @@ public enum SpoolDisposition {
             return SpoolDecision(keep: false, toasts: [.failed(.rejected)])
         case .failed(let kind):
             return SpoolDecision(keep: true, toasts: [.failed(kind)])
-        case .text(let truncated, let serverSaved):
+        case .text(let truncated, let serverSaved, let textSaved):
             guard let delivery else { return SpoolDecision(keep: true) }   // text never reached delivery
             var toasts: [SpoolToast] = []
             if truncated { toasts.append(.possiblyTruncated) }
             if !serverSaved { toasts.append(.notSavedOnServer) }
+            if !textSaved { toasts.append(.lastTextNotSaved) }
             if delivery == .noTarget { toasts.append(.copiedNotPasted) }
-            return SpoolDecision(keep: truncated || !serverSaved, toasts: toasts)
+            return SpoolDecision(keep: keepsAudio(truncated: truncated, serverSaved: serverSaved, textSaved: textSaved),
+                                 toasts: toasts)
         }
     }
 }

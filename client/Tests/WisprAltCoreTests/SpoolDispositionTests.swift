@@ -6,30 +6,44 @@ import WisprAltCore
     private func d(_ o: DictationOutcome, _ i: InjectOutcome?) -> SpoolDecision { SpoolDisposition.decide(o, delivery: i) }
 
     @Test func text_delivered_deletes() {
-        #expect(d(.text(truncated: false, serverSaved: true), .insertedVerified) == SpoolDecision(keep: false))
-        #expect(d(.text(truncated: false, serverSaved: true), .pastedUnverified) == SpoolDecision(keep: false))
-        #expect(d(.text(truncated: false, serverSaved: true), .refusedSecureField) == SpoolDecision(keep: false))
-        #expect(d(.text(truncated: false, serverSaved: true), .noTarget) == SpoolDecision(keep: false, toasts: [.copiedNotPasted]))
+        #expect(d(.text(truncated: false, serverSaved: true, textSaved: true), .insertedVerified) == SpoolDecision(keep: false))
+        #expect(d(.text(truncated: false, serverSaved: true, textSaved: true), .pastedUnverified) == SpoolDecision(keep: false))
+        #expect(d(.text(truncated: false, serverSaved: true, textSaved: true), .refusedSecureField) == SpoolDecision(keep: false))
+        #expect(d(.text(truncated: false, serverSaved: true, textSaved: true), .noTarget) == SpoolDecision(keep: false, toasts: [.copiedNotPasted]))
     }
 
     @Test func truncated_keeps() {
-        #expect(d(.text(truncated: true, serverSaved: true), .insertedVerified) == SpoolDecision(keep: true, toasts: [.possiblyTruncated]))
-        #expect(d(.text(truncated: true, serverSaved: true), .refusedSecureField) == SpoolDecision(keep: true, toasts: [.possiblyTruncated]))
-        #expect(d(.text(truncated: true, serverSaved: true), .noTarget)
+        #expect(d(.text(truncated: true, serverSaved: true, textSaved: true), .insertedVerified) == SpoolDecision(keep: true, toasts: [.possiblyTruncated]))
+        #expect(d(.text(truncated: true, serverSaved: true, textSaved: true), .refusedSecureField) == SpoolDecision(keep: true, toasts: [.possiblyTruncated]))
+        #expect(d(.text(truncated: true, serverSaved: true, textSaved: true), .noTarget)
                 == SpoolDecision(keep: true, toasts: [.possiblyTruncated, .copiedNotPasted]))
     }
 
     /// Part 4 contract: a 200 with `saved:false` delivers the text and keeps the audio + Retry entry.
     @Test func localSavedFalse_keeps_forEveryDelivery() {
         for i in all.compactMap({ $0 }) {
-            let out = d(.text(truncated: false, serverSaved: false), i)
+            let out = d(.text(truncated: false, serverSaved: false, textSaved: true), i)
             #expect(out.keep)
             #expect(out.toasts.first == .notSavedOnServer)
         }
     }
 
+    /// A failed `last.json` save keeps the recording under Retry, for every
+    /// delivery — the same rule Retry uses (`RetryEntries.dropAfterRetry`).
+    @Test func lastTextSaveFailed_keeps_forEveryDelivery() {
+        for i in all.compactMap({ $0 }) {
+            let out = d(.text(truncated: false, serverSaved: true, textSaved: false), i)
+            #expect(out.keep)
+            #expect(out.toasts.contains(.lastTextNotSaved))
+        }
+        #expect(SpoolDisposition.keepsAudio(truncated: false, serverSaved: true, textSaved: false))
+        #expect(!SpoolDisposition.keepsAudio(truncated: false, serverSaved: true, textSaved: true))
+        // Retry and the dictation path agree on the save-failed case.
+        #expect(!RetryEntries.dropAfterRetry(DictationResult(text: "hi", modelUsed: "m"), textSaved: false))
+    }
+
     @Test func text_withoutDelivery_keeps() {
-        #expect(d(.text(truncated: false, serverSaved: true), nil) == SpoolDecision(keep: true))
+        #expect(d(.text(truncated: false, serverSaved: true, textSaved: true), nil) == SpoolDecision(keep: true))
     }
 
     @Test func emptyRecording_deletesSilently_emptyText_keeps() {
