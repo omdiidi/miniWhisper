@@ -50,7 +50,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from wispralt import observability
+from wispralt import observability, setup_code
 from wispralt.accounts.store import AccountStore
 from wispralt.config import settings, verify_env_perms
 from wispralt.database import Database
@@ -137,6 +137,8 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
     app.state.db = database
     app.state.accounts = AccountStore(database)
     app.state.usage = UsageStore(database)
+    # Portal first-admin setup: a one-time code file while no enabled admin exists.
+    setup_code.prepare(app.state.accounts, settings.data_dir)
 
     # 1. Validate .env permissions
     env_path = find_env_path()

@@ -46,6 +46,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
+from .. import setup_code
+from .._errors import AlreadyBootstrapped
 from ..accounts import service as account_service
 from ..accounts.store import AccountStore, User
 from ..auth import (
@@ -153,6 +155,72 @@ async def login_submit(
     # unified path="/" session cookie so it scopes across /admin/* AND /me/*.
     set_session_cookie(resp, token)
     return resp
+
+
+# ── /admin/setup — portal first-admin setup (unauthenticated, gated) ─────────
+#
+# Exists only while no enabled admin exists (else 404) and only with the code from
+# ``data_dir/setup-code`` (written at startup by ``setup_code.prepare``). The race
+# between two submitters is settled by ``bootstrap_first_admin`` (``AlreadyBootstrapped``).
+
+NO_STORE = {"Cache-Control": "no-store"}
+
+
+async def _setup_open(request: Request) -> None:
+    if await asyncio.to_thread(_accounts(request).has_enabled_admin):
+        raise HTTPException(status_code=404)
+
+
+def _setup_form(request: Request, *, error: str | None = None, label: str = "owner",
+                status_code: int = 200) -> HTMLResponse:
+    return _form_page(
+        request,
+        "setup.html.j2",
+        {"hide_chrome": True, "error": error, "form_label": label,
+         "code_file": setup_code.FILENAME},
+        status_code=status_code,
+    )
+
+
+@public_router.get("/setup", response_class=HTMLResponse)
+async def setup_form(request: Request) -> HTMLResponse:
+    await _setup_open(request)
+    return _setup_form(request)
+
+
+@public_router.post("/setup", response_class=HTMLResponse)
+async def setup_submit(
+    request: Request,
+    code: str = Form(...),
+    label: str = Form("owner"),
+    csrf_token: str = Form(...),
+) -> HTMLResponse:
+    """Create the first admin with the on-disk setup code; show its key once."""
+    if not verify_csrf(request, csrf_token):
+        return _setup_form(request, error="Form expired. Reload and try again.", status_code=403)
+    await _setup_open(request)
+    clean_label, err = _validate_label(label)
+    if err is not None:
+        return _setup_form(request, error=err, label=label, status_code=400)
+    if not setup_code.matches(settings.data_dir, code):
+        logger.warning("admin setup refused: wrong or missing setup code")
+        return _setup_form(request, error="That setup code is not valid.", label=label,
+                           status_code=403)
+    try:
+        user, plaintext = await asyncio.to_thread(
+            account_service.bootstrap_first_admin, _accounts(request), clean_label
+        )
+    except AlreadyBootstrapped as exc:
+        raise HTTPException(status_code=404) from exc
+    setup_code.consume(settings.data_dir)
+    response = templates.TemplateResponse(
+        "setup.html.j2",
+        {"request": request, "hide_chrome": True, "created": user, "plaintext": plaintext,
+         "server_url": settings.server_url},
+        headers=NO_STORE,
+    )
+    set_session_cookie(response, plaintext)
+    return response
 
 
 # ── authed routes ─────────────────────────────────────────────────────────────
