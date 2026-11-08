@@ -1,4 +1,4 @@
-name: Lint installer
+name: Lint installer and scripts
 
 # Fail-closed guard for install.sh. It runs on a fresh Mac under macOS's frozen
 # bash 3.2 with `set -u` (an empty-array expansion once crashed the old installer
@@ -10,10 +10,12 @@ on:
     branches: [main]
     paths:
       - "install.sh"
+      - "scripts/**"
       - ".github/workflows/lint-install.yml"
   pull_request:
     paths:
       - "install.sh"
+      - "scripts/**"
       - ".github/workflows/lint-install.yml"
 
 permissions:
@@ -30,7 +32,9 @@ jobs:
         run: bash --version | head -1
 
       - name: Syntax check
-        run: bash -n install.sh
+        run: |
+          bash -n install.sh
+          for f in scripts/*.sh scripts/*/*.sh; do bash -n "$f" || exit 1; done
 
       - name: Sourced-function smoke (bash 3.2, set -u)
         run: |
