@@ -196,8 +196,7 @@ class JobStore:
                 duration_ms INTEGER,
                 text TEXT NOT NULL,
                 word_count INTEGER,
-                client_app_version TEXT,
-                smart_format_applied INTEGER
+                client_app_version TEXT
             )
             """
         )
@@ -401,7 +400,6 @@ class JobStore:
         text: str,
         duration_ms: int | None,
         client_app_version: str | None,
-        smart_format_applied: bool,
     ) -> int:
         """Persist one dictation transcript row.
 
@@ -420,8 +418,8 @@ class JobStore:
             cur = self.con.execute(
                 "INSERT INTO dictations("
                 "api_key_id, created_at, duration_ms, text, word_count,"
-                " client_app_version, smart_format_applied"
-                ") VALUES(?,?,?,?,?,?,?)",
+                " client_app_version"
+                ") VALUES(?,?,?,?,?,?)",
                 (
                     api_key_id,
                     time.time(),
@@ -429,7 +427,6 @@ class JobStore:
                     text,
                     word_count,
                     client_app_version,
-                    1 if smart_format_applied else 0,
                 ),
             )
             return int(cur.lastrowid)
@@ -441,7 +438,6 @@ class JobStore:
         text: str,
         duration_ms: int | None,
         client_app_version: str | None,
-        smart_format_applied: bool,
         client_dedup_id: str | None,
     ) -> int:
         """Idempotent variant of :meth:`insert_dictation` for the streaming
@@ -459,8 +455,8 @@ class JobStore:
                 cur = self.con.execute(
                     "INSERT INTO dictations("
                     " api_key_id, created_at, duration_ms, text, word_count,"
-                    " client_app_version, smart_format_applied"
-                    ") VALUES(?,?,?,?,?,?,?)",
+                    " client_app_version"
+                    ") VALUES(?,?,?,?,?,?)",
                     (
                         api_key_id,
                         time.time(),
@@ -468,15 +464,14 @@ class JobStore:
                         text,
                         word_count,
                         client_app_version,
-                        1 if smart_format_applied else 0,
                     ),
                 )
                 return int(cur.lastrowid)
             self.con.execute(
                 "INSERT INTO dictations("
                 " api_key_id, created_at, duration_ms, text, word_count,"
-                " client_app_version, smart_format_applied, client_dedup_id"
-                ") VALUES(?,?,?,?,?,?,?,?)"
+                " client_app_version, client_dedup_id"
+                ") VALUES(?,?,?,?,?,?,?)"
                 " ON CONFLICT(client_dedup_id)"
                 " WHERE client_dedup_id IS NOT NULL DO NOTHING",
                 (
@@ -486,7 +481,6 @@ class JobStore:
                     text,
                     word_count,
                     client_app_version,
-                    1 if smart_format_applied else 0,
                     client_dedup_id,
                 ),
             )
@@ -883,7 +877,6 @@ class JobStore:
         text: str,
         duration_ms: int | None,
         client_app_version: str | None,
-        smart_format_applied: bool,
         client_dedup_id: str,
         dictated_at: float,
     ) -> int | None:
@@ -903,8 +896,8 @@ class JobStore:
             cur = self.con.execute(
                 "INSERT INTO dictations("
                 " api_key_id, created_at, duration_ms, text, word_count,"
-                " client_app_version, smart_format_applied, client_dedup_id"
-                ") VALUES(?,?,?,?,?,?,?,?)"
+                " client_app_version, client_dedup_id"
+                ") VALUES(?,?,?,?,?,?,?)"
                 " ON CONFLICT(client_dedup_id)"
                 " WHERE client_dedup_id IS NOT NULL DO NOTHING",
                 (
@@ -914,7 +907,6 @@ class JobStore:
                     text,
                     word_count,
                     client_app_version,
-                    1 if smart_format_applied else 0,
                     client_dedup_id,
                 ),
             )

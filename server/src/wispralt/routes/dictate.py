@@ -27,7 +27,6 @@ from ..auth import require_api_key
 from ..config import settings
 from ..dictate.parakeet import MODEL_ID
 from ..jobs.store import JobStore
-from ..smart_format.mercury_client import _word_count
 from ..users.store import User
 
 logger = logging.getLogger(__name__)
@@ -121,48 +120,25 @@ async def transcribe_dictate(
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
     )
 
-    # Smart formatting: client-only opt-in via X-Smart-Format header.
-    # /v1/audio/transcriptions never sets this header (raw output by contract).
-    # Permissive value parsing: accept "true", "1", "yes" (case-insensitive).
-    header_val = request.headers.get("X-Smart-Format", "").strip().lower()
-    smart_format_requested = header_val in {"true", "1", "yes"}
     # Streaming plan §7: optional dedup id. Absent on legacy clients → None →
     # insert_dictation_idempotent runs the same INSERT as today.
     client_dedup_id = request.headers.get("X-Client-Dedup-Id")
     if client_dedup_id is not None and not _UUID_RE.match(client_dedup_id):
         client_dedup_id = None  # silently ignore malformed → preserve current behavior
-    mercury_client = getattr(request.app.state, "mercury_client", None)
-    applied_smart_format = False
-    smart_format_ms = 0.0
-    if smart_format_requested and mercury_client is not None:
-        raw_text = text
-        sf_start = time.perf_counter()
-        cleaned = await mercury_client.clean_up(text)
-        smart_format_ms = (time.perf_counter() - sf_start) * 1_000.0
-        if cleaned is not None:
-            text = cleaned
-            applied_smart_format = True
-            logger.info(
-                "dictate: smart-format applied raw_words=%d cleaned_words=%d ms=%.1f",
-                _word_count(raw_text),
-                _word_count(text),
-                smart_format_ms,
-            )
 
     # Single per-request timing line — the breakdown a future investigator
     # needs to attribute latency to a stage without re-deriving it from
     # request_id correlation. Order: how a request flows.
     total_handler_ms = (time.perf_counter() - body_start) * 1_000.0
     logger.info(
-        "dictate: body_read_ms=%.1f inference_ms=%.1f smart_format_ms=%.1f "
-        "total_handler_ms=%.1f bytes_in=%d chars=%d sf=%s",
+        "dictate: body_read_ms=%.1f inference_ms=%.1f "
+        "total_handler_ms=%.1f bytes_in=%d chars=%d words=%d",
         body_read_ms,
         inference_ms,
-        smart_format_ms,
         total_handler_ms,
         len(audio_bytes),
         len(text),
-        applied_smart_format,
+        len(text.split()),
     )
 
     # Phase 1 transcript-storage: fire-and-forget INSERT into the dictations
@@ -187,7 +163,6 @@ async def transcribe_dictate(
             int(inference_ms) if inference_ms is not None else None
         )
         captured_text = text
-        captured_smart_format = applied_smart_format
         captured_api_key_id = int(user.id)
         captured_dedup_id = client_dedup_id
 
@@ -205,7 +180,6 @@ async def transcribe_dictate(
                     text=captured_text,
                     duration_ms=captured_inference_ms,
                     client_app_version=client_version,
-                    smart_format_applied=captured_smart_format,
                     client_dedup_id=captured_dedup_id,
                 )
             except (sqlite3.Error, OSError) as exc:
@@ -234,6 +208,5 @@ async def transcribe_dictate(
             "text": text,
             "model_id": MODEL_ID,
             "duration_ms": round(inference_ms, 2),
-            "smart_formatted": applied_smart_format,
         }
     )

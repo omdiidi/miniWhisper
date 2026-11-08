@@ -144,7 +144,7 @@ The setup writes three files containing secrets. None are committed:
 
 | File | Mode | Contains |
 |---|---:|---|
-| `~/wispralt/server/.env` | 0600 | `WISPRALT_API_KEY`, optional `OPENROUTER_API_KEY` (Mercury) |
+| `~/wispralt/server/.env` | 0600 | `WISPRALT_API_KEY`, optional `OPENROUTER_API_KEY` (weekly insights) |
 | `~/.config/wispralt/cloudflare-token` | 0600 | Cloudflare tunnel token only |
 | `~/.config/wispralt/client-config.txt` | 0600 | `SERVER_URL`, `WISPRALT_API_KEY` (for paste-into-client) |
 
@@ -154,7 +154,7 @@ The setup writes three files containing secrets. None are committed:
 
 After any setup involving copy/paste into shared tools (chat, screen recordings, etc.), rotate:
 
-- **`OPENROUTER_API_KEY`** (if set, for Mercury smart formatting and insights): rotate at <https://openrouter.ai/keys>, update `server/.env`, restart the FastAPI LaunchAgent.
+- **`OPENROUTER_API_KEY`** (if set, for weekly insights): rotate at <https://openrouter.ai/keys>, update `server/.env`, restart the FastAPI LaunchAgent.
 - **Cloudflare tunnel token:** in the Zero Trust dashboard → tunnel → Configure → Rotate token. See "Cloudflared LaunchAgent (user-level)" below for the rotation procedure — the steps differ depending on whether your cloudflared version supports `--token-file`.
 - **`WISPRALT_API_KEY`:** `curl -X POST -H "Authorization: Bearer $OLD" $SERVER_URL/admin/rotate-key` returns `{"rotated": true}` and writes the new key to the server log; copy it into the client.
 

@@ -8,8 +8,7 @@ Two POSTs under ``/transcribe/dictate/stream/{session_id}/...``:
 * ``.../chunk/{index}`` — accepts a mid-recording WAV chunk, enqueues
   inference, returns 202 immediately.
 * ``.../finalize`` — accepts the tail WAV, awaits all pending inference (with
-  a hard timeout), joins partial transcripts, optionally runs Mercury smart-
-  format on the joined text, persists one idempotent dictation row, and
+  a hard timeout), joins partial transcripts, persists one idempotent dictation row, and
   returns the final transcript.
 
 Auth: same ``require_api_key`` dep as ``/transcribe/dictate``. Break-glass
@@ -149,7 +148,6 @@ async def stream_finalize(
     session_id: str,
     request: Request,
     file: UploadFile,
-    smart_format: bool = Form(False),
     client_dedup_id: str = Form(...),
     speech_started_at: float = Form(...),
     user: User = Depends(require_api_key),
@@ -163,7 +161,7 @@ async def stream_finalize(
 
     # v5.2: try/finally wraps from the FIRST status mutation onward so any
     # exception (CorruptAudioError from wav_header_duration_ms, HTTPException
-    # from cap re-check, generic sqlite/Mercury error) leaves the session in
+    # from cap re-check, generic sqlite error) leaves the session in
     # "aborted" rather than stuck in "finalizing" forever.
     #
     # Concurrency note: two concurrent /finalize calls race on the
@@ -234,17 +232,6 @@ async def stream_finalize(
             raise HTTPException(409, "Partial transcripts have gaps") from exc
 
         text = joined
-        applied_smart_format = False
-        sf_ms = 0.0
-        mercury = getattr(request.app.state, "mercury_client", None)
-        if smart_format and mercury is not None:
-            sf_start = time.perf_counter()
-            cleaned = await mercury.clean_up(joined)
-            sf_ms = (time.perf_counter() - sf_start) * 1_000.0
-            if cleaned is not None:
-                text = cleaned
-                applied_smart_format = True
-
         job_store: JobStore = request.app.state.job_store
         client_version = request.headers.get("X-WisprAlt-Client-Version")
         await asyncio.to_thread(
@@ -253,7 +240,6 @@ async def stream_finalize(
             text=text,
             duration_ms=int(total_inference_ms),
             client_app_version=client_version,
-            smart_format_applied=applied_smart_format,
             client_dedup_id=client_dedup_id,
             dictated_at=speech_started_at,
         )
@@ -266,14 +252,12 @@ async def stream_finalize(
         total_handler_ms = (time.perf_counter() - handler_start) * 1_000.0
         logger.info(
             "stream finalize: session=%s chunks=%d total_inference_ms=%.1f "
-            "mercury_ms=%.1f total_handler_ms=%.1f chars=%d sf=%s dedup=%s",
+            "total_handler_ms=%.1f chars=%d dedup=%s",
             session_id,
             chunk_count,
             total_inference_ms,
-            sf_ms,
             total_handler_ms,
             len(text),
-            applied_smart_format,
             client_dedup_id,
         )
 
@@ -282,11 +266,10 @@ async def stream_finalize(
                 "text": text,
                 "model_id": MODEL_ID,
                 "duration_ms": round(total_inference_ms, 2),
-                "smart_formatted": applied_smart_format,
             }
         )
     finally:
-        # Any non-finalized exit (HTTPException, sqlite error, Mercury error)
+        # Any non-finalized exit (HTTPException, sqlite error)
         # must reset status to "aborted" so the session doesn't stick in
         # "finalizing" forever. The lock is short-held — no awaitable work.
         #

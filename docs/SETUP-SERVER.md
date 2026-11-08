@@ -125,8 +125,7 @@ All configuration is read from `server/.env` (mode 0600). The template is `serve
 | `JOB_DB_PATH` | Yes | — | Path to SQLite job database file |
 | `STAGING_DIR` | Yes | — | Temporary directory for in-flight WAV uploads |
 | `SUPABASE_DATABASE_URL` | No | — | Postgres URL for the `wispralt` schema (multi-token auth + usage events). When unset, server falls back to env-var break-glass admin only. See [DEPLOY-TEAM.md](DEPLOY-TEAM.md) for the connection-string format and the schema-bootstrap migration. |
-| `OPENROUTER_API_KEY` | No | — | Enables the **Smart formatting** toggle. When set, `/transcribe/dictate` requests with `X-Smart-Format: true` AND at least `SMART_FORMAT_MIN_WORDS` words are post-processed by OpenRouter Mercury 2 (~$0.0001 per cleanup, ~250ms added wall-clock, fail-soft on timeout/error). Cleanup includes punctuation, casing, filler removal, and bullet-list formatting; meaning preserved. When unset, the header is silently a no-op and the toggle in the macOS client appears to do nothing. Get a key at https://openrouter.ai/keys. |
-| `SMART_FORMAT_MIN_WORDS` | No | `80` | Minimum word count for smart-formatting to engage. Below this the call short-circuits to raw Parakeet output. Targets long-form dictations (LLM prompts, notes) where the cleanup is actually visible; short utterances aren't worth the LLM round-trip. |
+| `OPENROUTER_API_KEY` | No | — | Enables the weekly insights cron (Sunday-night LLM summary via OpenRouter). When unset, the cron is a no-op. Server smart formatting (Mercury) was removed in Part 4. Get a key at https://openrouter.ai/keys. |
 | `FILE_MODEL_IDLE_EVICTION_SECONDS` | No | `60` | Seconds the file model (MLX Whisper) may sit idle before it is evicted to reclaim memory |
 | `MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum upload size in bytes (default 2 GiB) |
 
@@ -166,16 +165,6 @@ SELECT version, applied_at, notes FROM wispralt.schema_version ORDER BY version;
 ```
 
 The migration is idempotent (`ADD COLUMN IF NOT EXISTS` + `ON CONFLICT DO NOTHING` on the version row), so re-running is safe.
-
-### Optional: enable smart formatting
-
-Smart formatting (server-side cleanup via OpenRouter Mercury 2 — punctuation, casing, filler removal, and bullet-list formatting on dictations of at least 100 words; meaning preserved) is opt-in. To turn it on:
-
-1. Get an OpenRouter key at https://openrouter.ai/keys. Pricing is roughly $0.0001 per cleanup; for a single employee dictating heavily, expect under $1/month.
-2. Add `OPENROUTER_API_KEY=<key>` to `server/.env` (mode 0600 — never commit).
-3. Restart the server (`bash scripts/server-launchd.sh stop && bash scripts/server-launchd.sh start`).
-
-When the key is present, employees with the **Smart formatting** toggle ON in the macOS client get cleaned text. When the key is absent, the toggle silently does nothing — there is no client-visible error.
 
 ---
 

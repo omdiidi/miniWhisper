@@ -136,7 +136,7 @@ Transcribe a short audio clip using the warm Parakeet model.
 
 | Header | Values | Default | Notes |
 |---|---|---|---|
-| `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `SMART_FORMAT_ENABLED=true` (default off) AND `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized AND the raw transcript is at or above `SMART_FORMAT_MIN_WORDS` (default 80), the transcript is post-processed by OpenRouter Mercury 2: punctuation, casing, paragraph breaks, light filler removal ("um"/"uh"/repeats), and bullet-list formatting where the speaker is enumerating. Meaning is preserved (no rephrasing, no summarization, no new content). A length-window safety check (cleaned ∈ [0.7×, 1.10×] of raw word count) falls back to raw on suspicious output. Fail-soft: any timeout or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. The native macOS client sets this header when the user toggles "Smart formatting" in Settings. The `/v1/audio/transcriptions` shim never sets it. |
+| `X-Smart-Format` | — | — | **Removed (Part 4).** Server smart formatting (OpenRouter Mercury) is gone; the header is ignored and the raw transcript is always returned. Any formatting now happens in the client. |
 | `X-Client-Dedup-Id` | UUID v4 string | absent ⇒ off | **Optional, additive (Phase 5b streaming-dictation).** When present, must be a syntactically valid UUID v4. Forwarded to `JobStore.insert_dictation(..., client_dedup_id=...)`; the row participates in the `idx_dictations_client_dedup` partial-unique index, so a subsequent retry that sends the same UUID is silently de-duped (`ON CONFLICT(client_dedup_id) DO NOTHING`). Used by the safety-buffer fallback in `DictationStreamSession` to guarantee at most one persisted row per utterance when a streaming finalize loses to its local fallback. When the header is **absent**, behavior is bit-identical to the pre-streaming contract: the column is left NULL and the partial-unique index never applies. Malformed UUIDs are rejected at the validation boundary (422). |
 
 **Audio format flexibility (server-side resampling):**
@@ -156,19 +156,12 @@ Transcribe a short audio clip using the warm Parakeet model.
 {
   "text": "Hello world.",
   "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
-  "duration_ms": 143.7,
-  "smart_formatted": false
+  "duration_ms": 143.7
 }
 ```
 
 `duration_ms` is wall-clock Parakeet inference time (excludes queue wait).
-`smart_formatted` is `true` only when `X-Smart-Format` was truthy AND the raw
-transcript was at or above `SMART_FORMAT_MIN_WORDS` (default 80) AND the
-Mercury cleanup actually replaced the text (OpenRouter responded within the
-1500 ms budget, output passed the length-window safety check, no errors).
-It's `false` for every other case, including header absent, header non-truthy,
-raw word count below the threshold, server missing `OPENROUTER_API_KEY`,
-Mercury timeout, length-window safety check failed, or Mercury HTTP error.
+The `smart_formatted` key was removed in Part 4 along with server smart formatting.
 
 **Errors:**
 
@@ -225,7 +218,7 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 
 **Auth:** Bearer required; same per-user-owner gate as `/chunk`. **Opt-in, experimental.**
 
-Close out a streaming session. The server waits up to 15 s for all pending chunk tasks to drain, joins their texts in index order, runs Mercury cleanup ONCE on the joined string (same `SMART_FORMAT_MIN_WORDS` threshold + length-window safety rail as the single-shot path), persists the row to `dictations`, and returns the final text. The chunked-receive route stops accepting new chunks for this `session_id` (returns 410) the moment finalize starts.
+Close out a streaming session. The server waits up to 15 s for all pending chunk tasks to drain, joins their texts in index order, persists the row to `dictations`, and returns the final text. The chunked-receive route stops accepting new chunks for this `session_id` (returns 410) the moment finalize starts.
 
 **Path params:** `session_id` (UUID v4) — same as `/chunk`.
 
@@ -234,7 +227,7 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `file` | UploadFile | Yes | The tail WAV — the trailing speech segment that was still being accumulated when FN was released. `Content-Type: audio/*`. May be empty (zero-byte) if the speaker happened to finish exactly on a silence cut. |
-| `smart_format` | boolean | No | Default `false`. Equivalent to the `X-Smart-Format` header on `/transcribe/dictate`; routed through the same Mercury client. |
+| `smart_format` | — | — | **Removed (Part 4).** Ignored if an older client still sends it; the text is never post-processed on the server. |
 | `client_dedup_id` | UUID v4 | Yes | The same UUID the client will reuse on the safety-buffer fallback if this finalize loses. Persisted to `dictations.client_dedup_id`; combined with the `idx_dictations_client_dedup` partial-unique index, guarantees one row per utterance. |
 | `speech_started_at` | float (Unix epoch, sub-second precision) | Yes | The local wall-clock time the *user* began speaking (NOT FN press) — sent so the server can compute end-to-end latency from speech start to text injection without depending on local clock-sync. Sub-second precision is preserved (don't round to int). |
 
@@ -244,8 +237,7 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 {
   "text": "Hello world.",
   "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
-  "duration_ms": 213.4,
-  "smart_formatted": false
+  "duration_ms": 213.4
 }
 ```
 
@@ -298,9 +290,8 @@ canonical reference: **[OPENAI-COMPAT.md](OPENAI-COMPAT.md)**.
 - **CORS** — `Access-Control-Allow-Origin: *` on every `/v1/*`
   response including 429 envelopes, so browser clients see real HTTP
   errors instead of CORS failures.
-- **Smart formatting is never applied on `/v1/*`** — the shim
-  deliberately ignores `X-Smart-Format`. Third-party callers that want
-  cleanup hit `/transcribe/dictate` directly.
+- **No server-side smart formatting** on any route (removed in Part 4);
+  `/v1/*` returns the raw transcript.
 
 Sources: `server/src/wispralt/routes/v1_transcriptions.py`,
 `server/src/wispralt/routes/v1_models.py`.

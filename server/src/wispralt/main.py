@@ -75,7 +75,6 @@ from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
 from wispralt.routes import v1_models, v1_transcriptions
-from wispralt.smart_format.mercury_client import MercuryClient
 from wispralt.usage import writer as usage_writer
 from wispralt.usage.events import UsageEvent
 from wispralt.users import store as users_store
@@ -263,39 +262,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     streaming_sweeper_task = asyncio.create_task(_streaming_sweeper(app))
     app.state.streaming_sweeper_task = streaming_sweeper_task
 
-    # 6b. Mercury client — fail-soft. If init throws, smart formatting is silently
-    #     disabled. Same fail-soft contract as runtime: any error → None return.
-    app.state.mercury_client = None
-    if settings.smart_format_enabled and settings.openrouter_api_key:
-        try:
-            app.state.mercury_client = MercuryClient(
-                api_key=settings.openrouter_api_key,
-                model=settings.openrouter_model,
-                base_url=settings.openrouter_base_url,
-                timeout_ms=settings.openrouter_timeout_ms,
-                app_title=settings.openrouter_app_title,
-                min_words=settings.smart_format_min_words,
-            )
-            logger.info(
-                "mercury_client initialized model=%s timeout_ms=%d",
-                settings.openrouter_model,
-                settings.openrouter_timeout_ms,
-            )
-        except Exception:
-            logger.exception(
-                "mercury_client init failed — smart formatting will be disabled"
-            )
-            app.state.mercury_client = None
-    else:
-        logger.info(
-            "mercury_client disabled (SMART_FORMAT_ENABLED=%s, OPENROUTER_API_KEY %s)",
-            settings.smart_format_enabled,
-            "set" if settings.openrouter_api_key else "unset",
-        )
-
-    # 6c. InsightsClient — fail-soft mirror of mercury_client. None when
-    #     OPENROUTER_API_KEY is unset; weekly cron is a no-op in that case.
-    #     Different model + longer timeout than mercury (batch, not live).
+    # 6b. InsightsClient — fail-soft. None when OPENROUTER_API_KEY is unset;
+    #     the weekly cron is a no-op in that case.
     app.state.insights_client = None
     if settings.openrouter_api_key:
         try:
@@ -572,13 +540,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     _session.status = "aborted"
                     for _task in _session.pending_tasks.values():
                         _task.cancel()
-
-    mercury_client: MercuryClient | None = getattr(app.state, "mercury_client", None)
-    if mercury_client is not None:
-        try:
-            await mercury_client.aclose()
-        except Exception as exc:
-            logger.warning("mercury_client.aclose failed: %s", exc)
 
     insights_client: InsightsClient | None = getattr(
         app.state, "insights_client", None

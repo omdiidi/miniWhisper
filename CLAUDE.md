@@ -58,6 +58,6 @@ If you just need to read state and the user is sitting at the mini, the fastest 
   committed, never logged. The legacy `sudo cloudflared service install` flow is
   abandoned because its plist is broken on macOS 14/15. Rotation: see
   docs/DEPLOYMENT-NOTES.md.
-- Secrets: `WISPRALT_API_KEY` (and the optional `OPENROUTER_API_KEY` for Mercury smart formatting) in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
+- Secrets: `WISPRALT_API_KEY` (and the optional `OPENROUTER_API_KEY` for weekly insights) in `server/.env` (mode 0600). API key in client Keychain (`co.wispralt`). Never commit either.
 
 @CLAUDE.local.md

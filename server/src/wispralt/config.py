@@ -102,47 +102,9 @@ class Settings(BaseSettings):
     # to avoid IP spoofing in rate limiting.
     trust_forwarded_headers: bool = True
 
-    # OpenRouter Mercury 2 — server-side smart-formatting post-processor.
-    # Optional: when openrouter_api_key is None, smart formatting is silently disabled
-    # (clients toggling the X-Smart-Format header on get raw text back).
+    # OpenRouter key for the weekly insights cron (InsightsClient). Optional:
+    # when None, the cron is a no-op.
     openrouter_api_key: str | None = None
-    # Smart formatting is OFF by default: at the 600 ms budget Mercury timed
-    # out on nearly every production request, so each dictation paid an
-    # OpenRouter round-trip for nothing. Set SMART_FORMAT_ENABLED=true to opt
-    # in (also requires OPENROUTER_API_KEY). The weekly insights client does
-    # NOT depend on this flag.
-    smart_format_enabled: bool = False
-    openrouter_model: str = "inception/mercury-2"
-    # 600 ms ceiling for the Mercury cleanup (lowered from 1500 ms on
-    # 2026-05-02 after measuring 7-day production latency: dictate p95
-    # ran 5.4s with the old budget; this caps the disaster ceiling and
-    # keeps the path fail-soft). Cross-region OpenRouter on a warm TCP
-    # session is 200-400 ms; 600 ms preserves headroom while ruling out
-    # the "1.5s waiting on Mercury" failure mode in the long tail.
-    # If a deployment sees too many fail-overs to raw text, raise via env
-    # (OPENROUTER_TIMEOUT_MS=1000) and revisit.
-    openrouter_timeout_ms: int = 600
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_app_title: str = "WisprAlt"
-
-    # Minimum dictation length (words) before smart-formatting is invoked. Below
-    # this, raw Parakeet output is returned unchanged — short utterances aren't
-    # worth the LLM round-trip and Parakeet's inline punctuation is good enough.
-    #
-    # 2026-05-13 bump 100 -> 300: with the OpenRouter timeout pinned at 600 ms
-    # (see openrouter_timeout_ms above), Mercury empirically can't complete a
-    # 100-300 word polish within budget. Those requests time out and fail-soft
-    # to raw Parakeet text anyway, costing the user ~600 ms of dead wait. At
-    # >=300 words the cleanup is both noticeable AND inside budget. The user
-    # still gets correct Parakeet output (with its inline punctuation) below
-    # the threshold — no transcription content is lost, only the polish step.
-    #
-    # 2026-05-19 drop 300 -> 80 (user pref May 19): user explicitly asked for
-    # Mercury to fire on shorter dictations. Risk: at 80-300 words, polish may
-    # time out at 600 ms and fail-soft to raw text, costing ~600 ms of dead
-    # wait. Mitigation: revisit openrouter_timeout_ms if telemetry shows
-    # excessive fail-overs at the new threshold.
-    smart_format_min_words: int = 80
 
     # Transcript persistence TTL. After this many days, transcript text on
     # `jobs` rows is zeroed (the row stays as audit metadata) and `dictations`

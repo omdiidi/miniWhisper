@@ -31,11 +31,9 @@ WisprAlt is a two-component system: a native macOS menubar client running on you
 │   /healthz  /readyz/dictation  /admin/rotate-key                             │
 │   /me  (GET, PATCH)   ──▶ JSON self-service identity (label, display_name)   │
 │   /v1/audio/transcriptions ──▶ OpenAI-compat shim → ParakeetService          │
-│       (sync, dictate-only, 25 MB cap, never invokes Mercury)                  │
+│       (sync, dictate-only, 25 MB cap)                                        │
 │   /transcribe/dictate ──▶ ParakeetService (warm, single-thread executor)     │
-│       └─ optional X-Smart-Format: true & raw_words ≥ 100 ──▶ Mercury 2       │
-│             (OpenRouter, 1500ms hard timeout, fail-soft → raw on timeout,    │
-│              error, or length-window safety check failure)                   │
+│       (raw text; server smart formatting removed in Part 4)                  │
 │   /transcribe/file (+ /chunked/*) ──▶ stage → JobStore (SQLite) → runner     │
 │                          ↓                                                    │
 │                    FileJobRunner (1 job, dedicated executor)                  │
@@ -306,11 +304,11 @@ The server side is intentionally small and lives in two new modules:
 - **1 active session per `api_key_id`.** Returns `409 per_user_busy` if the same user opens a second session while their first is still active. Forces clients to either reuse the existing `sid` (idempotent — `open_or_get` returns `existing`) or wait for the prior `finalize` to land.
 - **270 s cumulative voiced audio mid-chunk; 300 s at finalize.** Mid-chunk cap → `413`. Finalize cap → `413`. Keeps any single session inside Parakeet's comfortable VRAM working-set even under HOL contention.
 - **900 s session TTL.** A background sweeper task (`_streaming_sweeper`) reaps any session whose `last_seen` is older than 900 s, regardless of status. On reap, pending chunk tasks are cancelled and the slot is freed.
-- **15 s finalize timeout.** `finalize` waits up to 15 s for all `pending_tasks` to drain before snapshotting `partial_texts`, joining, and running Mercury. Past 15 s the route returns `504 timeout` and the session is marked `aborted`; the client safety buffer kicks in.
+- **15 s finalize timeout.** `finalize` waits up to 15 s for all `pending_tasks` to drain before snapshotting `partial_texts` and joining. Past 15 s the route returns `504 timeout` and the session is marked `aborted`; the client safety buffer kicks in.
 
 **Single Parakeet executor (no second instance).** Every chunk task is submitted to the same `ParakeetService` `run_in_executor` that `/transcribe/dictate` uses. There is no second model load, no second executor, no second thread pool. This means cross-session head-of-line blocking exists on a shared queue — see Known limitations below. With the 2-session cap, the worst case is 2 chunks contending and is acceptable for the experimental rollout.
 
-**Mercury runs once on joined text.** Each chunk's Parakeet output goes into `partial_texts[index]`. On `finalize` the texts are joined with `" "` separators and Mercury 2 cleanup runs ONCE on the joined string — same Mercury client, same `SMART_FORMAT_MIN_WORDS` threshold, same length-window safety rail as the single-shot path. There is no per-chunk Mercury call: it would (a) cost N× more OpenRouter budget, (b) produce visible seam artifacts because Mercury sometimes capitalizes / repunctuates the first word, and (c) defeat the purpose of streaming since the user's last word lands ~Mercury-RTT after the tail arrives anyway.
+**Joined text is returned raw.** Each chunk's Parakeet output goes into `partial_texts[index]`. On `finalize` the texts are joined with `" "` separators and returned as-is; server smart formatting (Mercury) was removed in Part 4.
 
 ### Idempotency
 
@@ -344,7 +342,7 @@ The safety buffer is always written, so a streaming failure costs the user **at 
 | Concern | File:line landmark |
 |---|---|
 | Endpoint registration | `main.py` lifespan after `parakeet_service.load()`; `include_router(dictate_stream_routes.router)` after `dictate.router` |
-| Sweeper lifecycle | `main.py` lifespan creates `_streaming_sweeper` task; shutdown cancels + aborts active sessions before mercury teardown |
+| Sweeper lifecycle | `main.py` lifespan creates `_streaming_sweeper` task; shutdown cancels + aborts active sessions |
 | Per-session lock contract | `streaming_session.py` — every reader/writer of `status / partial_texts / pending_tasks / last_seen / cumulative_audio_ms` acquires `session.lock` before mutating; `finalize` snapshots under lock before releasing for the `asyncio.gather` await |
 | Dedup-id persistence | `jobs/store.py` — `dictations.client_dedup_id` column + `idx_dictations_client_dedup` partial-unique index (added in Plan A, reused here) |
 | Header passthrough on non-streaming | `routes/dictate.py` — additive read of `X-Client-Dedup-Id` (UUID v4 form), forwarded to `insert_dictation(..., client_dedup_id=...)` |

@@ -77,7 +77,7 @@ This section describes the rollback strategy that was in place during Phases 1â€
 | File | What it pins |
 |---|---|
 | `server/tests/test_dictate_corrupt_audio.py` | LibsndfileError â†’ CorruptAudioError boundary |
-| `server/tests/test_dictate_route_422.py` | `/transcribe/dictate` HTTP 422/415/413/200 contract |
+| `server/tests/test_dictate_route_422.py` | `/transcribe/dictate` HTTP 422/415/413/200 contract; `X-Smart-Format` / finalize `smart_format` ignored (raw text, no `smart_formatted`) |
 | `server/tests/test_observability_time_window.py` | recent-window p50 + low-traffic fallback on `/metrics` |
 | `server/tests/test_token_cache.py` | LRU + 60 s TTL on `TokenCache` |
 | `server/tests/test_usage_writer.py` | UsageEventQueue overflow + drainer batch + FK-violation retry |

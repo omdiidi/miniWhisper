@@ -128,3 +128,76 @@ class TestRouteCorruptAudioContract:
         assert body["text"] == "hello world"
         assert body["model_id"]
         assert isinstance(body["duration_ms"], (int, float))
+
+
+class TestSmartFormatRemoved:
+    """Server Mercury is gone: ``X-Smart-Format`` / ``smart_format`` change nothing.
+
+    Regression fixtures — the only place these literals may appear.
+    """
+
+    def test_x_smart_format_header_returns_raw_text(self) -> None:
+        app = _build_test_app(("um hello world", 3.0))
+        resp = TestClient(app).post(
+            "/transcribe/dictate",
+            files={"file": ("ok.wav", _silent_wav_bytes(0.05), "audio/wav")},
+            headers={"Authorization": "Bearer test", "X-Smart-Format": "true"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["text"] == "um hello world"
+        assert "smart_formatted" not in body
+
+    def test_stream_finalize_ignores_smart_format_field(self) -> None:
+        from wispralt.auth import require_api_key
+        from wispralt.dictate.streaming_session import StreamingSessionStore
+        from wispralt.routes.dictate_stream import router as stream_router
+        from wispralt.users.store import User
+
+        texts = iter(["um hello", "world"])
+
+        class _StubParakeet:
+            async def transcribe(self, audio_bytes: bytes) -> tuple[str, float]:
+                return next(texts), 1.0
+
+        saved: list[dict[str, Any]] = []
+
+        class _StubJobStore:
+            def insert_streaming_dictation_idempotent(self, **kwargs: Any) -> int:
+                saved.append(kwargs)
+                return 1
+
+        app = FastAPI()
+        app.state.parakeet_service = _StubParakeet()
+        app.state.job_store = _StubJobStore()
+        app.state.streaming_sessions = StreamingSessionStore(
+            max_active=2, max_queue_depth=12, ttl_s=900, finalize_timeout_s=15
+        )
+        app.include_router(stream_router)
+        app.dependency_overrides[require_api_key] = lambda: User(
+            id=7, label="t", role="employee"
+        )
+        sid = "11111111-2222-4333-8444-555555555555"
+        dedup = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        wav = _silent_wav_bytes(0.05)
+        with TestClient(app) as client:
+            chunk = client.post(
+                f"/transcribe/dictate/stream/{sid}/chunk/0",
+                files={"file": ("c.wav", wav, "audio/wav")},
+            )
+            assert chunk.status_code == 202, chunk.text
+            resp = client.post(
+                f"/transcribe/dictate/stream/{sid}/finalize",
+                files={"file": ("t.wav", wav, "audio/wav")},
+                data={
+                    "smart_format": "true",
+                    "client_dedup_id": dedup,
+                    "speech_started_at": "1700000000",
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["text"] == "um hello world"
+        assert "smart_formatted" not in body
+        assert saved and saved[0]["text"] == "um hello world"
+        assert not any("smart" in key for key in saved[0])
