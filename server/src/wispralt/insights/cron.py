@@ -399,7 +399,8 @@ async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome,
 
 if __name__ == "__main__":
     # Operator entry point: one run now, without the server. Same rules as the portal:
-    # AI must be enabled in the DB and OPENROUTER_API_KEY set in server/.env.
+    # AI must be enabled in the DB and OPENROUTER_API_KEY set: Settings reads .env from the
+    # working directory, so run it from ~/.config/wispralt (the service's .env) or export it.
     #   python -m wispralt.insights.cron --manual [--week YYYY-WW] [--force]
     import argparse
     from types import SimpleNamespace
@@ -426,7 +427,10 @@ if __name__ == "__main__":
 
     async def _main() -> None:
         if not settings.openrouter_api_key:
-            parser.error("OPENROUTER_API_KEY is not set in server/.env")
+            parser.error(
+                "OPENROUTER_API_KEY is not set: add it to ~/.config/wispralt/.env and run"
+                " from that directory (or export it)"
+            )
         database = Database(settings.db_path)
         database.migrate()
         app = SimpleNamespace(state=SimpleNamespace(

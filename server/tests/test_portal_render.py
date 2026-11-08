@@ -161,3 +161,15 @@ def test_no_template_interpolates_into_a_js_attribute() -> None:
         if "{{" in m.group(2) or "{%" in m.group(2)
     ]
     assert offenders == []
+
+
+def test_settings_page_points_at_the_real_env_file_when_the_key_is_missing(
+    client: TestClient, people, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wispralt.config import settings
+
+    monkeypatch.setattr(settings, "openrouter_api_key", None)
+    (_admin, token), _ = people
+    html = client.get("/admin/settings", headers=_auth(token)).text
+    assert "~/.config/wispralt/.env" in html and "wispralt restart" in html
+    assert "server/.env" not in html and "the CLI does this" not in html
