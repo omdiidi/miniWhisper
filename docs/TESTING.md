@@ -99,3 +99,26 @@ This section describes the rollback strategy that was in place during Phases 1�
 | `client/Tests/WisprAltCoreTests/KeychainItemTests.swift` | round-trip / update / delete on a throwaway `co.wispralt.test.<uuid>` item; runs only with `WISPRALT_KEYCHAIN_TESTS=1` (set by `scripts/test-client.sh` outside CI) |
 
 Client tests use **Swift Testing** (`import Testing`, `@Test`, `#expect`); the test target builds in Swift 5 language mode. Run them with `scripts/test-client.sh` (`swift build` + `swift test`; on a CommandLineTools-only Mac it adds the `-F`/`-rpath` flags for the CLT `Testing.framework` and turns off cross-import overlays, because the CLT copy of `_Testing_Foundation` has no module; it exports `WISPRALT_KEYCHAIN_TESTS=1` unless `CI` is set). Server tests: `pytest server/tests/` (locally `tmp/mission/part2/run-pytest.sh`). CI runs both suites on every PR via `.github/workflows/ci.yml` (see [CONTRIBUTING.md](CONTRIBUTING.md#continuous-integration)).
+
+## Real-API assumption gates (OpenAI)
+
+`scripts/online-assumptions/run-all.sh` checks Online-mode assumptions against the **real** OpenAI API, so it **costs money** and is never part of CI or `test-client.sh`. It builds the `WisprAltProbe` developer tool (`client/Probe/main.swift`, never bundled into the app) and runs:
+
+| Step | Probe | What it checks | Est. $ |
+|---|---|---|---|
+| `preflight` | P5 | the Keychain read of `co.wispralt.openai` / `default` (no spend) | 0 |
+| `preflight` | P1 (report-only) | `say -r 212` renders `fixtures/speech.txt` (re-checked to 590-600 s, else **probe FAIL (fixture)** with no API call), then **one** `gpt-transcribe` call on the 16 kHz mono WAV. Reports spoken words, returned words, `usage.output_tokens` and the tail marker (`OK` or `TRUNCATED(measured=N)`). Both marker outcomes PASS; the model catalog is never changed from it (A1) | ≈ 0.045 |
+| `suite-file` | per file model | every file model in `OpenAIModels.all` on one ≈ 5 s clip through the shipped `OpenAIFileProvider` (≤ 2 requests per model, so ≤ 3 calls), `gpt-4o-mini-transcribe-2025-03-20` with exactly one call (`model_not_found` is reported, not failed: A7), plus one direct m4a upload to `gpt-transcribe` | ≈ 0.003 |
+| `suite-live` | — | not built until Task 11 (prints "not built", exits 2); `run-all.sh` does not run it yet | — |
+
+- **Key.** Read inside the probe with `KeychainItem`; the shell script never touches it, and it never appears in argv, env, a log or a file. Missing key, `errSecAuthFailed`, `errSecInteractionNotAllowed` or a denied prompt → **BLOCKED**. `--keychain-service NAME` points the probe at another item (e.g. an absent one, to check the no-key path).
+- **Spend.** The probe projects each call's cost (`seconds / 60 × catalog price`) and refuses it (BLOCKED) if it would pass the pre-flight cap ($0.30 per run), the suites cap ($1 per run, combined) or the ledger cap ($5 ever). Every billable call is appended **before** it is sent to `tmp/mission/part3/openai-spend.jsonl` (override with `WISPRALT_SPEND_LEDGER`) as `{ts, run, probe, model, seconds, est_usd}`; a provider retry adds a second line.
+- **Audio.** Generated AIFF / WAV / m4a files live in a `wispralt-probe-<uuid>` temp dir that is removed on exit; only the text fixture is in git.
+- **Exit codes.** 0 all PASS; 1 any FAIL (`run-all.sh` halts at the failing step); 2 BLOCKED with no FAIL (continue, results UNVERIFIED).
+- **Fixture.** If a new `say` voice drifts outside 590-600 s, add or remove a sentence in `fixtures/speech.txt` and update its header.
+
+Last real run (2026-11-07, run `20261108T001338Z-47742`, $0.0471, exit 0):
+
+- P5 PASS. P1 PASS: clip 594.8 s (19.0 MB WAV), spoken 2,360 words, returned 2,359, `output_tokens` n/a (`usage` was `{type: duration, seconds: 595}`), marker **OK** (heard as "zebra chords"), 18.3 s latency. So `gpt-transcribe` returned a full 10-minute transcript, but it reports duration-only usage, so its output-token ceiling stays unverified (A1).
+- `suite-file`: all 6 file models PASS with one call each (`gpt-transcribe` and `whisper-1` report duration usage; the `gpt-4o*` models report `output_tokens`); `gpt-4o-mini-transcribe-2025-03-20` is usable (A7 verified on this date); the direct m4a upload PASS.
+

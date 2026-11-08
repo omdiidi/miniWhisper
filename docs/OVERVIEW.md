@@ -127,7 +127,8 @@ This file is the single source of truth for which documentation file covers each
 
 | File | Covered by |
 |---|---|
-| `client/Package.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md), [TESTING.md](TESTING.md) — macOS 14.0 target, Sparkle 2 dependency; `WisprAltCore` and `WisprAltCoreTests` both build in Swift 5 language mode |
+| `client/Package.swift` | [SETUP-CLIENT.md](SETUP-CLIENT.md), [TESTING.md](TESTING.md) — macOS 14.0 target, Sparkle 2 dependency; `WisprAltCore`, `WisprAltCoreTests` and the `WisprAltProbe` developer tool (never bundled) all build in Swift 5 language mode |
+| `client/Probe/main.swift` | [TESTING.md](TESTING.md#real-api-assumption-gates-openai) — `WisprAltProbe`: `preflight [--only P1\|P5]`, `suite-file`, `suite-live` (exits 2 until Task 11); reads the OpenAI key in-process via `KeychainItem`, enforces the spend caps and appends every call to the ledger |
 | `client/README.md` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — client build and run |
 | `client/WisprAlt/Info.plist` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — permission usage descriptions, Sparkle config |
 | `client/WisprAlt/WisprAlt.entitlements` | [SETUP-CLIENT.md](SETUP-CLIENT.md) — required entitlements |
@@ -193,6 +194,8 @@ This file is the single source of truth for which documentation file covers each
 | File | Covered by |
 |---|---|
 | `scripts/test-client.sh` | [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md) — client gate: `swift build` + `swift test` (Swift Testing), with CommandLineTools framework flags when needed; exports `WISPRALT_KEYCHAIN_TESTS=1` unless `CI` is set |
+| `scripts/online-assumptions/run-all.sh` | [TESTING.md](TESTING.md#real-api-assumption-gates-openai) — builds `WisprAltProbe`, runs `preflight` then `suite-file` against the real OpenAI API (costs money); exit 0 PASS / 1 FAIL / 2 BLOCKED |
+| `scripts/online-assumptions/fixtures/speech.txt` | [TESTING.md](TESTING.md#real-api-assumption-gates-openai) — P1 speech text tuned to 590-600 s with `say -r 212`; the header records the word count and measured length |
 | `scripts/setup-server.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/setup-cloudflared.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
 | `scripts/download-models.sh` | [SETUP-SERVER.md](SETUP-SERVER.md) |
