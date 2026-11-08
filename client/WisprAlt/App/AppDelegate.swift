@@ -147,6 +147,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
         // A file may have been picked while the dialog was open.
         guard !refuseInviteForLocalJob() else { return }
+        // One redeem at a time: a second one finishing later would clear the
+        // flag below while the first is still about to repoint the server.
+        guard !menuBarController.inviteRedeemInFlight else {
+            AppNotifications.notify(title: "Joining a Server",
+                                    body: "Another invite is still being redeemed. Try again in a moment.")
+            return
+        }
         // Until the redeem settles no Local file job may start (see
         // `transcribePickedFile`), so none can be stranded by the new server.
         menuBarController.inviteRedeemInFlight = true
