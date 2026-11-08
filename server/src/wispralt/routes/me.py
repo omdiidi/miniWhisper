@@ -34,6 +34,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
 from wispralt.auth import (
+    csrf_token_for,
     forbid_integration_kind,
     require_csrf,
     resolve_token,
@@ -437,7 +438,7 @@ async def me_history_row(
     decorated = _decorate_row(row, await insights_settings.timezone_for(request.app))
     decorated["kind"] = kind
     decorated["row_id"] = row_id
-    csrf = secrets.token_urlsafe(32)
+    csrf = csrf_token_for(request)  # never rotate: the page's other forms hold this token
     if compact:
         template_name = "_me_history_row.html.j2"
     elif is_htmx(request):

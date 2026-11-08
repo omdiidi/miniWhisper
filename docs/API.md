@@ -495,7 +495,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 **Auth:** Bearer required. Ownership-checked.
 
-One owned record. With `HX-Request: true` it returns the expanded row partial (or the compact one with `?compact=1`); a plain browser request returns a full **record page** (`record_detail.html.j2`, the target of AI source links). Unknown `kind`, unknown `row_id`, or a `row_id` owned by another user all uniformly return **404** so we never leak existence to non-owners.
+One owned record. With `HX-Request: true` it returns the expanded row partial (or the compact one with `?compact=1`); a plain browser request returns a full **record page** (`record_detail.html.j2`, the target of AI source links). Unknown `kind`, unknown `row_id`, or a `row_id` owned by another user all uniformly return **404** so we never leak existence to non-owners. It reuses the existing `wispralt_csrf` token (`auth.csrf_token_for`) instead of rotating it, so delete / restore forms already on the page keep working after an expand.
 
 **Path parameters:**
 

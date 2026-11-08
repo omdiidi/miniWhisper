@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import secrets
 import sqlite3
 from typing import TYPE_CHECKING
 
@@ -254,6 +255,15 @@ def set_csrf_cookie(resp: Response, csrf_token: str) -> None:
         max_age=_CSRF_COOKIE_MAX_AGE_S,
         path="/",
     )
+
+
+def csrf_token_for(request: Request) -> str:
+    """The CSRF cookie's current token, else a new one.
+
+    For partials rendered into a page that already carries forms: rotating
+    the cookie there would invalidate the tokens those forms hold.
+    """
+    return request.cookies.get(CSRF_COOKIE_NAME) or secrets.token_urlsafe(32)
 
 
 def verify_csrf(request: Request, form_token: str) -> bool:
