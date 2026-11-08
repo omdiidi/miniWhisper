@@ -271,7 +271,7 @@ Override at deploy via env vars:
 
 **Symptom:** Dictation completes successfully (status returns to idle) but the focused field initially looks unchanged in Electron apps (VS Code, Slack, Discord, Cursor, Notion, Figma, Linear, …) or in **Apple Messages** (`com.apple.MobileSMS`) and **Pane** (`com.dcouple.pane`).
 
-**Diagnosis:** These apps do not honour `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` — either they silently no-op the write or they don't expose a usable `kAXValueAttribute`. `AccessibilityInjector.tryInsertWith` detects this by reading `kAXValueAttribute` before and after the write; if both reads return the same value (or fail), the predicate `didInjectionLand(...)` returns `false` and `TextInjector` falls through to `ClipboardInjector.injectViaCmdV` which writes the text to `NSPasteboard.general`, synthesises ⌘V, and restores the original pasteboard 200 ms later. iMessages and Pane are expected to take this path — it's not a bug.
+**Diagnosis:** These apps do not honour `AXUIElementSetAttributeValue(kAXSelectedTextAttribute)` — either they silently no-op the write or they don't expose a usable `kAXValueAttribute`. `AccessibilityInjector.tryInsertWith` detects this by reading `kAXValueAttribute` before and after the write; if both reads return the same value (or fail), the predicate `didInjectionLand(...)` returns `false` and `TextInjector` falls through to `ClipboardInjector.injectViaCmdV` which writes the text to `NSPasteboard.general`, synthesises ⌘V, and leaves the text on the clipboard. iMessages and Pane are expected to take this path — it's not a bug.
 
 **Diagnostic log line format:**
 
@@ -288,13 +288,11 @@ Exactly one `info` line — `via AX` *or* `via Cmd+V`, never both — should app
 2. Ensure Accessibility permission is granted (Step 1 of the permission wizard).
 3. Confirm the focused app accepts ⌘V from a synthetic `CGEvent`. A handful of niche apps (custom event loops) ignore it; record the bundle ID in an issue.
 
-**Honest caveat about clipboard managers (Maccy, Raycast Clipboard History, Paste.app, Alfred Clipboard).** These tools watch `NSPasteboard.general` and copy every change into their history. WisprAlt restores your original clipboard 200 ms after pasting, **but** if a clipboard manager wrote during that window the restore is skipped (we won't stomp something the user just copied) and your previous clipboard contents are lost. If you rely on clipboard history, avoid selecting items from it immediately after dictating into a clipboard-fallback app.
+**The text stays on the clipboard.** When the Cmd+V fallback is used, WisprAlt cannot confirm the paste landed, so it leaves the dictation on the clipboard instead of restoring what was there before (a restore could erase the only copy). Clipboard managers will record it. **Copy last dictation** also returns it for 7 days.
 
 **Web password caveat.** The native secure-field gate (next section) catches AppKit `NSSecureTextField` and SwiftUI `SecureField`, but **web password inputs** (Safari, Chrome, Electron `<input type="password">`) usually do **not** surface `kAXSubroleAttribute == AXSecureTextField`, so the gate cannot detect them. **Do not dictate web passwords** — they may transit the system pasteboard where any clipboard manager could capture them.
 
 **Known limitation: secure-field skip notification debounce.** When dictation is refused due to a secure field, you'll see one local notification "Dictation Skipped — `<bundleID>` is asking for a password. Type the value manually." Subsequent skips against the same focus within 60 seconds are logged but not re-notified, to avoid spamming Notification Center if the field stays focused (e.g. unlocking 1Password).
-
-**Known limitation: repeat dictation within 200 ms.** Two FN-tap dictations in rapid succession can interact with the clipboard restore window: the second snapshot captures the first dictation's text rather than your true original, so when both restores complete the clipboard ends up holding the first dictation's text. Avoid back-to-back dictations if your clipboard contents matter.
 
 **Known limitation: post-capture focus shift on the clipboard path.** The secure-field gate captures focus context once at the top of `TextInjector.inject` and uses it to decide whether to refuse and which AX element to write to. The synthesised ⌘V, however, goes to whatever app is focused at the moment the `CGEvent` posts — which is usually the same app, but if you click into a different field (especially a password field) during the brief window inside `inject(_:)` between focus capture and the synthesised ⌘V (typically sub-millisecond, up to a few hundred ms if the AX-attempt times out on a hung target), the paste will land in the new focus. The gate cannot prevent this. If you need to switch fields right after dictating, wait for the text to land first.
 
@@ -559,4 +557,12 @@ dictation/timing: inject_ms=18.7 total_ms=1873.5
 ## Reading client logs
 
 Client log messages are `.private` in release builds, so Console.app and `log stream` show `<private>` for them; DEBUG builds (`swift build`, `swift run`) log them in full. Either way the client never logs transcript text, server responses or reasons, file names, paths, URLs or keys; errors appear only as a type and code (for example `server(status: 500)` or `NSURLErrorDomain#-1009`). To see message text on a release build, run a DEBUG build from source.
+
+### A dictation failed: Retry, Export…, Discard
+
+**Symptom:** "Dictation Failed … Audio saved under Retry." or "N saved recordings from last session — see Retry".
+
+**What happened:** the audio of a failed (or possibly cut-off) dictation is kept in `~/Library/Application Support/WisprAlt/retry/` (newest 2, 7 days, 16 kHz mono). A crash or quit mid-dictation leaves it in `spool/`, and the next launch moves it to Retry. Nothing is re-sent automatically.
+
+**Fix:** open the popover → **Retry N**. **Retry** re-sends it in the mode it was recorded in and puts the text on the clipboard (and in **Copy last dictation**). A recording from the other mode shows "Switch to Local to retry" (or Online). **Export…** saves the audio file; **Discard** deletes it. A Local server that answers 410 `dictation_deleted` or 409 `dedup_conflict` refuses that dictation for good: its recording is discarded.
 

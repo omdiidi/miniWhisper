@@ -383,7 +383,7 @@ Source: `server/src/wispralt/routes/me.py`.
 **Auth:** Bearer required (employee or admin token via `Authorization: Bearer <token>`).
 
 Returns the caller's most recent dictation as JSON. Powers the menubar
-"Copy last dictation" button (v0.5.0). The row is filtered by
+"Copy last dictation" button (v0.5.0). Since Part 3 the macOS client no longer calls it (the button reads the client's own `last.json`); the route stays for other clients. The row is filtered by
 `deleted_at IS NULL` so a soft-deleted dictation is not returned; tie-break
 on identical `created_at` is `id DESC`.
 

@@ -67,15 +67,19 @@ extension MenuBarController {
         }
     }
 
-    /// Stop → route → transcribe → inject. Filter OSLog timing with:
+    /// Stop → route → transcribe → last text → inject → spool disposition.
+    /// Filter OSLog timing with:
     /// `log show --last 5m --predicate 'subsystem == "co.wispralt" AND category == "dictation"' --info`
     @MainActor func runDictation(_ s: DictationSession, targetPID: pid_t?, fnReleasedAt: Date) async {
         let clock = ContinuousClock()
         let tStop = clock.now
+        var outcome: DictationOutcome
+        var delivery: InjectOutcome? = nil
+        var interrupted = false
         do {
+            // The spool file is owned by the disposition below, on every path.
             let out = try await dictationRecorder.stop()
-            // Tasks 2-6 (no spool yet): the recording is deleted on every path.
-            defer { try? FileManager.default.removeItem(at: out.recording.fileURL) }
+            interrupted = out.recording.interruptedByDeviceChange
             let stopMs = (clock.now - tStop).milliseconds
 
             let tNet = clock.now
@@ -87,17 +91,25 @@ extension MenuBarController {
                     .finish(capture: capture, durationSeconds: out.recording.durationSeconds)
             }
             let netMs = (clock.now - tNet).milliseconds
+            let cut = TruncationCheck.isTruncated(outputTokens: result.outputTokens,
+                                                  verifiedCap: s.snapshot.model?.maxOutputTokens)
 
-            let tInj = clock.now
-            await TextInjector.inject(result.text, targetPID: targetPID)
-            Log.debug(
-                "dictation/timing: stop_ms=\(String(format: "%.1f", stopMs)) net_ms=\(String(format: "%.1f", netMs)) " +
-                "inject_ms=\(String(format: "%.1f", (clock.now - tInj).milliseconds))",
-                category: "dictation"
-            )
+            if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                outcome = .emptyText
+            } else {
+                LastTextStore.save(result, mode: s.snapshot.mode)   // recoverable before any paste
+                let tInj = clock.now
+                delivery = await TextInjector.inject(result.text, targetPID: targetPID)
+                outcome = .text(truncated: cut, serverSaved: result.serverSaved)
+                Log.debug(
+                    "dictation/timing: stop_ms=\(String(format: "%.1f", stopMs)) net_ms=\(String(format: "%.1f", netMs)) " +
+                    "inject_ms=\(String(format: "%.1f", (clock.now - tInj).milliseconds))",
+                    category: "dictation"
+                )
+            }
             Log.info(
                 "Dictation done: chars=\(result.text.count) model=\(result.modelUsed) mode=\(s.snapshot.mode.rawValue) " +
-                "saved=\(result.serverSaved)",
+                "saved=\(result.serverSaved) truncated=\(cut)",
                 category: "dictation"
             )
 
@@ -113,46 +125,36 @@ extension MenuBarController {
         } catch {
             s.provider?.cancel()
             Log.error("dictation failed: \(ErrorLog.describe(error))", category: "dictation")
-            let outcome = ErrorLog.outcome(error)
+            outcome = DictationOutcome(ErrorLog.outcome(error))
             if outcome == .failed(.modelNotFound), s.snapshot.mode == .online, let model = s.snapshot.model {
                 // Reset the picker so the next dictation works.
-                let fallback = OpenAIModels.defaultID(for: model.kind)
-                Settings.shared.openAIModel = fallback
-                showToast("That OpenAI model is not available. Switched to \(fallback).")
-                return
-            }
-            if let body = Self.failureMessage(outcome, mode: s.snapshot.mode) {
-                AppNotifications.notify(title: "Dictation Failed", body: body)
+                Settings.shared.openAIModel = OpenAIModels.defaultID(for: model.kind)
             }
         }
+        if interrupted { showToast("Audio device changed — transcribed what was recorded") }
+        applySpool(SpoolDisposition.decide(outcome, delivery: delivery), id: s.snapshot.id, mode: s.snapshot.mode)
     }
 
-    /// User-facing text for a failed dictation; nil means stay silent (an
-    /// empty recording is an FN tap without speech).
-    static func failureMessage(_ outcome: ErrorOutcome, mode: TranscriptionMode) -> String? {
-        switch outcome {
-        case .empty:
-            return nil
-        case .cancelled:
-            return "The dictation was cancelled."
-        case .failed(let kind):
-            switch kind {
-            case .keyMissing: return "Add your OpenAI key in Settings → Advanced."
-            case .auth:
-                return mode == .online
-                    ? "OpenAI rejected the API key. Check it in Settings → Advanced."
-                    : "API key rejected. Re-paste your API key in Settings."
-            case .quota: return "OpenAI quota exceeded. Check your OpenAI billing."
-            case .modelNotFound: return "That OpenAI model is not available. Pick another in Settings → Advanced."
-            case .network: return "Network error. Check your connection and try again."
-            case .server: return "The transcription service returned an error. Try again."
-            case .deadline: return "Transcription took too long and was stopped."
-            case .deviceChanged: return "Audio device changed — press FN again"
-            case .writeFailed: return "Could not write audio to disk."
-            case .encodeFailed: return "Could not encode the recording."
-            case .other: return "Something went wrong. Try again."
-            case .rejected: return "The server refused this dictation (deleted or not yours). It will not be retried."
-            }
+    /// User-facing text for a failed dictation (an empty recording is silent
+    /// and never reaches here).
+    static func failureMessage(_ kind: FailureKind, mode: TranscriptionMode) -> String {
+        switch kind {
+        case .keyMissing: return "Add your OpenAI key in Settings → Advanced."
+        case .auth:
+            return mode == .online
+                ? "OpenAI rejected the API key. Check it in Settings → Advanced."
+                : "API key rejected. Re-paste your API key in Settings."
+        case .quota: return "OpenAI quota exceeded. Check your OpenAI billing."
+        case .modelNotFound:
+            return "That OpenAI model is not available. Switched to \(OpenAIModels.defaultID(for: .file))."
+        case .network: return "Network error. Check your connection and try again."
+        case .server: return "The transcription service returned an error. Try again."
+        case .deadline: return "Transcription took too long and was stopped."
+        case .deviceChanged: return "Audio device changed — press FN again"
+        case .writeFailed: return "Could not write audio to disk."
+        case .encodeFailed: return "Could not encode the recording."
+        case .other: return "Something went wrong. Try again."
+        case .rejected: return "The server refused this dictation (deleted or not yours). It will not be retried."
         }
     }
 }
@@ -183,6 +185,17 @@ extension MenuBarController: FNKeyEventsDelegate {
             return
         }
 
+        // The sidecar lands (synchronously) before the spool file opens, so
+        // any audio on disk always knows its mode and model.
+        do {
+            try SpoolFiles.writeSidecarSync(id: snapshot.id,
+                                            SpoolSidecar(mode: mode, model: snapshot.model?.id ?? "local"))
+        } catch {
+            Log.error("spool sidecar write failed: \(ErrorLog.describe(error))", category: "dictation")
+            showToast("Could not save audio")
+            return
+        }
+
         let provider = ProviderFactory.make(snapshot)
         let started: Bool
         do {
@@ -190,11 +203,13 @@ extension MenuBarController: FNKeyEventsDelegate {
                                                   maxSeconds: snapshot.capSeconds)
         } catch {
             provider?.cancel()
+            SpoolFiles.removeSidecarSync(snapshot.id)
             Log.error("DictationRecorder failed to start: \(ErrorLog.describe(error))", category: "dictation")
             return
         }
         guard started else {
             provider?.cancel()
+            SpoolFiles.removeSidecarSync(snapshot.id)
             showToast("Still saving the last dictation — press again")
             return
         }

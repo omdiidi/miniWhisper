@@ -18,7 +18,8 @@ private extension Duration {
 /// window between the secure-field check and the AX write), refuses injection
 /// outright if the focused element is a native secure field, then tries
 /// `AccessibilityInjector` first because it inserts directly at the cursor
-/// without touching the clipboard. Falls through to `ClipboardInjector` if the
+/// without touching the clipboard. Falls through to `ClipboardInjector` (text
+/// left on the clipboard) if the
 /// AX strategy reports failure (e.g. focused element is in an Electron app
 /// that silently no-ops AX attribute writes — iMessages, Pane, Slack, …).
 @MainActor
@@ -37,9 +38,14 @@ enum TextInjector {
     ///   4. `AccessibilityInjector.tryInsertWith` — AX kAXSelectedTextAttribute
     ///      with read-back verification. Returns true only if the value was
     ///      observed to change.
-    ///   5. `ClipboardInjector.injectViaCmdV` — writes text to pasteboard,
-    ///      synthesises Cmd+V, then restores the original pasteboard contents
-    ///      after 200 ms.
+    ///   5. `ClipboardInjector.injectViaCmdV` — writes text to the pasteboard
+    ///      and synthesises Cmd+V. The text is left on the clipboard (the paste
+    ///      cannot be verified, so nothing is restored over it).
+    ///
+    /// - Returns: `.insertedVerified` (AX, clipboard untouched; also for empty
+    ///   text, which has nothing to deliver), `.pastedUnverified` (Cmd+V, text
+    ///   on the clipboard), `.refusedSecureField` (nothing typed or copied) or
+    ///   `.noTarget` (no frontmost app: copied only).
     ///
     /// - Parameters:
     ///   - text: The string to inject (typically transcription output).
@@ -48,10 +54,11 @@ enum TextInjector {
     ///     (and not WisprAlt itself), the inject path activates that app
     ///     before resolving the AX element, so dictation lands where the user
     ///     intended even if their focus drifted during the upload.
-    static func inject(_ text: String, targetPID: pid_t? = nil) async {
+    @discardableResult
+    static func inject(_ text: String, targetPID: pid_t? = nil) async -> InjectOutcome {
         guard !text.isEmpty else {
             Log.debug("TextInjector: empty string — skipping injection.", category: "inject")
-            return
+            return .insertedVerified
         }
 
         // Per-stage timings so we can diagnose Terminal/TUI flakiness without
@@ -63,6 +70,12 @@ enum TextInjector {
 
         await restoreTargetIfNeeded(targetPID)
         let tAfterActivate = clock.now
+
+        guard NSWorkspace.shared.frontmostApplication != nil else {
+            ClipboardInjector.copyOnly(text)
+            Log.info("inject: no frontmost app — copied only.", category: "inject")
+            return .noTarget
+        }
 
         let (context, element) = captureFocus()
         let tAfterFocus = clock.now
@@ -81,7 +94,7 @@ enum TextInjector {
                 "inject: total=\(fmt(totalMs))ms activate=\(fmt(activateMs))ms focus=\(fmt(focusMs))ms ax=0ms clipboard=0ms path=refused bundle=\(context.bundleID) role=\(context.role)",
                 category: "inject"
             )
-            return
+            return .refusedSecureField
         }
 
         var axMs: Double = 0
@@ -119,6 +132,7 @@ enum TextInjector {
             "inject: total=\(fmt(totalMs))ms activate=\(fmt(activateMs))ms focus=\(fmt(focusMs))ms ax=\(fmt(axMs))ms clipboard=\(fmt(clipboardMs))ms path=\(path) bundle=\(context.bundleID) role=\(context.role)",
             category: "inject"
         )
+        return path == "ax" ? .insertedVerified : .pastedUnverified
     }
 
     /// Format a millisecond double as integer-ms for log readability.

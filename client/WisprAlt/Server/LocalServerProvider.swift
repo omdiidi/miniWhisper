@@ -23,4 +23,14 @@ struct LocalServerProvider {
         }
         return DictationResult(text: response.text, modelUsed: "local", serverSaved: response.saved)
     }
+
+    /// Retry of a saved recording: the whole file to this endpoint with the
+    /// entry's dictation id as `X-Client-Dedup-Id`, under the same deadline.
+    func retry(wav: Data, durationSeconds: Double) async throws -> DictationResult {
+        let (endpoint, dedupId) = (endpoint, dictationId)
+        let response = try await withDeadline(seconds: max(30, 10 + 0.5 * durationSeconds), onTimeout: {}) {
+            try await DictationAPI.wholeFile(endpoint: endpoint, wavData: wav, dedupId: dedupId)
+        }
+        return DictationResult(text: response.text, modelUsed: "local", serverSaved: response.saved)
+    }
 }
