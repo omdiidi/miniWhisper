@@ -141,6 +141,7 @@ Online file jobs (`App/OnlineFileJob.swift`) are app code; their decisions are t
 - **Key.** Read inside the probe with `KeychainItem`; the shell script never touches it, and it never appears in argv, env, a log or a file. Missing key, `errSecAuthFailed`, `errSecInteractionNotAllowed` or a denied prompt → **BLOCKED**. `--keychain-service NAME` points the probe at another item (e.g. an absent one, to check the no-key path).
 - **Spend.** The probe projects each call's cost (`seconds / 60 × catalog price`) and refuses it (BLOCKED) if it would pass the pre-flight cap ($0.30 per run), the suites cap ($1 per run, combined) or the ledger cap ($5 ever). Every billable call is appended **before** it is sent to `tmp/mission/part3/openai-spend.jsonl` (override with `WISPRALT_SPEND_LEDGER`) as `{ts, run, probe, model, seconds, est_usd}`; a provider retry adds a second line.
 - **Audio.** Generated AIFF / WAV / m4a files live in a `wispralt-probe-<uuid>` temp dir that is removed on exit; only the text fixture is in git.
+- **Keychain prompt.** The probe reads `co.wispralt.openai` itself. `run-all.sh` signs it with your first code-signing identity (or `WISPRALT_SIGN_IDENTITY`), so one **Always Allow** survives rebuilds; with no identity macOS re-prompts after every build.
 - **Exit codes.** 0 all PASS; 1 any FAIL (`run-all.sh` halts at the failing step); 2 BLOCKED with no FAIL (continue, results UNVERIFIED).
 - **Fixture.** If a new `say` voice drifts outside 590-600 s, add or remove a sentence in `fixtures/speech.txt` and update its header.
 

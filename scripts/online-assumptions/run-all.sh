@@ -22,6 +22,10 @@ RUN="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 (cd "$ROOT/client" && swift build --product WisprAltProbe) >/dev/null || { echo "run-all: probe build FAILED"; exit 1; }
 BIN="$(cd "$ROOT/client" && swift build --show-bin-path)/WisprAltProbe"
+# Sign with a stable identity so one Keychain "Always Allow" survives rebuilds
+# (an ad-hoc signature changes every build and re-prompts). Override with WISPRALT_SIGN_IDENTITY.
+IDENT="${WISPRALT_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' 'NF>1{print $2; exit}')}"
+[ -n "$IDENT" ] && { codesign --force --sign "$IDENT" "$BIN" 2>/dev/null || echo "run-all: codesign skipped (Keychain may re-prompt)"; }
 
 final=0
 for step in preflight suite-file suite-live; do
