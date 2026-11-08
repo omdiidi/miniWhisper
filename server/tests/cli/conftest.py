@@ -151,6 +151,7 @@ def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("WISPRALT_ROOT", str(tmp_path / "root"))
     monkeypatch.setenv("WISPRALT_LABEL", LABEL)
+    monkeypatch.delenv("HF_HOME", raising=False)  # main() pins it; restored after each test
     (tmp_path / "home").mkdir()
 
 

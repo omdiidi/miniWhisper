@@ -121,7 +121,6 @@ def warmup(ctx: Ctx) -> Check:
     """Load the dictation model in-process and transcribe a 1 s tone (text may be empty)."""
     import asyncio
 
-    os.environ["HF_HOME"] = str(ctx.paths.models_dir)
     os.environ.setdefault("DATA_DIR", str(ctx.paths.data_dir))  # parakeet imports Settings
     os.environ.setdefault("SERVER_URL", ctx.url)
     from wispralt.dictate.parakeet import ParakeetService

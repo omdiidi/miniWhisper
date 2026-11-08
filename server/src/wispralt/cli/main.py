@@ -9,6 +9,7 @@ raises ``CliError`` for anything else. Importing this module never imports MLX.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -183,6 +184,9 @@ def main(argv: list[str] | None = None, deps: Deps | None = None) -> int:
     args = parse(raw)
     try:
         ctx = make_ctx(args, deps or Deps())
+        # huggingface_hub reads HF_HOME once, at import: pin it before any command can
+        # import it, so downloads, verification and the warm-up all use models_dir.
+        os.environ["HF_HOME"] = str(ctx.paths.models_dir)
         return args.func(ctx, args)
     except CliError as exc:
         print(f"wispralt: {exc.msg}", file=sys.stderr)

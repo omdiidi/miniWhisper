@@ -186,3 +186,11 @@ def test_warmup_uses_the_injected_loader(healthy: Ctx, cli: CliFn, deps: Deps) -
     deps.load_fn = broken
     code, out, _ = cli("doctor", "--warmup")
     assert code == 3 and "weights missing" in out
+
+
+def test_every_command_pins_hf_home_to_models_dir(healthy: Ctx, cli: CliFn) -> None:
+    """huggingface_hub reads HF_HOME at import: main() sets it before any command runs."""
+    import os
+
+    cli("status")
+    assert os.environ["HF_HOME"] == str(healthy.paths.models_dir)
