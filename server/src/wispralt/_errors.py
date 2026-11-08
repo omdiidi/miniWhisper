@@ -8,6 +8,10 @@ boundaries) are rooted here so callers can catch them specifically.
 from __future__ import annotations
 
 
+class MigrationError(Exception):
+    """The DB's applied migrations do not match this code's migration files."""
+
+
 class DiskFullError(Exception):
     """Raised when a write fails because the filesystem has no free space (ENOSPC)."""
 

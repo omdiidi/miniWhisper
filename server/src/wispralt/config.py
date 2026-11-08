@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Re-export verify_env_perms from ops.env_writer so callers that import it
@@ -38,6 +38,11 @@ class Settings(BaseSettings):
 
     # Server identity
     server_url: str
+
+    # Local-mode data root: wispralt.db, outputs/ and staging/ live here.
+    # Must be absolute (an empty value would mean cwd). Optional until the
+    # auth cutover makes it required; see db_path / outputs_dir below.
+    data_dir: Path | None = None
 
     # Filesystem paths — resolved to absolute on access
     meeting_output_dir: Path
@@ -182,6 +187,28 @@ class Settings(BaseSettings):
     # Startup-catchup fail-closed by default. Operator opts in via .env AFTER verifying
     # OpenRouter pricing/model in Task 0 spike. Prevents accidental Wednesday-deploy charge.
     insights_catchup_enabled: bool = False
+
+    @field_validator("data_dir", mode="before")
+    @classmethod
+    def _absolute_data_dir(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not str(value).strip() or not Path(str(value)).is_absolute():
+            raise ValueError("DATA_DIR must be an absolute path")
+        return Path(str(value))
+
+    def _require_data_dir(self) -> Path:
+        if self.data_dir is None:
+            raise ValueError("DATA_DIR is not set")
+        return self.data_dir
+
+    @property
+    def db_path(self) -> Path:
+        return self._require_data_dir() / "wispralt.db"
+
+    @property
+    def outputs_dir(self) -> Path:
+        return self._require_data_dir() / "outputs"
 
 
 # Module-level singleton — import as ``from wispralt.config import settings``

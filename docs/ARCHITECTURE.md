@@ -632,6 +632,29 @@ headroom for ≤10 employees.
 
 Logging: launchd cannot rotate `server.log` / `server.err.log` without sudo, so `ops/logging_setup.configure_file_logging` sends root and uvicorn loggers to a `RotatingFileHandler` at `settings.server_log_path` (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). The launchd files now only capture crash output and the one-off `NEW_API_KEY=` print on key rotation. `/admin/server-log/{job_id}` reads `wispralt.log` plus its rotated backups (`.1`-`.5`).
 
+## Local database (`wispralt.db`)
+
+Part 4 moves the Local-mode host onto **one SQLite file**, `data_dir/wispralt.db`
+(`DATA_DIR` in `.env`, an absolute path; `outputs/` and `staging/` live beside it).
+`wispralt.database.Database` is the only way in:
+
+- a short-lived connection per call with `foreign_keys=ON`, `busy_timeout=5000`
+  and `synchronous=NORMAL`; WAL is set once by `migrate()`;
+- `read()` opens a `BEGIN` snapshot, `write()` a `BEGIN IMMEDIATE` transaction that
+  commits on exit and rolls back if the body raises; no transaction spans inference,
+  and async callers use `asyncio.to_thread`;
+- `migrate()` creates the file at mode 0600 before the first connect, then applies
+  `migrations/NNNN_*.sql` one statement at a time inside a single transaction
+  (never `executescript`, which commits implicitly) and records each file's sha256
+  in `schema_migrations`. An edited or missing applied file, or a DB newer than the
+  code, raises `MigrationError` before anything is applied;
+- `check()` backs readiness: `None`, `"db_error"` (any `sqlite3.Error`) or
+  `"schema_outdated"`.
+
+`0001_initial.sql` holds the full schema (users, api_keys, invites, usage_events,
+dictations, jobs, weekly_insights, settings). Callers move onto it task by task
+during Part 4; until then the sections below describe the current stores.
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output
