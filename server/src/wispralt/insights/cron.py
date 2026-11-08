@@ -1,6 +1,6 @@
 """Weekly LLM insights cron — Phase 2.
 
-Sunday 23:00 mini-local sweep. Walks Supabase users, pulls last-ISO-week
+Sunday 23:00 host-local sweep. Walks the active people (``AccountStore``), pulls last-ISO-week
 transcripts from the local JobStore, calls OpenRouter once per qualifying
 person, then once more for the team aggregate, and upserts results to
 ``weekly_insights``.
@@ -113,12 +113,7 @@ async def _run_weekly_insights_inner(
         return
 
     job_store = app.state.job_store
-    db_pool = getattr(app.state, "db_pool", None)
-    if db_pool is None:
-        logger.warning(
-            "Weekly insights skipped — db_pool is None (Supabase unavailable)"
-        )
-        return
+    accounts = app.state.accounts
 
     # Snapshot budget config at the top so a hot-reload mid-run doesn't change
     # the cap underneath the loop.
@@ -150,12 +145,9 @@ async def _run_weekly_insights_inner(
     )
 
     # 3. Per-person pass
-    users = await db_pool.fetch(
-        "SELECT id, label, display_name, role FROM wispralt.users"
-        " WHERE revoked_at IS NULL"
-    )
+    users = await asyncio.to_thread(accounts.list_people, active=True)
 
-    person_digests: list[tuple[int, str, dict]] = []  # (api_key_id, name, digest)
+    person_digests: list[tuple[int, str, dict]] = []  # (user_id, name, digest)
     # Snapshot baseline BEFORE the loop. Per-person upserts persist, so a fresh
     # rolling_insights_cost_usd(30) call mid-loop would include the rows we
     # just wrote — double-counting prior iterations. Use snapshot+accumulated.
@@ -175,7 +167,7 @@ async def _run_weekly_insights_inner(
         if baseline_30d_cost + accumulated_run_cost >= BUDGET:
             logger.warning(
                 "Per-user budget cap hit mid-run at user_id=%s; stopping cron",
-                user["id"],
+                user.id,
             )
             break
 
@@ -184,41 +176,41 @@ async def _run_weekly_insights_inner(
         # `force=True` (admin manual button) bypasses this so re-clicks produce
         # fresh insights via UPSERT; the lock + 30d budget guard still apply.
         if not force and (
-            job_store.get_weekly_insight_person(user["id"], iso_year, iso_week)
+            job_store.get_weekly_insight_person(user.id, iso_year, iso_week)
             is not None
         ):
             logger.info(
                 "Person insight already exists for user_id=%s W%02d — skipping",
-                user["id"],
+                user.id,
                 iso_week,
             )
             continue
 
         transcripts = await asyncio.to_thread(
             job_store.transcripts_in_range,
-            user["id"],
+            user.id,
             since_epoch=week_start_epoch,
             until_epoch=week_end_epoch,
         )
         if not transcripts:
             continue
 
-        # Word-count gate: >=N dictations OR >=1 meeting
+        # Activity gate: >=N dictations OR >=1 file transcription
         dictations = [t for t in transcripts if t["kind"] == "dictation"]
-        meetings = [t for t in transcripts if t["kind"] == "meeting"]
-        if len(dictations) < PER_PERSON_MIN_DICTATIONS and len(meetings) < 1:
+        files = [t for t in transcripts if t["kind"] == "file"]
+        if len(dictations) < PER_PERSON_MIN_DICTATIONS and len(files) < 1:
             continue
 
         # Build prompt, capped to INPUT_WORD_CAP
         blob, total_words = _assemble_blob(transcripts, cap=INPUT_WORD_CAP)
         user_prompt = PERSON_USER_PROMPT_TEMPLATE.format(
-            display_name=user["display_name"] or user["label"],
-            api_key_id=user["id"],
+            display_name=user.display_name or user.label,
+            user_id=user.id,
             iso_year=iso_year,
             iso_week=iso_week,
             total_words=total_words,
             dictation_count=len(dictations),
-            meeting_count=len(meetings),
+            file_count=len(files),
             input_word_cap=INPUT_WORD_CAP,
             transcript_blob=blob,
         )
@@ -241,7 +233,10 @@ async def _run_weekly_insights_inner(
         except InsightsError as exc:
             person_failures["openrouter_error"] += 1
             logger.warning(
-                "Person insights failed for user_id=%s: %s", user["id"], exc
+                "Person insights failed for user_id=%s: %s status=%s",
+                user.id,
+                type(exc).__name__,
+                exc.status_code,
             )
             continue
 
@@ -250,9 +245,9 @@ async def _run_weekly_insights_inner(
         except json.JSONDecodeError:
             person_failures["json_decode"] += 1
             logger.warning(
-                "Person insights returned non-JSON for user_id=%s; first 200 chars: %r",
-                user["id"],
-                resp.content[:200],
+                "Person insights returned non-JSON for user_id=%s (%d chars)",
+                user.id,
+                len(resp.content),
             )
             continue
 
@@ -263,8 +258,7 @@ async def _run_weekly_insights_inner(
         job_store.upsert_weekly_insight(
             iso_year=iso_year,
             iso_week=iso_week,
-            scope="person",
-            api_key_id=user["id"],
+            user_id=user.id,
             insight=insight,
             input_tokens=resp.input_tokens,
             output_tokens=resp.output_tokens,
@@ -272,7 +266,7 @@ async def _run_weekly_insights_inner(
             model=insights_client.model,
         )
         person_digests.append(
-            (user["id"], user["display_name"] or user["label"], insight)
+            (user.id, user.display_name or user.label, insight)
         )
         accumulated_run_cost += resp.cost_usd
         total_cost += resp.cost_usd
@@ -286,7 +280,7 @@ async def _run_weekly_insights_inner(
     if len(person_digests) >= 1:
         digests_jsonl = "\n".join(
             json.dumps(
-                {"employee": dn, "api_key_id": kid, "insight": d}
+                {"employee": dn, "user_id": kid, "insight": d}
             )
             for kid, dn, d in person_digests
         )
@@ -303,16 +297,18 @@ async def _run_weekly_insights_inner(
                 max_tokens=2500,
             )
         except InsightsError as exc:
-            logger.warning("Team insights failed: %s", exc)
+            logger.warning(
+                "Team insights failed: %s status=%s", type(exc).__name__, exc.status_code
+            )
 
         if team_resp is not None:
             try:
                 team_insight = json.loads(team_resp.content)
             except json.JSONDecodeError:
                 logger.warning(
-                    "Team insights returned non-JSON; first 200 chars: %r —"
-                    " retrying once at temperature=0.0",
-                    team_resp.content[:200],
+                    "Team insights returned non-JSON (%d chars) — retrying once at"
+                    " temperature=0.0",
+                    len(team_resp.content),
                 )
                 team_insight = None
                 try:
@@ -325,19 +321,20 @@ async def _run_weekly_insights_inner(
                     team_insight = json.loads(team_resp.content)
                 except InsightsError as exc:
                     logger.warning(
-                        "Team insights retry failed at temperature=0.0: %s", exc
+                        "Team insights retry failed at temperature=0.0: %s status=%s",
+                        type(exc).__name__,
+                        exc.status_code,
                     )
                 except json.JSONDecodeError:
                     logger.warning(
-                        "Team insights still non-JSON after retry; first 200 chars: %r",
-                        team_resp.content[:200] if team_resp else "",
+                        "Team insights still non-JSON after retry (%d chars)",
+                        len(team_resp.content) if team_resp else 0,
                     )
             if team_insight is not None:
                 job_store.upsert_weekly_insight(
                     iso_year=iso_year,
                     iso_week=iso_week,
-                    scope="team",
-                    api_key_id=None,
+                    user_id=None,
                     insight=team_insight,
                     input_tokens=team_resp.input_tokens,
                     output_tokens=team_resp.output_tokens,
@@ -514,10 +511,10 @@ if __name__ == "__main__":
     # Manual smoke gate (d) — run one cron pass without booting FastAPI/uvicorn.
     # `python -m wispralt.insights.cron --manual`
     import argparse
-    from pathlib import Path
     from types import SimpleNamespace
 
-    from wispralt import db as db_module
+    from wispralt.accounts.store import AccountStore
+    from wispralt.database import Database
     from wispralt.jobs.store import JobStore
 
     parser = argparse.ArgumentParser(
@@ -557,24 +554,18 @@ if __name__ == "__main__":
             parser.error(
                 "OPENROUTER_API_KEY not set in env — cannot run insights cron"
             )
-        if not settings.supabase_database_url:
-            parser.error(
-                "SUPABASE_DATABASE_URL not set — cannot fetch user list"
-            )
-
-        # Reuse the existing pool helper instead of asyncpg.create_pool directly
-        # so the manual path matches the production lifespan at main.py.
-        pool = await db_module.recreate_pool()
+        database = Database(settings.db_path)
+        database.migrate()
 
         app = SimpleNamespace(
             state=SimpleNamespace(
-                job_store=JobStore(Path(settings.job_db_path)),
+                job_store=JobStore(database, settings.data_dir),
                 insights_client=InsightsClient(
                     api_key=settings.openrouter_api_key,  # plain str, NOT SecretStr
                     model=settings.insights_model,
                     timeout_s=settings.insights_timeout_s,
                 ),
-                db_pool=pool,
+                accounts=AccountStore(database),
                 # No lock — __main__ path is single-process and never overlaps.
             )
         )
@@ -582,6 +573,5 @@ if __name__ == "__main__":
             await run_weekly_insights(app, iso_override=iso_override)
         finally:
             await app.state.insights_client.aclose()
-            await db_module.close_pool()
 
     asyncio.run(_main())

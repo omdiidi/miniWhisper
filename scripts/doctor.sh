@@ -5,11 +5,14 @@
 #   1. server/.env exists, mode is 0600, owner is $USER
 #   2. cloudflared service status (best-effort)
 #   3. Disk free on $HOME (warn if < 4 GB)
-#   4. STAGING_DIR and MEETING_OUTPUT_DIR on same filesystem
+#   4. DATA_DIR/staging and DATA_DIR/outputs on same filesystem
 #   5. Poll /healthz until 200 or 401 (max 60s)
 #   6. Poll /readyz/dictation until 200 (max 60s × 5s intervals)
-#   7. Generate test WAV via Python + POST to /transcribe/dictate
-#   8. GET /metrics and pretty-print JSON
+#   7. /readyz/db (local SQLite DB answers, schema current)
+#   8. An enabled admin exists (python -m wispralt.bootstrap --check)
+#
+# No API key is needed: every probe here is unauthenticated, and doctor never
+# reads or prints a token.
 #
 # The file-transcription model (MLX Whisper) loads lazily on the first file
 # job, so there is no readiness probe for it here.
@@ -59,9 +62,7 @@ _read_env_var() {
 }
 
 SERVER_URL="$(_read_env_var SERVER_URL)"
-WISPRALT_API_KEY="$(_read_env_var WISPRALT_API_KEY)"
-STAGING_DIR="$(_read_env_var STAGING_DIR)"
-MEETING_OUTPUT_DIR="$(_read_env_var MEETING_OUTPUT_DIR)"
+DATA_DIR="$(_read_env_var DATA_DIR | tr -d '"' || true)"
 
 if [[ -f "$REPO_ROOT/server/.venv/bin/python" ]]; then
     PYTHON_BIN="$REPO_ROOT/server/.venv/bin/python"
@@ -122,19 +123,20 @@ fi
 
 # ── 4. Same filesystem check ──────────────────────────────────────────────────
 echo ""
-echo "Check 4: STAGING_DIR and MEETING_OUTPUT_DIR on same filesystem"
-if [[ -z "$STAGING_DIR" || -z "$MEETING_OUTPUT_DIR" ]]; then
-    warn "STAGING_DIR or MEETING_OUTPUT_DIR not set in .env — using defaults"
-    STAGING_DIR="$HOME/Library/Application Support/WisprAlt/staging"
-    MEETING_OUTPUT_DIR="$HOME/Library/Application Support/WisprAlt/meetings"
+echo "Check 4: staging and outputs on same filesystem"
+if [[ -z "$DATA_DIR" ]]; then
+    fail "DATA_DIR not set in .env — run setup-server.sh"
+    DATA_DIR="$HOME/Library/Application Support/WisprAlt"
 fi
-mkdir -p "$STAGING_DIR" "$MEETING_OUTPUT_DIR"
+STAGING_DIR="$DATA_DIR/staging"
+OUTPUTS_DIR="$DATA_DIR/outputs"
+mkdir -p "$STAGING_DIR" "$OUTPUTS_DIR"
 STAGING_DEV="$(stat -f "%d" "$STAGING_DIR" 2>/dev/null || echo "unknown")"
-OUTPUT_DEV="$(stat -f "%d" "$MEETING_OUTPUT_DIR" 2>/dev/null || echo "unknown")"
+OUTPUT_DEV="$(stat -f "%d" "$OUTPUTS_DIR" 2>/dev/null || echo "unknown")"
 if [[ "$STAGING_DEV" == "$OUTPUT_DEV" && "$STAGING_DEV" != "unknown" ]]; then
-    pass "STAGING_DIR and MEETING_OUTPUT_DIR are on the same filesystem (device $STAGING_DEV)"
+    pass "staging and outputs are on the same filesystem (device $STAGING_DEV)"
 else
-    fail "STAGING_DIR ($STAGING_DIR, dev=$STAGING_DEV) and MEETING_OUTPUT_DIR ($MEETING_OUTPUT_DIR, dev=$OUTPUT_DEV) are on DIFFERENT filesystems"
+    fail "staging ($STAGING_DIR, dev=$STAGING_DEV) and outputs ($OUTPUTS_DIR, dev=$OUTPUT_DEV) are on DIFFERENT filesystems"
     info "Atomic renames across filesystems are not truly atomic. Move both to the same volume."
 fi
 
@@ -169,14 +171,13 @@ fi
 # ── 6. Poll /readyz/dictation ─────────────────────────────────────────────────
 echo ""
 echo "Check 6: /readyz/dictation (max 60s — Parakeet model load)"
-if [[ -z "$SERVER_URL" || -z "$WISPRALT_API_KEY" ]]; then
-    fail "SERVER_URL or WISPRALT_API_KEY not set — skipping readyz checks"
+if [[ -z "$SERVER_URL" ]]; then
+    fail "SERVER_URL not set — skipping readyz checks"
 else
     DICTATION_OK=false
     for i in $(seq 1 12); do
-        HTTP_CODE="$(curl -fsS -o /dev/null -w "%{http_code}" \
+        HTTP_CODE="$(curl -sS -o /dev/null -w "%{http_code}" \
             --connect-timeout 5 --max-time 10 \
-            -H "Authorization: Bearer $WISPRALT_API_KEY" \
             "$SERVER_URL/readyz/dictation" 2>/dev/null || echo "000")"
         if [[ "$HTTP_CODE" == "200" ]]; then
             pass "/readyz/dictation returned 200 — Parakeet model ready"
@@ -191,56 +192,38 @@ else
     if [[ "$DICTATION_OK" != "true" ]]; then
         fail "/readyz/dictation not ready within 60s"
         info "The Parakeet model may still be loading, or the server is in an error state."
+        info "No module named 'mlx' / 'parakeet_mlx' in the log? Install the MLX stack:"
+        info "  cd server && uv sync --extra host"
         info "Logs: tail -50 $HOME/Library/Logs/WisprAlt/server.err.log"
     fi
 fi
 
-# ── 7. WAV round-trip test ────────────────────────────────────────────────────
+# ── 7. /readyz/db ─────────────────────────────────────────────────────────────
 echo ""
-echo "Check 7: Dictation round-trip (generate WAV → POST /transcribe/dictate)"
-TEST_WAV="/tmp/wispralt_test_$$.wav"
-# P4#9 / validation-loop fallback: use Python+numpy+soundfile (works without ffmpeg)
-if "$PYTHON_BIN" -c \
-    "import numpy as np, soundfile as sf; sf.write('$TEST_WAV', np.zeros(16000, dtype='float32'), 16000)" \
-    2>/dev/null; then
-    if [[ -z "$SERVER_URL" || -z "$WISPRALT_API_KEY" ]]; then
-        warn "SERVER_URL or API key not set — skipping round-trip test"
-    else
-        ROUNDTRIP_RESP="$(curl -fsS \
-            --connect-timeout 10 --max-time 30 \
-            -H "Authorization: Bearer $WISPRALT_API_KEY" \
-            -F "file=@$TEST_WAV;type=audio/wav" \
-            "$SERVER_URL/transcribe/dictate" 2>/dev/null || echo "")"
-        if echo "$ROUNDTRIP_RESP" | grep -q '"text"'; then
-            pass "Round-trip dictation response contains 'text' field"
-            info "Response: $ROUNDTRIP_RESP"
-        else
-            fail "Round-trip dictation did not return expected JSON with 'text' field"
-            info "Response was: $ROUNDTRIP_RESP"
-        fi
-    fi
-    rm -f "$TEST_WAV"
+echo "Check 7: /readyz/db (local SQLite database)"
+if [[ -z "$SERVER_URL" ]]; then
+    fail "SERVER_URL not set — skipping /readyz/db"
 else
-    warn "Could not generate test WAV (numpy/soundfile not available in $PYTHON_BIN)"
-    info "Install with: cd server && uv sync"
+    DB_RESP="$(curl -sS --connect-timeout 5 --max-time 10 \
+        -w "\n%{http_code}" "$SERVER_URL/readyz/db" 2>/dev/null || echo "000")"
+    DB_CODE="$(echo "$DB_RESP" | tail -1)"
+    if [[ "$DB_CODE" == "200" ]]; then
+        pass "/readyz/db returned 200"
+    else
+        fail "/readyz/db returned HTTP $DB_CODE"
+        info "Response: $(echo "$DB_RESP" | sed '$d')"
+        info "reason=db_error: DATA_DIR/wispralt.db unreadable; reason=schema_outdated: restart the server to migrate."
+    fi
 fi
 
-# ── 8. /metrics ───────────────────────────────────────────────────────────────
+# ── 8. An enabled admin exists ────────────────────────────────────────────────
 echo ""
-echo "Check 8: /metrics"
-if [[ -z "$SERVER_URL" || -z "$WISPRALT_API_KEY" ]]; then
-    warn "SERVER_URL or API key not set — skipping /metrics"
+echo "Check 8: first admin exists"
+if (cd "$REPO_ROOT/server" && "$PYTHON_BIN" -m wispralt.bootstrap --check) >/dev/null 2>&1; then
+    pass "An enabled admin exists"
 else
-    METRICS_RESP="$(curl -fsS \
-        --connect-timeout 5 --max-time 10 \
-        -H "Authorization: Bearer $WISPRALT_API_KEY" \
-        "$SERVER_URL/metrics" 2>/dev/null || echo "")"
-    if [[ -n "$METRICS_RESP" ]]; then
-        pass "/metrics returned data"
-        echo "$METRICS_RESP" | "$PYTHON_BIN" -m json.tool 2>/dev/null || echo "$METRICS_RESP"
-    else
-        warn "/metrics returned empty response (server may not yet support this endpoint)"
-    fi
+    fail "No enabled admin (or the database is unreadable)"
+    info "Create one: cd server && .venv/bin/python -m wispralt.bootstrap --label owner"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

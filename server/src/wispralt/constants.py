@@ -11,6 +11,7 @@ OPENAI_KNOWN_MODELS: tuple[str, ...] = (
     "gpt-4o-mini-transcribe",
     "gpt-4o-mini-transcribe-2025-12-15",
     "gpt-4o-mini-transcribe-2025-03-20",
-)  # 5 models — gpt-4o-transcribe-diarize EXCLUDED (we 404 on it; matches /v1/models exclusion)
+    "gpt-transcribe",
+)  # 6 models; gpt-4o-transcribe-diarize EXCLUDED. /v1/audio/transcriptions 404s any other id.
 OPENAI_KNOWN_MODELS_CREATED = 1677532384  # Feb 27 2023 — OpenAI's whisper-1 created epoch
 OPENAI_KNOWN_MODELS_OWNED_BY = "wispralt"

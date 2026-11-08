@@ -30,14 +30,16 @@
           <td>{{ u.role }}</td>
           <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
           <td>{{ u.last_seen_at.strftime('%Y-%m-%d %H:%M') if u.last_seen_at else '—' }}</td>
-          <td>{% if u.revoked_at %}<span class="warn">revoked</span>{% else %}active{% endif %}</td>
+          <td>{% if u.disabled_at %}<span class="warn">revoked</span>{% else %}active{% endif %}</td>
           <td>
-            {% if not u.revoked_at %}
+            {% if not u.disabled_at %}
               <form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke" onsubmit="return confirm('Revoke user {{ u.label }}? This invalidates the token immediately.');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <button type="submit" class="danger">Revoke</button>
               </form>
             {% endif %}
             <form class="inline" method="post" action="/admin/users/{{ u.id }}/mint" onsubmit="return confirm('Mint a new token for {{ u.label }}? The old token will stop working immediately.');">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button type="submit">Mint new token</button>
             </form>
           </td>

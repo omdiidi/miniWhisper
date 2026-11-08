@@ -47,7 +47,7 @@
           <tr>
             <td>{{ u.display_name or u.label }}</td>
             <td>{{ us.get('dictation_count', 0) }}</td>
-            <td>{{ us.get('meeting_count', 0) }}</td>
+            <td>{{ us.get('file_count', 0) }}</td>
             <td>{{ us.get('total_words', 0) }}</td>
             <td>{{ us.get('time_saved_hours', 0) }}</td>
             <td><a href="/admin/data?range={{ range }}&user_id={{ u.id }}">View →</a></td>

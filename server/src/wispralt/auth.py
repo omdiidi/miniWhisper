@@ -1,101 +1,38 @@
 """
-auth.py — Multi-token bearer authentication backed by Supabase Postgres.
+auth.py — bearer-token authentication against the local SQLite DB.
 
-Path of an inbound bearer token:
+Path of an inbound token:
 
-    1. Extract from ``Authorization: Bearer ...`` header (or, for the admin
-       UI, the ``wispralt_admin_token`` cookie set by ``/admin/login``).
+    1. Extract it from ``Authorization: Bearer ...`` (or, for browser pages,
+       the ``wispralt_admin_token`` cookie set by ``/admin/login`` / ``/me/login``).
     2. ``sha256`` the plaintext.
-    3. Look up the hash in the in-process :class:`TokenCache` (60 s TTL).
-    4. Cache miss → query ``wispralt.users`` via the asyncpg pool stashed
-       on ``app.state.db_pool``.
-    5. Postgres unreachable / row missing → fall through to the
-       break-glass admin path: a single env-var hash stashed on
-       ``app.state.break_glass_token_hash`` grants admin so the operator
-       cannot get locked out of the server they administer.
+    3. ``AccountStore.lookup_key`` — one indexed ``api_keys ⋈ users`` read on
+       **every** request (no cache), so a revoke, disable or rotate, in this
+       process or from another one, applies to the next request.
+    4. No row → 401. ``sqlite3.Error`` → 503. There is no fallback admin.
 
-The ``User`` returned by :func:`require_api_key` is also stashed on
-``request.state.user`` so the observability middleware can attribute
-usage events.
-
-Legacy compatibility: ``current_key()`` and ``set_current_key()`` are
-retained as thin shims so the existing ``routes/admin.py:rotate-key``
-endpoint can keep operating on the env-var token until the admin UI's
-mint/revoke flow lands in Phase B/C.
+The ``User`` is stashed on ``request.state.user`` (the usage middleware reads
+it) and ``request.state.auth_via`` records ``"bearer"`` or ``"cookie"``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
-import threading
+import sqlite3
+from typing import TYPE_CHECKING
 
-import asyncpg
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import Response
 
-from wispralt.users import cache as _cache_mod
-from wispralt.users import store as _store_mod
-from wispralt.users.store import User
+from wispralt.accounts.service import hash_token
+from wispralt.accounts.store import User
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 logger = logging.getLogger(__name__)
-
-
-# ── singletons ────────────────────────────────────────────────────────────────
-
-# In-process token cache shared across all requests.  Exported so callers
-# (e.g. ``routes/admin_ui.py``) can ``invalidate`` after revoke / rotate.
-token_cache = _cache_mod.TokenCache()
-
-
-# ── legacy single-key shim ────────────────────────────────────────────────────
-#
-# The break-glass admin path sources its hash from
-# ``app.state.break_glass_token_hash`` (set by lifespan in ``main.py``).
-# These shims survive only so the existing rotate-key endpoint and any
-# tests that import ``current_key`` keep working until Phase B replaces
-# them with the admin UI's mint/rotate flow.
-
-_lock = threading.Lock()
-_current_key: str | None = None
-
-
-def _load_key_from_env() -> str:
-    """Read the API key from the environment via settings.
-
-    Falls back to the ``WISPRALT_API_KEY`` env var directly if
-    pydantic-settings fails (e.g. minimal test environments).
-    """
-    try:
-        from wispralt.config import settings
-
-        return settings.wispralt_api_key.get_secret_value()
-    except (ImportError, ValueError, RuntimeError):
-        import os
-
-        key = os.environ.get("WISPRALT_API_KEY", "")
-        if not key:
-            raise RuntimeError(
-                "WISPRALT_API_KEY is not set. "
-                "Ensure the .env file exists or the environment variable is exported."
-            ) from None
-        return key
-
-
-def current_key() -> str:
-    """Return the current break-glass API key.  Lazy + thread-safe."""
-    global _current_key
-    with _lock:
-        if _current_key is None:
-            _current_key = _load_key_from_env()
-        return _current_key
-
-
-def set_current_key(new_key: str) -> None:
-    """Replace the in-memory break-glass key.  Called by ``rotate-key``."""
-    global _current_key
-    with _lock:
-        _current_key = new_key
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -128,97 +65,31 @@ def _extract_bearer(request: Request) -> str | None:
     return token or None
 
 
-# ── shared token-resolution state machine ─────────────────────────────────────
+# ── token resolution ──────────────────────────────────────────────────────────
 
 
-async def _resolve_token_user(request: Request, plaintext: str) -> User:
-    """Resolve a plaintext bearer token to a :class:`User`.
+async def resolve_token(app: FastAPI, plaintext: str) -> User | None:
+    """The enabled user owning *plaintext*, else None. 503 on ``sqlite3.Error``.
 
-    Shared by :func:`require_api_key` (Bearer + cookie) and
-    :func:`require_api_key_v1` (Bearer-only). Side-effect: sets
-    ``request.state.user`` on every success path so the observability
-    middleware can attribute usage events.
-
-    State machine (preserve EXACTLY — security-critical):
-        1. Cache fast-path: ``token_cache.get(th)`` hit → stash on
-           ``request.state.user`` and return.
-        2. Postgres lookup via ``users_store.lookup(pool, th)``:
-           2a. Row found → cache it, stash on request.state.user, return.
-           2b. Row not found AND Postgres did NOT error → 401. (Revocation
-               invariant: do NOT consult break-glass — that would
-               undermine revoking a compromised token while Postgres is
-               healthy.)
-        3. Postgres errored (caught ``(asyncpg.PostgresError,
-           asyncpg.InterfaceError)`` — see 2026-05-17 postmortem for why
-           this exact tuple, no common base class) OR pool is None:
-           3a. Break-glass hash matches via ``hmac.compare_digest`` →
-               return the synthetic admin sentinel
-               ``User(id=-1, label="break-glass-admin", role="admin",
-               kind="employee")``. id=-1 tells the observability
-               middleware to skip the usage-event enqueue (no FK
-               violation against ``wispralt.usage_events.user_id``).
-           3b. No break-glass match → 503 so legitimate clients see
-               "service degraded" (NOT 401 — that would falsely suggest
-               their token is wrong).
+    Shared by the auth dependencies and the two login forms.
     """
-    th = _store_mod.hash_token(plaintext)
+    accounts = getattr(app.state, "accounts", None)
+    if accounts is None:
+        raise HTTPException(status_code=503, detail="Auth temporarily unavailable")
+    try:
+        return await asyncio.to_thread(accounts.lookup_key, hash_token(plaintext))
+    except sqlite3.Error as exc:
+        logger.error("auth lookup failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Auth temporarily unavailable") from exc
 
-    # 1. cache fast-path
-    cached = token_cache.get(th)
-    if cached is not None:
-        request.state.user = cached
-        return cached
 
-    # 2. Postgres lookup. The seeded break-glass row also lives here once
-    #    the lifespan has run; this is the path 99% of break-glass calls
-    #    take. Track WHY user is None — "row missing" (token revoked or
-    #    invalid) must NOT fall through to break-glass; only "Postgres
-    #    errored" or "pool unavailable" should trigger that escape hatch.
-    pool = getattr(request.app.state, "db_pool", None)
-    postgres_errored = False
-    if pool is not None:
-        try:
-            user = await _store_mod.lookup(pool, th)
-        except (asyncpg.PostgresError, asyncpg.InterfaceError):
-            # asyncpg has NO common base class for these two — PostgresError
-            # (server-side) and InterfaceError ("pool is closed", client-side)
-            # both inherit directly from Exception via separate private
-            # hierarchies. The explicit tuple is the only correct form.
-            # See 2026-05-17 postmortem.
-            logger.exception("Postgres lookup failed; falling through to break-glass")
-            user = None
-            postgres_errored = True
-        if user is not None:
-            token_cache.put(th, user)
-            request.state.user = user
-            return user
-        if not postgres_errored:
-            # Branch 2b: Postgres said "no row" — token is invalid OR
-            # was revoked. Do NOT consult break-glass: that would defeat
-            # revocation.
-            raise HTTPException(status_code=401, detail="Invalid bearer token")
-
-    # 3. Pool is None OR Postgres errored. The env-var token grants admin
-    #    so the operator never locks themselves out. Constant-time compare
-    #    on the hex digest to avoid timing oracles. user.id = -1 is a
-    #    sentinel; the observability middleware skips usage-event enqueue
-    #    for negative ids (no FK violation against wispralt.usage_events).
-    bg_hash = getattr(request.app.state, "break_glass_token_hash", None)
-    if bg_hash is not None and hmac.compare_digest(th, bg_hash):
-        user = User(
-            id=-1,
-            label="break-glass-admin",
-            role="admin",
-            kind="employee",
-        )
-        request.state.user = user
-        logger.warning("auth: break-glass admin path used (Postgres degraded)")
-        return user
-
-    # No pool, no break-glass match → 503 so legitimate clients know
-    # the service is degraded (NOT 401, which would suggest the token
-    # is wrong).
-    raise HTTPException(status_code=503, detail="Auth temporarily unavailable")
+async def _resolve_token_user(request: Request, plaintext: str, via: str) -> User:
+    user = await resolve_token(request.app, plaintext)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+    request.state.user = user
+    request.state.auth_via = via
+    return user
 
 
 # ── FastAPI dependencies ──────────────────────────────────────────────────────
@@ -232,34 +103,23 @@ async def require_api_key(request: Request) -> User:
     session flow — cross-page navigations can't carry Authorization
     headers).
 
-    Side effects:
-        - Stores the user on ``request.state.user`` for the observability
-          middleware to attribute usage events (via
-          :func:`_resolve_token_user`).
-
-    Raises
-    ------
-    HTTPException(400)
-        Multiple ``Authorization`` headers (via :func:`_extract_bearer`).
-    HTTPException(401)
-        Missing / empty / invalid bearer token.
-    HTTPException(503)
-        Postgres pool unavailable AND the bearer doesn't match the
-        break-glass hash — operator can't recover this without fixing
-        Postgres or re-setting WISPRALT_API_KEY in the env.
+    Raises 400 on multiple ``Authorization`` headers, 401 on a missing or
+    invalid token, 503 when the DB lookup fails.
     """
     bearer = _extract_bearer(request)
+    via = "bearer"
     if not bearer:
         # Cookie fallback: admin UI browser navigations can't attach
         # Authorization headers, so /admin/login sets ``wispralt_admin_token``
         # as a session cookie and we accept it here. Bearer-only surfaces
         # (i.e. /v1/*) use :func:`require_api_key_v1` which deliberately
         # skips this fallback.
-        bearer = request.cookies.get("wispralt_admin_token") or None
+        bearer = request.cookies.get(SESSION_COOKIE_NAME) or None
+        via = "cookie"
     if not bearer:
         raise HTTPException(status_code=401, detail="Missing bearer token")
 
-    return await _resolve_token_user(request, bearer)
+    return await _resolve_token_user(request, bearer, via)
 
 
 async def require_api_key_v1(request: Request) -> User:
@@ -277,7 +137,7 @@ async def require_api_key_v1(request: Request) -> User:
             status_code=401,
             detail="Expected 'Bearer <token>' Authorization header",
         )
-    return await _resolve_token_user(request, plaintext)
+    return await _resolve_token_user(request, plaintext, "bearer")
 
 
 async def forbid_integration_kind(
@@ -306,6 +166,38 @@ async def forbid_integration_kind(
 
 def require_admin(user: User = Depends(require_api_key)) -> User:
     """Variant of :func:`require_api_key` that also requires ``role='admin'``."""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return user
+
+
+CSRF_HEADER = "X-CSRF-Token"
+
+
+async def require_csrf(request: Request, user: User = Depends(require_api_key)) -> User:
+    """Auth, then CSRF for a mutation. Use as a PARAMETER dependency.
+
+    Auth is this dependency's own sub-dependency, so it always resolves first
+    and sets ``request.state.auth_via`` (a decorator-level ``dependencies=[…]``
+    entry would run before parameter dependencies). The token is skipped
+    **only** when that auth used a valid Bearer header: a non-Bearer
+    ``Authorization`` (e.g. ``Basic``) falls back to the cookie, so it must
+    carry the token like any cookie request. Otherwise the ``X-CSRF-Token``
+    header or the ``csrf_token`` form field must equal the CSRF cookie, else 403.
+    """
+    if getattr(request.state, "auth_via", None) == "bearer":
+        return user
+    token = request.headers.get(CSRF_HEADER)
+    if token is None:
+        value = (await request.form()).get("csrf_token")  # cached; route Form() params still work
+        token = value if isinstance(value, str) else ""
+    if not verify_csrf(request, token):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+    return user
+
+
+def require_admin_csrf(user: User = Depends(require_csrf)) -> User:
+    """:func:`require_csrf` + ``role='admin'`` (the admin portal's mutations)."""
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin role required")
     return user

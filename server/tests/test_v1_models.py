@@ -3,7 +3,7 @@ test_v1_models.py — Coverage for /v1/models (OpenAI-compat model listing).
 
 The route returns a hard-coded list (no DB). We exercise:
 
-  - the count + exclusion invariant (5 models; gpt-4o-transcribe-diarize
+  - the count + exclusion invariant (6 models incl. gpt-transcribe; gpt-4o-transcribe-diarize
     intentionally NOT advertised because we 404 on it at /v1/audio/transcriptions);
   - 404 on unknown ids (including the explicitly-excluded diarize id);
   - the Cache-Control + openai-version response headers;
@@ -16,11 +16,7 @@ from typing import Any
 
 # Pydantic Settings reads these at import time — set defaults BEFORE any
 # wispralt import so the tests work on a bare dev box without a .env.
-os.environ.setdefault("WISPRALT_API_KEY", "stub_api_key_for_tests_only")
 os.environ.setdefault("SERVER_URL", "http://test.local")
-os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
-os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
-os.environ.setdefault("STAGING_DIR", "/tmp/wispralt-test-staging")
 
 from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -29,7 +25,7 @@ from starlette.testclient import TestClient
 from wispralt.auth import require_api_key_v1
 from wispralt.middleware import openai_errors
 from wispralt.routes.v1_models import router as v1_models_router
-from wispralt.users.store import User
+from wispralt.accounts.store import User
 
 
 class _RequestIdMiddleware(BaseHTTPMiddleware):
@@ -53,6 +49,7 @@ def _build_app(*, override_auth: bool = True) -> FastAPI:
         async def _fake(_request: Any = None) -> User:
             return User(
                 id=99,
+                key_id=None,
                 label="key-test",
                 role="employee",
                 kind="integration",
@@ -65,7 +62,7 @@ def _build_app(*, override_auth: bool = True) -> FastAPI:
 # ── listing ───────────────────────────────────────────────────────────────────
 
 
-def test_list_returns_5_models() -> None:
+def test_list_returns_6_models() -> None:
     app = _build_app()
     with TestClient(app) as client:
         resp = client.get("/v1/models", headers={"Authorization": "Bearer test"})
@@ -73,7 +70,8 @@ def test_list_returns_5_models() -> None:
     body = resp.json()
     assert body["object"] == "list"
     assert isinstance(body["data"], list)
-    assert len(body["data"]) == 5
+    assert len(body["data"]) == 6
+    assert "gpt-transcribe" in {m["id"] for m in body["data"]}
 
 
 def test_list_no_diarize_model() -> None:

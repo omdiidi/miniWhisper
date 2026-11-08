@@ -1,674 +1,599 @@
 """
-jobs/store.py — SQLite-backed job repository for WisprAlt file transcription.
+jobs/store.py — ``JobStore``: file jobs, dictation transcripts and weekly insights.
 
-Design decisions (v3 deltas P4#4 + P5#2):
-- WAL mode + NORMAL synchronous: durability with reduced fsync latency.
-- Single lock guards all writes; reads also go through the lock for simplicity
-  given the single-writer, single-consumer access pattern.
-- recover_orphans() is called once at startup by main.py lifespan and follows
-  the P5#2 policy:
-    * running → failed (server restarted mid-job)
-    * pending with missing WAV → failed (staging file disappeared)
-    * pending with existing WAV → requeue (runner will re-enqueue)
-    * pending with truncated WAV → failed + file deleted (C14)
+Lives on the one SQLite DB (``Database``): a connection per call, one
+transaction per method (``read()`` = ``BEGIN``, ``write()`` = ``BEGIN
+IMMEDIATE``), so it is safe from any thread. ``user_id`` columns are real FKs
+to ``users``. ``jobs.wav_path`` is stored relative to ``data_dir`` and
+returned as an absolute ``Path``; outputs always live in ``outputs_dir``.
+
+Recovery and shutdown (Locked Decision 8):
+
+* ``recover_orphans()`` runs once at startup, BEFORE the staging sweep. A
+  ``running`` row (the server died mid-job) goes back to ``pending`` when its
+  input still exists, no cancel was requested and it has attempts left;
+  otherwise it fails with an explicit reason. Pending rows then get today's
+  checks (input missing → failed; truncated WAV → failed + unlinked).
+* ``requeue_interrupted(jid)`` is the graceful-shutdown path: the row goes
+  back to ``pending`` and the attempt ``set_running`` took is refunded.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import sqlite3
-import stat
-import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any
 
-from wispralt._errors import UploadTruncatedError
+from wispralt._errors import DedupConflict, DictationDeleted, UploadTruncatedError
 from wispralt.ops.staging import validate_wav_completeness
 
+if TYPE_CHECKING:
+    import sqlite3
+
+    from wispralt.database import Database
+
 logger = logging.getLogger(__name__)
+
+MAX_ATTEMPTS = 3
+_DAY = 86_400.0
+_CANCELLED = "cancelled by user"
+_HISTORY_KINDS = ("dictation", "file")
 
 
 @dataclass
 class Job:
     id: str
-    status: str            # pending | running | done | failed
-    mode: Optional[str]    # remote | in_person | None until done (set on done)
+    status: str  # pending | running | done | failed
+    mode: str | None  # set on done by the pipeline ("single")
     created_at: float
-    started_at: Optional[float]
-    finished_at: Optional[float]
-    error: Optional[str]
-    output_dir: Optional[str]
-    wav_path: str
-    attempts: int = 0      # C9: incremented each time the job is set to running
-    # Legacy flag (always written True now; every file job is mono-transcribed).
-    # Defaulted to 0 in SQL via in-place ALTER; the column stays.
-    force_single_channel: bool = False
-    # NEW (Phase 3) — observability + intent. All idempotent ALTERs in __init__.
-    # request_mode: always "file" for new rows; legacy rows may say "meeting".
-    # Distinct from `mode`, which is set on completion ("single").
-    request_mode: Optional[str] = None
-    phase: Optional[str] = None
-    phase_started_at: Optional[float] = None
+    started_at: float | None
+    finished_at: float | None
+    error: str | None
+    wav_path: Path  # absolute
+    user_id: int
+    attempts: int = 0
+    phase: str | None = None
+    phase_started_at: float | None = None
     chunk_index: int = 0
     total_chunks: int = 0
     cancel_requested: bool = False
-    audio_duration_s: Optional[float] = None
-    # Transcript-storage foundation (Phase 1). Captured at completion via
-    # set_done so the future weekly-insights cron has data. Legacy rows have
-    # NULL — Phase 2 cron filters those out. api_key_id is the existing
-    # per-user FK; required for per-employee filtering.
-    transcript_text: Optional[str] = None
-    word_count: Optional[int] = None
-    client_app_version: Optional[str] = None
-    api_key_id: Optional[int] = None
+    audio_duration_s: float | None = None
+    transcript_text: str | None = None
+    word_count: int | None = None
+    client_app_version: str | None = None
+    outputs_removed_at: float | None = None
+    deleted_at: float | None = None
 
 
-def _row_to_job(row: tuple, cursor: sqlite3.Cursor) -> Job:
-    """Construct a Job from a SELECT * row, dict-unpacked from cursor.description.
+def _word_count(text: str | None) -> int | None:
+    return len(text.split()) if text else None
 
-    Order-independent: future ALTERs need not match the dataclass field order.
-    """
-    d = dict(zip([c[0] for c in cursor.description], row))
-    return Job(
-        id=d["id"],
-        status=d["status"],
-        mode=d.get("mode"),
-        created_at=d["created_at"],
-        started_at=d.get("started_at"),
-        finished_at=d.get("finished_at"),
-        error=d.get("error"),
-        output_dir=d.get("output_dir"),
-        wav_path=d["wav_path"],
-        attempts=int(d.get("attempts") or 0),
-        force_single_channel=bool(d.get("force_single_channel") or 0),
-        request_mode=d.get("request_mode"),
-        phase=d.get("phase"),
-        phase_started_at=d.get("phase_started_at"),
-        chunk_index=int(d.get("chunk_index") or 0),
-        total_chunks=int(d.get("total_chunks") or 0),
-        cancel_requested=bool(d.get("cancel_requested") or 0),
-        audio_duration_s=d.get("audio_duration_s"),
-        transcript_text=d.get("transcript_text"),
-        word_count=d.get("word_count"),
-        client_app_version=d.get("client_app_version"),
-        api_key_id=d.get("api_key_id"),
-    )
+
+def _stats(row: sqlite3.Row | None) -> dict[str, int | float]:
+    total_words = int(row["total_words"] or 0) if row else 0
+    return {
+        "dictation_count": int(row["dictation_count"] or 0) if row else 0,
+        "file_count": int(row["file_count"] or 0) if row else 0,
+        "total_words": total_words,
+        "total_inference_ms": int(row["total_inference_ms"] or 0) if row else 0,
+        "time_saved_hours": round(total_words / 40.0 / 60.0, 2),  # 40 WPM typing baseline
+    }
+
+
+# Per-user activity since ?: dictations (non-deleted) + finished file jobs with text.
+_ACTIVITY_SQL = """
+SELECT user_id,
+       SUM(kind = 'dictation') AS dictation_count,
+       SUM(kind = 'file') AS file_count,
+       COALESCE(SUM(word_count), 0) AS total_words,
+       COALESCE(SUM(duration_ms), 0) AS total_inference_ms
+  FROM (
+    SELECT user_id, 'dictation' AS kind, word_count, duration_ms
+      FROM dictations WHERE created_at >= ? AND deleted_at IS NULL
+    UNION ALL
+    SELECT user_id, 'file' AS kind, word_count, NULL
+      FROM jobs WHERE created_at >= ? AND transcript_text IS NOT NULL AND deleted_at IS NULL
+  )
+"""
+
+
+_EXPIRED_DICTATIONS = "SELECT {cols} FROM dictations WHERE created_at < ? AND source IS NULL"
+_EXPIRED_JOBS = (
+    "SELECT {cols} FROM jobs WHERE status IN ('done','failed') AND source IS NULL"
+    " AND COALESCE(finished_at, created_at) < ?"
+)
 
 
 class JobStore:
-    """Thread-safe SQLite repository for file transcription jobs.
+    def __init__(self, db: Database, data_dir: Path) -> None:
+        self.db = db
+        self.data_dir = Path(data_dir)
 
-    Usage::
+    # ── paths ─────────────────────────────────────────────────────────────────
 
-        store = JobStore(Path("~/.wispralt/jobs.db").expanduser())
-        jid = store.create("/tmp/wispralt/abc.m4a")
-        store.set_running(jid)
-        store.set_done_if_not_cancelled(jid, "single", "/var/outputs")
-        job = store.get(jid)  # -> Job
-    """
+    def _rel(self, path: Path | str) -> str:
+        """``path`` relative to ``data_dir`` when inside it (else kept absolute)."""
+        p = Path(path)
+        return str(p.relative_to(self.data_dir)) if p.is_relative_to(self.data_dir) else str(p)
 
-    def __init__(self, db_path: Path) -> None:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        # Retain the path for the chmod-on-startup logic below and for
-        # diagnostics. Sidecar files (-wal, -shm) are derived from this path.
-        self._db_path = db_path
-        # isolation_level=None → autocommit; we manage transactions explicitly
-        # check_same_thread=False → fine because we guard every call with _lock
-        self.con = sqlite3.connect(
-            str(db_path), isolation_level=None, check_same_thread=False
-        )
-        self._lock = threading.Lock()
+    def _abs(self, stored: str) -> Path:
+        return self.data_dir / stored
 
-        # P4#4: WAL journal mode + NORMAL synchronous — better write throughput,
-        # still durable for our single-writer workload.
-        self.con.execute("PRAGMA journal_mode=WAL")
-        self.con.execute("PRAGMA synchronous=NORMAL")
-
-        self.con.execute(
-            """CREATE TABLE IF NOT EXISTS jobs(
-                id          TEXT PRIMARY KEY,
-                status      TEXT NOT NULL,
-                mode        TEXT,
-                created_at  REAL NOT NULL,
-                started_at  REAL,
-                finished_at REAL,
-                error       TEXT,
-                output_dir  TEXT,
-                wav_path    TEXT NOT NULL,
-                attempts    INTEGER DEFAULT 0
-            )"""
-        )
-        # C9: add `attempts` column to existing DBs that were created without it.
-        try:
-            self.con.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-        # Legacy column: always written True now (every file job is mono).
-        # Kept so old databases keep migrating cleanly.
-        try:
-            self.con.execute(
-                "ALTER TABLE jobs ADD COLUMN force_single_channel INTEGER NOT NULL DEFAULT 0"
-            )
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-        # Phase 3: observability + intent columns. Idempotent ALTERs that match
-        # the existing pattern. `request_mode` (file | meeting) is the explicit
-        # intent at submit time; do NOT confuse with the existing `mode` column
-        # (remote | in_person | None) which is set on done by the pipeline.
-        for _alter in (
-            "ALTER TABLE jobs ADD COLUMN request_mode TEXT",
-            "ALTER TABLE jobs ADD COLUMN phase TEXT",
-            "ALTER TABLE jobs ADD COLUMN phase_started_at REAL",
-            "ALTER TABLE jobs ADD COLUMN chunk_index INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE jobs ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE jobs ADD COLUMN audio_duration_s REAL",
-            # Transcript-storage foundation (Phase 1). api_key_id is the
-            # existing per-user FK; required for per-employee filters in
-            # the future weekly-insights cron. Legacy rows are NULL —
-            # Phase 2 filters those out at insight-render time.
-            "ALTER TABLE jobs ADD COLUMN transcript_text TEXT",
-            "ALTER TABLE jobs ADD COLUMN word_count INTEGER",
-            "ALTER TABLE jobs ADD COLUMN client_app_version TEXT",
-            "ALTER TABLE jobs ADD COLUMN api_key_id INTEGER",
-        ):
-            try:
-                self.con.execute(_alter)
-            except sqlite3.OperationalError:
-                pass  # column already exists
-
-        # Dictation transcripts live in a separate table because dictation is
-        # request-response and never produces a row in `jobs`. One INSERT per
-        # successful dictation; capture is fire-and-forget from the route.
-        self.con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dictations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                api_key_id INTEGER NOT NULL,
-                created_at REAL NOT NULL,
-                duration_ms INTEGER,
-                text TEXT NOT NULL,
-                word_count INTEGER,
-                client_app_version TEXT,
-                smart_format_applied INTEGER
-            )
-            """
-        )
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dictations_api_key_created"
-            " ON dictations(api_key_id, created_at)"
-        )
-        # Plan A history + client dedup columns. Idempotent ALTERs run
-        # AFTER the dictations CREATE TABLE so existing prod DBs (which lack
-        # these columns) are migrated forward. For a brand-new DB the CREATE
-        # TABLE above produces the legacy schema and these ALTERs immediately
-        # add the new columns — same shape either way.
-        #   deleted_at (REAL epoch) — soft-delete tombstone for /me/history.
-        #     NULL = live; non-NULL = hidden from reads but kept on disk for
-        #     audit + restore. Added to BOTH dictations and jobs.
-        #   source (TEXT) — origin tag for dictations. NULL coalesces to
-        #     'server' on read; cloud-fallback inserts populate 'cloud_fallback'.
-        #   client_dedup_id (TEXT) — client-supplied UUID for cloud-fallback
-        #     idempotency. Unique partial index below enforces dedup.
-        for _alter in (
-            "ALTER TABLE dictations ADD COLUMN deleted_at REAL",
-            "ALTER TABLE jobs ADD COLUMN deleted_at REAL",
-            "ALTER TABLE dictations ADD COLUMN source TEXT",
-            "ALTER TABLE dictations ADD COLUMN client_dedup_id TEXT",
-        ):
-            try:
-                self.con.execute(_alter)
-            except sqlite3.OperationalError:
-                pass  # column already exists
-        # Plan A history: partial indexes scoped to live (non-soft-deleted)
-        # rows for the per-user history feed. Partial unique index enforces
-        # cloud-fallback dedup without imposing uniqueness on legacy rows
-        # where client_dedup_id is NULL.
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dictations_api_key_active"
-            " ON dictations(api_key_id, created_at) WHERE deleted_at IS NULL"
-        )
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_api_key_active"
-            " ON jobs(api_key_id)"
-            " WHERE deleted_at IS NULL AND transcript_text IS NOT NULL"
-        )
-        self.con.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dictations_client_dedup"
-            " ON dictations(client_dedup_id) WHERE client_dedup_id IS NOT NULL"
+    def _job(self, r: sqlite3.Row) -> Job:
+        d = dict(r)
+        return Job(
+            id=d["id"],
+            status=d["status"],
+            mode=d["mode"],
+            created_at=d["created_at"],
+            started_at=d["started_at"],
+            finished_at=d["finished_at"],
+            error=d["error"],
+            wav_path=self._abs(d["wav_path"]),
+            user_id=d["user_id"],
+            attempts=int(d["attempts"] or 0),
+            phase=d["phase"],
+            phase_started_at=d["phase_started_at"],
+            chunk_index=int(d["chunk_index"] or 0),
+            total_chunks=int(d["total_chunks"] or 0),
+            cancel_requested=bool(d["cancel_requested"]),
+            audio_duration_s=d["audio_duration_s"],
+            transcript_text=d["transcript_text"],
+            word_count=d["word_count"],
+            client_app_version=d["client_app_version"],
+            outputs_removed_at=d["outputs_removed_at"],
+            deleted_at=d["deleted_at"],
         )
 
-        # Weekly LLM insights (Phase 2). One row per (iso_year, iso_week, scope,
-        # api_key_id). scope='person' stores per-employee summaries with the
-        # api_key_id populated; scope='team' stores the aggregated team summary
-        # with api_key_id NULL. Upsert semantics let the cron re-run a week
-        # idempotently (e.g. retry after transient OpenRouter failure).
-        self.con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS weekly_insights (
-                iso_year     INTEGER NOT NULL,
-                iso_week     INTEGER NOT NULL,
-                scope        TEXT NOT NULL,
-                api_key_id   INTEGER,
-                insight_json TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                cost_usd     REAL NOT NULL,
-                model        TEXT NOT NULL,
-                generated_at REAL NOT NULL,
-                PRIMARY KEY (iso_year, iso_week, scope, api_key_id)
-            )
-            """
-        )
-        self.con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_weekly_insights_generated"
-            " ON weekly_insights(generated_at)"
-        )
-
-        # chmod 600 on jobs.db + -wal + -shm sidecars. Applied unconditionally
-        # on every startup so a restored backup (which may have wider perms
-        # propagated from the source filesystem) is auto-tightened. Logs at
-        # INFO when a mode actually changes so an operator who deliberately
-        # broadened perms knows about the revert.
-        target_mode = stat.S_IRUSR | stat.S_IWUSR  # 0o600
-        for suffix in ("", "-wal", "-shm"):
-            sidecar = Path(str(self._db_path) + suffix)
-            try:
-                current = sidecar.stat().st_mode & 0o777
-            except FileNotFoundError:
-                continue  # -wal / -shm may not exist yet
-            if current != 0o600:
-                try:
-                    os.chmod(sidecar, target_mode)
-                    logger.info("chmod 600 %s (was %o)", sidecar, current)
-                except OSError as exc:
-                    logger.warning(
-                        "chmod 600 failed for %s: %s (continuing)", sidecar, exc
-                    )
-
-    # ── private ───────────────────────────────────────────────────────────────
-
-    def _exec(self, sql: str, *params: object) -> sqlite3.Cursor:
-        """Execute *sql* with positional *params* under the write lock."""
-        with self._lock:
-            return self.con.execute(sql, params)
-
-    # ── write operations ──────────────────────────────────────────────────────
+    # ── job lifecycle ─────────────────────────────────────────────────────────
 
     def create(
-        self,
-        wav_path: str,
-        *,
-        request_mode: str = "file",
-        client_app_version: str | None = None,
-        api_key_id: int | None = None,
+        self, wav_path: Path | str, *, user_id: int, client_app_version: str | None = None
     ) -> str:
-        """Insert a new pending job and return its UUID.
-
-        ``request_mode`` is always ``file`` for new rows (the column stays for
-        legacy rows and the portal labels; relabelled in a later pass).
-
-        ``client_app_version`` (Phase 1 transcript-storage) records the
-        submitting client's app version at submit time. Survives worker
-        crashes because it's persisted on the original INSERT, not at
-        ``set_done`` time.
-
-        ``api_key_id`` is the owning user's ``wispralt.users.id``. Required
-        for per-employee filtering in the future weekly-insights cron. Pass
-        ``None`` for the break-glass admin (user.id < 0); those rows are
-        explicitly excluded from capture.
-        """
+        """Insert a pending job; ``sqlite3.IntegrityError`` for an unknown user."""
         jid = str(uuid.uuid4())
-        self._exec(
-            "INSERT INTO jobs("
-            "id, status, created_at, wav_path, request_mode,"
-            " client_app_version, api_key_id"
-            ") VALUES(?,?,?,?,?,?,?)",
-            jid,
-            "pending",
-            time.time(),
-            wav_path,
-            request_mode,
-            client_app_version,
-            api_key_id,
-        )
+        with self.db.write() as con:
+            con.execute(
+                "INSERT INTO jobs(id, user_id, status, created_at, wav_path, client_app_version)"
+                " VALUES (?, ?, 'pending', ?, ?, ?)",
+                (jid, user_id, time.time(), self._rel(wav_path), client_app_version),
+            )
         return jid
 
     def set_running(self, jid: str) -> bool:
-        """Atomically transition pending → running.  Increments `attempts`.
-
-        Only a ``pending`` row with no cancel request moves, so a DELETE that
-        flagged cancel before the worker started can never be overtaken.
-        Returns True iff the row changed.
-        """
-        cur = self._exec(
-            "UPDATE jobs SET status='running', started_at=?, attempts=attempts+1"
-            " WHERE id=? AND status='pending' AND cancel_requested=0",
-            time.time(),
-            jid,
-        )
-        return cur.rowcount == 1
+        """pending → running (+1 attempt), refused for a cancelled row. True iff it moved."""
+        with self.db.write() as con:
+            return (
+                con.execute(
+                    "UPDATE jobs SET status='running', started_at=?, attempts=attempts+1"
+                    " WHERE id=? AND status='pending' AND cancel_requested=0",
+                    (time.time(), jid),
+                ).rowcount
+                == 1
+            )
 
     def set_done_if_not_cancelled(
-        self,
-        jid: str,
-        mode: str,
-        output_dir: str,
-        *,
-        transcript_text: str | None = None,
+        self, jid: str, mode: str, *, transcript_text: str | None = None
     ) -> bool:
-        """Atomically transition running → done unless cancel was requested.
+        """running → done unless cancel was requested (one guarded UPDATE). True iff it moved."""
+        with self.db.write() as con:
+            return (
+                con.execute(
+                    "UPDATE jobs SET status='done', mode=?, finished_at=?, transcript_text=?,"
+                    " word_count=? WHERE id=? AND status='running' AND cancel_requested=0",
+                    (mode, time.time(), transcript_text, _word_count(transcript_text), jid),
+                ).rowcount
+                == 1
+            )
 
-        One UPDATE guarded by ``status='running' AND cancel_requested=0``, so
-        no interleaving with a cancel (or the watchdog writing ``failed``) can
-        leave a ``done`` row behind. Returns True iff the row changed; on
-        False the caller discards the outputs.
+    def set_failed(self, jid: str, error: str) -> None:
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
+                (error, time.time(), jid),
+            )
 
-        ``transcript_text`` (Phase 1 transcript-storage) is the plain-text
-        transcript derived from the pipeline's segment list. When provided
-        the helper also computes ``word_count`` server-side so callers don't
-        have to. Pass ``None`` to leave the columns untouched (e.g. legacy
-        callers that never populated transcripts).
+    def requeue_interrupted(self, jid: str) -> None:
+        """Graceful shutdown: running → pending and refund the attempt ``set_running`` took."""
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE jobs SET status='pending', attempts=MAX(attempts-1, 0), phase=NULL,"
+                " phase_started_at=NULL, started_at=NULL WHERE id=? AND status='running'",
+                (jid,),
+            )
 
-        ``client_app_version`` is intentionally NOT a kwarg here — it is
-        already persisted at :meth:`create` time so the value survives a
-        worker crash mid-pipeline.
+    def mark_outputs_removed(self, jid: str) -> None:
+        """DELETE after download: outputs are gone, the row and its text stay for history."""
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE jobs SET outputs_removed_at=? WHERE id=? AND outputs_removed_at IS NULL",
+                (time.time(), jid),
+            )
+
+    def update_after_transcode(self, jid: str, *, wav_path: Path | str) -> None:
+        """Persist the canonical WAV path (durability boundary before the source is unlinked)."""
+        with self.db.write() as con:
+            con.execute("UPDATE jobs SET wav_path=? WHERE id=?", (self._rel(wav_path), jid))
+
+    def update_phase(self, jid: str, phase: str) -> None:
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE jobs SET phase=?, phase_started_at=? WHERE id=?", (phase, time.time(), jid)
+            )
+
+    def update_chunk(self, jid: str, idx: int, total: int) -> None:
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE jobs SET chunk_index=?, total_chunks=? WHERE id=?",
+                (int(idx), int(total), jid),
+            )
+
+    def update_audio_duration(self, jid: str, seconds: float) -> None:
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE jobs SET audio_duration_s=? WHERE id=?", (float(seconds), jid)
+            )
+
+    def set_cancel_requested(self, jid: str) -> None:
+        with self.db.write() as con:
+            con.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (jid,))
+
+    # ── job reads ─────────────────────────────────────────────────────────────
+
+    def get(self, jid: str) -> Job | None:
+        with self.db.read() as con:
+            r = con.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+        return None if r is None else self._job(r)
+
+    def get_status(self, jid: str) -> str | None:
+        with self.db.read() as con:
+            r = con.execute("SELECT status FROM jobs WHERE id=?", (jid,)).fetchone()
+        return None if r is None else r["status"]
+
+    def check_cancel_requested(self, jid: str) -> bool:
+        with self.db.read() as con:
+            r = con.execute("SELECT cancel_requested FROM jobs WHERE id=?", (jid,)).fetchone()
+        return bool(r and r["cancel_requested"])
+
+    def count_24h(self, status: str) -> int:
+        """Finished jobs with *status* in the last 24 hours."""
+        with self.db.read() as con:
+            return con.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status=? AND finished_at > ?",
+                (status, time.time() - _DAY),
+            ).fetchone()[0]
+
+    def list_active_jobs(self) -> list[Job]:
+        with self.db.read() as con:
+            rows = con.execute("SELECT * FROM jobs WHERE status IN ('pending','running')")
+            return [self._job(r) for r in rows]
+
+    def list_pending_jobs(self) -> list[tuple[str, Path]]:
+        """``(id, absolute wav_path)`` of every pending job, oldest first."""
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT id, wav_path FROM jobs WHERE status='pending' ORDER BY created_at"
+            )
+            return [(r["id"], self._abs(r["wav_path"])) for r in rows]
+
+    # ── retention (DB setting ``retention_days``; 0 = keep forever) ──────────
+    # Imported rows (``source IS NOT NULL``) and ``usage_events`` are never purged.
+
+    def retention_days(self) -> int:
+        with self.db.read() as con:
+            r = con.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()
+        return int(r["value"]) if r else 0
+
+    def set_retention_days(self, days: int) -> None:
+        if days < 0:
+            raise ValueError("retention_days must be >= 0")
+        with self.db.write() as con:
+            con.execute(
+                "INSERT INTO settings(key, value) VALUES ('retention_days', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(days),),
+            )
+
+    def retention_preview(self, days: int) -> dict[str, int]:
+        """Rows a purge at *days* would delete now (0 → nothing)."""
+        if days <= 0:
+            return {"dictations": 0, "jobs": 0}
+        cutoff = time.time() - days * _DAY
+        with self.db.read() as con:
+            dicts = con.execute(_EXPIRED_DICTATIONS.format(cols="COUNT(*)"), (cutoff,)).fetchone()
+            jobs = con.execute(_EXPIRED_JOBS.format(cols="COUNT(*)"), (cutoff,)).fetchone()
+        return {"dictations": int(dicts[0]), "jobs": int(jobs[0])}
+
+    def expired_jobs(self, days: int) -> list[str]:
+        """Ids of finished (done/failed), non-imported jobs older than *days* (finish, else creation)."""
+        if days <= 0:
+            return []
+        with self.db.read() as con:
+            rows = con.execute(
+                _EXPIRED_JOBS.format(cols="id"), (time.time() - days * _DAY,)
+            ).fetchall()
+        return [r["id"] for r in rows]
+
+    def delete_finished_jobs(self, job_ids: list[str]) -> int:
+        """Hard-delete the given jobs if still done/failed and not imported. Returns rows deleted."""
+        deleted = 0
+        with self.db.write() as con:
+            for i in range(0, len(job_ids), 500):  # bound-variable limit
+                batch = job_ids[i : i + 500]
+                deleted += con.execute(
+                    "DELETE FROM jobs WHERE status IN ('done','failed') AND source IS NULL"
+                    f" AND id IN ({','.join('?' * len(batch))})",
+                    batch,
+                ).rowcount
+        return deleted
+
+    def purge_dictations(self, days: int) -> int:
+        """Delete non-imported dictations older than *days* (0 → none). Returns rows deleted."""
+        if days <= 0:
+            return 0
+        with self.db.write() as con:
+            return con.execute(
+                "DELETE FROM dictations WHERE created_at < ? AND source IS NULL",
+                (time.time() - days * _DAY,),
+            ).rowcount
+
+    # ── startup recovery ──────────────────────────────────────────────────────
+
+    def recover_orphans(self) -> dict[str, list[str]]:
+        """Startup recovery (call before the staging sweep). Returns ``{"requeue", "failed"}``."""
+        failed: list[str] = []
+        requeue: list[str] = []
+        now = time.time()
+        with self.db.write() as con:
+
+            def fail(jid: str, reason: str) -> None:
+                con.execute(
+                    "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
+                    (reason, now, jid),
+                )
+                failed.append(jid)
+
+            for r in con.execute(
+                "SELECT id, wav_path, attempts, cancel_requested, phase FROM jobs"
+                " WHERE status='running'"
+            ).fetchall():
+                logger.warning("[%s] recover_orphans: interrupted at phase=%s", r["id"], r["phase"])
+                if r["cancel_requested"]:
+                    fail(r["id"], _CANCELLED)
+                elif not self._abs(r["wav_path"]).exists():
+                    fail(r["id"], "staging file missing after restart")
+                elif r["attempts"] >= MAX_ATTEMPTS:
+                    fail(r["id"], "max retries exceeded")
+                else:
+                    con.execute(
+                        "UPDATE jobs SET status='pending', phase=NULL, phase_started_at=NULL,"
+                        " started_at=NULL WHERE id=?",
+                        (r["id"],),
+                    )
+
+            for r in con.execute("SELECT id, wav_path FROM jobs WHERE status='pending'").fetchall():
+                wav = self._abs(r["wav_path"])
+                if not wav.exists():
+                    fail(r["id"], "staging file missing after restart")
+                    continue
+                # A pre-transcode source (non-.wav) is re-probed by the runner.
+                if wav.suffix.lower() == ".wav":
+                    try:
+                        validate_wav_completeness(wav)
+                    except UploadTruncatedError as exc:
+                        fail(r["id"], f"WAV truncated; re-record ({exc})")
+                        wav.unlink(missing_ok=True)
+                        continue
+                requeue.append(r["id"])
+        return {"requeue": requeue, "failed": failed}
+
+    # ── dictations ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _stored_text(con: sqlite3.Connection, dedup_id: str, user_id: int) -> str | None:
+        """Stored text for *dedup_id* owned by *user_id*, None if absent.
+
+        ``DedupConflict`` when another user owns the id; ``DictationDeleted``
+        when the owner soft-deleted it (re-running would resurrect it).
         """
-        word_count = len(transcript_text.split()) if transcript_text else None
-        cur = self._exec(
-            "UPDATE jobs SET status='done', mode=?, output_dir=?,"
-            " finished_at=?, transcript_text=?, word_count=?"
-            " WHERE id=? AND status='running' AND cancel_requested=0",
-            mode,
-            output_dir,
-            time.time(),
-            transcript_text,
-            word_count,
-            jid,
-        )
-        return cur.rowcount == 1
+        row = con.execute(
+            "SELECT user_id, text, deleted_at FROM dictations WHERE client_dedup_id = ?",
+            (dedup_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["user_id"] != user_id:
+            raise DedupConflict(dedup_id)
+        if row["deleted_at"] is not None:
+            raise DictationDeleted(dedup_id)
+        return row["text"]
+
+    def find_dictation(self, dedup_id: str, user_id: int) -> str | None:
+        """Replay lookup: the stored text, None, or ``DedupConflict`` / ``DictationDeleted``."""
+        with self.db.read() as con:
+            return self._stored_text(con, dedup_id, user_id)
 
     def insert_dictation(
         self,
-        api_key_id: int,
-        text: str,
-        duration_ms: int | None,
-        client_app_version: str | None,
-        smart_format_applied: bool,
-    ) -> int:
-        """Persist one dictation transcript row.
-
-        Called from a background asyncio task in ``routes/dictate.py`` after
-        the user-facing response has already been returned. ``duration_ms``
-        stores Parakeet inference latency (NOT audio length); the future
-        weekly-insights cron uses it to derive per-user transcription-latency
-        trends.
-
-        Returns the new row's ``id`` (used by Plan 2 dedup logic). Direct
-        ``con.execute`` under ``self._lock`` so we can capture ``lastrowid``
-        before any subsequent statement resets the cursor.
-        """
-        word_count = len(text.split()) if text else 0
-        with self._lock:
-            cur = self.con.execute(
-                "INSERT INTO dictations("
-                "api_key_id, created_at, duration_ms, text, word_count,"
-                " client_app_version, smart_format_applied"
-                ") VALUES(?,?,?,?,?,?,?)",
-                (
-                    api_key_id,
-                    time.time(),
-                    duration_ms,
-                    text,
-                    word_count,
-                    client_app_version,
-                    1 if smart_format_applied else 0,
-                ),
-            )
-            return int(cur.lastrowid)
-
-    def insert_dictation_idempotent(
-        self,
         *,
-        api_key_id: int,
+        user_id: int,
         text: str,
         duration_ms: int | None,
         client_app_version: str | None,
-        smart_format_applied: bool,
-        client_dedup_id: str | None,
-    ) -> int:
-        """Idempotent variant of :meth:`insert_dictation` for the streaming
-        plan's cross-route dedup. When ``client_dedup_id`` is ``None`` the
-        method runs the same INSERT as :meth:`insert_dictation` (no ON
-        CONFLICT clause needed because the partial unique index ignores NULL
-        ids); the behavior is bit-identical to the legacy path. When a dedup
-        id is supplied, the partial unique index ``idx_dictations_client_dedup``
-        enforces dedup; on conflict the existing row's id is returned so
-        callers always get a row id back.
+        dedup_id: str | None,
+        created_at: float | None = None,
+    ) -> tuple[str, bool]:
+        """Atomic select-or-insert in one ``BEGIN IMMEDIATE``. Returns ``(text, replayed)``.
+
+        An existing row for *dedup_id* returns its stored text with
+        ``replayed=True`` (or raises as ``find_dictation``).
         """
-        word_count = len(text.split()) if text else 0
-        with self._lock:
-            if client_dedup_id is None:
-                cur = self.con.execute(
-                    "INSERT INTO dictations("
-                    " api_key_id, created_at, duration_ms, text, word_count,"
-                    " client_app_version, smart_format_applied"
-                    ") VALUES(?,?,?,?,?,?,?)",
-                    (
-                        api_key_id,
-                        time.time(),
-                        duration_ms,
-                        text,
-                        word_count,
-                        client_app_version,
-                        1 if smart_format_applied else 0,
-                    ),
-                )
-                return int(cur.lastrowid)
-            self.con.execute(
-                "INSERT INTO dictations("
-                " api_key_id, created_at, duration_ms, text, word_count,"
-                " client_app_version, smart_format_applied, client_dedup_id"
-                ") VALUES(?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(client_dedup_id)"
-                " WHERE client_dedup_id IS NOT NULL DO NOTHING",
+        with self.db.write() as con:
+            if dedup_id is not None:
+                stored = self._stored_text(con, dedup_id, user_id)
+                if stored is not None:
+                    return stored, True
+            con.execute(
+                "INSERT INTO dictations(user_id, created_at, duration_ms, text, word_count,"
+                " client_app_version, client_dedup_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    api_key_id,
-                    time.time(),
+                    user_id,
+                    time.time() if created_at is None else created_at,
                     duration_ms,
                     text,
-                    word_count,
+                    len(text.split()),
                     client_app_version,
-                    1 if smart_format_applied else 0,
-                    client_dedup_id,
+                    dedup_id,
                 ),
             )
-            row = self.con.execute(
-                "SELECT id FROM dictations WHERE client_dedup_id = ?",
-                (client_dedup_id,),
-            ).fetchone()
-            return int(row["id"])
+        return text, False
 
-    # ── weekly insights (Phase 2) ────────────────────────────────────────────
+    def dictation_counts(self, now: float) -> dict[str, int]:
+        """Non-deleted dictations in the last 24 h / 7 d / 30 d (portal tiles)."""
+        with self.db.read() as con:
+            r = con.execute(
+                "SELECT COALESCE(SUM(created_at >= ?), 0), COALESCE(SUM(created_at >= ?), 0),"
+                " COUNT(*) FROM dictations WHERE deleted_at IS NULL AND created_at >= ?",
+                (now - _DAY, now - 7 * _DAY, now - 30 * _DAY),
+            ).fetchone()
+        return {"24h": int(r[0]), "7d": int(r[1]), "30d": int(r[2])}
+
+    # ── weekly insights ───────────────────────────────────────────────────────
 
     def upsert_weekly_insight(
-        self, *, iso_year: int, iso_week: int, scope: str,
-        api_key_id: int | None, insight: dict,
-        input_tokens: int, output_tokens: int, cost_usd: float, model: str,
+        self,
+        *,
+        iso_year: int,
+        iso_week: int,
+        user_id: int | None,
+        insight: dict[str, Any],
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float,
+        model: str,
     ) -> None:
-        """Upsert one weekly_insights row keyed by (iso_year, iso_week, scope, api_key_id).
-        Idempotent — a Sunday-night re-run for the same week overwrites in place.
-        """
-        self._exec(
-            """
-            INSERT INTO weekly_insights
-                (iso_year, iso_week, scope, api_key_id, insight_json,
-                 input_tokens, output_tokens, cost_usd, model, generated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(iso_year, iso_week, scope, api_key_id) DO UPDATE SET
-                insight_json=excluded.insight_json,
-                input_tokens=excluded.input_tokens,
-                output_tokens=excluded.output_tokens,
-                cost_usd=excluded.cost_usd,
-                model=excluded.model,
-                generated_at=excluded.generated_at
-            """,
-            iso_year, iso_week, scope, api_key_id, json.dumps(insight),
-            input_tokens, output_tokens, cost_usd, model, time.time(),
-        )
+        """One row per (week, scope): ``user_id=None`` is the team row (``scope_key='team'``)."""
+        scope_key = "team" if user_id is None else f"user:{user_id}"
+        with self.db.write() as con:
+            con.execute(
+                "INSERT INTO weekly_insights(iso_year, iso_week, scope_key, user_id, insight_json,"
+                " input_tokens, output_tokens, cost_usd, model, generated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(iso_year, iso_week, scope_key) DO UPDATE SET"
+                " insight_json=excluded.insight_json, input_tokens=excluded.input_tokens,"
+                " output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd,"
+                " model=excluded.model, generated_at=excluded.generated_at",
+                (
+                    iso_year,
+                    iso_week,
+                    scope_key,
+                    user_id,
+                    json.dumps(insight),
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    model,
+                    time.time(),
+                ),
+            )
+
+    def _insight(self, iso_year: int, iso_week: int, scope_key: str) -> dict[str, Any] | None:
+        with self.db.read() as con:
+            r = con.execute(
+                "SELECT insight_json FROM weekly_insights"
+                " WHERE iso_year=? AND iso_week=? AND scope_key=?",
+                (iso_year, iso_week, scope_key),
+            ).fetchone()
+        return json.loads(r[0]) if r else None
 
     def get_weekly_insight_person(
-        self, api_key_id: int, iso_year: int, iso_week: int,
-    ) -> dict | None:
-        cur = self._exec(
-            "SELECT insight_json FROM weekly_insights"
-            " WHERE scope='person' AND api_key_id=? AND iso_year=? AND iso_week=?",
-            api_key_id, iso_year, iso_week,
-        )
-        row = cur.fetchone()
-        return json.loads(row[0]) if row else None
+        self, user_id: int, iso_year: int, iso_week: int
+    ) -> dict[str, Any] | None:
+        return self._insight(iso_year, iso_week, f"user:{user_id}")
 
-    def get_weekly_insight_team(self, iso_year: int, iso_week: int) -> dict | None:
-        cur = self._exec(
-            "SELECT insight_json FROM weekly_insights"
-            " WHERE scope='team' AND api_key_id IS NULL AND iso_year=? AND iso_week=?",
-            iso_year, iso_week,
-        )
-        row = cur.fetchone()
-        return json.loads(row[0]) if row else None
+    def get_weekly_insight_team(self, iso_year: int, iso_week: int) -> dict[str, Any] | None:
+        return self._insight(iso_year, iso_week, "team")
 
     def has_any_insight_for_week(self, iso_year: int, iso_week: int) -> bool:
-        """True if at least one row exists for the given ISO week (any scope).
+        with self.db.read() as con:
+            return (
+                con.execute(
+                    "SELECT 1 FROM weekly_insights WHERE iso_year=? AND iso_week=? LIMIT 1",
+                    (iso_year, iso_week),
+                ).fetchone()
+                is not None
+            )
 
-        Used by the cron's startup-catchup to skip a week that already has
-        person and/or team rows so a Sunday-night restart never double-charges.
-        """
-        cur = self._exec(
-            "SELECT 1 FROM weekly_insights WHERE iso_year=? AND iso_week=? LIMIT 1",
-            iso_year, iso_week,
-        )
-        return cur.fetchone() is not None
-
-    def list_filler_counts_for_week(
-        self, iso_year: int, iso_week: int,
-    ) -> list[tuple[int, int]]:
-        """Return ``[(api_key_id, filler_word_count), ...]`` for all person rows
-        in the week, sorted descending by count.
-
-        Filters out malformed insight_json silently (logs a warning) so one
-        bad row doesn't blank the leaderboard.
-        """
+    def list_filler_counts_for_week(self, iso_year: int, iso_week: int) -> list[tuple[int, int]]:
+        """``[(user_id, filler_word_count)]`` of the week's person rows, highest first."""
         out: list[tuple[int, int]] = []
-        cur = self._exec(
-            "SELECT api_key_id, insight_json FROM weekly_insights"
-            " WHERE scope='person' AND iso_year=? AND iso_week=?",
-            iso_year, iso_week,
-        )
-        for row in cur.fetchall():
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT user_id, insight_json FROM weekly_insights"
+                " WHERE user_id IS NOT NULL AND iso_year=? AND iso_week=?",
+                (iso_year, iso_week),
+            ).fetchall()
+        for r in rows:
             try:
-                doc = json.loads(row[1])
-            except (TypeError, ValueError):
-                logger.warning(
-                    "malformed insight_json for api_key_id=%s W%02d",
-                    row[0], iso_week,
-                )
+                n = json.loads(r["insight_json"]).get("filler_word_count")
+            except (TypeError, ValueError, AttributeError):
+                logger.warning("malformed insight_json for user_id=%s W%02d", r["user_id"], iso_week)
                 continue
-            n = doc.get("filler_word_count")
             if isinstance(n, int):
-                out.append((int(row[0]), n))
-        out.sort(key=lambda r: r[1], reverse=True)
+                out.append((int(r["user_id"]), n))
+        out.sort(key=lambda t: t[1], reverse=True)
         return out
 
-    def compute_user_stats(
-        self, api_key_id: int, *, since_epoch: float,
-    ) -> dict[str, int | float]:
-        """Read-only stats for one user across dictations + jobs since ``since_epoch``.
-
-        Returns ``{dictation_count, meeting_count, total_words, total_inference_ms,
-        time_saved_hours}``. Goes through ``_exec`` for single-writer-lock
-        discipline. Time-saved baseline: 40 WPM typing rate.
-
-        Requires SQLite >= 3.30 for ``COUNT(*) FILTER (WHERE ...)`` syntax.
-        """
-        cur = self._exec(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE kind='dictation') AS dictation_count,
-                COUNT(*) FILTER (WHERE kind='meeting') AS meeting_count,
-                COALESCE(SUM(word_count), 0) AS total_words,
-                COALESCE(SUM(duration_ms), 0) AS total_inference_ms
-            FROM (
-                SELECT 'dictation' AS kind, word_count, duration_ms, created_at
-                  FROM dictations WHERE api_key_id = ? AND created_at >= ?
-                              AND deleted_at IS NULL
-                UNION ALL
-                SELECT 'meeting' AS kind, word_count, NULL AS duration_ms, created_at
-                  FROM jobs WHERE api_key_id = ?
-                              AND transcript_text IS NOT NULL
-                              AND deleted_at IS NULL
-                              AND created_at >= ?
-            )
-            """,
-            api_key_id, since_epoch, api_key_id, since_epoch,
-        )
-        row = cur.fetchone() or (0, 0, 0, 0)
-        total_words = int(row[2] or 0)
-        return {
-            "dictation_count": int(row[0] or 0),
-            "meeting_count": int(row[1] or 0),
-            "total_words": total_words,
-            "total_inference_ms": int(row[3] or 0),
-            "time_saved_hours": round(total_words / 40.0 / 60.0, 2),
-        }
-
     def rolling_insights_cost_usd(self, days: int = 30) -> float:
-        cutoff = time.time() - days * 86400
-        cur = self._exec(
-            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM weekly_insights"
-            " WHERE generated_at >= ?",
-            cutoff,
-        )
-        return float(cur.fetchone()[0])
+        with self.db.read() as con:
+            return float(
+                con.execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM weekly_insights WHERE generated_at >= ?",
+                    (time.time() - days * _DAY,),
+                ).fetchone()[0]
+            )
+
+    # ── per-user stats + transcripts ──────────────────────────────────────────
+
+    def compute_user_stats(self, user_id: int, *, since_epoch: float) -> dict[str, int | float]:
+        """``{dictation_count, file_count, total_words, total_inference_ms, time_saved_hours}``."""
+        with self.db.read() as con:
+            r = con.execute(
+                _ACTIVITY_SQL + " WHERE user_id = ?", (since_epoch, since_epoch, user_id)
+            ).fetchone()
+        return _stats(r if r is not None and r["user_id"] is not None else None)
+
+    def stats_by_user(self, since_epoch: float) -> dict[int, dict[str, int | float]]:
+        """``compute_user_stats`` for every user with activity, in one grouped query."""
+        with self.db.read() as con:
+            rows = con.execute(_ACTIVITY_SQL + " GROUP BY user_id", (since_epoch, since_epoch))
+            return {r["user_id"]: _stats(r) for r in rows}
 
     def transcripts_in_range(
-        self, api_key_id: int, *, since_epoch: float, until_epoch: float,
-    ) -> list[dict]:
-        """Combined dictation + meeting/file transcripts for one employee in
-        [since_epoch, until_epoch). Returns dicts {created_at, text, kind}
-        sorted newest-first. Honors single-writer lock via `_exec`.
-        """
-        cur = self._exec(
-            """
-            SELECT created_at, text, kind FROM (
-                SELECT created_at, text, 'dictation' AS kind
-                  FROM dictations
-                 WHERE api_key_id = ? AND created_at >= ? AND created_at < ?
-                   AND deleted_at IS NULL
-                UNION ALL
-                SELECT created_at, transcript_text AS text, 'meeting' AS kind
-                  FROM jobs
-                 WHERE api_key_id = ? AND transcript_text IS NOT NULL
-                   AND deleted_at IS NULL
-                   AND created_at >= ? AND created_at < ?
-            ) ORDER BY created_at DESC
-            """,
-            api_key_id, since_epoch, until_epoch,
-            api_key_id, since_epoch, until_epoch,
-        )
-        return [{"created_at": r[0], "text": r[1], "kind": r[2]} for r in cur.fetchall()]
-
-    # ── /me/history (Plan A) ─────────────────────────────────────────────────
+        self, user_id: int, *, since_epoch: float, until_epoch: float
+    ) -> list[dict[str, Any]]:
+        """``{created_at, text, kind}`` (kind ``dictation`` | ``file``), newest first."""
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT created_at, text, kind FROM ("
+                " SELECT created_at, text, 'dictation' AS kind FROM dictations"
+                "  WHERE user_id = ? AND created_at >= ? AND created_at < ? AND deleted_at IS NULL"
+                " UNION ALL"
+                " SELECT created_at, transcript_text AS text, 'file' AS kind FROM jobs"
+                "  WHERE user_id = ? AND transcript_text IS NOT NULL AND deleted_at IS NULL"
+                "  AND created_at >= ? AND created_at < ?"
+                ") ORDER BY created_at DESC",
+                (user_id, since_epoch, until_epoch, user_id, since_epoch, until_epoch),
+            )
+            return [dict(r) for r in rows]
 
     def transcripts_in_range_filtered(
         self,
-        api_key_id: int,
+        user_id: int,
         *,
         since_epoch: float,
         until_epoch: float,
@@ -677,551 +602,97 @@ class JobStore:
         dict_cursor: tuple[float, str] | None = None,
         jobs_cursor: tuple[float, str] | None = None,
         limit: int = 50,
-    ) -> tuple[
-        list[dict],
-        tuple[float, str] | None,
-        tuple[float, str] | None,
-    ]:
-        """Per-leg cursor pagination for the personal history feed.
+    ) -> tuple[list[dict[str, Any]], tuple[float, str] | None, tuple[float, str] | None]:
+        """Personal history with per-leg cursors: ``(rows, next_dict_cursor, next_jobs_cursor)``.
 
-        Returns ``(rows, next_dict_cursor, next_jobs_cursor)`` where ``rows``
-        is a merged list of dicts ``{row_id, kind, created_at, preview,
-        word_count, deleted_at, source}`` sorted by ``created_at DESC`` and
-        capped at ``limit``. Each leg's cursor is populated only if THAT leg
-        returned ``limit`` rows (i.e. there may be more to page through);
-        ``None`` signals end-of-leg.
-
-        Reviewer fix vs. plan pseudocode: the plan's ``next_*`` derivation
-        keyed off the merged ``rows`` (which is wrong — the merged tail is
-        not the per-leg tail). We capture each leg's raw query result and
-        derive cursors from those instead so subsequent pages are correct.
+        Each leg's cursor is set only when that leg returned ``limit`` rows.
         """
-        dict_rows_raw: list[dict] = []
-        jobs_rows_raw: list[dict] = []
+        dict_rows: list[dict[str, Any]] = []
+        job_rows: list[dict[str, Any]] = []
+        with self.db.read() as con:
+            if kind != "file":
+                sql = (
+                    "SELECT CAST(id AS TEXT) AS row_id, 'dictation' AS kind, created_at,"
+                    " substr(text, 1, 200) AS preview, word_count, deleted_at,"
+                    " COALESCE(source, 'server') AS source FROM dictations"
+                    " WHERE user_id = ? AND created_at >= ? AND created_at < ? AND deleted_at IS NULL"
+                )
+                args: list[object] = [user_id, since_epoch, until_epoch]
+                if search:
+                    sql += " AND text LIKE ?"
+                    args.append(f"%{search}%")
+                if dict_cursor is not None:
+                    # dictations.id is INTEGER: compare as INTEGER (a text compare
+                    # disagrees across digit widths).
+                    sql += " AND (created_at, id) < (?, CAST(? AS INTEGER))"
+                    args.extend(dict_cursor)
+                sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+                dict_rows = [dict(r) for r in con.execute(sql, (*args, limit))]
+            if kind != "dictation":
+                sql = (
+                    "SELECT id AS row_id, 'file' AS kind, created_at,"
+                    " substr(transcript_text, 1, 200) AS preview, word_count, deleted_at,"
+                    " 'server' AS source FROM jobs"
+                    " WHERE user_id = ? AND created_at >= ? AND created_at < ?"
+                    " AND transcript_text IS NOT NULL AND deleted_at IS NULL"
+                )
+                args = [user_id, since_epoch, until_epoch]
+                if search:
+                    sql += " AND transcript_text LIKE ?"
+                    args.append(f"%{search}%")
+                if jobs_cursor is not None:
+                    sql += " AND (created_at, id) < (?, ?)"
+                    args.extend(jobs_cursor)
+                sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+                job_rows = [dict(r) for r in con.execute(sql, (*args, limit))]
 
-        if kind != "meeting":
-            sql_d = (
-                "SELECT CAST(id AS TEXT) AS row_id, 'dictation' AS kind,"
-                " created_at, substr(text, 1, 200) AS preview,"
-                " word_count, deleted_at,"
-                " COALESCE(source, 'server') AS source"
-                " FROM dictations"
-                " WHERE api_key_id = ?"
-                " AND created_at >= ? AND created_at < ?"
+        merged = sorted(dict_rows + job_rows, key=lambda r: (-r["created_at"], r["row_id"]))[:limit]
+
+        def _next(rows: list[dict[str, Any]]) -> tuple[float, str] | None:
+            return (rows[-1]["created_at"], rows[-1]["row_id"]) if len(rows) == limit else None
+
+        return merged, _next(dict_rows), _next(job_rows)
+
+    # ── /me/history rows (kind: dictation | file) ─────────────────────────────
+
+    def get_history_row(self, user_id: int, kind: str, row_id: str) -> dict[str, Any] | None:
+        """Owner-checked, non-deleted single row (``SELECT *``), or None."""
+        if kind == "dictation":
+            sql = (
+                "SELECT * FROM dictations WHERE user_id=? AND id=CAST(? AS INTEGER)"
                 " AND deleted_at IS NULL"
             )
-            args_d: list[object] = [api_key_id, since_epoch, until_epoch]
-            if search:
-                sql_d += " AND text LIKE ?"
-                args_d.append(f"%{search}%")
-            if dict_cursor is not None:
-                # dictations.id is INTEGER; ORDER BY id DESC uses integer
-                # ordering, so the WHERE must compare as INTEGER too — a
-                # text compare disagrees across digit-width boundaries
-                # (e.g. id=9 vs id=10 with the same created_at would drop
-                # or repeat rows). The cursor wire-format stays as a
-                # decimal string for jobs compatibility; we coerce here.
-                sql_d += " AND (created_at, id) < (?, CAST(? AS INTEGER))"
-                args_d.extend(dict_cursor)
-            sql_d += " ORDER BY created_at DESC, id DESC LIMIT ?"
-            args_d.append(limit)
-            cur_d = self._exec(sql_d, *args_d)
-            cols_d = [c[0] for c in cur_d.description]
-            dict_rows_raw = [dict(zip(cols_d, r)) for r in cur_d.fetchall()]
-
-        if kind != "dictation":
-            sql_j = (
-                "SELECT id AS row_id, 'meeting' AS kind, created_at,"
-                " substr(transcript_text, 1, 200) AS preview,"
-                " word_count, deleted_at, 'server' AS source"
-                " FROM jobs"
-                " WHERE api_key_id = ?"
-                " AND created_at >= ? AND created_at < ?"
-                " AND transcript_text IS NOT NULL"
-                " AND deleted_at IS NULL"
-            )
-            args_j: list[object] = [api_key_id, since_epoch, until_epoch]
-            if search:
-                sql_j += " AND transcript_text LIKE ?"
-                args_j.append(f"%{search}%")
-            if jobs_cursor is not None:
-                sql_j += " AND (created_at, id) < (?, ?)"
-                args_j.extend(jobs_cursor)
-            sql_j += " ORDER BY created_at DESC, id DESC LIMIT ?"
-            args_j.append(limit)
-            cur_j = self._exec(sql_j, *args_j)
-            cols_j = [c[0] for c in cur_j.description]
-            jobs_rows_raw = [dict(zip(cols_j, r)) for r in cur_j.fetchall()]
-
-        merged = sorted(
-            dict_rows_raw + jobs_rows_raw,
-            key=lambda r: (-r["created_at"], r["row_id"]),
-        )[:limit]
-
-        next_dict = (
-            (dict_rows_raw[-1]["created_at"], dict_rows_raw[-1]["row_id"])
-            if len(dict_rows_raw) == limit
-            else None
-        )
-        next_jobs = (
-            (jobs_rows_raw[-1]["created_at"], jobs_rows_raw[-1]["row_id"])
-            if len(jobs_rows_raw) == limit
-            else None
-        )
-        return merged, next_dict, next_jobs
-
-    def get_most_recent_dictation(self, api_key_id: int) -> dict | None:
-        """Return the newest non-deleted dictation row for *api_key_id*, or None.
-
-        Selects from the same ``dictations`` table that ``/me/history`` reads.
-        Always filtered by ``api_key_id`` — no cross-user leak possible.
-        Honors the soft-delete semantics: rows with ``deleted_at IS NOT NULL``
-        are excluded (matches the ``idx_dictations_api_key_active`` partial
-        index used by ``/me/history``).
-
-        The ``id`` is CAST to TEXT in the SELECT so the JSON response shape
-        matches the Swift ``LastDictation.id: String`` decoder. Tie-break by
-        ``id DESC`` on identical ``created_at`` ensures deterministic results.
-        """
-        cur = self.con.execute(
-            "SELECT CAST(id AS TEXT) AS id, text, created_at "
-            "FROM dictations "
-            "WHERE api_key_id = ? AND text != '' AND deleted_at IS NULL "
-            "ORDER BY created_at DESC, id DESC "
-            "LIMIT 1",
-            (api_key_id,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return {"id": row[0], "text": row[1], "created_at": row[2]}
-
-    def get_history_row(
-        self, api_key_id: int, kind: str, row_id: str,
-    ) -> dict | None:
-        """Owner-checked + deleted_at-filtered single-row fetch.
-
-        ``row_id`` is always a string: jobs uses UUID-string id, dictations
-        uses INTEGER id (we CAST inside the WHERE so callers don't have to
-        cast). Returns ``dict(row)`` or ``None``.
-        """
-        if kind == "dictation":
-            cur = self._exec(
-                "SELECT * FROM dictations"
-                " WHERE api_key_id=? AND id=CAST(? AS INTEGER)"
-                " AND deleted_at IS NULL",
-                api_key_id, row_id,
-            )
-        elif kind == "meeting":
-            cur = self._exec(
-                "SELECT * FROM jobs"
-                " WHERE api_key_id=? AND id=?"
-                " AND transcript_text IS NOT NULL AND deleted_at IS NULL",
-                api_key_id, row_id,
+        elif kind == "file":
+            sql = (
+                "SELECT * FROM jobs WHERE user_id=? AND id=?"
+                " AND transcript_text IS NOT NULL AND deleted_at IS NULL"
             )
         else:
             return None
-        row = cur.fetchone()
-        if row is None:
-            return None
-        cols = [c[0] for c in cur.description]
-        return dict(zip(cols, row))
+        with self.db.read() as con:
+            r = con.execute(sql, (user_id, row_id)).fetchone()
+        return None if r is None else dict(r)
 
-    def soft_delete_history_row(
-        self, api_key_id: int, kind: str, row_id: str,
-    ) -> bool:
-        """Set ``deleted_at = now`` for one owner-checked row. Returns True
-        iff a live row was updated (a re-delete is a no-op → False).
-        """
-        now = time.time()
-        if kind == "dictation":
-            cur = self._exec(
-                "UPDATE dictations SET deleted_at=?"
-                " WHERE api_key_id=? AND id=CAST(? AS INTEGER)"
-                " AND deleted_at IS NULL",
-                now, api_key_id, row_id,
-            )
-        elif kind == "meeting":
-            cur = self._exec(
-                "UPDATE jobs SET deleted_at=?"
-                " WHERE api_key_id=? AND id=?"
-                " AND deleted_at IS NULL",
-                now, api_key_id, row_id,
-            )
-        else:
+    def _set_deleted(self, user_id: int, kind: str, row_id: str, *, deleted: bool) -> bool:
+        if kind not in _HISTORY_KINDS:
             return False
-        return cur.rowcount > 0
-
-    def restore_history_row(
-        self, api_key_id: int, kind: str, row_id: str,
-    ) -> bool:
-        """Symmetric inverse of :meth:`soft_delete_history_row`. Returns True
-        iff a previously-soft-deleted row was restored.
-        """
-        if kind == "dictation":
-            cur = self._exec(
-                "UPDATE dictations SET deleted_at=NULL"
-                " WHERE api_key_id=? AND id=CAST(? AS INTEGER)"
-                " AND deleted_at IS NOT NULL",
-                api_key_id, row_id,
-            )
-        elif kind == "meeting":
-            cur = self._exec(
-                "UPDATE jobs SET deleted_at=NULL"
-                " WHERE api_key_id=? AND id=?"
-                " AND deleted_at IS NOT NULL",
-                api_key_id, row_id,
-            )
-        else:
-            return False
-        return cur.rowcount > 0
-
-    def insert_streaming_dictation_idempotent(
-        self,
-        *,
-        api_key_id: int,
-        text: str,
-        duration_ms: int | None,
-        client_app_version: str | None,
-        smart_format_applied: bool,
-        client_dedup_id: str,
-        dictated_at: float,
-    ) -> int | None:
-        """Persist one streaming-dictation transcript row using the client's
-        speech-started-at timestamp as ``created_at`` (mirrors the cloud-fallback
-        pattern so the history feed and weekly-insights cron see the event in
-        its true time window).
-
-        Idempotency: ``client_dedup_id`` is required; the partial unique index
-        ``idx_dictations_client_dedup`` enforces dedup. Returns the new row's
-        ``id`` on insert, or ``None`` if a row with the same ``client_dedup_id``
-        already exists (the streaming finalize succeeded but the HTTP response
-        was lost; the recorder's safety-net retry must NOT create a second row).
-        """
-        word_count = len(text.split()) if text else 0
-        with self._lock:
-            cur = self.con.execute(
-                "INSERT INTO dictations("
-                " api_key_id, created_at, duration_ms, text, word_count,"
-                " client_app_version, smart_format_applied, client_dedup_id"
-                ") VALUES(?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(client_dedup_id)"
-                " WHERE client_dedup_id IS NOT NULL DO NOTHING",
-                (
-                    api_key_id,
-                    dictated_at,
-                    duration_ms,
-                    text,
-                    word_count,
-                    client_app_version,
-                    1 if smart_format_applied else 0,
-                    client_dedup_id,
-                ),
-            )
-            return int(cur.lastrowid) if cur.rowcount > 0 else None
-
-    def sweep_transcripts(self, days: int) -> tuple[int, int]:
-        """Zero ``jobs.transcript_text`` and delete ``dictations`` rows older
-        than *days* days.
-
-        TTL is measured from the moment the transcript existed:
-        - jobs: ``COALESCE(finished_at, created_at) < cutoff``. Without
-          COALESCE, a job created 91 days ago but finished today would be
-          reaped tomorrow — wrong intent.
-        - dictations: ``created_at < cutoff``. Dictations are INSERTed at
-          completion, so there is no separate "finished" timestamp.
-
-        Returns ``(jobs_rows_zeroed, dictations_rows_deleted)``.
-
-        Note: ``jobs.word_count`` and other metadata survive the sweep — the
-        row stays as audit history. Dictations are deleted entirely because
-        per-row metadata on a fast-flowing stream isn't worth retaining past
-        the privacy TTL.
-        """
-        cutoff = time.time() - days * 86400
-        # `_exec` is varargs — pass `cutoff` positionally, NOT as a tuple.
-        jobs_cur = self._exec(
-            "UPDATE jobs SET transcript_text = NULL"
-            " WHERE transcript_text IS NOT NULL"
-            " AND COALESCE(finished_at, created_at) < ?",
-            cutoff,
+        table, id_expr = (
+            ("dictations", "CAST(? AS INTEGER)") if kind == "dictation" else ("jobs", "?")
         )
-        dicts_cur = self._exec(
-            "DELETE FROM dictations WHERE created_at < ?",
-            cutoff,
-        )
-        return jobs_cur.rowcount, dicts_cur.rowcount
-
-    def list_expired_finished_jobs(self, days: int) -> list[tuple[str, str | None]]:
-        """Return ``(id, output_dir)`` of *finished* (done/failed) jobs older than *days*.
-
-        Age is ``COALESCE(finished_at, created_at)``. Pending/running jobs are
-        never returned, regardless of age, so an in-flight meeting can't be
-        reaped.
-        """
-        cutoff = time.time() - days * 86400
-        cur = self._exec(
-            "SELECT id, output_dir FROM jobs WHERE status IN ('done','failed')"
-            " AND COALESCE(finished_at, created_at) < ?",
-            cutoff,
-        )
-        return [(row[0], row[1]) for row in cur.fetchall()]
-
-    def delete_finished_jobs(self, job_ids: list[str]) -> int:
-        """Hard-delete the given jobs, but only if still done/failed.
-
-        The status guard is re-applied in SQL so a row that changed state
-        between :meth:`list_expired_finished_jobs` and this call survives.
-        Returns the number of rows deleted.
-        """
-        deleted = 0
-        # Chunked to stay under SQLite's bound-variable limit.
-        for i in range(0, len(job_ids), 500):
-            batch = job_ids[i : i + 500]
-            placeholders = ",".join("?" * len(batch))
-            cur = self._exec(
-                f"DELETE FROM jobs WHERE status IN ('done','failed')"
-                f" AND id IN ({placeholders})",
-                *batch,
-            )
-            deleted += cur.rowcount
-        return deleted
-
-    def set_failed(self, jid: str, error: str) -> None:
-        """Transition any job status → failed."""
-        self._exec(
-            "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
-            error,
-            time.time(),
-            jid,
-        )
-
-    def delete(self, jid: str) -> None:
-        """Hard-delete a job row (called after client confirms download)."""
-        self._exec("DELETE FROM jobs WHERE id=?", jid)
-
-    def update_after_transcode(
-        self,
-        jid: str,
-        *,
-        wav_path: str,
-        force_single_channel: bool,
-    ) -> None:
-        """Persist the canonical-WAV path + single-channel flag.
-
-        Durability boundary for /transcribe/file: once committed, the original
-        source upload may be safely deleted because the row now points at the
-        ffmpeg-produced canonical WAV.
-        """
-        self._exec(
-            "UPDATE jobs SET wav_path=?, force_single_channel=? WHERE id=?",
-            wav_path,
-            1 if force_single_channel else 0,
-            jid,
-        )
-
-    # ── read operations ───────────────────────────────────────────────────────
-
-    def get(self, jid: str) -> Optional[Job]:
-        """Return a Job by id, or None if not found."""
-        cur = self._exec("SELECT * FROM jobs WHERE id=?", jid)
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return _row_to_job(row, cur)
-
-    def count_24h(self, status: str) -> int:
-        """Return the count of finished jobs with *status* in the last 24 hours."""
-        cur = self._exec(
-            "SELECT COUNT(*) FROM jobs"
-            " WHERE status=? AND finished_at IS NOT NULL AND finished_at > ?",
-            status,
-            time.time() - 86400,
-        )
-        return int(cur.fetchone()[0])
-
-    def list_active_jobs(self) -> list[Job]:
-        """Return all non-terminal jobs (pending or running)."""
-        cur = self._exec(
-            "SELECT * FROM jobs WHERE status IN ('pending','running')"
-        )
-        rows = cur.fetchall()
-        return [_row_to_job(row, cur) for row in rows]
-
-    def list_pending_ids(self) -> list[str]:
-        """Return the IDs of all pending jobs. Used by FileJobRunner.reenqueue_pending."""
-        cur = self._exec("SELECT id FROM jobs WHERE status='pending'")
-        return [row[0] for row in cur.fetchall()]
-
-    def list_pending_ids_with_mode(self) -> list[tuple[str, str, Optional[str]]]:
-        """Return ``(id, wav_path, request_mode)`` for every pending job.
-
-        Used by :meth:`FileJobRunner.reenqueue_pending`, which re-runs every
-        pending row as a file job; ``request_mode`` is informational only.
-        """
-        cur = self._exec(
-            "SELECT id, wav_path, request_mode FROM jobs"
-            " WHERE status='pending' ORDER BY created_at"
-        )
-        return [(row[0], row[1], row[2]) for row in cur.fetchall()]
-
-    # ── Phase 3 observability helpers ────────────────────────────────────────
-
-    def update_phase(self, jid: str, phase: str) -> None:
-        """Persist current phase + freshen ``phase_started_at`` for the watchdog."""
-        self._exec(
-            "UPDATE jobs SET phase=?, phase_started_at=? WHERE id=?",
-            phase,
-            time.time(),
-            jid,
-        )
-
-    def update_chunk(self, jid: str, idx: int, total: int) -> None:
-        """Persist progress within a chunked phase (e.g. ``transcribe``)."""
-        self._exec(
-            "UPDATE jobs SET chunk_index=?, total_chunks=? WHERE id=?",
-            int(idx),
-            int(total),
-            jid,
-        )
-
-    def set_cancel_requested(self, jid: str) -> None:
-        """Flag the job for cooperative cancellation. Cancel mid-ffmpeg is
-        honored by ``transcode_to_canonical_wav``'s ``cancel_cb`` poll;
-        cancel mid-transcribe is advisory (the executor cannot be
-        interrupted). The UI uses this flag to show a 'finishing on server'
-        banner."""
-        self._exec("UPDATE jobs SET cancel_requested=1 WHERE id=?", jid)
-
-    def check_cancel_requested(self, jid: str) -> bool:
-        """Return True iff ``set_cancel_requested`` was called for *jid*."""
-        cur = self._exec(
-            "SELECT cancel_requested FROM jobs WHERE id=?", jid
-        )
-        row = cur.fetchone()
-        return bool(row[0]) if row else False
-
-    def update_audio_duration(self, jid: str, seconds: float) -> None:
-        """Persist the ffprobed audio duration so the watchdog can scale
-        per-phase budgets to the actual content."""
-        self._exec(
-            "UPDATE jobs SET audio_duration_s=? WHERE id=?",
-            float(seconds),
-            jid,
-        )
-
-    def fail_running_jobs(self, reason: str) -> int:
-        """Mark all currently running jobs as failed with *reason*.
-
-        Returns the number of rows updated.  Used by the SIGTERM handler (M1).
-        """
-        cur = self._exec(
-            "UPDATE jobs SET status='failed', error=?, finished_at=?"
-            " WHERE status='running'",
-            reason,
-            time.time(),
-        )
-        return cur.rowcount
-
-    # ── startup recovery ──────────────────────────────────────────────────────
-
-    def recover_orphans(self) -> dict[str, list[str]]:
-        """P5#2 orphan recovery — call once at server startup.
-
-        Policy:
-        - running  → always failed (server restarted mid-job; job is dead)
-        - pending + wav exists → leave pending, return in "requeue" list so
-          the runner can re-enqueue them.
-        - pending + wav missing → failed (staging file disappeared, cannot run)
-
-        Returns a dict::
-
-            {"requeue": [jid, ...], "failed": [jid, ...]}
-
-        so the caller can log the outcome.
-        """
-        with self._lock:
-            # Log the last-known phase + chunk progress for jobs that were
-            # mid-flight when the server died — helps post-mortem diagnosis.
-            try:
-                running_cur = self.con.execute(
-                    "SELECT id, phase, chunk_index, total_chunks"
-                    " FROM jobs WHERE status='running'"
-                )
-                for jid, phase, ci, tc in running_cur.fetchall():
-                    import logging as _l  # local import to avoid header churn
-                    _l.getLogger(__name__).warning(
-                        "[%s] recover_orphans: crashed mid-job"
-                        " phase=%s chunk_index=%s total_chunks=%s",
-                        jid, phase, ci, tc,
-                    )
-            except sqlite3.OperationalError:
-                # phase/chunk_index columns absent → very old DB; skip log.
-                pass
-
-            # All running jobs are dead after a restart
-            self.con.execute(
-                "UPDATE jobs SET status='failed', error='server restart'"
-                " WHERE status='running'"
+        guard = "deleted_at IS NULL" if deleted else "deleted_at IS NOT NULL"
+        with self.db.write() as con:
+            return (
+                con.execute(
+                    f"UPDATE {table} SET deleted_at=? WHERE user_id=? AND id={id_expr} AND {guard}",
+                    (time.time() if deleted else None, user_id, row_id),
+                ).rowcount
+                > 0
             )
 
-            # Backfill request_mode for legacy rows. Every job is a file job
-            # now; the column stays for the portal labels.
-            try:
-                self.con.execute(
-                    "UPDATE jobs SET request_mode='file'"
-                    " WHERE request_mode IS NULL"
-                )
-            except sqlite3.OperationalError:
-                pass
+    def soft_delete_history_row(self, user_id: int, kind: str, row_id: str) -> bool:
+        """Hide one owned row (``deleted_at = now``). False if already hidden or not owned."""
+        return self._set_deleted(user_id, kind, row_id, deleted=True)
 
-            # Pending jobs: check WAV still on disk
-            cur = self.con.execute(
-                "SELECT id, wav_path FROM jobs WHERE status='pending'"
-            )
-            rows = cur.fetchall()
-
-            requeue: list[str] = []
-            failed: list[str] = []
-            for jid, wav_path in rows:  # type: ignore[misc]
-                wav = Path(wav_path)
-                if not wav.exists():
-                    self.con.execute(
-                        "UPDATE jobs SET status='failed',"
-                        " error='staging file missing after restart'"
-                        " WHERE id=?",
-                        (jid,),
-                    )
-                    failed.append(jid)
-                    continue
-
-                # /transcribe/file: a pre-transcode source (non-.wav extension)
-                # cannot be WAV-validated — skip the check and just re-queue;
-                # the runner's _run_source will (re)run ffprobe + ffmpeg.
-                # Without this branch, m4a/mp3/etc. orphans would always crash
-                # validate_wav_completeness and be marked failed on every
-                # restart.
-                if wav.suffix.lower() != ".wav":
-                    requeue.append(jid)
-                    continue
-
-                # C14: Validate WAV completeness before re-queuing. A truncated
-                # upload would succeed submit but fail transcription; fail-fast here.
-                try:
-                    validate_wav_completeness(wav)
-                except UploadTruncatedError as exc:
-                    self.con.execute(
-                        "UPDATE jobs SET status='failed', error=?"
-                        " WHERE id=?",
-                        (f"WAV truncated; re-record ({exc})", jid),
-                    )
-                    try:
-                        wav.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    failed.append(jid)
-                    continue
-
-                requeue.append(jid)
-
-        return {"requeue": requeue, "failed": failed}
+    def restore_history_row(self, user_id: int, kind: str, row_id: str) -> bool:
+        """Inverse of :meth:`soft_delete_history_row`."""
+        return self._set_deleted(user_id, kind, row_id, deleted=False)

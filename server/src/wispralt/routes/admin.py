@@ -1,25 +1,16 @@
 """
 routes/admin.py — Administrative endpoints for WisprAlt server.
 
-POST /admin/rotate-key  (bearer auth with *current* key)
-    Generates a new 64-hex-char API key, persists it to .env and to a
-    chmod-600 fallback file, hot-swaps it in memory, and prints it to stdout
-    (captured by launchd to ~/Library/Logs/WisprAlt/server.log).
-    Returns only ``{"rotated": true}``; the new key is NEVER in the response
-    body (v3 delta P4#6 security requirement).
-
 GET /metrics  (bearer auth)
     Returns structured observability data for parakeet, the file-job
-    pipeline (under the legacy ``meeting`` key), memory, and disk.
+    pipeline (``file``), memory, and disk.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import secrets
 import shutil
-import threading
 import time
 from pathlib import Path
 
@@ -27,14 +18,11 @@ import psutil
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from .. import auth, observability
+from .. import observability
 from ..auth import require_admin
 from ..config import settings
-from ..jobs.runner import PHASE_LABELS
 from ..files import pipeline as files_pipeline
-from ..ops import env_writer
-from ..ops.env_writer import find_env_path
-from ..users import store as users_store
+from ..jobs.runner import PHASE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -58,104 +46,6 @@ def _mlx_memory_mb() -> dict[str, int]:
     except Exception:
         return {"mlx_active_mb": 0, "mlx_cache_mb": 0}
 
-# C10: Module-level lock prevents concurrent rotate-key requests from interleaving
-# rewrite_env_var and set_current_key, which would leave the in-memory key and
-# the on-disk key out of sync for a brief window.
-_rotate_lock = threading.Lock()
-
-# Fallback key file — chmod 600; deleted on next successful auth (Phase 2 wires that)
-_LAST_ROTATION_KEY_PATH = (
-    Path.home() / "Library" / "Application Support" / "WisprAlt" / ".last-rotation-key"
-)
-
-
-@router.post(
-    "/admin/rotate-key",
-    dependencies=[Depends(require_admin)],
-    summary="Rotate the break-glass admin API key (hot-swap, no restart required)",
-)
-async def rotate_key(request: Request) -> JSONResponse:
-    """Generate and hot-swap a new break-glass admin API key.
-
-    The break-glass admin is the env-derived fallback (``WISPRALT_API_KEY``).
-    Per-employee tokens should be rotated via ``POST /admin/users/{id}/mint``
-    in the admin UI; this endpoint exists ONLY to rotate the operator's
-    break-glass credential without restarting the server.
-
-    Steps
-    -----
-    1. Authentication requires the **admin** role (employees get 403).
-    2. Generate ``secrets.token_hex(32)`` (64 hex chars).
-    3. Persist to .env via ``env_writer.rewrite_env_var`` (atomic, chmod 600).
-    4. Write to ``~/Library/Application Support/WisprAlt/.last-rotation-key``
-       (chmod 600) as a one-time retrieval mechanism.
-    5. Print ``NEW_API_KEY=<key>`` to stdout (captured by launchd log).
-    6. Update the corresponding ``wispralt.users`` row's ``token_hash`` so
-       Postgres-path lookups work with the new key.
-    7. Update ``app.state.break_glass_token_hash`` so the in-process
-       break-glass branch matches the new key.
-    8. Invalidate the OLD hash from ``token_cache``.
-    9. Update legacy ``auth._current_key`` for any callers still using it.
-    10. Return ``{"rotated": true}`` — the key is NEVER in the response body.
-    """
-    # C10: env-write + Postgres update + state mutation must be atomic so that
-    # concurrent rotations cannot leave on-disk, Postgres, and in-memory state
-    # out of sync.
-    pool = getattr(request.app.state, "db_pool", None)
-    old_bg_hash = getattr(request.app.state, "break_glass_token_hash", None)
-    with _rotate_lock:
-        new_key = secrets.token_hex(32)
-        new_hash = users_store.hash_token(new_key)
-
-        env_path = find_env_path()
-
-        # 1. Persist to .env atomically (chmod 600 guaranteed by env_writer)
-        try:
-            env_writer.rewrite_env_var(env_path, "WISPRALT_API_KEY", new_key)
-        except OSError as exc:
-            logger.error("Failed to rewrite .env during key rotation: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to persist new key") from exc
-
-        # 2. Write to fallback retrieval file (chmod 600)
-        try:
-            _LAST_ROTATION_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _write_secure_file(_LAST_ROTATION_KEY_PATH, new_key)
-        except OSError as exc:
-            logger.warning("Could not write last-rotation-key file: %s", exc)
-
-        # 3. Emit to stdout (launchd captures → server.log)
-        print(f"NEW_API_KEY={new_key}", flush=True)  # noqa: T201
-
-        # 4. Update the wispralt.users row whose token_hash matches the OLD
-        #    break-glass hash so Postgres-path lookups continue to work.
-        if pool is not None and old_bg_hash is not None:
-            try:
-                await pool.execute(
-                    "UPDATE wispralt.users SET token_hash = $1, revoked_at = NULL "
-                    "WHERE token_hash = $2",
-                    new_hash, old_bg_hash,
-                )
-            except Exception as exc:  # noqa: BLE001 — typed-recovery path: log and degrade
-                logger.exception("Failed to update wispralt.users row during rotation: %s", exc)
-                # Continue: the env file is already rewritten. The break-glass
-                # path below will still grant admin until the operator can
-                # reconcile manually.
-
-        # 5. Update break-glass hash so auth.require_api_key matches the new key.
-        request.app.state.break_glass_token_hash = new_hash
-
-        # 6. Invalidate cached entry for the OLD key.
-        if old_bg_hash is not None:
-            auth.token_cache.invalidate(old_bg_hash)
-
-        # 7. Update legacy in-memory key for any callers still using current_key().
-        auth.set_current_key(new_key)
-
-    logger.info("API key rotated successfully at %s", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-
-    return JSONResponse(content={"rotated": True})
-
-
 @router.get(
     "/metrics",
     dependencies=[Depends(require_admin)],
@@ -164,8 +54,7 @@ async def rotate_key(request: Request) -> JSONResponse:
 async def metrics(request: Request) -> JSONResponse:
     """Return observability snapshot.
 
-    The ``meeting.*`` block reports the file-job runner and the files
-    pipeline (the key name stays ``meeting`` until the portal relabel).
+    The ``file.*`` block reports the file-job runner and the files pipeline.
 
     Fields
     ------
@@ -176,11 +65,11 @@ async def metrics(request: Request) -> JSONResponse:
         (always 0 or 1 in steady state with one worker).
     parakeet.last_inference_at
         ISO-8601 timestamp of the most recent inference, or null.
-    meeting.active
+    file.active
         True if a file job is queued or running.
-    meeting.completed_24h / failed_24h
+    file.completed_24h / failed_24h
         File-job counts from the last 24 hours (JobStore).
-    meeting.current_eta_s
+    file.current_eta_s
         Estimated seconds until the active job completes, or null.
     memory.rss_mb
         Server process RSS in MiB.
@@ -239,7 +128,7 @@ async def metrics(request: Request) -> JSONResponse:
                 "queue_depth": 0,  # Phase 2: wire from executor queue size
                 "last_inference_at": last_inference_at,
             },
-            "meeting": {
+            "file": {
                 "active": file_job_active,
                 "active_job_id": active_job_id,
                 "completed_24h": completed_24h,
@@ -287,6 +176,10 @@ async def metrics(request: Request) -> JSONResponse:
                     observability.streaming_sessions_aborted_total.as_dict()
                 ),
             },
+            "usage_write_failures_total": observability.usage_write_failures_total.value,
+            "dictation_save_failures_total": (
+                observability.dictation_save_failures_total.value
+            ),
             "process_uptime_seconds": round(
                 time.monotonic() - observability.process_started_at_monotonic, 1
             ),
@@ -329,7 +222,6 @@ async def admin_active(request: Request) -> JSONResponse:
         jobs_payload.append({
             "id": job.id,
             "status": job.status,
-            "request_mode": job.request_mode,
             "mode": job.mode,
             "phase": phase,
             "phase_label": phase_label,
@@ -337,7 +229,7 @@ async def admin_active(request: Request) -> JSONResponse:
             "chunk_index": job.chunk_index,
             "total_chunks": job.total_chunks,
             "started_at": job.started_at,
-            "wav_path": job.wav_path,
+            "wav_path": str(job.wav_path),
             "audio_duration_s": job.audio_duration_s,
             "attempts": job.attempts,
             "cancel_requested": bool(job.cancel_requested),
@@ -408,19 +300,3 @@ async def admin_server_log(request: Request, job_id: str) -> PlainTextResponse:
     end = min(len(lines), last + 50 + 1)
     selected = lines[start:end]
     return PlainTextResponse("\n".join(selected) + "\n", media_type="text/plain")
-
-
-def _write_secure_file(path: Path, content: str) -> None:
-    """Write *content* to *path* with mode 0600, atomically.
-
-    Uses os.open with O_CREAT|O_WRONLY|O_TRUNC and explicit chmod so the file
-    is never readable by other users even for the brief moment before chmod.
-    """
-    # Open with restricted permissions from the start (O_CREAT sets umask-masked
-    # mode; we follow up with explicit chmod to guarantee 0600 regardless of umask)
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, content.encode())
-    finally:
-        os.close(fd)
-    os.chmod(path, 0o600)

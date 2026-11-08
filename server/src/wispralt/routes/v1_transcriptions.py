@@ -34,6 +34,7 @@ from wispralt.config import settings
 from wispralt.constants import (
     OPENAI_COMPAT_SIZE_CAP,
     OPENAI_COMPAT_VERSION,
+    OPENAI_KNOWN_MODELS,
 )
 from wispralt.dictate.sync_decode import decode_to_pcm
 from wispralt.dictate.v1_response_builders import (
@@ -42,20 +43,15 @@ from wispralt.dictate.v1_response_builders import (
     build_vtt,
 )
 from wispralt.ratelimit_per_token import rate_limit_v1_per_token
-from wispralt.users.store import User
+from wispralt.accounts.store import User
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
 _ALL_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
-_KNOWN_MODELS = {
-    "whisper-1",
-    "gpt-4o-transcribe",
-    "gpt-4o-mini-transcribe",
-    "gpt-4o-mini-transcribe-2025-12-15",
-    "gpt-4o-mini-transcribe-2025-03-20",
-}
+# The ids /v1/models advertises (one list); any other id is 404 model_not_found.
+_KNOWN_MODELS = frozenset(OPENAI_KNOWN_MODELS)
 # gpt-4o-transcribe-diarize: NOT in _KNOWN_MODELS AND NOT advertised in /v1/models.
 # Requests with this model id return 404 model_not_found (matches OpenAI semantics
 # for a model that doesn't exist on this endpoint).
@@ -151,8 +147,13 @@ async def create_transcription(
         )
 
     if model not in _KNOWN_MODELS:
-        logger.info(
-            "v1.transcriptions.unknown_model model=%r user=%d", model, user.id
+        return _openai_error(
+            request,
+            f"Model '{model}' does not exist on this server. "
+            f"Allowed: {list(OPENAI_KNOWN_MODELS)}.",
+            "invalid_request_error",
+            "model_not_found",
+            404,
         )
 
     if temperature is not None and (temperature < 0.0 or temperature > 1.0):

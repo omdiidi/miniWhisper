@@ -4,11 +4,6 @@ version = "0.1.0"
 description = "WisprAlt — self-hosted dictation and file-transcription server"
 requires-python = ">=3.11,<4.0"
 dependencies = [
-    # ML — dictation
-    "parakeet-mlx==0.5.1",
-    "mlx>=0.22.1,<0.32.0",
-    # ML — file transcription (torch arrives only transitively via mlx-whisper)
-    "mlx-whisper==0.4.2",
     # Web framework
     "fastapi==0.115.0",
     "uvicorn[standard]==0.30.0",
@@ -27,13 +22,21 @@ dependencies = [
     "huggingface_hub>=1.12.0,<1.13",
     # OOM guard (v3 delta)
     "psutil>=6.0",
-    # Postgres (Supabase) — multi-tenant auth + usage events
-    "asyncpg>=0.29,<0.31",
     # Server-rendered admin UI templates
     "jinja2>=3.1,<4",
 ]
 
 [project.optional-dependencies]
+# Apple-Silicon inference stack for the Local-mode host. Install with
+# `uv sync --extra host` (or `pip install -e '.[host]'`). `wispralt.main`
+# imports without it (MLX is imported lazily); CI uses stubs instead.
+host = [
+    # ML — dictation
+    "parakeet-mlx==0.5.1",
+    "mlx>=0.22.1,<0.32.0",
+    # ML — file transcription (torch arrives only transitively via mlx-whisper)
+    "mlx-whisper==0.4.2",
+]
 dev = [
     "ruff==0.6.9",
     "pyright==1.1.380",

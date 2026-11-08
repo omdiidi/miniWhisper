@@ -608,6 +608,6 @@ def assert_same_filesystem(a: Path, b: Path) -> None:
     b.mkdir(parents=True, exist_ok=True)
     if os.stat(a).st_dev != os.stat(b).st_dev:
         raise RuntimeError(
-            f"STAGING_DIR ({a}) and MEETING_OUTPUT_DIR ({b}) must be on the"
+            f"Staging ({a}) and outputs ({b}) must be on the"
             " same filesystem for atomic file renames to be reliable."
         )

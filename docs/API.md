@@ -16,11 +16,12 @@ Most routes require:
 Authorization: Bearer <token>
 ```
 
-The bearer is sha256-hashed and resolved against `wispralt.users` via the asyncpg pool, with a 60-second in-process `TokenCache` in front. See [ARCHITECTURE.md → Auth (multi-token)](ARCHITECTURE.md#auth-multi-token) for the full path.
+The bearer is sha256-hashed and looked up in the local SQLite DB (`api_keys ⋈ users`: key not revoked, user not disabled) on **every** request — there is no cache, so a revoke applies to the next request. See [ARCHITECTURE.md → Auth](ARCHITECTURE.md#auth-local-sqlite-no-cache) for the full path.
 
 **Unauthenticated endpoints** (probe-style + admin login, no API key required):
 - `GET /healthz` — liveness probe
 - `GET /readyz/dictation` — dictation-pipeline readiness probe
+- `GET /readyz/db` — local SQLite DB readiness (`reason`: `db_error` / `schema_outdated`; body carries `usage_write_failures` and `dictation_save_failures`)
 - `GET /admin/login` and `POST /admin/login` — admin UI login form (chicken-and-egg: must be reachable without the cookie it sets)
 - `GET /me/login` and `POST /me/login` — employee portal login form (Phase 2; same chicken-and-egg reason)
 
@@ -31,7 +32,6 @@ These are intentionally open so Kubernetes-style probes, Cloudflare health check
 - `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/models/{id}` (OpenAI-compatible drop-in surface — see [OPENAI-COMPAT.md](OPENAI-COMPAT.md))
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
-- `GET /me/dictations/last` (v0.5.0 — caller's most recent non-deleted dictation; powers the "Copy last dictation" menubar button)
 - `GET /metrics`
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
 - `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
@@ -56,7 +56,7 @@ storage + 90-day retention sweep details.
 - A missing or invalid token returns **401**.
 - An empty token after the `Bearer ` prefix returns **401**.
 - Multiple `Authorization` headers in one request return **400** `"Multiple Authorization headers not allowed"`.
-- When Postgres is unreachable AND the bearer doesn't match the break-glass env-var hash, the server returns **503** `"Auth temporarily unavailable"` rather than 401, so the operator can distinguish "wrong key" from "DB down".
+- When the auth lookup itself fails (`sqlite3.Error`), the server returns **503** `"Auth temporarily unavailable"` rather than 401, so the operator can distinguish "wrong key" from "DB down". There is no fallback admin.
 
 ---
 
@@ -116,7 +116,7 @@ Readiness probe for the dictation (Parakeet) endpoint.
 
 ---
 
-There is no readiness probe for file transcription: the file model (MLX Whisper) loads lazily on the first file job and is evicted when idle, so it is normally cold. `GET /metrics` → `meeting.models_warm` reports its current state. (The meeting readiness probe was removed with the meeting pipeline and now returns 404.)
+There is no readiness probe for file transcription: the file model (MLX Whisper) loads lazily on the first file job and is evicted when idle, so it is normally cold. `GET /metrics` → `file.models_warm` reports its current state. (The meeting readiness probe was removed with the meeting pipeline and now returns 404.)
 
 ---
 
@@ -136,12 +136,17 @@ Transcribe a short audio clip using the warm Parakeet model.
 
 | Header | Values | Default | Notes |
 |---|---|---|---|
-| `X-Smart-Format` | `true` / `1` / `yes` (case-insensitive) | absent ⇒ off | When set to a truthy value AND the server has `SMART_FORMAT_ENABLED=true` (default off) AND `OPENROUTER_API_KEY` configured AND `app.state.mercury_client` is initialized AND the raw transcript is at or above `SMART_FORMAT_MIN_WORDS` (default 80), the transcript is post-processed by OpenRouter Mercury 2: punctuation, casing, paragraph breaks, light filler removal ("um"/"uh"/repeats), and bullet-list formatting where the speaker is enumerating. Meaning is preserved (no rephrasing, no summarization, no new content). A length-window safety check (cleaned ∈ [0.7×, 1.10×] of raw word count) falls back to raw on suspicious output. Fail-soft: any timeout or error returns the raw text and `smart_formatted: false`. WisprAlt-specific extension; not part of OpenAI compatibility. Since Part 3 the native macOS client never sets this header (Mercury runs in the client); the server still honors it until Part 4 removes server Mercury. The `/v1/audio/transcriptions` shim never sets it. |
-| `X-Client-Dedup-Id` | UUID v4 string | absent ⇒ off | **Optional, additive (Phase 5b streaming-dictation).** When present, must be a syntactically valid UUID v4. Forwarded to `JobStore.insert_dictation(..., client_dedup_id=...)`; the row participates in the `idx_dictations_client_dedup` partial-unique index, so a subsequent retry that sends the same UUID is silently de-duped (`ON CONFLICT(client_dedup_id) DO NOTHING`). Used by the safety-buffer fallback in `DictationStreamSession` to guarantee at most one persisted row per utterance when a streaming finalize loses to its local fallback. When the header is **absent**, behavior is bit-identical to the pre-streaming contract: the column is left NULL and the partial-unique index never applies. Malformed UUIDs are rejected at the validation boundary (422). |
+| `X-Smart-Format` | — | — | **Removed (Part 4).** Server smart formatting (OpenRouter Mercury) is gone; the header is ignored and the raw transcript is always returned. Any formatting now happens in the client. |
+| `X-Client-Dedup-Id` | UUID string | absent ⇒ no dedup | Optional here (required on the stream routes). RFC-4122 shape, lowercased on read; malformed → 422. Names one dictation: the server claims the id for the whole request (concurrent requests with the same id, from any user, run inference once), replays a stored dictation without inference, and stores at most one `dictations` row per id. Absent ⇒ no claim, no replay, the row is stored with a NULL id. See [Client dedup contract](#client-dedup-contract). |
 
 #### Client dedup contract
 
-The macOS client (Core `LocalRequests`) sends `X-Client-Dedup-Id: <dictation id>` (lowercase UUID v4) on every Local dictation request: whole-file, every stream chunk, and finalize (which also carries the `client_dedup_id` field with the same value). It reads `"saved": true|false` from a 200 (absent ⇒ true): on `false` the text is delivered and the audio is kept. It treats 410 `{"error":"dictation_deleted"}` and 409 `{"error":"dedup_conflict"}` as terminal for that dictation (no fallback, no retry); a 409/410 without an `error` key is handled as today. The server side of `saved`, 409 and 410 lands in Part 4.
+Pinned in Part 4 (server `dedup.py`, Locked Decision 7); the macOS client (Core `LocalRequests`) implements it.
+
+1. Every Local dictation request (whole-file, every stream chunk, finalize, Retry) sends `X-Client-Dedup-Id: <dictation id>` (lowercase UUID). Finalize may also send the `client_dedup_id` form field; header and field present and unequal → 422.
+2. Every 200 dictation response carries `"saved": true|false` and `"replayed": true|false`. `"saved": false` means the server returned the text but could not store it (a `sqlite3.Error`; `dictation_save_failures_total` +1): the client delivers the text **and keeps the audio and its Retry entry**; a later Retry with the same id transcribes and saves again.
+3. `409 {"error":"dedup_conflict"}` (the id belongs to another user) and `410 {"error":"dictation_deleted"}` (the owner deleted that dictation; re-running would resurrect it) are **terminal**: no inference, no row; the client discards the entry. A 409/410 without an `error` key (e.g. `{"detail":"Session is aborted"}` from a stream route) is not terminal.
+4. `"replayed": true` means the stored text was returned without new inference (`duration_ms` is 0). A replay writes no `usage_events` row.
 
 **Audio format flexibility (server-side resampling):**
 
@@ -161,18 +166,13 @@ The macOS client (Core `LocalRequests`) sends `X-Client-Dedup-Id: <dictation id>
   "text": "Hello world.",
   "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
   "duration_ms": 143.7,
-  "smart_formatted": false
+  "replayed": false,
+  "saved": true
 }
 ```
 
-`duration_ms` is wall-clock Parakeet inference time (excludes queue wait).
-`smart_formatted` is `true` only when `X-Smart-Format` was truthy AND the raw
-transcript was at or above `SMART_FORMAT_MIN_WORDS` (default 80) AND the
-Mercury cleanup actually replaced the text (OpenRouter responded within the
-1500 ms budget, output passed the length-window safety check, no errors).
-It's `false` for every other case, including header absent, header non-truthy,
-raw word count below the threshold, server missing `OPENROUTER_API_KEY`,
-Mercury timeout, length-window safety check failed, or Mercury HTTP error.
+`duration_ms` is wall-clock Parakeet inference time (excludes queue wait). The row is saved synchronously before the response; blank text is not stored and reports `"saved": true` (nothing to keep).
+The `smart_formatted` key was removed in Part 4 along with server smart formatting.
 
 **Errors:**
 
@@ -180,15 +180,17 @@ Mercury timeout, length-window safety check failed, or Mercury HTTP error.
 |---|---|
 | 401 | Missing or invalid bearer token |
 | 413 | Upload size exceeds `MAX_UPLOAD_BYTES` |
+| 409 | `{"error":"dedup_conflict"}` — the dedup id is another user's (terminal) |
+| 410 | `{"error":"dictation_deleted"}` — the owner deleted that dictation (terminal) |
 | 415 | `Content-Type` is not `audio/*` |
-| 422 | Audio bytes cannot be decoded (corrupt file). Includes `LibsndfileError` and `RuntimeError` raised by `soundfile.read` — the decode boundary in `parakeet.py:_sync_transcribe` converts both to `CorruptAudioError` and the route handler maps them to 422. Regression-locked by `server/tests/test_dictate_corrupt_audio.py`. |
+| 422 | Malformed `X-Client-Dedup-Id`, or audio bytes cannot be decoded (corrupt file). Includes `LibsndfileError` and `RuntimeError` raised by `soundfile.read` — the decode boundary in `parakeet.py:_sync_transcribe` converts both to `CorruptAudioError` and the route handler maps them to 422. Regression-locked by `server/tests/test_dictate_corrupt_audio.py`. |
 | 429 | Rate limit exceeded (60 req/min) — includes `Retry-After: 60` header |
 
 ---
 
 ### `POST /transcribe/dictate/stream/{session_id}/chunk/{index}`
 
-**Auth:** Bearer required. **Break-glass / single-key admin callers are rejected (403)** — streaming dictation requires a real `api_key_id` for per-user session bookkeeping. **Opt-in, experimental** — see [ARCHITECTURE.md → Streaming dictation](ARCHITECTURE.md#streaming-dictation-opt-in-experimental) for the end-to-end design.
+**Auth:** Bearer required. Sessions are owned by the authenticated user. **Opt-in, experimental** — see [ARCHITECTURE.md → Streaming dictation](ARCHITECTURE.md#streaming-dictation-opt-in-experimental) for the end-to-end design.
 
 Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session. The first chunk for a given `session_id` opens a server-side `StreamingSession`; subsequent chunks reuse it. Chunks run on the same single-instance Parakeet executor as `/transcribe/dictate` — no second model is loaded.
 
@@ -199,13 +201,15 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 | `session_id` | UUID v4 string | Client-generated. Syntactically validated (422 on malformed). The same `session_id` is reused for every chunk + the finalize call. |
 | `index` | integer ≥ 0 | Zero-based monotonic chunk index. Out-of-order arrival is tolerated server-side (first arrival wins the slot via `partial_texts[index]`). |
 
-**Request:** `multipart/form-data` with a single `file` field; `Content-Type: audio/wav` (or `audio/*`).
+**Request:** `multipart/form-data` with a single `file` field; `Content-Type: audio/wav` (or `audio/*`). Header `X-Client-Dedup-Id` is **required** (422 if absent or malformed); the session records it when it opens.
 
 **Response 202:**
 
 ```json
 { "received_index": 0, "queue_depth": 1 }
 ```
+
+If a dictation with this dedup id is already stored for the caller, the chunk is not processed and no session is opened: `202 {"received_index": N, "queue_depth": 0, "finalized": true}`.
 
 `queue_depth` is the count of currently-pending Parakeet tasks for this session (≥1 because the just-ingested chunk is counted). The route returns as soon as the chunk is enqueued — actual Parakeet work runs asynchronously and lands in `partial_texts` when complete.
 
@@ -214,12 +218,12 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer token. |
-| 403 | Break-glass admin caller, OR the bearer resolves to an `api_key_id` that does not match the session's owner (recorded at first-chunk open). |
-| 409 | `per_user_busy` — this `api_key_id` already owns a different active session. Either reuse its `session_id` or wait for it to finalize/expire. |
-| 410 | Session is no longer active (status ∈ {finalizing, done, aborted, expired}). The client should fall back to single-shot `/transcribe/dictate` with the safety-buffer WAV. |
+| 403 | The bearer resolves to a user who is not the session's owner (recorded at first-chunk open). |
+| 409 | `per_user_busy` — this user already owns a different active session. Either reuse its `session_id` or wait for it to finalize/expire. Also: the session was opened under a different dedup id (`{"detail": …}`), or `{"error":"dedup_conflict"}` (the id is another user's). |
+| 410 | `{"error":"dictation_deleted"}` for a deleted stored id; otherwise (`{"detail": …}`) session is no longer active (status ∈ {finalizing, done, aborted, expired}). The client should fall back to single-shot `/transcribe/dictate` with the safety-buffer WAV. |
 | 413 | Cumulative voiced audio for this session exceeds the 270 s mid-chunk ceiling. (Finalize allows up to 300 s.) |
 | 415 | `Content-Type` is not `audio/*`. |
-| 422 | `session_id` is not a valid UUID v4 OR audio bytes cannot be decoded. |
+| 422 | `session_id` is not a valid UUID, `X-Client-Dedup-Id` missing or malformed, OR audio bytes cannot be decoded. |
 | 429 | Per-session pending-task queue depth exceeded (defends against runaway clients). |
 | 503 | `capacity_exceeded` — the global 2-session cap is already saturated. Retry after the other sessions drain, or fall back to single-shot. |
 
@@ -229,7 +233,7 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 
 **Auth:** Bearer required; same per-user-owner gate as `/chunk`. **Opt-in, experimental.**
 
-Close out a streaming session. The server waits up to 15 s for all pending chunk tasks to drain, joins their texts in index order, runs Mercury cleanup ONCE on the joined string (same `SMART_FORMAT_MIN_WORDS` threshold + length-window safety rail as the single-shot path), persists the row to `dictations`, and returns the final text. The chunked-receive route stops accepting new chunks for this `session_id` (returns 410) the moment finalize starts.
+Close out a streaming session. The dedup id is claimed first and a stored dictation is replayed **before** the session lookup, so a Retry after the session expired still gets its text (`"replayed": true`). Otherwise the server waits up to 15 s for all pending chunk tasks to drain, joins their texts in index order, persists the row to `dictations`, and returns the final text. The chunked-receive route stops accepting new chunks for this `session_id` (returns 410) the moment finalize starts.
 
 **Path params:** `session_id` (UUID v4) — same as `/chunk`.
 
@@ -238,8 +242,8 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `file` | UploadFile | Yes | The tail WAV — the trailing speech segment that was still being accumulated when FN was released. `Content-Type: audio/*`. May be empty (zero-byte) if the speaker happened to finish exactly on a silence cut. |
-| `smart_format` | boolean | No | Default `false`. Equivalent to the `X-Smart-Format` header on `/transcribe/dictate`; routed through the same Mercury client. The macOS client stopped sending it in Part 3 (client-side Mercury). |
-| `client_dedup_id` | UUID v4 | Yes | The same UUID the client will reuse on the safety-buffer fallback if this finalize loses. Persisted to `dictations.client_dedup_id`; combined with the `idx_dictations_client_dedup` partial-unique index, guarantees one row per utterance. |
+| `smart_format` | — | — | **Removed (Part 4).** Ignored if an older client still sends it; the text is never post-processed on the server. |
+| `client_dedup_id` | UUID | No | Optional copy of the required `X-Client-Dedup-Id` header (the header wins; both present and unequal → 422). Must equal the id the session opened with (else 409). |
 | `speech_started_at` | float (Unix epoch, sub-second precision) | Yes | The local wall-clock time the *user* began speaking (NOT FN press) — sent so the server can compute end-to-end latency from speech start to text injection without depending on local clock-sync. Sub-second precision is preserved (don't round to int). |
 
 **Response 200:**
@@ -249,7 +253,8 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
   "text": "Hello world.",
   "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
   "duration_ms": 213.4,
-  "smart_formatted": false
+  "replayed": false,
+  "saved": true
 }
 ```
 
@@ -260,12 +265,13 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer token. |
-| 403 | Bearer's `api_key_id` does not match the session's owner. |
+| 403 | The bearer's user is not the session's owner. |
 | 409 | `gap_detected` — `partial_texts` contains a `None` entry between two ingested chunks (a chunk POST landed for index N but index N−1 never arrived). The client should fall back to single-shot. |
-| 410 | Session is not in `status="active"` (already finalizing, done, aborted, or expired). |
+| 409 | Also: the dedup id differs from the session's, or `{"error":"dedup_conflict"}`. |
+| 410 | `{"error":"dictation_deleted"}` (terminal), or `{"detail": …}`: session is not in `status="active"` (already finalizing, done, aborted, or expired). |
 | 413 | Cumulative voiced audio + tail exceeds 300 s. |
 | 415 | Tail `Content-Type` is not `audio/*`. |
-| 422 | `session_id` or `client_dedup_id` is not a valid UUID v4, OR tail audio cannot be decoded. |
+| 422 | `session_id` not a valid UUID; dedup id missing, malformed, or header ≠ form field; OR tail audio cannot be decoded. |
 | 502 | `inference_failed` — Parakeet raised on the tail or on a still-pending chunk during the 15 s drain. |
 | 504 | `timeout` — pending chunks did not drain inside 15 s. Session marked `aborted`; client safety-buffer fallback kicks in. |
 
@@ -302,9 +308,8 @@ canonical reference: **[OPENAI-COMPAT.md](OPENAI-COMPAT.md)**.
 - **CORS** — `Access-Control-Allow-Origin: *` on every `/v1/*`
   response including 429 envelopes, so browser clients see real HTTP
   errors instead of CORS failures.
-- **Smart formatting is never applied on `/v1/*`** — the shim
-  deliberately ignores `X-Smart-Format`. Third-party callers that want
-  cleanup hit `/transcribe/dictate` directly.
+- **No server-side smart formatting** on any route (removed in Part 4);
+  `/v1/*` returns the raw transcript.
 
 Sources: `server/src/wispralt/routes/v1_transcriptions.py`,
 `server/src/wispralt/routes/v1_models.py`.
@@ -342,13 +347,13 @@ Return the calling user's own profile. Each user can only read their own row —
 |---|---|
 | 401 | Missing/invalid bearer |
 | 404 | User row genuinely missing (should not happen for an authed token; indicates DB drift) |
-| 503 | Postgres pool unavailable |
+| 503 | Auth lookup failed (`sqlite3.Error`) |
 
 ---
 
 ### `PATCH /me`
 
-**Auth:** Bearer required (any role).
+**Auth:** Bearer required (any role), or the session cookie **plus** the CSRF token (`X-CSRF-Token` header = `wispralt_csrf` cookie; otherwise 403). A Bearer request needs no CSRF token (the macOS client sends Bearer + JSON).
 
 Update the calling user's own `display_name`. The `label` and `role` are not user-editable; admin must change those via the admin UI.
 
@@ -370,47 +375,17 @@ Update the calling user's own `display_name`. The `label` and `role` are not use
 |---|---|
 | 401 | Missing/invalid bearer |
 | 422 | `display_name` length out of range or contains control chars |
-| 503 | Postgres pool unavailable |
+| 503 | Auth lookup failed (`sqlite3.Error`) |
 
-The token cache is **not** invalidated on `display_name` change because the auth `User` object only carries `(id, label, role)` — `display_name` is fetched fresh from `wispralt.users` each time the client opens its Identity section.
+`display_name` is read fresh from `users` each time (auth never caches the `User`).
 
 Source: `server/src/wispralt/routes/me.py`.
 
 ---
 
-### `GET /me/dictations/last`
+### `GET /me/dictations/last` (removed)
 
-**Auth:** Bearer required (employee or admin token via `Authorization: Bearer <token>`).
-
-Returns the caller's most recent dictation as JSON. Powers the menubar
-"Copy last dictation" button (v0.5.0). Since Part 3 the macOS client no longer calls it (the button reads the client's own `last.json`); the route stays for other clients. The row is filtered by
-`deleted_at IS NULL` so a soft-deleted dictation is not returned; tie-break
-on identical `created_at` is `id DESC`.
-
-**Response 200** (`application/json`):
-
-```json
-{ "id": "4217", "text": "<dictation transcript>", "created_at": 1747700123.456 }
-```
-
-| Field | Type | Notes |
-|---|---|---|
-| `id` | string | The `dictations.id` row id, `CAST(id AS TEXT)` server-side so the value decodes cleanly into the Swift `LastDictationResponse.id: String` shape. |
-| `text` | string | Raw transcript text (no smart-format reapplication). |
-| `created_at` | number | Epoch seconds (float). |
-
-**Errors:**
-
-| Code | Condition |
-|---|---|
-| 401 | Missing / invalid bearer. |
-| 403 | Caller is the break-glass admin (`user.id < 0`) — break-glass identities have no personal dictation history. |
-| 404 | Caller has zero non-deleted dictations. |
-| 503 | SQLite job store transiently unavailable. |
-
-Source: `server/src/wispralt/routes/me.py` +
-`JobStore.get_most_recent_dictation(api_key_id)` in
-`server/src/wispralt/jobs/store.py`.
+Removed in Part 4 with `JobStore.get_most_recent_dictation`: since Part 3 the macOS client's "Copy last dictation" reads its own `last.json`. The route now returns 404.
 
 ---
 
@@ -428,23 +403,22 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 **Auth:** None required (this endpoint is what produces the auth cookie).
 
-Validate a pasted token and set the session cookie. Mirrors `POST /admin/login` but rejects break-glass admin tokens at this surface so the break-glass identity stays scoped to emergency admin use.
+Validate a pasted token and set the session cookie. Mirrors `POST /admin/login`.
 
 **Request:** `application/x-www-form-urlencoded`
 
 | Field | Type | Notes |
 |---|---|---|
-| `token` | string | 64-char hex bearer token. Validated through the same 3-stage lookup as admin login: `TokenCache` → asyncpg `wispralt.users` → break-glass env-var hash. |
+| `token` | string | 64-char hex bearer token. Validated with the same lookup as every request (`auth.resolve_token`). |
 
-**Response 303** — token valid (non-break-glass). Redirects to `/me/insights` by default, or to the value of the optional `?next=` query parameter when it's a **relative path under `/me/*`** (open-redirect guard — absolute URLs, scheme-prefixed values, and paths outside `/me/*` are silently ignored and the redirect falls back to `/me/insights`). The menubar "Open My Dictations" button (v0.5.0) uses `?next=/me/history` so first-time employees land directly on their history page after token-paste. Sets `wispralt_admin_token` cookie with `path="/"`, `HttpOnly`, `Secure`, `SameSite=Strict`, `max-age=8h`. The `path="/"` scoping lets the same cookie cover both `/admin/*` and `/me/*` surfaces; admin login was simultaneously broadened to set the cookie with `path="/"` as well.
+**Response 303** — token valid. Redirects to `/me/insights` by default, or to the value of the optional `?next=` query parameter when it's a **relative path under `/me/*`** (open-redirect guard — absolute URLs, scheme-prefixed values, and paths outside `/me/*` are silently ignored and the redirect falls back to `/me/insights`). The menubar "Open My Dictations" button (v0.5.0) uses `?next=/me/history` so first-time employees land directly on their history page after token-paste. Sets `wispralt_admin_token` cookie with `path="/"`, `HttpOnly`, `Secure`, `SameSite=Strict`, `max-age=8h`. The `path="/"` scoping lets the same cookie cover both `/admin/*` and `/me/*` surfaces; admin login was simultaneously broadened to set the cookie with `path="/"` as well.
 
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Invalid / revoked token — re-renders `me_login.html.j2` with an error message. |
-| 403 | Token resolved to the break-glass admin identity — rejected at this surface with an explanatory error. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 See [ARCHITECTURE.md → Data portal](ARCHITECTURE.md#data-portal) for the rationale behind sharing the cookie between admin + employee surfaces.
 
@@ -454,7 +428,7 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 ### `GET /me/insights`
 
-**Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
+**Auth:** Bearer or session cookie (any role; integration keys get 403).
 
 Per-employee weekly insights page. Returns the most recent `weekly_insights` row with `scope='person'` for the calling user, plus a time-range stats grid (transcript volume, word count, dictation/file-transcription split) for the selected window.
 
@@ -468,15 +442,13 @@ Per-employee weekly insights page. Returns the most recent `weekly_insights` row
 
 **Response 200 (HTMX partial)** — when the request carries `HX-Request: true`, the handler returns only the `_stats_grid_partial.html.j2` fragment for in-place swap. Use this for time-range tab clicks; the full page is only needed on first navigation.
 
-**Response 303** — caller is break-glass admin (`user.id < 0`). Redirects to `/admin/data` because break-glass identities have no per-user transcript history to summarize.
-
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer. |
 | 422 | `range` is not one of the accepted values. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 The hallucination disclaimer ("AI-generated, may be inaccurate") is rendered inline on each insight card — see [ARCHITECTURE.md → Weekly insights](ARCHITECTURE.md#weekly-insights) for the two-tier scrub policy that backs it.
 
@@ -486,16 +458,16 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 ### `GET /me/history`
 
-**Auth:** Bearer required (any role, but break-glass admin is 303'd to `/admin/data`).
+**Auth:** Bearer or session cookie (any role; integration keys get 403).
 
-Personal transcript archive — the calling user's own dictations + file transcriptions (including legacy meeting rows) in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `api_key_id` AND `deleted_at IS NULL`).
+Personal transcript archive — the calling user's own dictations + file transcriptions in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `user_id` AND `deleted_at IS NULL`).
 
 **Query parameters:**
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `range` | enum | `30d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all`. Reuses `insights.timewindow.epoch_for_range`. |
-| `kind` | enum \| empty | unset | Either `dictation` or `meeting`. `meeting` is the stored value for every job row (file jobs included) and is **displayed** as "File transcriptions"; the value is migrated in a later schema pass. Empty string from a `<select>` is normalized to "no filter". |
+| `kind` | enum \| empty | unset | Either `dictation` or `file` (displayed as "File transcriptions"). Empty string from a `<select>` is normalized to "no filter". The row routes `/me/history/{kind}/{row_id}` take the same two kinds; `meeting` (pre-Part 4) now 404s. |
 | `search` | string | unset | Free-text LIKE filter on the transcript body. Strings shorter than **3 chars after `.strip()`** are silently dropped to keep the scan bounded. |
 | `dict_cursor` | opaque | unset | Base64-urlsafe encoded `(created_at, row_id)` tuple for the dictations leg. Malformed → silently restart pagination. |
 | `jobs_cursor` | opaque | unset | Same shape, for the jobs (file transcription) leg. |
@@ -506,15 +478,13 @@ Personal transcript archive — the calling user's own dictations + file transcr
 
 **Response 200 (HTMX Load-more)** — when a cursor was sent, returns `_me_history_page.html.j2` (the next batch of `<tr>` rows + the updated Load-more button). Page size is `settings.history_page_size` (default **50**) per leg.
 
-**Response 303** — caller is break-glass admin (`user.id < 0`). Redirects to `/admin/data`.
-
 **Errors:**
 
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer. |
 | 422 | `range` is not one of the accepted values. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 Source: `server/src/wispralt/routes/me.py` (Plan A).
 
@@ -530,8 +500,8 @@ Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `
 
 | Field | Type | Notes |
 |---|---|---|
-| `kind` | enum | `dictation` or `meeting` (the stored value for job rows; shown as "File transcription"). Anything else → 404. |
-| `row_id` | string | Job UUID for `meeting`, integer row id for `dictation`. |
+| `kind` | enum | `dictation` or `file` (shown as "File transcription"). Anything else (incl. the pre-Part 4 `meeting`) → 404. |
+| `row_id` | string | Job UUID for `file`, integer row id for `dictation`. |
 
 **Query parameters:**
 
@@ -554,7 +524,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ### `DELETE /me/history/{kind}/{row_id}`
 
-**Auth:** Bearer required + CSRF token. Ownership-checked.
+**Auth:** Session cookie + CSRF token, or a Bearer token (no CSRF token needed). Ownership-checked.
 
 Soft-delete one owned row. Flips `deleted_at = NOW()` on the underlying row; downstream read paths (`/me/history`, `compute_user_stats`, the weekly-insights cron) all filter `deleted_at IS NULL`, so the row disappears from every surface. Reversible via the `/restore` route below until the 90-day TTL sweep zeros the transcript text.
 
@@ -562,7 +532,7 @@ Soft-delete one owned row. Flips `deleted_at = NOW()` on the underlying row; dow
 
 | Field | Type | Notes |
 |---|---|---|
-| `csrf_token` | string | Double-submit value matched against the cookie set by the prior `GET /me/history*` render. Constant-time compare via `hmac.compare_digest`. |
+| `csrf_token` | string | Double-submit value matched against the cookie set by the prior `GET /me/history*` render (or send it as `X-CSRF-Token`). Constant-time compare via `hmac.compare_digest`. Not needed with a Bearer token. |
 
 **Response 200** — body is the OOB delete fragment `<tr id="row-{kind}-{row_id}" hx-swap-oob="delete"></tr>`. HTMX removes the row from the table without re-fetching the page.
 
@@ -580,7 +550,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ### `POST /me/history/{kind}/{row_id}/restore`
 
-**Auth:** Bearer required + CSRF token. Ownership-checked.
+**Auth:** Session cookie + CSRF token, or a Bearer token (no CSRF token needed). Ownership-checked.
 
 Restore one soft-deleted row by clearing `deleted_at`. Returns the compact row partial (`_me_history_row.html.j2`) so HTMX can drop the row back into the table at its original position.
 
@@ -622,7 +592,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ### `GET /admin/data`
 
-**Auth:** Bearer required + `role='admin'`. Router-level `require_admin` + `_require_db_pool` deps mean employee tokens get 403 and a degraded Postgres pool gets 503 — never an `AttributeError` deeper in the handler.
+**Auth:** Bearer required + `role='admin'`. Handler-level `require_admin`: employee tokens get 403.
 
 Admin Data tab. Renders the team `weekly_insights` row (most recent completed ISO week) on top, plus a per-user leaderboard underneath. `?user_id=N` drills into one employee using the same card layout the employee self-view (`me_insights.html.j2`) renders, so admin and employee see identical surfaces.
 
@@ -643,9 +613,9 @@ Admin Data tab. Renders the team `weekly_insights` row (most recent completed IS
 |---|---|
 | 401 | Missing or invalid bearer. |
 | 403 | Token is valid but role is not `admin`. |
-| 404 | `user_id` was supplied but no such user exists in `wispralt.users`. |
+| 404 | `user_id` was supplied but no such user exists. |
 | 422 | `range` is not one of the accepted values. |
-| 503 | Postgres pool unavailable. |
+| 503 | Auth lookup failed (`sqlite3.Error`). |
 
 Source: `server/src/wispralt/routes/admin_data.py` (Phase 2).
 
@@ -653,11 +623,11 @@ Source: `server/src/wispralt/routes/admin_data.py` (Phase 2).
 
 ### `POST /admin/data/insights/run-now`
 
-**Auth:** Bearer + `wispralt_admin_token` session cookie + `role='admin'`. Router-level `_require_db_pool` + handler-level `require_admin` mean an employee token gets **403** and a degraded Postgres pool gets **503**.
+**Auth:** Bearer + `wispralt_admin_token` session cookie + `role='admin'`. Handler-level `require_admin`: an employee token gets **403**.
 
 Admin-only manual trigger for `insights.cron.run_weekly_insights` against the **current in-progress ISO week**. Fire-and-forget — the handler returns immediately with a tiny HTML body (toast + OOB-swap button fragment) for HTMX to render in place. The spawned task is strong-referenced in `app.state.weekly_insights_manual_tasks` (set of `asyncio.Task`) and removed by a closure-based done-callback that also logs any unhandled exception.
 
-Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip — if a `weekly_insights` row already exists for `(api_key_id, iso_year, iso_week, scope='person')`, the OpenRouter call is skipped. The in-flight lock pre-check is purely UX.
+Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip — if a `weekly_insights` row already exists for `(iso_year, iso_week, scope_key='user:<id>')`, the OpenRouter call is skipped. The in-flight lock pre-check is purely UX.
 
 **Request:** `application/x-www-form-urlencoded`
 
@@ -678,7 +648,7 @@ Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip �
 
 **Response 403** — empty body. Triggered by non-admin role (the standard `require_admin` 403 path; employees never reach this surface via the UI).
 
-**Response 503** — Postgres pool unavailable (`_require_db_pool`).
+**Response 503** — auth lookup failed (`sqlite3.Error`).
 
 **Notes:**
 
@@ -727,7 +697,7 @@ The `code` field is what the macOS client branches on (`file_job_busy` → "prev
 
 ### `GET /transcribe/file/{job_id}`
 
-**Auth:** Bearer required. The caller sees a job only if it owns it (`job.api_key_id == user.id`) or is an admin; legacy jobs with no owner are admin-only. Anything else is **404**, exactly like a missing job, so existence never leaks.
+**Auth:** Bearer required. The caller sees a job only if it owns it (`job.user_id == user.id`) or is an admin. Anything else is **404**, exactly like a missing job, so existence never leaks.
 
 Poll job status. The client polls every few seconds.
 
@@ -737,7 +707,6 @@ Poll job status. The client polls every few seconds.
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "done",
   "mode": "single",
-  "request_mode": "file",
   "formats": ["json", "srt", "txt", "vtt"],
   "outputs": {
     "json": "/transcribe/file/550e8400-e29b-41d4-a716-446655440000/download/json",
@@ -751,7 +720,7 @@ Poll job status. The client polls every few seconds.
 | Field | Present when |
 |---|---|
 | `status` | Always. Values: `pending`, `running`, `done`, `failed`. |
-| `mode` / `request_mode` | When recorded on the row. Current jobs are `single` / `file`. |
+| `mode` | When recorded on the row (`single`). `request_mode` was removed in Part 4 (the client never read it). |
 | `error` | When `status == "failed"`. A cancelled job reads `cancelled by user`. |
 | `progress` | When `status == "running"`: `phase`, `phase_label`, `chunk_index`, `total_chunks`, optional `phase_elapsed_s`, `audio_duration_s`. |
 | `serverFinishing` | `true` when `status == "running"` and a cancel was requested: the Whisper call is still running and its result will be discarded. |
@@ -795,17 +764,18 @@ Stream a completed output file.
 
 **Auth:** Bearer required. Same ownership rule as the poll route.
 
-Cancel a pending or running job, or remove a finished one. The client calls it to cancel, and after it has downloaded all four formats.
+Cancel a pending or running job, or remove a finished job's output files. The client calls it to cancel, and after it has downloaded all four formats.
 
 | Job state | Response | Effect |
 |---|---|---|
 | Missing, or owned by someone else | **204** | Nothing (idempotent; no existence leak). |
-| `pending` or `running` | **202** | Cancel is requested. The status is then re-read: if the job finished in the meantime, its outputs and row are removed and the response is **204** instead. |
-| `done` or `failed` | **204** | Outputs (`{job_id}.{json,srt,vtt,txt}`) and the row are removed. |
-| `done` or `failed`, but an output file could not be removed | **500** `{"error"}` | The row is kept so a retried `DELETE` or the retention sweep can finish the cleanup. |
+| `pending` or `running`, or `failed` by the watchdog while the runner is still executing it | **202** | Cancel is requested. The status is then re-read: if the job finished in the meantime (and the runner no longer executes it), its outputs are removed and the response is **204** instead. |
+| `done` or `failed` | **204** | Outputs (`{job_id}.{json,srt,vtt,txt}`) are removed and `outputs_removed_at` is set. The row and its transcript text **stay** for `/me/history` and retention; on `/transcribe/file/*` the job is then invisible (poll and download 404, a repeat `DELETE` 204). |
+| `done` or `failed`, but an output file could not be removed | **500** `{"error"}` | The job stays visible so a retried `DELETE` or the retention purge can finish the cleanup. |
 
 **What a 202 means:**
 
+- A cancel that lands while the file is being decoded stops the job right after the decode, before the file model loads (`failed: cancelled by user`). A requested cancel also wins over a phase timeout or watchdog failure: the job reads `cancelled by user`.
 - A **pending** job never starts: the runner's conditional `set_running` refuses a cancelled row, deletes the staged source and marks the job `failed: cancelled by user`.
 - A **running** job cannot be interrupted mid-transcribe. Whisper transcribes the whole file in one call, so the job keeps the model and the single job slot until that call returns. Only then is the result discarded: `set_done` refuses a cancelled row, the outputs are removed, the job ends `failed: cancelled by user` and `transcript_text` stays NULL. A new submission during that window gets 429 `code=file_job_busy`.
 
@@ -843,7 +813,7 @@ Open a chunked upload to bypass Cloudflare's 100 MB request-body cap on free / p
 
 `upload_id` is a `secrets.token_urlsafe(16)` value (22 URL-safe chars). The server records the caller's API-key user id in the upload's metadata; subsequent chunk + finalize calls MUST present a bearer token resolving to the same user id (403 otherwise). Break-glass / single-key clients cannot use chunked upload — they must fall back to single-shot `POST /transcribe/file`.
 
-**Errors:** 403 (anonymous / break-glass caller), 413 (`total_bytes` over limit), 415 (extension), 422 (`chunk_count` out of range), 503 (RAM <4 GiB), 507 (disk).
+**Errors:** 401 (unauthenticated), 413 (`total_bytes` over limit), 415 (extension), 422 (`chunk_count` out of range), 503 (RAM <4 GiB), 507 (disk).
 
 ---
 
@@ -880,33 +850,15 @@ Verify all chunks are present, concatenate them into the staging dir, and hand t
 
 From this point the client polls `GET /transcribe/file/{job_id}` exactly as it would for a single-shot `/transcribe/file` upload.
 
-**Errors:** 403 (ownership), 404 (upload not found), 409 (missing chunks or size mismatch), 429 (same body and `code` as `POST /transcribe/file`; the assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
+**Errors:** 403 (ownership), 404 (upload not found), 409 (a chunk index in `0…chunk_count-1` is missing — the detail names it, e.g. `Missing chunk 1 of 3`; only `chunk-NNNN.part` files with those exact names count — or a size mismatch), 429 (same body and `code` as `POST /transcribe/file`; the assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
 
 **Stale-upload TTL:** chunked staging directories whose `meta.json` mtime is older than 1 h are reaped at server startup (and on demand by `ops.staging.sweep_chunked`). Each successful chunk write touches `meta.json` so actively-progressing uploads are never reaped.
 
 ---
 
-### `POST /admin/rotate-key`
+### `POST /admin/rotate-key` (removed)
 
-**Auth:** Bearer required (current key — this invalidates immediately on success).
-
-Rotate the API key. No server restart required.
-
-**Response 200:**
-```json
-{ "rotated": true }
-```
-
-The new key is **not** in the response body. It is emitted to stdout (captured by launchd to `~/Library/Logs/WisprAlt/server.log`) as `NEW_API_KEY=<key>` and written to `~/Library/Application Support/WisprAlt/.last-rotation-key` (mode 0600).
-
-Steps performed (see `routes/admin.py:rotate_key`):
-1. Generate `secrets.token_hex(32)` (64 hex chars).
-2. Atomically rewrite `server/.env` via `env_writer.rewrite_env_var` (tempfile-in-same-dir + `os.replace`, mode 0600 preserved).
-3. Write to `.last-rotation-key` (mode 0600, using `os.O_CREAT | os.O_WRONLY | os.O_TRUNC`).
-4. Print `NEW_API_KEY=<key>` to stdout.
-5. Call `auth.set_current_key(new_key)` — hot-swaps the in-memory key.
-
-**Errors:** 500 if `.env` rewrite fails.
+Removed in Part 4 with the env admin key. The first admin comes from `python -m wispralt.bootstrap --label NAME`; a lost admin key is replaced with `python -m wispralt.bootstrap --rotate-admin` (both run from `server/` in a terminal and print the token once). Employee and integration keys are rotated from the admin UI (`/admin/users/{id}/mint`, `/admin/keys/{id}/rotate`).
 
 ---
 
@@ -925,7 +877,7 @@ Structured server observability snapshot.
     "queue_depth": 0,
     "last_inference_at": "2026-04-24T15:43:01Z"
   },
-  "meeting": {
+  "file": {
     "active": false,
     "active_job_id": null,
     "completed_24h": 3,
@@ -953,6 +905,8 @@ Structured server observability snapshot.
     "transcribe/dictate": {"p50": 143.0, "p95": 198.5, "p99": 240.1},
     "transcribe/file": {"p50": null, "p95": null, "p99": null}
   },
+  "usage_write_failures_total": 0,
+  "dictation_save_failures_total": 0,
   "process_uptime_seconds": 3712.4
 }
 ```
@@ -962,15 +916,15 @@ Structured server observability snapshot.
 | `parakeet.p50_ms` / `p95_ms` | Percentiles of the last 100 Parakeet inference calls |
 | `parakeet.queue_depth` | Requests currently waiting for the single-thread executor |
 | `parakeet.last_inference_at` | ISO-8601 timestamp of most recent inference, or `null` |
-| `meeting.*` | The **file-job** block. The `meeting` key name is kept from the meeting era until a later schema pass. |
-| `meeting.active` | `true` while a file job is queued or running |
-| `meeting.active_job_id` | UUID of the currently running job, or `null` |
-| `meeting.completed_24h` / `failed_24h` | Job counts from the last 24 hours |
-| `meeting.current_eta_s` | Estimated seconds until active job completes, or `null` |
-| `meeting.models_warm` | `true` iff the file model (MLX Whisper) is resident. It loads lazily on the first file job and is evicted when idle. |
-| `meeting.models_loading` | `true` iff a lazy load is currently in flight. |
-| `meeting.idle_seconds` / `idle_eviction_threshold_s` | Seconds since the file model was last used, and the eviction threshold (`FILE_MODEL_IDLE_EVICTION_SECONDS`). |
-| `meeting.eviction_failures_total` | Count of eviction self-checks that found memory not returned. |
+| `file.*` | The **file-job** block (renamed from `meeting` in Part 4). |
+| `file.active` | `true` while a file job is queued or running |
+| `file.active_job_id` | UUID of the currently running job, or `null` |
+| `file.completed_24h` / `failed_24h` | Job counts from the last 24 hours |
+| `file.current_eta_s` | Estimated seconds until active job completes, or `null` |
+| `file.models_warm` | `true` iff the file model (MLX Whisper) is resident. It loads lazily on the first file job and is evicted when idle. |
+| `file.models_loading` | `true` iff a lazy load is currently in flight. |
+| `file.idle_seconds` / `idle_eviction_threshold_s` | Seconds since the file model was last used, and the eviction threshold (`FILE_MODEL_IDLE_EVICTION_SECONDS`). |
+| `file.eviction_failures_total` | Count of eviction self-checks that found memory not returned. |
 | `memory.rss_mb` | Server process RSS in MiB. **Does NOT include MLX/Metal allocations** on Apple Silicon — unified memory is tracked by Metal separately. Use `mlx_active_mb` + `mlx_cache_mb` to close the gap with what Activity Monitor's "Memory" column reports. |
 | `memory.available_mb` | System available RAM in MiB |
 | `memory.mlx_active_mb` | Bytes currently held by live MLX tensors (Parakeet weights ≈ 1218 MB warm, 0 if model not loaded). Returns 0 if MLX isn't initialized or the API is missing. |
@@ -980,13 +934,15 @@ Structured server observability snapshot.
 | `requests_total` | Request counts keyed by `"route:status"` (last process lifetime) |
 | `errors_total` | Error counts keyed by `"route:status"` for 4xx/5xx responses |
 | `latencies` | Per-route p50/p95/p99 latency in ms; `null` if fewer than 2 observations. **Recent-window only**: percentiles include only observations from the last 5 minutes (`LatencyHistogram._RECENT_WINDOW_S`). This protects p50 from being poisoned by a single old outlier (e.g. a hung 197-second upload). The full deque (last 1000 entries, all-time) remains queryable via `LatencyHistogram.percentiles(route, recent_only=False)` for callers that need the legacy view. Regression-locked by `server/tests/test_observability_time_window.py`. |
+| `usage_write_failures_total` | Usage rows lost because `UsageStore.record` raised `sqlite3.Error` (usage is best-effort; the request itself succeeded). Resets on restart. Also in the `/readyz/db` body as `usage_write_failures`. |
+| `dictation_save_failures_total` | Dictations whose text was returned but whose row could not be saved (`sqlite3.Error`; the response said `"saved": false`). Resets on restart. Also in the `/readyz/db` body as `dictation_save_failures`. |
 | `process_uptime_seconds` | Wall time since the FastAPI lifespan started (`time.monotonic() - observability.process_started_at_monotonic`). Useful as a deploy/restart sentinel: `< 60` immediately after `bash scripts/server-launchd.sh restart`. |
 
 ---
 
 ## Admin API
 
-The `/admin/*` routes (other than `/admin/rotate-key` and `/admin/login`) render **HTML** via Jinja2 templates, not JSON. They are intended for browser navigation; curl/Postman work too but you'll get markup back.
+The `/admin/*` routes (other than `/admin/login`, `/admin/active`, `/admin/server-log` and `/metrics`) render **HTML** via Jinja2 templates, not JSON. They are intended for browser navigation; curl/Postman work too but you'll get markup back.
 
 Source: `server/src/wispralt/routes/admin_ui.py` +
 `server/src/wispralt/admin/templates/*.html.j2`.
@@ -1006,12 +962,12 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 | GET | `/admin/me` | any role | Admin: 303 → `/admin/`. Employee: 200 with that user's `user_detail` page (admin nav hidden). |
 | GET | `/admin/` | admin | Overview dashboard HTML |
 | GET | `/admin/users` | admin | Users-list HTML with per-row Mint/Revoke forms |
-| POST | `/admin/users/{id}/mint` | admin | HTML page showing the new plaintext token **once** |
-| POST | `/admin/users/{id}/revoke` | admin | 303 → `/admin/users` (revokes + invalidates cache by hash) |
+| POST | `/admin/users/{id}/mint` | admin | Revokes the user's keys, issues one new key (re-enabling a revoked user); HTML page shows it **once**. 404 for an unknown user. |
+| POST | `/admin/users/{id}/revoke` | admin | 303 → `/admin/users` (disables the user; its keys 401 from the next request) |
 | GET | `/admin/users/{id}` | admin | Per-user detail HTML (24h/7d/30d tiles + last 50 events) |
 | GET | `/admin/usage` | admin | Drill-down HTML, paginated 100/page. Filters: `kind`, `status`, `user_id`, `since`, `until`, `offset`. |
 | GET | `/admin/usage.csv` | admin | `text/csv` stream (max 10000 rows) |
 | GET | `/admin/data` | admin | Phase 2 — weekly insights Data tab (`data.html.j2`). HTMX partial swap returns `_stats_grid_partial.html.j2`. Documented in detail above under `GET /admin/data`. |
 | POST | `/admin/data/insights/run-now` | admin | Manual trigger for the weekly-insights cron against the current in-progress ISO week. Form-style CSRF. Fire-and-forget; returns HTML toast + OOB-swap button fragment. Documented in detail above under `POST /admin/data/insights/run-now`. |
 
-All authed admin routes return **503** "Admin UI unavailable: Postgres degraded." when `app.state.db_pool` is `None` — the admin UI is unusable without a pool, so it fails loudly rather than crashing on `AttributeError` deeper in. The break-glass admin path (env-var bearer when Postgres is unreachable) lets the operator authenticate to the rest of the API but **not** to the admin UI; restart the server once Postgres is back to recover.
+All admin pages read the local SQLite DB (`AccountStore` / `UsageStore`); an auth lookup failure returns **503**.

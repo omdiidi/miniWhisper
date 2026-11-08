@@ -6,20 +6,29 @@ Startup sequence (Phase 2 / Task 13b)
 1.  Validate .env file permissions (warn loudly if not 0600/owned by us).
 2.  Assert staging and output dirs are on the same filesystem (R1#15 + P4#11).
 3.  Sweep old staging WAVs (> 24 h) left over from a previous run.
-4.  Instantiate JobStore (SQLite WAL, P4#4) and run orphan recovery (P5#2).
+4.  JobStore on the same DB; orphan recovery BEFORE the staging sweep (a
+    running job whose input survived goes back to pending, Locked Decision 8).
     Log {"requeue": [...], "failed": [...]}.
 5.  Instantiate FileJobRunner; re-enqueue surviving pending jobs.
 6.  Instantiate ParakeetService and call .load() (loads weights + warmup JIT).
 7.  Re-enqueue pending jobs (the file model loads lazily on the first job,
     not at startup).
-8.  Register SIGTERM handler (P5#5): mark running jobs failed, set shutting_down,
-    call sys.exit(0) so launchd ExitTimeOut=15 can observe a clean exit code.
+8.  Register SIGTERM handler (P5#5): set shutting_down and ask uvicorn to exit
+    (running jobs are NOT failed; the lifespan shutdown requeues them).
 9.  Expose state on app.state for routes and health endpoints.
+
+Before any of that, the lifespan takes ``<data_dir>.lock`` (``ops.backup.
+server_lock``; a second server refuses to start), then
+``Database(settings.db_path).migrate()`` opens the one SQLite DB
+(``app.state.db``) and its ``accounts`` / ``usage`` repositories. After the
+staging sweep the ``retention_days`` purge runs once.
 
 Shutdown
 --------
-Logs "clean shutdown" message.  The SIGTERM handler handles graceful job
-failure before the process is killed by launchd.
+``shutting_down = True`` → ``file_runner.shutdown()`` FIRST (an interrupted
+job keeps its input and is requeued with its attempt refunded), then the
+daemon loops, streaming sessions and insights client, then the stores are
+dropped, and the server lock is released last.
 """
 
 from __future__ import annotations
@@ -31,20 +40,20 @@ import shutil
 import signal
 import sqlite3
 import subprocess
-import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-import asyncpg
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from wispralt import db, observability
+from wispralt import observability
+from wispralt.accounts.store import AccountStore
 from wispralt.config import settings, verify_env_perms
+from wispralt.database import Database
 from wispralt.dictate.parakeet import ParakeetService
 from wispralt.dictate.streaming_session import (
     StreamingSessionStore,
@@ -58,27 +67,26 @@ from wispralt.insights.cron import (
 )
 from wispralt.jobs.runner import FileJobRunner
 from wispralt.jobs.store import JobStore
-from wispralt.ops import background
-from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.middleware import openai_errors
 from wispralt.middleware.rate_limit import RateLimitMiddleware
-from wispralt.ops import staging
+from wispralt.ops import background, staging
+from wispralt.ops.backup import server_lock
 from wispralt.ops.env_writer import find_env_path
+from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.routes import (
     admin,
     admin_data,
     admin_ui,
     dictate,
     health,
+    v1_models,
+    v1_transcriptions,
 )
 from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
-from wispralt.routes import v1_models, v1_transcriptions
-from wispralt.smart_format.mercury_client import MercuryClient
-from wispralt.usage import writer as usage_writer
 from wispralt.usage.events import UsageEvent
-from wispralt.users import store as users_store
+from wispralt.usage.store import UsageStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,37 +98,17 @@ logger = logging.getLogger(__name__)
 # ── lifespan ──────────────────────────────────────────────────────────────────
 
 
-async def _seed_admin_if_empty(pool: asyncpg.Pool) -> None:
-    """Idempotently insert a row for the env-var break-glass token.
-
-    Bails when ``wispralt.users`` already has any row.  ``ON CONFLICT
-    (token_hash) DO NOTHING`` makes a restart with the same env-var token
-    (after a manual revoke) a no-op rather than a crash.
-    """
-    n = await pool.fetchval("SELECT COUNT(*) FROM wispralt.users")
-    if n and n > 0:
-        return
-    bearer = settings.wispralt_api_key.get_secret_value()
-    th = users_store.hash_token(bearer)
-    await pool.execute(
-        "INSERT INTO wispralt.users (label, token_hash, role, notes) "
-        "VALUES ($1, $2, 'admin', $3) "
-        "ON CONFLICT (token_hash) DO NOTHING",
-        "break-glass-admin (seeded from env)",
-        th,
-        "Auto-seeded on first startup. Rotate via /admin/users to a real label.",
-    )
-    logger.info("Seeded first admin user from WISPRALT_API_KEY env var.")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI lifespan context manager.
+    """FastAPI lifespan: the server lock wraps everything, taken first, released last.
 
-    Everything before ``yield`` runs at startup; everything after at shutdown.
+    DATA_DIR must already exist (setup / bootstrap create it); the server
+    never creates it, so a server started against a missing or half-restored
+    tree fails instead of writing into it. ``<data_dir>.lock`` (a sibling,
+    see ``ops/backup.py``) is held for the server's life: a second server
+    refuses to start (``ServerRunning``), and offline backup/restore refuse
+    while this one runs.
     """
-    # ── startup ───────────────────────────────────────────────────────────────
-
     # Size-capped app log (launchd can't rotate without sudo). Done here, not
     # at import, so importing main in tests never touches ~/Library/Logs.
     configure_file_logging(
@@ -128,21 +116,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.server_log_max_bytes,
         settings.server_log_backup_count,
     )
+    if not settings.data_dir.is_dir():
+        raise RuntimeError(f"DATA_DIR does not exist: {settings.data_dir}")
+    with server_lock(settings.data_dir):
+        async with _serve(app):
+            yield
+    logger.info("Shutdown: server lock released.")
 
-    # Verify the watcher's exception coverage. asyncpg has NO common base
-    # class for the two failure modes we need to catch: PostgresError
-    # (server-side) and InterfaceError ("pool is closed", client-side).
-    # Both inherit directly from Exception via separate private hierarchies
-    # (verified asyncpg 0.31.0). The watcher and route catches enumerate
-    # both explicitly; this assertion confirms both class names still exist
-    # at module top-level. A future asyncpg rename/unexport will fail boot
-    # loudly instead of silently regressing the watcher to the 2026-05-17 bug.
-    assert hasattr(asyncpg, "PostgresError") and hasattr(asyncpg, "InterfaceError"), (
-        "asyncpg taxonomy changed — PostgresError or InterfaceError no longer "
-        "exposed at the package top-level. Audit every "
-        "`except (asyncpg.PostgresError, asyncpg.InterfaceError)` site and "
-        "re-verify the watcher path covers both. See 2026-05-17 postmortem."
-    )
+
+@asynccontextmanager
+async def _serve(app: FastAPI) -> AsyncIterator[None]:
+    """Startup before ``yield``, shutdown after (runs under the server lock)."""
+    # ── startup ───────────────────────────────────────────────────────────────
+
+    # 0. The one SQLite DB.
+    database = Database(settings.db_path)
+    applied = database.migrate()
+    if applied:
+        logger.info("Database migrations applied: %s", applied)
+    app.state.db = database
+    app.state.accounts = AccountStore(database)
+    app.state.usage = UsageStore(database)
 
     # 1. Validate .env permissions
     env_path = find_env_path()
@@ -155,9 +149,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 2. R1#15 + P4#11: assert staging and output dirs share one filesystem so
     #    that os.replace in output.py is truly atomic (POSIX rename(2)).
     try:
-        staging.assert_same_filesystem(
-            settings.staging_dir, settings.meeting_output_dir
-        )
+        staging.assert_same_filesystem(settings.staging_dir, settings.outputs_dir)
     except RuntimeError as exc:
         # Log as ERROR — server can still start, but atomicity is compromised.
         logger.error("Filesystem check failed: %s", exc)
@@ -181,7 +173,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    WAV files still exist are observed and their paths can be excluded from
     #    the sweep.  If sweep ran first it could delete WAVs that orphan recovery
     #    would later try to re-queue (C7 fix).
-    job_store = JobStore(settings.job_db_path)
+    job_store = JobStore(database, settings.data_dir)
     recovery = job_store.recover_orphans()
     logger.info(
         "Orphan recovery: requeue=%s failed=%s",
@@ -208,36 +200,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if tmp_removed:
         logger.info("Startup tmp sweep removed %d stale .tmp file(s).", tmp_removed)
 
-    # 4c. Phase 1 transcript-storage: zero transcript text on `jobs` rows and
-    #     delete `dictations` rows older than transcript_retention_days. Same
-    #     sweep is re-run every 24 h by the daily timer registered below so a
-    #     long-uptime server eventually reaps.
+    # 4c. Retention purge (DB setting `retention_days`; 0 = keep forever).
+    #     Re-run every 24 h by the daily sweep loop below.
     try:
-        jobs_swept, dicts_deleted = job_store.sweep_transcripts(
-            days=settings.transcript_retention_days
-        )
-        if jobs_swept or dicts_deleted:
+        dicts_deleted, jobs_deleted = background.run_retention(job_store)
+        if dicts_deleted or jobs_deleted:
             logger.info(
-                "Startup transcript sweep: jobs.transcript_text zeroed=%d, "
-                "dictations deleted=%d",
-                jobs_swept,
+                "Startup retention purge: dictations=%d, jobs=%d",
                 dicts_deleted,
+                jobs_deleted,
             )
     except sqlite3.Error:
-        logger.exception(
-            "Startup transcript sweep failed; daily timer will retry"
-        )
+        logger.exception("Startup retention purge failed; daily timer will retry")
 
     # 5. File-job runner — re-enqueue any pending jobs that survived the restart.
-    file_runner = FileJobRunner(job_store)
+    file_runner = FileJobRunner(job_store, app.state)
     app.state.file_runner = file_runner
     app.state.shutting_down = False
-
-    # Phase 1 transcript-storage: holds strong refs to in-flight
-    # `_persist_dictation` background tasks so asyncio doesn't GC them
-    # before they complete. The dictate route adds tasks here and removes
-    # them via add_done_callback. Drained on shutdown below.
-    app.state.pending_persists = set()
 
     # Re-enqueueing is deferred until after models load (done below via task).
 
@@ -263,39 +242,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     streaming_sweeper_task = asyncio.create_task(_streaming_sweeper(app))
     app.state.streaming_sweeper_task = streaming_sweeper_task
 
-    # 6b. Mercury client — fail-soft. If init throws, smart formatting is silently
-    #     disabled. Same fail-soft contract as runtime: any error → None return.
-    app.state.mercury_client = None
-    if settings.smart_format_enabled and settings.openrouter_api_key:
-        try:
-            app.state.mercury_client = MercuryClient(
-                api_key=settings.openrouter_api_key,
-                model=settings.openrouter_model,
-                base_url=settings.openrouter_base_url,
-                timeout_ms=settings.openrouter_timeout_ms,
-                app_title=settings.openrouter_app_title,
-                min_words=settings.smart_format_min_words,
-            )
-            logger.info(
-                "mercury_client initialized model=%s timeout_ms=%d",
-                settings.openrouter_model,
-                settings.openrouter_timeout_ms,
-            )
-        except Exception:
-            logger.exception(
-                "mercury_client init failed — smart formatting will be disabled"
-            )
-            app.state.mercury_client = None
-    else:
-        logger.info(
-            "mercury_client disabled (SMART_FORMAT_ENABLED=%s, OPENROUTER_API_KEY %s)",
-            settings.smart_format_enabled,
-            "set" if settings.openrouter_api_key else "unset",
-        )
-
-    # 6c. InsightsClient — fail-soft mirror of mercury_client. None when
-    #     OPENROUTER_API_KEY is unset; weekly cron is a no-op in that case.
-    #     Different model + longer timeout than mercury (batch, not live).
+    # 6b. InsightsClient — fail-soft. None when OPENROUTER_API_KEY is unset;
+    #     the weekly cron is a no-op in that case.
     app.state.insights_client = None
     if settings.openrouter_api_key:
         try:
@@ -335,9 +283,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             background.eviction_loop(app, file_runner, files_pipeline)
         )
 
-    # 7d. Phase 1 transcript-storage: daily sweep loop. Re-runs the same
-    #     `sweep_transcripts` that ran at startup so a long-uptime server
-    #     eventually reaps. Daemon-loop pattern: broad-except + log so a
+    # 7d. Daily sweep loop: staging sweeps + the retention purge that ran at
+    #     startup, so a long-uptime server eventually reaps. Daemon-loop pattern: broad-except + log so a
     #     transient SQLite error never kills the task.
     app.state.transcript_sweep_task = asyncio.create_task(
         background.daily_sweep_loop(
@@ -403,23 +350,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    signal module.
     #
     #    The handler signals graceful shutdown via uvicorn's `should_exit` flag,
-    #    NOT `os._exit(0)`.  `os._exit` skips the lifespan teardown — which
-    #    means the usage-event drainer's final flush is lost and any queued
-    #    events are dropped.  We instead let uvicorn run its normal shutdown
+    #    NOT `os._exit(0)`, which would skip the lifespan teardown.  We instead
+    #    let uvicorn run its normal shutdown
     #    path (which invokes our lifespan ``finally`` block) and trust
     #    launchd's ExitTimeout=15 to bound the wait.
     def _sigterm_handler() -> None:
         logger.info("SIGTERM received — initiating graceful shutdown.")
         app.state.shutting_down = True
-        try:
-            n = job_store.fail_running_jobs("server shutdown")
-            if n:
-                logger.info("Marked %d running job(s) as failed on SIGTERM.", n)
-        except (OSError, RuntimeError) as exc:
-            logger.warning("Could not mark running jobs failed on SIGTERM: %s", exc)
 
-        # Trigger uvicorn graceful shutdown so the lifespan teardown runs
-        # (drainer cancel + usage flush + db.close_pool).  Fallback to raising
+        # Trigger uvicorn graceful shutdown so the lifespan teardown runs.
+        # Fallback to raising
         # SIGINT in the same loop if no uvicorn server is registered (e.g.
         # tests running the app via TestClient).
         server_obj = getattr(app.state, "uvicorn_server", None)
@@ -431,43 +371,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # bypasses the lifespan teardown.
         signal.raise_signal(signal.SIGINT)
 
-    loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
-
-    # 9. Auth: break-glass admin hash + Postgres pool + usage drainer.
-    #    Order matters:
-    #      a. break_glass_token_hash is pure compute — set it FIRST so even
-    #         if the pool init below explodes, the operator can still hit
-    #         /admin/* via the env-var token.
-    #      b. Pre-set db_pool / usage_drainer to None so the shutdown
-    #         branch can safely test them with getattr().
-    #      c. Try to spin up the pool, seed the admin row, and start the
-    #         drainer.  Catch only typed Postgres / OS errors.
-    app.state.break_glass_token_hash = users_store.hash_token(
-        settings.wispralt_api_key.get_secret_value()
-    )
-    app.state.db_pool = None
-    app.state.usage_drainer = None
-
     try:
-        pool = await db.get_pool()
-        app.state.db_pool = pool
-        await _seed_admin_if_empty(pool)
-        app.state.usage_drainer = asyncio.create_task(
-            usage_writer.drain_loop(observability.usage_queue, pool)
-        )
-    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, db.PostgresUnavailable):
-        logger.exception(
-            "Postgres unavailable at startup; only break-glass admin will work"
-        )
-
-    # 9b. Pool watcher — every 10s, probe the pool with SELECT 1 and recreate
-    #     if dead. Without this, a transient Supabase blip leaves db_pool=None
-    #     forever and every authenticated request returns 503 until the
-    #     operator restarts the server. Triggered by a real outage 2026-05-02.
-    app.state.db_watcher_task = None
-
-    app.state.db_watcher_task = asyncio.create_task(background.db_watcher_loop(app))
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _sigterm_handler)
+    except (NotImplementedError, RuntimeError, ValueError) as exc:
+        # Not the main thread (e.g. TestClient's portal): uvicorn's own
+        # handler still triggers the lifespan shutdown below.
+        logger.warning("SIGTERM handler not installed: %s", exc)
 
     # Initialize per-token rate-limit state for /v1/* routes. Idempotent.
     # Imported locally to avoid a top-of-module cycle with the auth/users modules.
@@ -480,31 +389,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── shutdown ──────────────────────────────────────────────────────────────
 
-    # Phase 1 transcript-storage: drain in-flight dictation persists FIRST so
-    # the SQLite write-lock isn't being released mid-INSERT below. The 2 s
-    # budget is total across all pending persists (gather waits for ALL),
-    # not 2 s each; under a SIGTERM burst some tasks may be abandoned and
-    # the warning log records the count. insert_dictation is SQLite-only
-    # today — placing the drain first keeps the teardown rule clear if a
-    # future persist path ever adds Postgres reads.
-    pending: set[asyncio.Task[None]] | None = getattr(
-        app.state, "pending_persists", None
-    )
-    if pending:
-        logger.info(
-            "Awaiting %d pending dictation persist(s) on shutdown...",
-            len(pending),
-        )
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*pending, return_exceptions=True),
-                timeout=2.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Dictation persist drain timed out; %d task(s) abandoned",
-                len(pending),
-            )
+    # Stop the file runner FIRST, while the DB is still open: a job it
+    # interrupts keeps its staged input and goes back to pending with its
+    # attempt refunded (Locked Decision 8).
+    app.state.shutting_down = True
+    await file_runner.shutdown()
+    logger.info("Shutdown: file runner stopped.")
 
     # Cancel the daily transcript sweep AND the weekly insights cron together.
     # Both are pure daemon loops; same cancel pattern. transcript_sweep_task
@@ -517,30 +407,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             with contextlib.suppress(asyncio.CancelledError):
                 await _task
 
-    # Cancel the db pool watcher first so it stops trying to probe / rebuild
-    # while the rest of shutdown is tearing the pool down.
-    db_watcher: asyncio.Task | None = getattr(app.state, "db_watcher_task", None)
-    if db_watcher is not None and not db_watcher.done():
-        db_watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await db_watcher
-
     # Cancel the idle-eviction loop first so it stops emitting log noise.
     eviction_task: asyncio.Task | None = getattr(app.state, "eviction_task", None)
     if eviction_task is not None and not eviction_task.done():
         eviction_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await eviction_task
-
-    # Cancel the usage-event drainer so its CancelledError handler can
-    # do the final flush of any pending events.  getattr is defensive —
-    # the lifespan pre-sets the attr, so we only fall through if the
-    # startup branch was bypassed entirely.
-    drainer: asyncio.Task | None = getattr(app.state, "usage_drainer", None)
-    if drainer is not None:
-        drainer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await drainer
 
     # Streaming-dictation sweeper + active sessions. Cancel the sweeper first
     # so it stops mutating session state, then walk surviving sessions and
@@ -573,13 +445,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     for _task in _session.pending_tasks.values():
                         _task.cancel()
 
-    mercury_client: MercuryClient | None = getattr(app.state, "mercury_client", None)
-    if mercury_client is not None:
-        try:
-            await mercury_client.aclose()
-        except Exception as exc:
-            logger.warning("mercury_client.aclose failed: %s", exc)
-
     insights_client: InsightsClient | None = getattr(
         app.state, "insights_client", None
     )
@@ -589,8 +454,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("insights_client.aclose failed: %s", exc)
 
-    await db.close_pool()
-
+    app.state.job_store = app.state.accounts = app.state.usage = app.state.db = None
+    logger.info("Shutdown: database released.")
     logger.info("WisprAlt server clean shutdown.")
 
 
@@ -624,10 +489,11 @@ _KIND_MAP = {
 class _ObservabilityMiddleware(BaseHTTPMiddleware):
     """Times each request and records it in the observability singletons (G4).
 
-    Also enqueues a :class:`UsageEvent` after the latency record when the
-    request resolved to a real (non-break-glass) user on a tracked route +
-    method.  Enqueue is fire-and-forget; the background drainer in
-    ``usage.writer`` flushes batches into Postgres off the hot path.
+    Also writes one ``usage_events`` row (``UsageStore.record`` in a thread,
+    about 1 ms) when the request authenticated a user on a tracked route +
+    method and was not a dedup replay. Best-effort: a ``sqlite3.Error`` loses
+    the row, bumps ``usage_write_failures_total`` and logs the error type;
+    the response is unaffected.
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[type-arg]
@@ -647,33 +513,36 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
             observability.error_counter.increment(route_key, response.status_code)
         observability.latency_histogram.record(route_key, latency_ms)
 
-        # Enqueue a usage event when:
-        #   - auth resolved to a real DB user (skip None and break-glass id<0),
-        #   - the route is one we track, and
-        #   - the method creates work (skip GET status polls).
+        # Record a usage row when auth resolved a user, the route is tracked,
+        # the method creates work (skip GET polls), and it was not a replay.
         user = getattr(request.state, "user", None)
+        usage: UsageStore | None = getattr(request.app.state, "usage", None)
         if (
             user is not None
-            and user.id >= 0
+            and usage is not None
             and route_key in TRACKED_ROUTES
             and request.method in TRACKED_METHODS
+            and not getattr(request.state, "dedup_replay", False)
         ):
             try:
                 bytes_in = int(request.headers.get("content-length", 0) or 0)
             except ValueError:
                 bytes_in = 0
-            observability.usage_queue.offer(
-                UsageEvent(
-                    user_id=user.id,
-                    ts=time.time(),
-                    kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
-                    status=response.status_code,
-                    duration_ms=latency_ms,
-                    bytes_in=bytes_in,
-                    request_id=request.headers.get("x-request-id")
-                    or getattr(request.state, "request_id", None),
-                )
+            event = UsageEvent(
+                user_id=user.id,
+                ts=time.time(),
+                kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
+                status=response.status_code,
+                duration_ms=latency_ms,
+                bytes_in=bytes_in,
+                request_id=request.headers.get("x-request-id")
+                or getattr(request.state, "request_id", None),
             )
+            try:
+                await asyncio.to_thread(usage.record, event)
+            except sqlite3.Error as exc:
+                observability.usage_write_failures_total.increment()
+                logger.error("usage write failed: %s", type(exc).__name__)
 
         return response
 
@@ -764,7 +633,7 @@ def create_app() -> FastAPI:
     # /transcribe/dictate/stream/* — additive streaming path; same auth as
     # /transcribe/dictate.
     app.include_router(dictate_stream_routes.router)
-    # /admin/* legacy JSON endpoints (rotate-key, /metrics) — auth per-route.
+    # /admin/* JSON endpoints (/metrics, /admin/active, server-log) — auth per-route.
     app.include_router(admin.router)
     # /admin/* Jinja2 UI: three routers under the same prefix.
     # public_router  — /admin/login (must be reachable WITHOUT auth).

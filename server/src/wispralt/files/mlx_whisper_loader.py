@@ -14,8 +14,10 @@ invocations cannot interleave the temporary attribute swap. Today the
 runner serialises with Semaphore(1) so this is defensive only.
 
 Public surface (replaced whisperx_loader.py in Phase 10):
+    MODEL_ID: str
     load() -> None
     reset() -> None
+    release_cache() -> None
     transcribe_channel(audio_16k, *, word_timestamps=False,
                        progress_cb=None, cancel_cb=None,
                        duration_s_override=None) -> dict
@@ -35,7 +37,11 @@ logger = logging.getLogger(__name__)
 
 # Default model: mlx-community whisper-large-v3-turbo. May be swapped to
 # the non-turbo large-v3 variant per Phase 0 T0.5 if accuracy regresses.
-_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+# The one label: pipeline.py's transcript ``model`` block reads it too.
+MODEL_ID = "mlx-community/whisper-large-v3-turbo"
+
+# MLX (``mlx``, ``mlx_whisper``) is imported lazily inside the functions that
+# need it, so ``wispralt.main`` imports on a host without the ``[host]`` extra.
 
 _loaded: bool = False
 _patch_lock = threading.Lock()
@@ -53,17 +59,30 @@ def load() -> None:
         return
     import mlx_whisper  # type: ignore[import-untyped]
 
-    logger.info("Warming mlx-whisper model %s …", _MODEL_REPO)
+    logger.info("Warming mlx-whisper model %s …", MODEL_ID)
     silence = np.zeros(16_000, dtype=np.float32)
     _ = mlx_whisper.transcribe(
         silence,
-        path_or_hf_repo=_MODEL_REPO,
+        path_or_hf_repo=MODEL_ID,
         word_timestamps=False,
         language="en",
         verbose=False,
     )
     _loaded = True
     logger.info("mlx-whisper ready.")
+
+
+def release_cache() -> None:
+    """Return MLX's cached unified-memory pages to the OS and reset the peak counter.
+
+    Called after every file job (per-job activation cache) and on idle
+    eviction (after ``reset()`` dropped the weights). ``mx.metal.*`` are
+    deprecated; these are the modern API.
+    """
+    import mlx.core as mx
+
+    mx.clear_cache()
+    mx.reset_peak_memory()
 
 
 def reset() -> None:
@@ -199,7 +218,7 @@ def transcribe_channel(
         try:
             result: dict = mlx_whisper.transcribe(
                 audio_16k,
-                path_or_hf_repo=_MODEL_REPO,
+                path_or_hf_repo=MODEL_ID,
                 word_timestamps=word_timestamps,
                 language="en",
                 hallucination_silence_threshold=2.0,

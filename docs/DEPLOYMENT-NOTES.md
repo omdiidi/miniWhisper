@@ -55,7 +55,7 @@ Versioned deploy script for the mini. Contract:
 
 1. Reads server code from the dev box, tarballs it (excludes `__pycache__`, `.venv`, `*.log`), transfers to the mini via the `/macmini paste` skill's gist-transport mechanism.
 2. On the mini: creates `.wf-deploy-backup-<epoch>/` (using `mkdir -p` first — BSD `cp -r src1 src2 dst` requires `dst` to be an existing dir), then `cp -r server scripts "$BACKUP/"`, then overwrites with the new tree.
-3. Runs `uv sync` to install/upgrade pinned deps.
+3. Runs `pip install -e '.[host]'` to install/upgrade pinned deps (the MLX stack is the `[host]` extra).
 4. Runs `server/scripts/prefetch-mlx-whisper.sh` (idempotent).
 5. `launchctl kickstart -k gui/$UID/co.wispralt.server` — or, when the installed plist still names an old module path (the pre-rename package), `scripts/server-launchd.sh install` to regenerate it.
 6. Polls `/healthz` for up to 60 s.
@@ -144,9 +144,9 @@ The setup writes three files containing secrets. None are committed:
 
 | File | Mode | Contains |
 |---|---:|---|
-| `~/wispralt/server/.env` | 0600 | `WISPRALT_API_KEY`, optional `OPENROUTER_API_KEY` (Mercury) |
+| `~/wispralt/server/.env` | 0600 | `DATA_DIR`, `SERVER_URL`, optional `OPENROUTER_API_KEY` (weekly insights). No API key: keys live hashed in `DATA_DIR/wispralt.db` |
 | `~/.config/wispralt/cloudflare-token` | 0600 | Cloudflare tunnel token only |
-| `~/.config/wispralt/client-config.txt` | 0600 | `SERVER_URL`, `WISPRALT_API_KEY` (for paste-into-client) |
+| `~/.config/wispralt/client-config.txt` | 0600 | Legacy (pre-Part 4) copy of `SERVER_URL` + the old env key; the bootstrap step now prints the token to the terminal only, so delete this file on an upgraded host |
 
 `.gitignore` covers all three. Cloudflare tunnel token is **never** stored in `server/.env` — it lives in `~/.config/wispralt/cloudflare-token` and is read by the cloudflared LaunchAgent via `--token-file` at start time.
 
@@ -154,9 +154,9 @@ The setup writes three files containing secrets. None are committed:
 
 After any setup involving copy/paste into shared tools (chat, screen recordings, etc.), rotate:
 
-- **`OPENROUTER_API_KEY`** (if set, for Mercury smart formatting and insights): rotate at <https://openrouter.ai/keys>, update `server/.env`, restart the FastAPI LaunchAgent.
+- **`OPENROUTER_API_KEY`** (if set, for weekly insights): rotate at <https://openrouter.ai/keys>, update `server/.env`, restart the FastAPI LaunchAgent.
 - **Cloudflare tunnel token:** in the Zero Trust dashboard → tunnel → Configure → Rotate token. See "Cloudflared LaunchAgent (user-level)" below for the rotation procedure — the steps differ depending on whether your cloudflared version supports `--token-file`.
-- **`WISPRALT_API_KEY`:** `curl -X POST -H "Authorization: Bearer $OLD" $SERVER_URL/admin/rotate-key` returns `{"rotated": true}` and writes the new key to the server log; copy it into the client.
+- **Admin token:** on the server, `cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin` revokes the old key and prints a new one (terminal only); enter it in the client. Employee / integration keys rotate from the admin UI.
 
 ## Client (`client/`) — Swift package gotchas
 

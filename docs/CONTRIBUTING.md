@@ -79,7 +79,7 @@ See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) "TCC permissions and Apple Develo
 **Server (Python):**
 - Formatter: `ruff format` (line length 100)
 - Linter: `ruff check` + `pyright --strict`
-- Run both before submitting: `cd server && uv run ruff format . && uv run ruff check . && uv run pyright`
+- Run both before submitting: `cd server && uv run --extra dev --extra host ruff format . && uv run --extra dev --extra host ruff check . && uv run --extra dev --extra host pyright` (name both extras so `uv run` does not strip the MLX stack)
 
 **Client (Swift):**
 - SwiftLint is not configured; follow [Swift API Design Guidelines](https://www.swift.org/documentation/api-design-guidelines/).

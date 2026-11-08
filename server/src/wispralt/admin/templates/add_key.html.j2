@@ -7,6 +7,7 @@
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
 <form method="POST" action="/admin/keys/new">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <label for="program_name">Program name <small>(displayed in admin UI; e.g. "Buzz on Bob's MacBook", "Open WebUI prod")</small></label>
   <input type="text" name="program_name" id="program_name" required maxlength="40" autofocus value="{{ form_program_name or '' }}" />
 

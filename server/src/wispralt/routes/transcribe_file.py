@@ -20,10 +20,9 @@ GET    /transcribe/file/{job_id}                 Poll job status.
 GET    /transcribe/file/{job_id}/download/{fmt}  Stream a completed output.
 DELETE /transcribe/file/{job_id}                 Cancel (202) or remove (204).
 
-Ownership: the caller sees a job only if ``job.api_key_id == user.id`` or the
-caller is an admin. Legacy jobs with a NULL owner are admin-only. A job owned
-by someone else looks exactly like a missing one (404 on GET, 204 on DELETE),
-so existence never leaks.
+Ownership: the caller sees a job only if ``job.user_id == user.id`` or the
+caller is an admin. A job owned by someone else looks exactly like a missing
+one (404 on GET, 204 on DELETE), so existence never leaks.
 
 Auth: ``Bearer`` via ``Depends(require_api_key)``.
 Usage telemetry: route-key ``transcribe/file`` is registered in
@@ -132,13 +131,12 @@ def _load_meta_or_404(chunked_dir: Path) -> dict:
 def _require_owner(request: Request, meta: dict) -> None:
     """R-B: caller's authenticated user.id must match the one recorded at init.
 
-    Raises HTTPException(403) on mismatch. Anonymous / break-glass requests
-    (user.id < 0) cannot own uploads — they would not have hit init either.
+    Raises HTTPException(403) on mismatch, 401 when no user is authenticated.
     """
     user = getattr(request.state, "user", None)
     if user is None or not hasattr(user, "id"):
         raise HTTPException(401, "Unauthenticated")
-    if int(meta.get("api_key_id", -999)) != int(user.id):
+    if meta.get("user_id") != int(user.id):
         raise HTTPException(403, "Upload owned by a different API key")
 
 
@@ -214,23 +212,21 @@ async def submit_file(
     )
 
     runner = _runner(request)
-    # Phase 1 transcript-storage: capture client version + owning api_key_id
-    # at submit time so they survive worker crashes and restart re-enqueue.
+    # Phase 1 transcript-storage: capture client version + owning user at
+    # submit time so they survive worker crashes and restart re-enqueue.
     client_version = request.headers.get("X-WisprAlt-Client-Version")
     user = getattr(request.state, "user", None)
-    api_key_id = (
-        int(user.id)
-        if user is not None and hasattr(user, "id") and int(user.id) >= 0
-        else None
-    )
+    if user is None:
+        src_path.unlink(missing_ok=True)
+        raise HTTPException(401, "Unauthenticated")
     try:
         # Worker (_run_source) runs ffprobe + ffmpeg + pipeline. Route returns
         # 202 immediately so Cloudflare Tunnel doesn't see a long-running
         # request.
         jid = await runner.submit_source_or_429(
             src_path,
+            user_id=int(user.id),
             client_version=client_version,
-            api_key_id=api_key_id,
         )
     except FileJobInProgressError as exc:
         src_path.unlink(missing_ok=True)
@@ -324,11 +320,8 @@ async def init_chunked(
         )
 
     user = getattr(request.state, "user", None)
-    if user is None or not hasattr(user, "id") or int(user.id) < 0:
-        # Break-glass admin (id=-1) cannot own uploads because we cannot
-        # later verify ownership across requests. Force them through the
-        # single-shot route.
-        raise HTTPException(403, "Chunked upload requires a per-user API key")
+    if user is None:
+        raise HTTPException(401, "Unauthenticated")
 
     upload_id = secrets.token_urlsafe(16)
     chunked_dir = chunked_root / upload_id
@@ -345,7 +338,7 @@ async def init_chunked(
         "original_filename": req.original_filename,
         "ext": ext,
         "created_at": time.time(),
-        "api_key_id": int(user.id),  # R-B: persist owner for chunk/finalize
+        "user_id": int(user.id),  # R-B: persist owner for chunk/finalize
         # Phase 1 transcript-storage: capture client version at init so the
         # value reflects the ORIGINATING client even if the user upgrades
         # mid-multi-hour-upload. Reads as None on in-flight uploads from
@@ -534,11 +527,14 @@ async def finalize_chunked(
             headers={"Retry-After": "60"},
         )
 
-    parts = sorted(chunked_dir.glob("chunk-*.part"))
-    if len(parts) != chunk_count:
+    # Exactly chunk-0000 … chunk-(N-1), by name: never count whatever the
+    # directory holds (a stray or temp file must not stand in for a chunk).
+    parts = [chunked_dir / f"chunk-{i:04d}.part" for i in range(chunk_count)]
+    missing = [i for i, p in enumerate(parts) if not p.is_file()]
+    if missing:
         raise HTTPException(
             409,
-            f"Expected {chunk_count} chunks, got {len(parts)}",
+            f"Missing chunk {missing[0]} of {chunk_count}",
         )
     # R-G: pre-flight total size check before any I/O work — catches
     # truncation cheaply.
@@ -595,18 +591,14 @@ async def finalize_chunked(
     runner = _runner(request)
     # Phase 1 transcript-storage: read client version that was captured at
     # /init (more robust than the live header — survives mid-upload client
-    # upgrade). api_key_id is already ownership-verified above.
+    # upgrade). The owner is verified above.
     client_version = meta.get("client_app_version")
-    try:
-        meta_api_key_id = int(meta.get("api_key_id", -999))
-    except (TypeError, ValueError):
-        meta_api_key_id = -999
-    api_key_id = meta_api_key_id if meta_api_key_id >= 0 else None
+    user_id = int(meta["user_id"])
     try:
         jid = await runner.submit_source_or_429(
             out_path,
+            user_id=user_id,
             client_version=client_version,
-            api_key_id=api_key_id,
         )
     except FileJobInProgressError as exc:
         out_path.unlink(missing_ok=True)
@@ -643,19 +635,20 @@ def _owned_job(request: Request, job_id: str) -> Job | None:
     """Return the job if the caller owns it or is an admin, else None.
 
     400 on a malformed job_id (server-issued UUIDs only; this also keeps
-    path-traversal shapes out of the output-path join). A missing job and a
-    job owned by someone else both return None so existence never leaks.
-    Legacy jobs with ``api_key_id IS NULL`` are visible to admins only.
+    path-traversal shapes out of the output-path join). A missing job, a job
+    owned by someone else, and a job whose outputs were removed (DELETE after
+    download; the row stays for history) all return None so existence never
+    leaks.
     """
     if not _JOB_ID_RE.fullmatch(job_id):
         raise HTTPException(400, "Invalid job_id format")
     job = request.app.state.job_store.get(job_id)
     user = getattr(request.state, "user", None)
-    if job is None or user is None:
+    if job is None or user is None or job.outputs_removed_at is not None:
         return None
     if getattr(user, "role", None) == "admin":
         return job
-    if job.api_key_id is not None and int(job.api_key_id) == int(user.id):
+    if int(job.user_id) == int(user.id):
         return job
     return None
 
@@ -666,7 +659,7 @@ def poll_file_job(request: Request, job_id: str) -> JSONResponse:
 
     Returns
     -------
-    200 ``{"job_id", "status", ["mode"], ["request_mode"], ["error"],
+    200 ``{"job_id", "status", ["mode"], ["error"],
         ["progress"], ["serverFinishing"], ["formats", "outputs"]}``
     400 Malformed job_id.
     404 Job not found (or not visible to the caller).
@@ -678,8 +671,6 @@ def poll_file_job(request: Request, job_id: str) -> JSONResponse:
     body: dict[str, object] = {"job_id": job.id, "status": job.status}
     if job.mode is not None:
         body["mode"] = job.mode
-    if job.request_mode is not None:
-        body["request_mode"] = job.request_mode
     if job.error is not None:
         body["error"] = job.error
 
@@ -736,10 +727,10 @@ def download_file_job(request: Request, job_id: str, fmt: str) -> StreamingRespo
         raise HTTPException(400, f"Unknown format '{fmt}'; valid: {sorted(_VALID_FORMATS)}")
 
     job = _owned_job(request, job_id)
-    if job is None or job.status != "done" or job.output_dir is None:
+    if job is None or job.status != "done":
         raise HTTPException(404, "Job not found or not yet complete")
 
-    output_path = Path(job.output_dir) / f"{job_id}.{fmt}"
+    output_path = settings.outputs_dir / f"{job_id}.{fmt}"
     if not output_path.exists():
         raise HTTPException(410, "Output file missing; the job may have been cleaned up")
 
@@ -757,15 +748,18 @@ def download_file_job(request: Request, job_id: str, fmt: str) -> StreamingRespo
     summary="Cancel a pending/running file job, or remove a finished one",
 )
 def delete_file_job(request: Request, job_id: str) -> Response:
-    """Cancel or remove a file job.
+    """Cancel a file job, or remove a finished job's outputs.
 
     Returns
     -------
-    202  The job was pending or running: cancel is requested and the runner
-         finishes it (``failed: cancelled by user``, outputs discarded).
+    202  The job is pending or running, or the runner is still executing it
+         (a watchdog-``failed`` row whose executor has not returned): cancel
+         is requested and the runner finishes it (``failed: cancelled by
+         user``, outputs discarded).
     204  Missing / not-visible job (idempotent, no leak), or a finished job
-         whose outputs and row are now removed. A job that finished between
-         the cancel request and the re-read is removed the same way.
+         whose outputs are now removed. The row and its transcript text stay
+         (``outputs_removed_at``) for ``/me/history`` and retention; on
+         ``/transcribe/file/*`` the job is then invisible (poll/download 404).
     400  Malformed job_id.
     """
     job = _owned_job(request, job_id)
@@ -773,7 +767,12 @@ def delete_file_job(request: Request, job_id: str) -> Response:
         return Response(status_code=204)
 
     store = request.app.state.job_store
-    if job.status in _ACTIVE_STATUSES:
+    runner = getattr(request.app.state, "file_runner", None)
+
+    def executing() -> bool:
+        return runner is not None and runner.active_job_id == job_id
+
+    if job.status in _ACTIVE_STATUSES or executing():
         store.set_cancel_requested(job_id)
         # Re-read: the runner may have finished between the GET above and
         # the cancel flag landing. The runner's conditional set_running /
@@ -782,21 +781,18 @@ def delete_file_job(request: Request, job_id: str) -> Response:
         job = store.get(job_id)
         if job is None:
             return Response(status_code=204)
-        if job.status in _ACTIVE_STATUSES:
+        if job.status in _ACTIVE_STATUSES or executing():
             logger.info("File job %s cancel requested.", job_id)
             return Response(status_code=202)
 
-    # A failed/cancelled job has no output_dir; its partial outputs (if any)
-    # live in the default output root, same fallback as the retention sweep.
-    out_root = Path(job.output_dir) if job.output_dir else Path(settings.meeting_output_dir)
-    if not remove_job_outputs(out_root, job_id):
-        # Keep the row: it is what lets a retried DELETE or the retention
-        # sweep find and remove the leftover transcript files.
-        logger.warning("File job %s: some outputs could not be removed; row kept.", job_id)
+    if not remove_job_outputs(settings.outputs_dir, job_id):
+        # Keep the row visible: a retried DELETE or the retention purge
+        # finds and removes the leftover transcript files.
+        logger.warning("File job %s: some outputs could not be removed; retry.", job_id)
         return JSONResponse(
             status_code=500,
             content={"error": "could not remove job outputs; retry the delete"},
         )
-    store.delete(job_id)
-    logger.info("File job %s deleted.", job_id)
+    store.mark_outputs_removed(job_id)
+    logger.info("File job %s outputs removed (row kept).", job_id)
     return Response(status_code=204)

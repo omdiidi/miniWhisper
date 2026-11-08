@@ -66,7 +66,7 @@ echo "Step 3: Python virtual environment"
 VENV_PATH="$REPO_ROOT/server/.venv"
 if [[ -d "$VENV_PATH" ]]; then
     VENV_SIZE="$(du -sh "$VENV_PATH" 2>/dev/null | cut -f1)"
-    if confirm "  Remove server/.venv/ ($VENV_SIZE)? (Python packages; re-installable via uv sync)"; then
+    if confirm "  Remove server/.venv/ ($VENV_SIZE)? (Python packages; re-installable via uv sync --extra host)"; then
         rm -rf "$VENV_PATH"
         echo "  Removed $VENV_PATH"
     else

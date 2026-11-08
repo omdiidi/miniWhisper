@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Re-export verify_env_perms from ops.env_writer so callers that import it
@@ -28,21 +28,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Secrets — never logged or serialized
-    wispralt_api_key: SecretStr
-
-    # Supabase Postgres URL for multi-tenant auth + usage events.
-    # Optional: when None, the server runs in break-glass-only mode
-    # (env-var WISPRALT_API_KEY grants admin; no per-user lookups).
-    supabase_database_url: SecretStr | None = None
-
     # Server identity
     server_url: str
 
-    # Filesystem paths — resolved to absolute on access
-    meeting_output_dir: Path
-    job_db_path: Path
-    staging_dir: Path
+    # Local-mode data root: wispralt.db, outputs/ and staging/ live here.
+    # Required and absolute (an empty value would mean cwd). setup-server.sh
+    # writes it into .env; the server never creates it (bootstrap does).
+    data_dir: Path
 
     # Upload guard (default 2 GiB)
     max_upload_bytes: int = 2_147_483_648
@@ -63,12 +55,12 @@ class Settings(BaseSettings):
     # Eviction self-check thresholds (added by the 2026-05-19 invariant-gates plan).
     # Probe-verified 2026-05-19 that mx.metal.get_active_memory() is synchronous
     # with mx.clear_cache() — no async sampling needed.
-    meeting_eviction_delta_floor_mb: int = 1000
+    file_eviction_delta_floor_mb: int = 1000
     # A real eviction releases ~1500 MB of file-model (Whisper) active memory.
     # Today's bug had delta=0. Floor of 1000 catches the bug AND partial-release
     # regressions (e.g., a future library leaking 500 MB while clearing 1000).
 
-    meeting_eviction_pre_active_gate_mb: int = 1500
+    file_eviction_pre_active_gate_mb: int = 1500
     # Parakeet baseline (~1218) + 300 MB headroom = definitively file-model-loaded.
     # Excludes cold-start, partial-load failures. Gate prevents false-positives
     # when there was nothing meaningful to evict.
@@ -97,63 +89,9 @@ class Settings(BaseSettings):
     # to avoid IP spoofing in rate limiting.
     trust_forwarded_headers: bool = True
 
-    # OpenRouter Mercury 2 — server-side smart-formatting post-processor.
-    # Optional: when openrouter_api_key is None, smart formatting is silently disabled
-    # (clients toggling the X-Smart-Format header on get raw text back).
+    # OpenRouter key for the weekly insights cron (InsightsClient). Optional:
+    # when None, the cron is a no-op.
     openrouter_api_key: str | None = None
-    # Smart formatting is OFF by default: at the 600 ms budget Mercury timed
-    # out on nearly every production request, so each dictation paid an
-    # OpenRouter round-trip for nothing. Set SMART_FORMAT_ENABLED=true to opt
-    # in (also requires OPENROUTER_API_KEY). The weekly insights client does
-    # NOT depend on this flag.
-    smart_format_enabled: bool = False
-    openrouter_model: str = "inception/mercury-2"
-    # 600 ms ceiling for the Mercury cleanup (lowered from 1500 ms on
-    # 2026-05-02 after measuring 7-day production latency: dictate p95
-    # ran 5.4s with the old budget; this caps the disaster ceiling and
-    # keeps the path fail-soft). Cross-region OpenRouter on a warm TCP
-    # session is 200-400 ms; 600 ms preserves headroom while ruling out
-    # the "1.5s waiting on Mercury" failure mode in the long tail.
-    # If a deployment sees too many fail-overs to raw text, raise via env
-    # (OPENROUTER_TIMEOUT_MS=1000) and revisit.
-    openrouter_timeout_ms: int = 600
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_app_title: str = "WisprAlt"
-
-    # Minimum dictation length (words) before smart-formatting is invoked. Below
-    # this, raw Parakeet output is returned unchanged — short utterances aren't
-    # worth the LLM round-trip and Parakeet's inline punctuation is good enough.
-    #
-    # 2026-05-13 bump 100 -> 300: with the OpenRouter timeout pinned at 600 ms
-    # (see openrouter_timeout_ms above), Mercury empirically can't complete a
-    # 100-300 word polish within budget. Those requests time out and fail-soft
-    # to raw Parakeet text anyway, costing the user ~600 ms of dead wait. At
-    # >=300 words the cleanup is both noticeable AND inside budget. The user
-    # still gets correct Parakeet output (with its inline punctuation) below
-    # the threshold — no transcription content is lost, only the polish step.
-    #
-    # 2026-05-19 drop 300 -> 80 (user pref May 19): user explicitly asked for
-    # Mercury to fire on shorter dictations. Risk: at 80-300 words, polish may
-    # time out at 600 ms and fail-soft to raw text, costing ~600 ms of dead
-    # wait. Mitigation: revisit openrouter_timeout_ms if telemetry shows
-    # excessive fail-overs at the new threshold.
-    smart_format_min_words: int = 80
-
-    # Transcript persistence TTL. After this many days, transcript text on
-    # `jobs` rows is zeroed (the row stays as audit metadata) and `dictations`
-    # rows are deleted entirely. Measured from COALESCE(finished_at, created_at)
-    # on jobs and from created_at on dictations — i.e. the moment the text
-    # actually existed, not job submission. Daily sweep runs in the lifespan
-    # background task. See docs/ARCHITECTURE.md "Transcript persistence".
-    transcript_retention_days: int = 90
-
-    # Finished (done/failed) meeting job rows and their output files
-    # (<id>.txt/.srt/.vtt/.json in meeting_output_dir) older than this many
-    # days are deleted by the daily sweep. 0 disables. Default matches
-    # transcript_retention_days so /me/history keeps meeting rows for as long
-    # as their transcript text is retained. Pending/running jobs are never
-    # deleted.
-    meeting_job_retention_days: int = 90
 
     # Application log (RotatingFileHandler). launchd's server.log /
     # server.err.log are left for crash output only. /admin/server-log reads
@@ -182,6 +120,25 @@ class Settings(BaseSettings):
     # Startup-catchup fail-closed by default. Operator opts in via .env AFTER verifying
     # OpenRouter pricing/model in Task 0 spike. Prevents accidental Wednesday-deploy charge.
     insights_catchup_enabled: bool = False
+
+    @field_validator("data_dir", mode="before")
+    @classmethod
+    def _absolute_data_dir(cls, value: object) -> object:
+        if value is None or not str(value).strip() or not Path(str(value)).is_absolute():
+            raise ValueError("DATA_DIR must be an absolute path")
+        return Path(str(value))
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "wispralt.db"
+
+    @property
+    def outputs_dir(self) -> Path:
+        return self.data_dir / "outputs"
+
+    @property
+    def staging_dir(self) -> Path:
+        return self.data_dir / "staging"
 
 
 # Module-level singleton — import as ``from wispralt.config import settings``

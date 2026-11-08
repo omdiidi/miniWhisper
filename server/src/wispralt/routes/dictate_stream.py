@@ -8,13 +8,18 @@ Two POSTs under ``/transcribe/dictate/stream/{session_id}/...``:
 * ``.../chunk/{index}`` — accepts a mid-recording WAV chunk, enqueues
   inference, returns 202 immediately.
 * ``.../finalize`` — accepts the tail WAV, awaits all pending inference (with
-  a hard timeout), joins partial transcripts, optionally runs Mercury smart-
-  format on the joined text, persists one idempotent dictation row, and
+  a hard timeout), joins partial transcripts, persists one idempotent dictation row, and
   returns the final transcript.
 
-Auth: same ``require_api_key`` dep as ``/transcribe/dictate``. Break-glass
-admin (``user.id < 0``) is rejected — streaming requires a per-user api_key
-because session ownership is enforced by ``api_key_id``.
+Auth: same ``require_api_key`` dep as ``/transcribe/dictate``; session
+ownership is enforced by the authenticated user's id.
+
+Dedup (``dedup.py``, Locked Decision 7): both routes require
+``X-Client-Dedup-Id``. A chunk for an already-stored id returns 202
+``finalized: true`` without inference or a session. Finalize claims the id,
+replays a stored dictation BEFORE the session lookup (so a Retry after the
+session expired still gets its text), then saves synchronously; every 200
+carries ``"saved"``. A session remembers the id it opened with; another id → 409.
 
 Concurrency contract: every read or write of ``StreamingSession`` state must
 hold ``session.lock``; this route obeys that rule and snapshots ``pending_tasks``
@@ -23,9 +28,7 @@ under the lock before awaiting ``store.finalize``.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
 import time
 
 from fastapi import (
@@ -38,8 +41,9 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 
-from .. import observability
+from .. import dedup, observability
 from .._errors import CorruptAudioError
+from ..accounts.store import User
 from ..audio import wav_header_duration_ms
 from ..auth import require_api_key
 from ..config import settings
@@ -51,16 +55,10 @@ from ..dictate.streaming_session import (
     StreamingSessionStore,
 )
 from ..jobs.store import JobStore
-from ..users.store import User
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# Same regex as routes/dictate.py — keep them in sync. The streaming protocol
-# requires both session_id and client_dedup_id to be UUID-shaped (lowercase
-# hex with hyphens; the i-flag tolerates uppercase from older Swift builds).
-_UUID_RE = re.compile(r"^[0-9a-f-]{36}$", re.I)
 
 
 @router.post(
@@ -74,13 +72,24 @@ async def stream_chunk(
     file: UploadFile,
     user: User = Depends(require_api_key),
 ) -> JSONResponse:
-    if not _UUID_RE.match(session_id) or index < 0:
+    if not dedup.is_uuid(session_id) or index < 0:
         raise HTTPException(422, "Invalid session_id or index")
-    if int(user.id) < 0:
-        raise HTTPException(403, "Streaming requires per-user API key")
+    did = dedup.dedup_id(request, None, required=True)
+    assert did is not None
+
+    # Replay check BEFORE opening a session: a stored dictation needs no work.
+    stored = await dedup.replay_or_none(request, request.app.state.job_store, did, user.id)
+    if isinstance(stored, JSONResponse):
+        return stored
+    if stored is not None:
+        return JSONResponse(
+            {"received_index": index, "queue_depth": 0, "finalized": True}, status_code=202
+        )
 
     store: StreamingSessionStore = request.app.state.streaming_sessions
-    session, status_code = await store.open_or_get(session_id, int(user.id))
+    session, status_code = await store.open_or_get(session_id, int(user.id), did)
+    if status_code == "denied_dedup_mismatch":
+        raise HTTPException(409, "Dedup id does not match session")
     if status_code == "denied_capacity":
         raise HTTPException(503, "Streaming capacity exceeded")
     if status_code == "denied_user_busy":
@@ -149,21 +158,42 @@ async def stream_finalize(
     session_id: str,
     request: Request,
     file: UploadFile,
-    smart_format: bool = Form(False),
-    client_dedup_id: str = Form(...),
     speech_started_at: float = Form(...),
+    client_dedup_id: str | None = Form(None),
     user: User = Depends(require_api_key),
 ) -> JSONResponse:
-    if not _UUID_RE.match(session_id) or not _UUID_RE.match(client_dedup_id):
-        raise HTTPException(422, "Invalid session_id or client_dedup_id")
-    if int(user.id) < 0:
-        raise HTTPException(403, "Streaming requires per-user API key")
+    if not dedup.is_uuid(session_id):
+        raise HTTPException(422, "Invalid session_id")
+    did = dedup.dedup_id(request, client_dedup_id, required=True)
+    assert did is not None
+    async with dedup.locks(request).claim(did):
+        return await _finalize(request, session_id, did, file, speech_started_at, user)
+
+
+async def _finalize(
+    request: Request,
+    session_id: str,
+    did: str,
+    file: UploadFile,
+    speech_started_at: float,
+    user: User,
+) -> JSONResponse:
+    """Replay → session → join → persist, under the caller's dedup claim."""
+    job_store: JobStore = request.app.state.job_store
+    stored = await dedup.replay_or_none(request, job_store, did, user.id)
+    if isinstance(stored, JSONResponse):
+        return stored
+    if stored is not None:
+        return _final_response(stored, 0.0, replayed=True, saved=True)
+
     store: StreamingSessionStore = request.app.state.streaming_sessions
     session = await store.get_for_owner(session_id, int(user.id))
+    if session.dedup_id != did:
+        raise HTTPException(409, "Dedup id does not match session")
 
     # v5.2: try/finally wraps from the FIRST status mutation onward so any
     # exception (CorruptAudioError from wav_header_duration_ms, HTTPException
-    # from cap re-check, generic sqlite/Mercury error) leaves the session in
+    # from cap re-check, generic sqlite error) leaves the session in
     # "aborted" rather than stuck in "finalizing" forever.
     #
     # Concurrency note: two concurrent /finalize calls race on the
@@ -233,30 +263,19 @@ async def stream_finalize(
             observability.streaming_sessions_aborted_total.increment("gap")
             raise HTTPException(409, "Partial transcripts have gaps") from exc
 
-        text = joined
-        applied_smart_format = False
-        sf_ms = 0.0
-        mercury = getattr(request.app.state, "mercury_client", None)
-        if smart_format and mercury is not None:
-            sf_start = time.perf_counter()
-            cleaned = await mercury.clean_up(joined)
-            sf_ms = (time.perf_counter() - sf_start) * 1_000.0
-            if cleaned is not None:
-                text = cleaned
-                applied_smart_format = True
-
-        job_store: JobStore = request.app.state.job_store
-        client_version = request.headers.get("X-WisprAlt-Client-Version")
-        await asyncio.to_thread(
-            job_store.insert_streaming_dictation_idempotent,
-            api_key_id=int(user.id),
-            text=text,
+        saved = await dedup.persist(
+            request,
+            job_store,
+            user_id=int(user.id),
+            text=joined,
             duration_ms=int(total_inference_ms),
-            client_app_version=client_version,
-            smart_format_applied=applied_smart_format,
-            client_dedup_id=client_dedup_id,
-            dictated_at=speech_started_at,
+            client_app_version=request.headers.get("X-WisprAlt-Client-Version"),
+            dedup_id=did,
+            created_at=speech_started_at,
         )
+        if isinstance(saved, JSONResponse):
+            return saved  # session stays "finalizing" → finally aborts it
+        text, ok = saved
 
         async with session.lock:
             session.status = "finalized"
@@ -266,27 +285,18 @@ async def stream_finalize(
         total_handler_ms = (time.perf_counter() - handler_start) * 1_000.0
         logger.info(
             "stream finalize: session=%s chunks=%d total_inference_ms=%.1f "
-            "mercury_ms=%.1f total_handler_ms=%.1f chars=%d sf=%s dedup=%s",
+            "total_handler_ms=%.1f chars=%d dedup=%s",
             session_id,
             chunk_count,
             total_inference_ms,
-            sf_ms,
             total_handler_ms,
             len(text),
-            applied_smart_format,
-            client_dedup_id,
+            did,
         )
-
-        return JSONResponse(
-            {
-                "text": text,
-                "model_id": MODEL_ID,
-                "duration_ms": round(total_inference_ms, 2),
-                "smart_formatted": applied_smart_format,
-            }
-        )
+        replayed = bool(getattr(request.state, "dedup_replay", False))
+        return _final_response(text, total_inference_ms, replayed=replayed, saved=ok)
     finally:
-        # Any non-finalized exit (HTTPException, sqlite error, Mercury error)
+        # Any non-finalized exit (HTTPException, sqlite error)
         # must reset status to "aborted" so the session doesn't stick in
         # "finalizing" forever. The lock is short-held — no awaitable work.
         #
@@ -302,3 +312,15 @@ async def stream_finalize(
                     observability.streaming_sessions_aborted_total.increment(
                         "finalize_error"
                     )
+
+
+def _final_response(text: str, inference_ms: float, *, replayed: bool, saved: bool) -> JSONResponse:
+    return JSONResponse(
+        {
+            "text": text,
+            "model_id": MODEL_ID,
+            "duration_ms": round(inference_ms, 2),
+            "replayed": replayed,
+            "saved": saved,
+        }
+    )

@@ -22,16 +22,16 @@ Update model weights and bounce the server cleanly.
 
 3. **Wait for dictation readiness** — Parakeet is loaded at startup:
 
-       curl -fsS -H "Authorization: Bearer $WISPRALT_API_KEY" "$SERVER_URL/readyz/dictation"
+       curl -fsS -H "Authorization: Bearer $API_KEY" "$SERVER_URL/readyz/dictation"
 
    Expect 200 within about 60 s.
 
 4. **Verify the file model** (optional): the Whisper file model loads lazily on the first file job and is evicted when idle. To prove the new weights load, submit a short file:
 
-       curl -fsS -H "Authorization: Bearer $WISPRALT_API_KEY" -F "file=@/path/to/short.wav" "$SERVER_URL/transcribe/file"
+       curl -fsS -H "Authorization: Bearer $API_KEY" -F "file=@/path/to/short.wav" "$SERVER_URL/transcribe/file"
        # -> 202 {"job_id": "..."}; then poll GET $SERVER_URL/transcribe/file/<job_id> until status is done
 
-   Then `curl -H "Authorization: Bearer $WISPRALT_API_KEY" "$SERVER_URL/metrics"` shows `meeting.models_warm: true` (the `meeting` block is the file-job block; the key name is kept for now) and `parakeet.last_inference_at` populated after any dictation.
+   Then `curl -H "Authorization: Bearer $API_KEY" "$SERVER_URL/metrics"` shows `meeting.models_warm: true` (the `meeting` block is the file-job block; the key name is kept for now) and `parakeet.last_inference_at` populated after any dictation.
 
 ## Never
 

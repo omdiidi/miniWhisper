@@ -8,7 +8,7 @@ Run a full health/functional check of the server from the current Mac.
 
 ## Prerequisites
 
-Read `server/.env` (or read `tmp/client-config.txt`) for `SERVER_URL` and `WISPRALT_API_KEY` (or `API_KEY`). Abort with a clear message if either is missing.
+Read `SERVER_URL` from `server/.env`. `API_KEY` is a user token (the admin token printed once by `python -m wispralt.bootstrap`, or an employee token); it is not stored in `.env`, so ask the user to export it as `API_KEY` in their shell. Abort with a clear message if either is missing.
 
 ## Checks (run in order, report each)
 

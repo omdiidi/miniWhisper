@@ -9,8 +9,13 @@ Design decisions (v3 deltas P4#3 + P5#1 + P5#11):
   from the default asyncio thread pool used by other I/O tasks.
 - OOM guard: reject a new job if less than 2 GiB RAM is available before
   starting.
-- Staging WAV is always cleaned up in the ``finally`` block (R1#2), regardless
-  of success or failure.
+- The staging WAV / source is cleaned up when the job ends (R1#2) — EXCEPT
+  when the worker was interrupted (``CancelledError``, or the server is
+  shutting down and the row is still ``running``): then the input is kept and
+  ``store.requeue_interrupted`` puts the row back to ``pending`` with its
+  attempt refunded, so a deploy never loses or spends a job.
+- ``shutdown()`` (lifespan, before the DB goes away) cancels and awaits the
+  workers, then shuts the executor down without waiting for its thread.
 - reenqueue_pending(): called at startup after recover_orphans() to re-run any
   pending jobs whose source files survived the previous restart.
 
@@ -52,7 +57,7 @@ from ..config import settings
 from ..files import pipeline as files_pipeline
 from ..files.output import remove_job_outputs
 from ..ops import staging
-from .store import JobStore
+from .store import MAX_ATTEMPTS, JobStore
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +99,7 @@ class FileJobRunner:
 
     Lifecycle::
 
-        runner = FileJobRunner(store)
+        runner = FileJobRunner(store, app.state)
         jid = await runner.submit_source_or_429(src_path)  # FileJobInProgressError if busy
         # ... poll store.get(jid).status ...
 
@@ -103,8 +108,10 @@ class FileJobRunner:
         await runner.reenqueue_pending()
     """
 
-    def __init__(self, store: JobStore) -> None:
+    def __init__(self, store: JobStore, app_state: object) -> None:
         self.store = store
+        # ``app.state``: ``shutting_down`` tells an interrupted job from a finished one.
+        self.app_state = app_state
         # Dedicated single-thread pool — isolates heavy file-job I/O + CPU from
         # the default pool used by asyncio.to_thread for lighter tasks.
         self._executor = ThreadPoolExecutor(
@@ -141,8 +148,8 @@ class FileJobRunner:
         self,
         src_path: Path,
         *,
+        user_id: int,
         client_version: str | None = None,
-        api_key_id: int | None = None,
     ) -> str:
         """Create a job for a NOT-YET-TRANSCODED source and fire-and-forget it.
 
@@ -150,9 +157,9 @@ class FileJobRunner:
         container; the worker (:meth:`_run_source`) runs ffprobe + ffmpeg
         before handing the canonical WAV to the pipeline.
 
-        ``client_version`` + ``api_key_id`` are persisted on the original
+        ``client_version`` + ``user_id`` are persisted on the original
         ``store.create`` so they survive worker crashes and restart-driven
-        re-enqueues. Pass ``api_key_id=None`` for break-glass admin requests.
+        re-enqueues.
 
         Raises FileJobInProgressError (the route converts it to HTTP 429 with
         ``code`` in the body) if:
@@ -173,9 +180,7 @@ class FileJobRunner:
                 )
 
             jid = self.store.create(
-                str(src_path),
-                client_app_version=client_version,
-                api_key_id=api_key_id,
+                src_path, user_id=user_id, client_app_version=client_version
             )
             self._spawn(jid, src_path)
             return jid
@@ -190,31 +195,58 @@ class FileJobRunner:
         Every pending row (including legacy ``.wav`` rows) goes through
         :meth:`_run_source`, which re-probes and transcodes it.
 
-        C9: Jobs with attempts >= 3 are skipped and immediately failed to
-        prevent unbounded poison-pill re-enqueue loops.
+        C9: Jobs with attempts >= MAX_ATTEMPTS are skipped and immediately
+        failed to prevent unbounded poison-pill re-enqueue loops.
         """
-        rows = self.store.list_pending_ids_with_mode()
+        rows = self.store.list_pending_jobs()
         if rows:
             logger.info(
                 "Re-enqueueing %d pending job(s) from last run: %s",
                 len(rows),
                 [r[0] for r in rows],
             )
-        for jid, src_path, _request_mode in rows:
+        for jid, src_path in rows:
             job = self.store.get(jid)
             if job is None:
                 continue
-            if job.attempts >= 3:
+            if job.attempts >= MAX_ATTEMPTS:
                 logger.warning(
-                    "[%s] Skipping re-enqueue: job has %d attempts (max 3). Marking failed.",
+                    "[%s] Skipping re-enqueue: job has %d attempts (max %d). Marking failed.",
                     jid,
                     job.attempts,
+                    MAX_ATTEMPTS,
                 )
                 self.store.set_failed(jid, "max retries exceeded")
                 continue
-            self._spawn(job.id, Path(src_path))
+            self._spawn(jid, src_path)
+
+    async def shutdown(self) -> None:
+        """Stop the workers (lifespan shutdown, before the DB and the lock are released).
+
+        Cancelling a worker keeps its input and requeues its row (see
+        ``_interrupted``). ``run_in_executor`` work cannot be cancelled, so
+        the executor is shut down without waiting for its thread.
+        """
+        workers = list(self._workers)
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     # ── private ───────────────────────────────────────────────────────────────
+
+    def _interrupted(self, jid: str, cancelled: bool) -> bool:
+        """True when the job stopped because the server is going down, not because it ended."""
+        return cancelled or (
+            bool(getattr(self.app_state, "shutting_down", False))
+            and self.store.get_status(jid) == "running"
+        )
+
+    def _fail(self, jid: str, reason: str) -> None:
+        """Fail *jid*; a requested cancel wins over any other reason (timeouts, watchdog, errors)."""
+        self.store.set_failed(
+            jid, _CANCELLED if self.store.check_cancel_requested(jid) else reason
+        )
 
     def _spawn(self, jid: str, src_path: Path) -> None:
         """Start a worker task for *jid* and track it until it finishes."""
@@ -235,8 +267,9 @@ class FileJobRunner:
         progress. Applies the atomic cancel rule on completion and removes
         outputs on every path that does not end ``done``.
         """
-        output_dir = Path(settings.meeting_output_dir)
+        output_dir = settings.outputs_dir
         self._active_job_id = jid
+        cancelled = False
         try:
             self.store.update_phase(jid, "transcribe_load")
             logger.info("[%s] File transcription started.", jid)
@@ -305,10 +338,7 @@ class FileJobRunner:
             # Atomic cancel rule: one UPDATE ... WHERE status='running' AND
             # cancel_requested=0. On False nothing may survive as done.
             if not self.store.set_done_if_not_cancelled(
-                jid,
-                mode,
-                str(output_dir),
-                transcript_text=transcript_text or None,
+                jid, mode, transcript_text=transcript_text or None
             ):
                 remove_job_outputs(output_dir, jid)
                 if self.store.check_cancel_requested(jid):
@@ -322,6 +352,9 @@ class FileJobRunner:
                 return
             logger.info("[%s] File job done (mode=%s).", jid, mode)
 
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as exc:
             error_repr = repr(exc)
             current = self.store.get(jid)
@@ -331,16 +364,15 @@ class FileJobRunner:
                 # that did not finish.
                 remove_job_outputs(output_dir, jid)
             if current is None or current.status not in ("done", "failed"):
-                if self.store.check_cancel_requested(jid):
-                    self.store.set_failed(jid, _CANCELLED)
-                else:
-                    self.store.set_failed(jid, error_repr)
+                self._fail(jid, error_repr)
             logger.exception("[%s] File job failed: %s", jid, error_repr)
 
         finally:
             self._active_job_id = None
-            # Always clean up the staging WAV (R1#2).
-            staging.cleanup(wav_path)
+            # Clean up the staging WAV (R1#2) unless shutdown interrupted the
+            # job: then it is the input the requeued row needs.
+            if not self._interrupted(jid, cancelled):
+                staging.cleanup(wav_path)
 
     async def _run_source(
         self,
@@ -378,6 +410,7 @@ class FileJobRunner:
         """
         async with self._semaphore:
             watchdog_task: asyncio.Task[None] | None = None
+            cancelled = False
             try:
                 self._active_job_id = jid
                 # Atomic: refuses a row whose cancel was requested before the
@@ -426,14 +459,17 @@ class FileJobRunner:
                 )
 
                 # Durability boundary: persist canonical wav_path BEFORE
-                # deleting the source. force_single_channel is always True
-                # now (every file job is mono-transcribed); the column stays.
-                self.store.update_after_transcode(
-                    jid,
-                    wav_path=str(wav_path),
-                    force_single_channel=True,
-                )
+                # deleting the source.
+                self.store.update_after_transcode(jid, wav_path=wav_path)
                 src_path.unlink(missing_ok=True)
+
+                # A cancel that landed during the decode stops here, before
+                # the file model is ever loaded.
+                if self.store.check_cancel_requested(jid):
+                    self.store.set_failed(jid, _CANCELLED)
+                    staging.cleanup(wav_path)
+                    logger.info("[%s] File job cancelled after decode.", jid)
+                    return
 
                 # Spawn the watchdog before the big executor call. It will
                 # mark the row failed (advisory) if any in-pipeline phase
@@ -444,6 +480,11 @@ class FileJobRunner:
 
                 await self._run_pipeline_inner(jid, wav_path)
 
+            except asyncio.CancelledError:
+                # Shutdown: keep the source (and any canonical WAV); the row
+                # is requeued below.
+                cancelled = True
+                raise
             except staging.StagingCancelled:
                 logger.info("[%s] cancelled mid-decode by user", jid)
                 current = self.store.get(jid)
@@ -460,7 +501,7 @@ class FileJobRunner:
                 error_repr = repr(exc)
                 current = self.store.get(jid)
                 if current is None or current.status not in ("done", "failed"):
-                    self.store.set_failed(jid, error_repr)
+                    self._fail(jid, error_repr)
                 logger.exception(
                     "[%s] File job failed: %s", jid, error_repr
                 )
@@ -469,6 +510,9 @@ class FileJobRunner:
                 if watchdog_task is not None:
                     watchdog_task.cancel()
                 self._active_job_id = None
+                if self._interrupted(jid, cancelled):
+                    self.store.requeue_interrupted(jid)
+                    logger.info("[%s] Interrupted by shutdown; input kept, job requeued.", jid)
 
     # ── phase + progress + watchdog helpers ──────────────────────────────────
 
@@ -514,9 +558,7 @@ class FileJobRunner:
                 "[%s] phase_timeout name=%s budget_s=%.1f",
                 jid, name, budget_resolved,
             )
-            self.store.set_failed(
-                jid, f"Phase '{name}' exceeded timeout {budget_resolved:.0f}s"
-            )
+            self._fail(jid, f"Phase '{name}' exceeded timeout {budget_resolved:.0f}s")
             raise
         logger.info(
             "[%s] phase_done name=%s duration_ms=%d",
@@ -534,7 +576,7 @@ class FileJobRunner:
         """Pipeline-side callback: persist phase change + chunk progress.
 
         Called from inside the executor thread (mlx-whisper's tqdm patch +
-        wall-clock fallback). NPE-guarded: a concurrent ``store.delete``
+        wall-clock fallback). NPE-guarded: a row that is gone (retention)
         leaves nothing to update.
         """
         job = self.store.get(jid)
@@ -587,8 +629,5 @@ class FileJobRunner:
                     " semaphore still held)",
                     jid, job.phase, elapsed, budget_s,
                 )
-                self.store.set_failed(
-                    jid,
-                    f"Phase '{job.phase}' watchdog timeout (advisory)",
-                )
+                self._fail(jid, f"Phase '{job.phase}' watchdog timeout (advisory)")
                 return

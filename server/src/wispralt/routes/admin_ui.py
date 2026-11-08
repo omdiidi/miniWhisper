@@ -6,9 +6,13 @@ Two routers under the same prefix:
 - :data:`public_router` exposes ``/admin/login`` (GET form + POST submit) —
   these endpoints MUST be reachable without auth, otherwise the operator
   has no way to acquire the session cookie that gates the rest of the UI.
-- :data:`authed_router` covers everything else and is gated by both
-  :func:`require_admin` and :func:`_require_db_pool`, so a browser hitting
-  ``/admin/`` without a valid token is bounced to ``/admin/login``.
+- :data:`authed_router` covers everything else and is gated by
+  :func:`require_admin`.
+- :data:`me_router` serves ``/admin/me`` to any authenticated user.
+
+Every page reads the local SQLite DB through ``app.state.accounts``
+(:class:`AccountStore`) and ``app.state.usage`` (:class:`UsageStore`), each
+call in a worker thread. Tokens are generated only by ``accounts.service``.
 
 Auth model
 ----------
@@ -19,72 +23,75 @@ Auth model
    ``_extract_bearer`` (in ``auth.py``) falls back to the cookie when the
    header is absent.
 
-The login POST validates the token DIRECTLY against ``users.store.lookup``
-+ the break-glass hash on app.state.  We do NOT call ``require_api_key``
+The login POST validates the token with :func:`auth.resolve_token` (the same
+lookup the auth dependency uses). We do NOT call ``require_api_key``
 recursively because Starlette's ``request.cookies`` is read-only — writing
 into it has no effect on the very next dependency that would re-read it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
-import json
 import logging
 import re
 import secrets
+import sqlite3
+import time
 import urllib.parse
 from datetime import datetime
 from typing import Any
 
-import asyncpg
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
-from .. import auth as auth_mod
+from ..accounts import service as account_service
+from ..accounts.store import AccountStore, User
 from ..auth import (
     require_admin,
+    require_admin_csrf,
     require_api_key,
+    resolve_token,
     set_csrf_cookie,
     set_session_cookie,
     verify_csrf,
 )
 from ..config import settings
 from ..constants import MAX_DISPLAY_NAME_LEN
-from ..users import store as users_store
-from ..users.store import User
+from ..usage.store import UsageFilters, UsageStore
 from ..web.templates_env import templates
 
 logger = logging.getLogger(__name__)
 
 
-async def _require_db_pool(request: Request) -> asyncpg.Pool:
-    """Dependency: 503 if the asyncpg pool is unavailable.
+def _accounts(request: Request) -> AccountStore:
+    return request.app.state.accounts
 
-    The admin UI is unusable without Postgres (every page issues a query),
-    so fail loudly rather than crashing on AttributeError further down.
-    """
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is None:
-        raise HTTPException(
-            status_code=503, detail="Admin UI unavailable: Postgres degraded."
-        )
-    return pool
+
+def _form_page(
+    request: Request, template: str, ctx: dict[str, Any], status_code: int = 200
+) -> HTMLResponse:
+    """Render a page that holds a mutating form: mint a CSRF token, embed it, set its cookie."""
+    csrf = secrets.token_urlsafe(32)
+    response = templates.TemplateResponse(
+        template, {"request": request, "csrf_token": csrf, **ctx}, status_code=status_code
+    )
+    set_csrf_cookie(response, csrf)
+    return response
+
+
+def _usage(request: Request) -> UsageStore:
+    return request.app.state.usage
 
 
 # Two routers under the same /admin prefix.
 public_router = APIRouter(prefix="/admin")
-authed_router = APIRouter(
-    prefix="/admin",
-    dependencies=[Depends(require_admin), Depends(_require_db_pool)],
-)
+authed_router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 # Self-only router: any authenticated user (admin OR employee) can hit /admin/me
 # to see their own usage.  Gated by require_api_key (not require_admin) so
 # employees don't get 403'd out of their own page.
-me_router = APIRouter(
-    prefix="/admin",
-    dependencies=[Depends(_require_db_pool)],
-)
+me_router = APIRouter(prefix="/admin")
 
 
 # ── /admin/login (unauthenticated) ─────────────────────────────────────────────
@@ -122,14 +129,7 @@ async def login_submit(
     token: str = Form(...),
     csrf_token: str = Form(...),
 ) -> Any:
-    """Validate *token* and set the session cookie on success.
-
-    We resolve the token via the same paths the auth middleware uses
-    (cache → Postgres → break-glass) but inline rather than calling
-    :func:`require_api_key`: Starlette's ``request.cookies`` is read-only,
-    so a recursive call to ``require_api_key`` after a hypothetical
-    cookie-write would still see no cookie.
-    """
+    """Validate *token* (:func:`resolve_token`) and set the session cookie on success."""
     if not verify_csrf(request, csrf_token):
         return _render_admin_login_error(
             request,
@@ -137,38 +137,7 @@ async def login_submit(
             status_code=403,
         )
 
-    th = users_store.hash_token(token)
-    pool = getattr(request.app.state, "db_pool", None)
-    user: User | None = None
-
-    # 1. Cache fast-path — if this admin token is already cached we can
-    #    skip the DB round-trip.
-    cached = auth_mod.token_cache.get(th)
-    if cached is not None:
-        user = cached
-
-    # 2. Postgres lookup.
-    if user is None and pool is not None:
-        try:
-            user = await users_store.lookup(pool, th)
-        except (asyncpg.PostgresError, asyncpg.InterfaceError):
-            # asyncpg has NO common base class for these two — PostgresError
-            # (server-side) and InterfaceError ("pool is closed", client-side)
-            # both inherit directly from Exception via separate private
-            # hierarchies. The explicit tuple is the only correct form.
-            # See 2026-05-17 postmortem.
-            logger.exception("Postgres lookup failed during admin login")
-            user = None
-        if user is not None:
-            auth_mod.token_cache.put(th, user)
-
-    # 3. Break-glass: env-var hash always grants admin even when Postgres
-    #    is degraded so the operator never gets locked out.
-    if user is None:
-        bg = getattr(request.app.state, "break_glass_token_hash", None)
-        if bg is not None and th == bg:
-            user = User(id=-1, label="break-glass-admin", role="admin")
-
+    user = await resolve_token(request.app, token)
     if user is None:
         return _render_admin_login_error(
             request, error="Invalid token", status_code=401,
@@ -189,83 +158,17 @@ async def login_submit(
 # ── authed routes ─────────────────────────────────────────────────────────────
 
 
-_OVERVIEW_SQL = """
-WITH
-  now_ts AS (SELECT now() AS t),
-  totals AS (
-    SELECT
-      (SELECT count(*) FROM wispralt.users WHERE revoked_at IS NULL) AS active_users,
-      (SELECT count(*) FROM wispralt.users) AS total_users,
-      (SELECT count(*) FROM wispralt.usage_events
-        WHERE ts >= (SELECT t FROM now_ts) - INTERVAL '1 day') AS dictations_24h,
-      (SELECT count(*) FROM wispralt.usage_events
-        WHERE ts >= (SELECT t FROM now_ts) - INTERVAL '7 days') AS dictations_7d,
-      (SELECT count(*) FROM wispralt.usage_events
-        WHERE ts >= (SELECT t FROM now_ts) - INTERVAL '30 days') AS dictations_30d,
-      (SELECT count(*) FROM wispralt.usage_events
-        WHERE status >= 400
-          AND ts >= (SELECT t FROM now_ts) - INTERVAL '1 day') AS errors_24h,
-      (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms)
-         FROM wispralt.usage_events
-        WHERE duration_ms IS NOT NULL
-          AND ts >= (SELECT t FROM now_ts) - INTERVAL '1 day') AS p50_24h
-  ),
-  top_users AS (
-    SELECT u.id, u.label, u.role, count(e.id) AS n
-      FROM wispralt.users u
-      LEFT JOIN wispralt.usage_events e
-        ON e.user_id = u.id
-       AND e.ts >= (SELECT t FROM now_ts) - INTERVAL '7 days'
-     GROUP BY u.id, u.label, u.role
-     ORDER BY n DESC
-     LIMIT 5
-  ),
-  daily AS (
-    SELECT to_char(date_trunc('day', e.ts), 'YYYY-MM-DD') AS day,
-           count(*) AS n
-      FROM wispralt.usage_events e
-     WHERE e.ts >= (SELECT t FROM now_ts) - INTERVAL '14 days'
-     GROUP BY 1
-     ORDER BY 1
-  )
-SELECT
-  (SELECT row_to_json(totals) FROM totals)::text AS totals,
-  (SELECT json_agg(row_to_json(top_users)) FROM top_users)::text AS top_users,
-  (SELECT json_agg(row_to_json(daily)) FROM daily)::text AS daily
-"""
-
-
-def _decode_json_col(raw: Any, default: Any) -> Any:
-    """Decode a JSON-as-text column emitted by Postgres' ``::text`` cast.
-
-    asyncpg returns the column as ``str`` (or ``None`` when the inner
-    aggregate yielded no rows).  Decode to Python; fall back to *default*
-    for ``None``.
-    """
-    if raw is None:
-        return default
-    if isinstance(raw, (dict, list)):
-        return raw
-    return json.loads(raw)
-
-
-async def _aggregate_stats(pool: asyncpg.Pool) -> dict[str, Any]:
-    """Single CTE round-trip serving every tile on the overview page."""
-    row = await pool.fetchrow(_OVERVIEW_SQL)
-    if row is None:
-        return {"totals": {}, "top_users": [], "daily": []}
-    return {
-        "totals": _decode_json_col(row["totals"], {}),
-        "top_users": _decode_json_col(row["top_users"], []),
-        "daily": _decode_json_col(row["daily"], []),
-    }
-
-
 @authed_router.get("/", response_class=HTMLResponse)
 async def overview(request: Request) -> HTMLResponse:
-    pool = request.app.state.db_pool
-    stats = await _aggregate_stats(pool)
-    integration_count = await users_store.count_kind(pool, "integration")
+    now = time.time()
+    stats = await asyncio.to_thread(_usage(request).overview, now)
+    # "Dictations" tiles count dictation rows (a streamed dictation is one row,
+    # however many chunk requests it took); usage_events stays request telemetry.
+    counts = await asyncio.to_thread(request.app.state.job_store.dictation_counts, now)
+    stats["totals"].update(
+        dictations_24h=counts["24h"], dictations_7d=counts["7d"], dictations_30d=counts["30d"]
+    )
+    integration_count = await asyncio.to_thread(_accounts(request).count_kind, "integration")
     return templates.TemplateResponse(
         "overview.html.j2",
         {"request": request, "integration_count": integration_count, **stats},
@@ -274,11 +177,8 @@ async def overview(request: Request) -> HTMLResponse:
 
 @authed_router.get("/users", response_class=HTMLResponse)
 async def users_list(request: Request) -> HTMLResponse:
-    rows = await users_store.list_all(request.app.state.db_pool)
-    return templates.TemplateResponse(
-        "users.html.j2",
-        {"request": request, "users": rows},
-    )
+    rows = await asyncio.to_thread(_accounts(request).list_people)
+    return _form_page(request, "users.html.j2", {"users": rows})
 
 
 _VALID_ROLES = {"admin", "employee"}
@@ -339,15 +239,15 @@ def _build_install_command(server_url: str, plaintext: str) -> str:
 @authed_router.get("/users/new", response_class=HTMLResponse)
 async def users_add_form(request: Request) -> HTMLResponse:
     """Render the add-employee form."""
-    return templates.TemplateResponse(
+    return _form_page(
+        request,
         "add_employee.html.j2",
-        {
-            "request": request,
-            "form_label": "",
-            "form_role": "employee",
-            "form_display_name": "",
-        },
+        {"form_label": "", "form_role": "employee", "form_display_name": ""},
     )
+
+
+# The six admin mutations take their user through ``require_admin_csrf`` as a
+# PARAMETER dependency (auth first, then CSRF; a valid Bearer skips the token).
 
 
 @authed_router.post("/users/new", response_class=HTMLResponse)
@@ -356,6 +256,7 @@ async def users_add_submit(
     label: str = Form(...),
     role: str = Form("employee"),
     display_name: str = Form(""),
+    _admin: User = Depends(require_admin_csrf),
 ) -> HTMLResponse:
     """Create a new user, mint a token, and render the install one-liner.
 
@@ -369,10 +270,10 @@ async def users_add_submit(
     if err is not None or role not in _VALID_ROLES:
         if err is None:
             err = f"Invalid role: {role!r}."
-        return templates.TemplateResponse(
+        return _form_page(
+            request,
             "add_employee.html.j2",
             {
-                "request": request,
                 "error": err,
                 "form_label": label,
                 "form_role": role if role in _VALID_ROLES else "employee",
@@ -381,12 +282,14 @@ async def users_add_submit(
             status_code=400,
         )
 
-    pool = request.app.state.db_pool
-    user, plaintext = await users_store.mint(
-        pool,
-        label=clean_label,
-        role=role,
-        display_name=clean_display_name,
+    user, plaintext = await asyncio.to_thread(
+        lambda: account_service.create_user(
+            _accounts(request),
+            label=clean_label,
+            role=role,
+            kind="employee",
+            display_name=clean_display_name,
+        )
     )
     return templates.TemplateResponse(
         "employee_added.html.j2",
@@ -403,22 +306,20 @@ async def users_add_submit(
 
 
 @authed_router.post("/users/{user_id}/revoke")
-async def users_revoke(request: Request, user_id: int) -> RedirectResponse:
-    """Revoke *user_id* and invalidate its cached token entry."""
-    pool = request.app.state.db_pool
-    revoked_hash = await users_store.revoke(pool, user_id)
-    if revoked_hash:
-        auth_mod.token_cache.invalidate(revoked_hash)
+async def users_revoke(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> RedirectResponse:
+    """Disable *user_id*: none of its keys authenticate from the next request."""
+    await asyncio.to_thread(_accounts(request).disable_user, user_id)
     return RedirectResponse("/admin/users", status_code=303)
 
 
 @authed_router.post("/users/{user_id}/mint", response_class=HTMLResponse)
-async def users_mint(request: Request, user_id: int) -> HTMLResponse:
-    """Rotate the user's token in place; show the new plaintext once."""
-    pool = request.app.state.db_pool
-    new_plaintext, old_hash = await users_store.rotate(pool, user_id)
-    if old_hash:
-        auth_mod.token_cache.invalidate(old_hash)
+async def users_mint(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> HTMLResponse:
+    """Revoke the user's keys, issue one new key (re-enabling the user); show it once."""
+    new_plaintext = await _rotate_or_404(request, user_id)
     return templates.TemplateResponse(
         "token_minted.html.j2",
         {
@@ -429,12 +330,23 @@ async def users_mint(request: Request, user_id: int) -> HTMLResponse:
     )
 
 
+async def _rotate_or_404(request: Request, user_id: int) -> str:
+    """``service.rotate_user_key`` → the new plaintext; 404 for an unknown user."""
+    try:
+        _user, plaintext = await asyncio.to_thread(
+            account_service.rotate_user_key, _accounts(request), user_id
+        )
+    except sqlite3.IntegrityError as exc:  # FK: no such user
+        raise HTTPException(status_code=404, detail="User not found") from exc
+    return plaintext
+
+
 # ── /admin/keys — integration API keys (OpenAI-compat /v1 callers) ────────────
 #
 # Distinct from /admin/users (humans) — these are tokens issued for third-party
 # programs (Buzz, MacWhisper, Open WebUI, etc.) that talk to /v1/audio/*.
-# Under the hood: same wispralt.users row + role='employee', but with
-# kind='integration' which both (a) hides them from /admin/users and
+# Under the hood: a users row with role='employee' and kind='integration'
+# (plus its api_keys row), which both (a) hides them from /admin/users and
 # (b) blocks them from /me/* via forbid_integration_kind.
 
 
@@ -458,27 +370,21 @@ def _slugify_program_name(raw: str) -> str:
 @authed_router.get("/keys", response_class=HTMLResponse)
 async def keys_list(request: Request) -> HTMLResponse:
     """List all non-revoked integration keys (kind='integration')."""
-    pool = request.app.state.db_pool
-    rows = await users_store.list_integrations(pool)
-    return templates.TemplateResponse(
-        "keys.html.j2",
-        {"request": request, "keys": rows},
-    )
+    rows = await asyncio.to_thread(_accounts(request).list_integrations)
+    return _form_page(request, "keys.html.j2", {"keys": rows})
 
 
 @authed_router.get("/keys/new", response_class=HTMLResponse)
 async def keys_add_form(request: Request) -> HTMLResponse:
     """Render the add-integration-key form."""
-    return templates.TemplateResponse(
-        "add_key.html.j2",
-        {"request": request, "form_program_name": ""},
-    )
+    return _form_page(request, "add_key.html.j2", {"form_program_name": ""})
 
 
 @authed_router.post("/keys/new", response_class=HTMLResponse)
 async def keys_add_submit(
     request: Request,
     program_name: str = Form(...),
+    _admin: User = Depends(require_admin_csrf),
 ) -> HTMLResponse:
     """Mint an integration API key tied to a third-party program name.
 
@@ -487,36 +393,27 @@ async def keys_add_submit(
            control chars). Reuses ``_validate_optional_display_name`` but
            treats empty as an error here (Add Employee allows empty).
         2. Slugify the name into ``label = "key-<slug>"``.
-        3. Mint the user row (role='employee', display_name=program_name).
-        4. Flip ``kind`` to ``'integration'`` (separate UPDATE — column
-           default is 'employee').
-        5. Re-fetch the row so the User dataclass we pass to the template
-           reflects the post-update ``kind='integration'`` value (avoids
-           the stale-from-mint footgun).
-        6. Render the key_added page with the plaintext + OpenAI env-var
+        3. Create the integration user + key in one transaction
+           (role='employee', kind='integration', display_name=program_name).
+        4. Render the key_added page with the plaintext + OpenAI env-var
            snippet.
     """
     clean_name, err = _validate_optional_display_name(program_name)
     if err is not None or not clean_name:
-        return templates.TemplateResponse(
+        return _form_page(
+            request,
             "add_key.html.j2",
-            {
-                "request": request,
-                "error": err or "Program name is required.",
-                "form_program_name": program_name,
-            },
+            {"error": err or "Program name is required.", "form_program_name": program_name},
             status_code=400,
         )
 
     slug = _slugify_program_name(clean_name)
     if not slug:
-        return templates.TemplateResponse(
+        return _form_page(
+            request,
             "add_key.html.j2",
             {
-                "request": request,
-                "error": (
-                    "Program name must contain at least one letter or digit."
-                ),
+                "error": "Program name must contain at least one letter or digit.",
                 "form_program_name": program_name,
             },
             status_code=400,
@@ -524,19 +421,15 @@ async def keys_add_submit(
 
     label = f"{_KEY_LABEL_PREFIX}{slug}"
 
-    pool = request.app.state.db_pool
-    user, plaintext = await users_store.mint(
-        pool,
-        label=label,
-        role="employee",
-        display_name=clean_name,
+    user, plaintext = await asyncio.to_thread(
+        lambda: account_service.create_user(
+            _accounts(request),
+            label=label,
+            role="employee",
+            kind="integration",
+            display_name=clean_name,
+        )
     )
-    await users_store.set_kind(pool, user_id=user.id, kind="integration")
-    # Re-fetch so the value we hand to the template carries the updated
-    # kind='integration'. The mint() return is built from the INSERT row,
-    # which still shows the column-default 'employee'.
-    refreshed = await users_store.lookup_by_id(pool, user.id)
-    user_kind = refreshed.kind if refreshed is not None else "integration"
 
     return templates.TemplateResponse(
         "key_added.html.j2",
@@ -546,40 +439,31 @@ async def keys_add_submit(
             "program_name": clean_name,
             "plaintext": plaintext,
             "label": label,
-            "kind": user_kind,
+            "kind": user.kind,
+            "server_url": settings.server_url.rstrip("/"),
         },
     )
 
 
 @authed_router.post("/keys/{user_id}/revoke")
-async def keys_revoke(request: Request, user_id: int) -> RedirectResponse:
-    """Revoke an integration key and invalidate its cached token entry."""
-    pool = request.app.state.db_pool
-    revoked_hash = await users_store.revoke(pool, user_id)
-    if revoked_hash:
-        auth_mod.token_cache.invalidate(revoked_hash)
+async def keys_revoke(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> RedirectResponse:
+    """Revoke an integration key (disables its user; applies to the next request)."""
+    await asyncio.to_thread(_accounts(request).disable_user, user_id)
     return RedirectResponse("/admin/keys", status_code=303)
 
 
 @authed_router.post("/keys/{user_id}/rotate", response_class=HTMLResponse)
-async def keys_rotate(request: Request, user_id: int) -> HTMLResponse:
+async def keys_rotate(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> HTMLResponse:
     """Rotate an integration key in place; show the new plaintext once."""
-    pool = request.app.state.db_pool
-    new_plaintext, old_hash = await users_store.rotate(pool, user_id)
-    if old_hash:
-        auth_mod.token_cache.invalidate(old_hash)
-
+    new_plaintext = await _rotate_or_404(request, user_id)
     # Re-fetch so we can show the original program name on the success page.
-    refreshed = await users_store.lookup_by_id(pool, user_id)
-    program_name = None
-    label = None
-    if refreshed is not None:
-        label = refreshed.label
-        # We don't have display_name on the cached User dataclass; pull it
-        # via fetch_profile_by_id which returns it.
-        profile = await users_store.fetch_profile_by_id(pool, user_id)
-        if profile is not None:
-            program_name = profile.display_name
+    profile = await asyncio.to_thread(_accounts(request).profile, user_id)
+    program_name = profile.display_name if profile is not None else None
+    label = profile.label if profile is not None else None
 
     return templates.TemplateResponse(
         "key_added.html.j2",
@@ -590,55 +474,26 @@ async def keys_rotate(request: Request, user_id: int) -> HTMLResponse:
             "plaintext": new_plaintext,
             "label": label,
             "kind": "integration",
+            "server_url": settings.server_url.rstrip("/"),
         },
     )
 
 
-_USER_DETAIL_SQL = """
-WITH
-  now_ts AS (SELECT now() AS t)
-SELECT
-  (SELECT count(*) FROM wispralt.usage_events
-    WHERE user_id = $1
-      AND ts >= (SELECT t FROM now_ts) - INTERVAL '1 day') AS dictations_24h,
-  (SELECT count(*) FROM wispralt.usage_events
-    WHERE user_id = $1
-      AND ts >= (SELECT t FROM now_ts) - INTERVAL '7 days') AS dictations_7d,
-  (SELECT count(*) FROM wispralt.usage_events
-    WHERE user_id = $1
-      AND ts >= (SELECT t FROM now_ts) - INTERVAL '30 days') AS dictations_30d,
-  (SELECT count(*) FROM wispralt.usage_events
-    WHERE user_id = $1
-      AND status >= 400
-      AND ts >= (SELECT t FROM now_ts) - INTERVAL '1 day') AS errors_24h,
-  (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms)
-     FROM wispralt.usage_events
-    WHERE user_id = $1
-      AND duration_ms IS NOT NULL
-      AND ts >= (SELECT t FROM now_ts) - INTERVAL '1 day') AS p50_24h
-"""
-
-
 async def _render_user_detail(request: Request, user_id: int) -> HTMLResponse:
     """Shared body for the admin /admin/users/{id} and self-only /admin/me routes."""
-    pool = request.app.state.db_pool
-    user = await users_store.fetch_profile_by_id(pool, user_id)
+    user = await asyncio.to_thread(_accounts(request).profile, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    totals_row = await pool.fetchrow(_USER_DETAIL_SQL, user_id)
-    events = await pool.fetch(
-        "SELECT ts, kind, status, duration_ms, bytes_in, error_class, request_id "
-        "FROM wispralt.usage_events "
-        "WHERE user_id = $1 ORDER BY ts DESC LIMIT 50",
-        user_id,
-    )
+    usage = _usage(request)
+    totals = await asyncio.to_thread(usage.user_totals, user_id, time.time())
+    events = await asyncio.to_thread(usage.recent_events, user_id, 50)
     return templates.TemplateResponse(
         "user_detail.html.j2",
         {
             "request": request,
             "user": user,
-            "totals": dict(totals_row) if totals_row is not None else {},
-            "events": [dict(e) for e in events],
+            "totals": totals,
+            "events": events,
         },
     )
 
@@ -649,7 +504,7 @@ async def user_detail(request: Request, user_id: int) -> HTMLResponse:
 
 
 @me_router.get("/me", response_class=HTMLResponse)
-async def me(request: Request, user: "User" = Depends(require_api_key)) -> Any:
+async def me(request: Request, user: User = Depends(require_api_key)) -> Any:
     """Self-only landing page.
 
     Admins are redirected to the global dashboard so /admin/me is a safe
@@ -660,10 +515,6 @@ async def me(request: Request, user: "User" = Depends(require_api_key)) -> Any:
     """
     if user.role == "admin":
         return RedirectResponse("/admin/", status_code=303)
-    if user.id < 0:
-        # Sentinel break-glass user without an admin role shouldn't reach
-        # here in normal operation, but guard the case to avoid a 500.
-        raise HTTPException(status_code=403, detail="Account not provisioned")
     return await _render_user_detail(request, user.id)
 
 
@@ -676,26 +527,20 @@ def _parse_dt(raw: str | None) -> datetime | None:
         return None
 
 
-def _build_usage_query(
-    pool_query: dict[str, Any], where: list[str], params: list[Any]
-) -> tuple[str, list[Any]]:
-    """Compose the WHERE clause for /usage filters."""
-    if pool_query.get("kind"):
-        params.append(pool_query["kind"])
-        where.append(f"e.kind = ${len(params)}")
-    if pool_query.get("status") is not None:
-        params.append(pool_query["status"])
-        where.append(f"e.status = ${len(params)}")
-    if pool_query.get("user_id") is not None:
-        params.append(pool_query["user_id"])
-        where.append(f"e.user_id = ${len(params)}")
-    if pool_query.get("since"):
-        params.append(pool_query["since"])
-        where.append(f"e.ts >= ${len(params)}")
-    if pool_query.get("until"):
-        params.append(pool_query["until"])
-        where.append(f"e.ts < ${len(params)}")
-    return (" AND ".join(where) if where else "TRUE"), params
+def _filters(
+    kind: str | None,
+    status: int | None,
+    user_id: int | None,
+    since: str | None,
+    until: str | None,
+) -> UsageFilters:
+    return UsageFilters(
+        kind=kind or None,
+        status=status,
+        user_id=user_id,
+        since=_parse_dt(since),
+        until=_parse_dt(until),
+    )
 
 
 _PAGE_SIZE = 100
@@ -711,28 +556,10 @@ async def usage_drilldown(
     until: str | None = Query(None),
     offset: int = Query(0, ge=0),
 ) -> HTMLResponse:
-    pool = request.app.state.db_pool
-    filters_in = {
-        "kind": kind,
-        "status": status,
-        "user_id": user_id,
-        "since": _parse_dt(since),
-        "until": _parse_dt(until),
-    }
-    where_sql, params = _build_usage_query(filters_in, [], [])
-    params_with_paging = list(params) + [_PAGE_SIZE + 1, offset]
-    sql = (
-        "SELECT e.id, e.user_id, u.label AS user_label, e.ts, e.kind, e.status, "
-        "       e.duration_ms, e.bytes_in, e.error_class, e.request_id "
-        "  FROM wispralt.usage_events e "
-        "  LEFT JOIN wispralt.users u ON u.id = e.user_id "
-        f" WHERE {where_sql} "
-        " ORDER BY e.ts DESC "
-        f" LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
-    )
-    rows = await pool.fetch(sql, *params_with_paging)
+    filters = _filters(kind, status, user_id, since, until)
+    rows = await asyncio.to_thread(_usage(request).events, filters, _PAGE_SIZE + 1, offset)
     has_more = len(rows) > _PAGE_SIZE
-    page_rows = [dict(r) for r in rows[:_PAGE_SIZE]]
+    page_rows = rows[:_PAGE_SIZE]
 
     raw_filters = {
         "kind": kind or "",
@@ -777,26 +604,9 @@ async def usage_csv(
     until: str | None = Query(None),
 ) -> StreamingResponse:
     """Stream the filtered usage events as CSV."""
-    pool = request.app.state.db_pool
-    filters_in = {
-        "kind": kind,
-        "status": status,
-        "user_id": user_id,
-        "since": _parse_dt(since),
-        "until": _parse_dt(until),
-    }
-    where_sql, params = _build_usage_query(filters_in, [], [])
-    sql = (
-        "SELECT e.id, e.user_id, u.label AS user_label, e.ts, e.kind, e.status, "
-        "       e.duration_ms, e.chars, e.bytes_in, e.bytes_out, e.error_class, "
-        "       e.request_id "
-        "  FROM wispralt.usage_events e "
-        "  LEFT JOIN wispralt.users u ON u.id = e.user_id "
-        f" WHERE {where_sql} "
-        " ORDER BY e.ts DESC "
-        " LIMIT 10000"
-    )
-    rows = await pool.fetch(sql, *params)
+    filters = _filters(kind, status, user_id, since, until)
+    usage = _usage(request)
+    rows = await asyncio.to_thread(lambda: list(usage.iter_events(filters)))
 
     buf = io.StringIO()
     writer = csv.writer(buf)

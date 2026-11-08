@@ -8,6 +8,38 @@ boundaries) are rooted here so callers can catch them specifically.
 from __future__ import annotations
 
 
+class MigrationError(Exception):
+    """The DB's applied migrations do not match this code's migration files."""
+
+
+class AlreadyBootstrapped(Exception):
+    """First-admin bootstrap refused: an enabled admin already exists."""
+
+
+class DedupConflict(Exception):
+    """The dictation dedup id is already stored for another user (HTTP 409 ``dedup_conflict``)."""
+
+
+class DictationDeleted(Exception):
+    """The dictation stored under this dedup id was deleted by its owner (HTTP 410 ``dictation_deleted``)."""
+
+
+class ServerRunning(Exception):
+    """A server holds ``<data_dir>.lock``; backup/restore (and a second server) refuse."""
+
+
+class InsufficientSpace(Exception):
+    """Disk preflight failed: the message names the bytes needed and free (nothing written)."""
+
+
+class BackupRefused(Exception):
+    """Backup target is unusable (exists, or overlaps ``data_dir`` / its lock)."""
+
+
+class RestoreRefused(Exception):
+    """The backup failed a restore check (manifest, symlink, extra file, hash, integrity)."""
+
+
 class DiskFullError(Exception):
     """Raised when a write fails because the filesystem has no free space (ENOSPC)."""
 
@@ -51,3 +83,25 @@ class DecodeTimeoutError(Exception):
 
     NOT 408 — openai-python retries 408. Map to 400 so SDK doesn't retry.
     """
+
+
+class ImportIntegrityError(Exception):
+    """History import refused: a snapshot failed verification or the accounting does not add up."""
+
+
+class ExportUnavailable(Exception):
+    """The Supabase export cannot run here (no ``psql``, no connection string, bad SQL)."""
+
+
+class ExportBlocked(Exception):
+    """The Supabase project is unreachable or paused. Never unpaused by WisprAlt."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class OwnerMappingRequired(Exception):
+    """A local admin exists but no owner mapping was confirmed (``--owner-map`` or ``--yes``)."""
+
+

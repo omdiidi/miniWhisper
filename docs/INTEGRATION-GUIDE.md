@@ -210,45 +210,13 @@ contacting your operator about a failed call.
 
 ---
 
-## Smart formatting (WisprAlt-specific extension)
+## Smart formatting
 
-The WisprAlt macOS client has a "Smart formatting" toggle that calls
-[OpenRouter Mercury 2](https://openrouter.ai/) on the server to add punctuation
-and casing, remove obvious filler words, collapse repeats, and apply light
-list formatting on dictations of at least `SMART_FORMAT_MIN_WORDS` (default
-80) words. Meaning is preserved — no rephrasing, no summarization. **We
-deliberately do NOT apply that on `/v1/audio/transcriptions`** — third-party
-API consumers expect raw model output, not opinionated post-processing. If
-you want cleanup in your own pipeline, do it yourself.
-
-### Need cleanup but not via the WisprAlt client?
-
-Hit the native endpoint directly with the `X-Smart-Format: true` header. Your
-operator must have `SMART_FORMAT_ENABLED=true` and `OPENROUTER_API_KEY` configured server-side for this to
-work; without the key, the header is silently ignored and you get raw output.
-
-```bash
-curl https://transcribe.integrateapi.ai/transcribe/dictate \
-  -H "Authorization: Bearer $WISPRALT_API_KEY" \
-  -H "X-Smart-Format: true" \
-  -F file=@audio.wav
-```
-
-Returns:
-
-```json
-{
-  "text": "Cleaned-up transcript with proper punctuation.",
-  "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
-  "duration_ms": 142.3,
-  "smart_formatted": true
-}
-```
-
-The header accepts `true`, `1`, or `yes` (case-insensitive). Anything else,
-or an absent header, leaves output raw and `smart_formatted: false`. This is a
-WisprAlt-specific extension, **not** part of OpenAI compatibility — do not
-expect upstream OpenAI clients to send it.
+The server never post-processes transcripts: both `/v1/audio/transcriptions`
+and the native `/transcribe/dictate` return raw model output. Server smart
+formatting (OpenRouter Mercury, the `X-Smart-Format` header and the
+`smart_formatted` response key) was removed in Part 4. If you want cleanup in
+your own pipeline, do it yourself.
 
 ---
 

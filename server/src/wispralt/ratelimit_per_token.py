@@ -10,7 +10,6 @@ Buckets live on app.state.v1_rate_buckets (NOT a module-level dict — test
 isolation requires per-app state).
 
 Limit: 60 req / 60s window per user.id.
-Break-glass users (user.id < 0) bypass — no key id to bucket on.
 """
 from __future__ import annotations
 
@@ -21,8 +20,8 @@ import time
 
 from fastapi import Depends, HTTPException, Request
 
+from wispralt.accounts.store import User
 from wispralt.auth import require_api_key_v1
-from wispralt.users.store import User
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +51,6 @@ async def rate_limit_v1_per_token(
     Defensive lazy-init: if lifespan didn't run (older TestClient usage
     without `with`), initialize on first miss and warn.
     """
-    if user.id < 0:
-        return user  # break-glass exemption
-
     buckets = getattr(request.app.state, "v1_rate_buckets", None)
     lock = getattr(request.app.state, "v1_rate_buckets_lock", None)
     if buckets is None or lock is None:

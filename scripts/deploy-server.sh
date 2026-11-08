@@ -8,12 +8,12 @@
 #   1. Backup current /Users/$USER/wispralt/server + scripts/ to .wf-deploy-backup-<TS>.
 #   2. Replace server/src/ and server/pyproject.toml with the contents of the
 #      provided tarball.
-#   3. Run uv sync (or pip install -e .) inside the existing venv.
+#   3. Run pip install -e '.[host]' (the MLX stack is the [host] extra) inside the existing venv.
 #   4. Kickstart launchd: `launchctl kickstart -k gui/$UID/co.wispralt.server`.
 #   5. Poll /healthz until 200 or 60s timeout (curl errors are NORMAL while
 #      uvicorn is binding; we use `|| echo "000"` to keep set -e happy).
 #   6. Print final status. Exit non-zero only on a real failure (rsync error,
-#      uv sync error, post-restart timeout).
+#      dependency install error, post-restart timeout).
 #
 # Idempotent. Safe to re-run after a partial failure.
 #
@@ -23,14 +23,14 @@
 #
 # Optional env:
 #   DEPLOY_BACKUP_DIR — override the default backup parent (~/.wf-deploy-backups/).
-#   SKIP_PIP — set to 1 to skip `uv sync` / pip install (if you know deps unchanged).
+#   SKIP_PIP — set to 1 to skip the `pip install -e '.[host]'` step (if you know deps unchanged).
 #   SKIP_RESTART — set to 1 to skip launchctl kickstart (rare; for dry runs).
 #
 # Exit codes:
 #   0   — success
 #   2   — bad invocation (missing SRC_DIR)
 #   3   — rsync failure
-#   4   — uv sync failure
+#   4   — dependency install failure
 #   5   — healthz never returned 200 within timeout
 #
 # Lives in scripts/ so it's tracked in git. Edit the script + commit; don't
@@ -116,10 +116,10 @@ else
         fi
         # Install from pyproject in editable mode so future deploys can be
         # src-only without re-running pip.
-        echo "  pip install -e ."
+        echo "  pip install -e '.[host]'"
         .venv/bin/python -m pip install --upgrade pip >/dev/null 2>&1 || true
-        .venv/bin/python -m pip install -e . 2>&1 | tail -10 || {
-            echo "ERROR: pip install -e . failed" >&2
+        .venv/bin/python -m pip install -e '.[host]' 2>&1 | tail -10 || {
+            echo "ERROR: pip install -e '.[host]' failed" >&2
             exit 4
         }
     else

@@ -54,7 +54,7 @@ This is the only test that intentionally exercises the **honest limitation** doc
 
 ### SRT / VTT / TXT output-format regression
 
-File mode (`request_mode=file`) emits segments **without a `words[]` array** — `mlx_whisper.transcribe` is called with `word_timestamps=False` for performance. The output formatters in `server/src/wispralt/files/output.py` must never index `seg["words"]` in the SRT/VTT/TXT branches. To pin this:
+File transcription emits segments **without a `words[]` array** — `mlx_whisper.transcribe` is called with `word_timestamps=False` for performance. The output formatters in `server/src/wispralt/files/output.py` must never index `seg["words"]` in the SRT/VTT/TXT branches. To pin this:
 
 1. Run row #2 (5-min file).
 2. Diff the SRT, VTT, and TXT outputs against the post-swap golden (recorded from a known-good mlx-whisper run on the same input; the original goldens were captured from the last WhisperX run before Phase 10).
@@ -77,13 +77,25 @@ This section describes the rollback strategy that was in place during Phases 1�
 | File | What it pins |
 |---|---|
 | `server/tests/test_dictate_corrupt_audio.py` | LibsndfileError → CorruptAudioError boundary |
-| `server/tests/test_dictate_route_422.py` | `/transcribe/dictate` HTTP 422/415/413/200 contract |
+| `server/tests/test_dictate_route_422.py` | `/transcribe/dictate` HTTP 422/415/413/200 contract; `X-Smart-Format` / finalize `smart_format` ignored (raw text, no `smart_formatted`) |
 | `server/tests/test_observability_time_window.py` | recent-window p50 + low-traffic fallback on `/metrics` |
-| `server/tests/test_token_cache.py` | LRU + 60 s TTL on `TokenCache` |
-| `server/tests/test_usage_writer.py` | UsageEventQueue overflow + drainer batch + FK-violation retry |
-| `server/tests/test_admin_routes_auth.py` | `/admin/*` 403 employee / 200 admin |
-| `server/tests/test_db_health.py` | `db.health_check` + `db.recreate_pool` |
-| `server/tests/test_auth_break_glass.py` | Postgres-unreachable → env-var bearer → admin path |
+| `server/tests/test_admin_routes_auth.py` | `/admin/*` 401/403/200 with real tokens, login cookie, Add employee, revoke; portal numbers equal `UsageStore` |
+| `server/tests/test_admin_keys.py` | `/admin/keys/*` create / revoke / rotate on real SQLite |
+| `server/tests/test_integration_kind_guards.py` | integration keys: 403 on `/me/*`, allowed on `/v1` |
+| `server/tests/conftest.py` | shared harness: `DATA_DIR` set before import, per-test `settings.data_dir = tmp_path`, migrated `db` fixture, `accounts` / `usage` stores, `make_user`, `wire(app)` |
+| `server/tests/test_accounts.py` | `AccountStore` lookup / rotate / revoke / disable, first-admin bootstrap, no token in logs |
+| `server/tests/test_usage_store.py` | `UsageStore` record, overview, user totals, p50, drilldown filters, CSV rows |
+| `server/tests/test_supabase_export.py` | Part 7 read-only export against `FakeSource` and a fake `psql` (`subprocess.run` patched; never contacts Supabase): modes, suffixes, paging, retry, read-only SQL proof, BLOCKED, no-delete grep gate. Shared fakes live in `tests/_import_fakes.py`. |
+| `server/tests/test_supabase_import.py` | Part 7 snapshot import on the per-test DB: owner link, remaps, accounting equation, idempotent re-run, tamper refusal, dry run (DB + WAL hash unchanged), owner-mapping refusals, crash + resume from the checkpoint |
+| `server/tests/test_file_import.py` | Part 7 transcript-file import in a temp tree: grouping, parsing, honest timestamps, copies, duplicates, idempotent re-run, untouched sources, dry run, copy-failure rollback |
+| `server/tests/test_importer_cli.py` | Part 7 `python -m wispralt.importer` exit codes and prompts (no network) |
+| `server/tests/test_imports.py` | Part 7 history writer: `import_rows` idempotency + per-row `RowError`s, input validation, `link_existing`, `import_runs` resume, offline lock, `0003` across the `0002` gap |
+| `server/tests/test_database.py` | `Database` migrations (fresh, idempotent, failed, edited, missing, newer), pragmas, rollback, concurrent writers, `check()`, `DATA_DIR` validation |
+| `server/tests/test_db_health.py` | `/readyz/db` ok / `schema_outdated` / `db_error`; usage middleware writes one row per tracked POST; a failing write is counted, response kept |
+| `server/tests/test_auth.py` | per-request key lookup: revoked / disabled / unknown → 401, `sqlite3.Error` → 503, out-of-process revoke, disable → mint → new key works |
+| `server/tests/test_job_store.py` | `JobStore` on the shared DB: transitions + cancel rules, `requeue_interrupted` refund, FK `IntegrityError`, relative→absolute `wav_path`, `recover_orphans` policy + `reenqueue_pending` on absolute paths, dictation insert under a running job, `dictation_counts`, one insight row per scope, `stats_by_user` = `compute_user_stats` |
+| `server/tests/test_insights_cron.py` | the cron with a stub `InsightsClient`: a week with only a `file` transcript yields a person insight |
+| `server/tests/test_bootstrap.py` | `python -m wispralt.bootstrap` subprocesses under a pty: TTY refusal, client config + one token, already-exists, `--check`, `--rotate-admin`, bad `DATA_DIR` |
 | `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | 11-row injection truth table |
 | `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | 5-case secure-field refusal pin |
 | `client/Tests/WisprAltCoreTests/FileJobContractTests.swift` | `FileJobContract.cancelledByUserReason` matches the server's cancel reason; the Online JSON shape; `commitOutputs` (both files moved and staging empty; a failing second move removes the new folder and rethrows; a failing `makeDirectory` creates nothing). Same file: `OnlineUploadPlanTests` (cap 600: 25,000,000 B / 300 s direct, 900 s / 601 s / unknown duration / 25,000,001 B / mov·caf·aiff·aac → decode, `M4A` direct), `AudioExtractPolicyTests` (every strict / non-strict row), `ChunkPlannerTests` (seeded random envelopes: every range ≤ max, all but the last ≥ max − 20 s, deterministic; quietest window wins; no final range < 1 s) |

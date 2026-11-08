@@ -30,7 +30,6 @@ import time
 from pathlib import Path
 from typing import Callable
 
-import mlx.core as mx
 import numpy as np
 import soundfile as sf
 
@@ -42,9 +41,7 @@ from wispralt.files.segments import build_speakers_table, label_all
 
 logger = logging.getLogger(__name__)
 
-_MODEL_META = {
-    "transcription": "mlx-community/whisper-large-v3-turbo",
-}
+_MODEL_META = {"transcription": _mlx_mod.MODEL_ID}
 
 # Ready flag — set to True by _ensure_models_loaded(); read via is_ready()/state().
 _models_ready: bool = False
@@ -142,8 +139,8 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
     threshold, unload mlx-whisper and return True. Otherwise return False.
 
     Background task in main.py calls this every minute. Single-flight via the
-    same _load_lock used by _ensure_models_loaded — eviction will skip rather
-    than block if a file job is currently loading or processing.
+    same _load_lock that ``transcribe_file`` holds for the whole job — eviction
+    skips rather than blocks while any file job is loading or processing.
 
     Failure mode: same best-effort RAM reclaim caveat as the partial-load path
     (Python references dropped + gc.collect() hint; OS may hold slabs).
@@ -186,13 +183,10 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
         # above only drops the Python ref; Apple unified memory keeps the
         # backing pool cached unless we explicitly clear. Without this call,
         # idle RSS stays at 6.5-9 GB after a 105m job. With it, ~3 GB.
-        # Note: mx.clear_cache() and mx.reset_peak_memory() are the modern
-        # API (mx.metal.* are deprecated and emit a warning).
         try:
-            mx.clear_cache()
-            mx.reset_peak_memory()
+            _mlx_mod.release_cache()
         except Exception:  # noqa: BLE001 — best-effort; clear_cache is non-critical
-            logger.debug("mx.clear_cache() failed during eviction", exc_info=True)
+            logger.debug("release_cache() failed during eviction", exc_info=True)
         post_active_mb = observability.mlx_active_mb()
         post_cache_mb_after = observability.mlx_cache_mb()
         _models_ready = False
@@ -214,8 +208,8 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
             )
             # Self-check: invariant verification.
             delta_mb = pre_active_mb - post_active_mb
-            if (pre_active_mb > settings.meeting_eviction_pre_active_gate_mb
-                    and delta_mb < settings.meeting_eviction_delta_floor_mb):
+            if (pre_active_mb > settings.file_eviction_pre_active_gate_mb
+                    and delta_mb < settings.file_eviction_delta_floor_mb):
                 observability.eviction_failures_total.increment()
                 try:
                     mlx_whisper_version = _meta.version("mlx-whisper")
@@ -229,7 +223,7 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
                     "docs/TROUBLESHOOTING.md section 'Trust invariants, "
                     "not flags'.",
                     os.getpid(), pre_active_mb, post_active_mb, delta_mb,
-                    settings.meeting_eviction_delta_floor_mb,
+                    settings.file_eviction_delta_floor_mb,
                     post_cache_mb_after, mlx_whisper_version,
                 )
 
@@ -351,28 +345,32 @@ def transcribe_file(
         If model load fails inside _ensure_models_loaded() on first call.
     """
     global _last_job_finished_at
-    _ensure_models_loaded()
-    logger.info("[%s] Starting file transcription pipeline …", job_id)
-    try:
-        return _transcribe_file_inner(
-            wav_path,
-            output_dir,
-            job_id,
-            progress_cb=progress_cb,
-            cancel_cb=cancel_cb,
-            phase_setter_cb=phase_setter_cb,
-        )
-    finally:
-        # Stamp the idle timer on every exit (success OR failure) so the
-        # background eviction task can correctly schedule unload.
-        _last_job_finished_at = time.monotonic()
-        # Reclaim per-job MLX activation cache (separate from the model
-        # weights, which evict_if_idle handles). Without this, peak RSS
-        # compounds across back-to-back jobs.
+    # _load_lock (an RLock; _ensure_models_loaded re-enters it) is held for the
+    # whole job, so evict_if_idle's non-blocking acquire skips meanwhile: a
+    # job can no longer pass the unlocked fast path and then lose its model.
+    with _load_lock:
         try:
-            mx.clear_cache()
-        except Exception:  # noqa: BLE001
-            logger.debug("post-job mx.clear_cache() failed", exc_info=True)
+            _ensure_models_loaded()
+            logger.info("[%s] Starting file transcription pipeline …", job_id)
+            return _transcribe_file_inner(
+                wav_path,
+                output_dir,
+                job_id,
+                progress_cb=progress_cb,
+                cancel_cb=cancel_cb,
+                phase_setter_cb=phase_setter_cb,
+            )
+        finally:
+            # Stamp the idle timer on every exit (success, failure, or a failed
+            # warmup) so the background eviction task schedules correctly.
+            _last_job_finished_at = time.monotonic()
+            # Reclaim per-job MLX activation cache (separate from the model
+            # weights, which evict_if_idle handles). Without this, peak RSS
+            # compounds across back-to-back jobs.
+            try:
+                _mlx_mod.release_cache()
+            except Exception:  # noqa: BLE001
+                logger.debug("post-job release_cache() failed", exc_info=True)
 
 
 def _transcribe_file_inner(

@@ -52,7 +52,7 @@ If you just need to read state and the user is sitting at the mini, the fastest 
 - Repository pattern: database queries in repository functions, business logic in services, validation at route boundaries only.
 - No generic `except Exception` — use typed errors.
 - No model loading per dictation request; dictation models are resident at startup. The file model (MLX Whisper) loads lazily on the first file job and is evicted when idle (async batch — load cost is invisible).
-- No Redis. File jobs/dictation transcripts live in a SQLite job store; users, tokens and usage events live in Postgres (Supabase, via asyncpg).
+- No Redis, no Postgres. Everything (users, hashed keys, usage, dictations, file jobs, insights, import runs) lives in one SQLite file, `DATA_DIR/wispralt.db` (numbered migrations in `server/src/wispralt/migrations/`).
 - Cloudflared tunnel token: stored in `~/.config/wispralt/cloudflare-token` (mode 0600)
   outside the repo. Read by the cloudflared LaunchAgent via `--token-file`. Never
   committed, never logged. The legacy `sudo cloudflared service install` flow is
@@ -60,6 +60,6 @@ If you just need to read state and the user is sitting at the mini, the fastest 
   docs/DEPLOYMENT-NOTES.md.
 - Client modes: Online (OpenAI, default) and Local (self-hosted server). Online never contacts the Local host; no OpenAI ↔ Local fallback. Testable client decisions live in `client/WisprAltCore` (Swift Testing, run by `scripts/test-client.sh`); app code only wires them.
 - Client logs: an `Error` reaches a `Log` call only via `ErrorLog.describe`; never log transcript text, response bodies, server reasons, paths, URLs or keys (`scripts/check-log-privacy.py` enforces it).
-- Secrets: `WISPRALT_API_KEY` (and the optional `OPENROUTER_API_KEY` for server Mercury, removed in Part 4) in `server/.env` (mode 0600). Client keys in the Keychain only: Local `co.wispralt`, OpenAI `co.wispralt.openai`, OpenRouter `co.wispralt.openrouter` (client-side Mercury smart formatting). Never commit any of them.
+- Secrets: the optional `OPENROUTER_API_KEY` (weekly insights) in `server/.env` (mode 0600). Server API keys live hashed in `DATA_DIR/wispralt.db`; the first admin token is printed once by `python -m wispralt.bootstrap` (terminal only). Client keys in the Keychain only: Local `co.wispralt`, OpenAI `co.wispralt.openai`, OpenRouter `co.wispralt.openrouter` (client-side Mercury smart formatting). Never commit any of them.
 
 @CLAUDE.local.md

@@ -118,53 +118,52 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 **Fix:**
 1. Check `GET /metrics` for `disk.free_gb` and `disk.staging_count`.
 2. Clean up stale staging files: `ls -lh $STAGING_DIR` and remove any files older than a few days.
-3. Clean up old file-job outputs from `MEETING_OUTPUT_DIR` (the retention sweep removes finished jobs after `MEETING_JOB_RETENTION_DAYS`).
+3. Clean up old file-job outputs from `$DATA_DIR/outputs`. Retention is the DB setting `retention_days` (default 0 = keep forever); when it is set, the daily purge removes finished jobs and dictations older than that. Also check for old `<DATA_DIR>.pre-restore-*` directories: a restore keeps the replaced tree aside and never deletes it.
 4. The disk guard requires free space ≥ 2× the upload size before accepting a file.
 
 ---
 
-## DB pool watcher — diagnosing a stuck state
+## Local database (`/readyz/db`) and usage-write failures
 
-### Symptoms
-- `/me/*` or `/admin/*` returns 503 for >2 minutes.
-- Dictation: mic light is on but no text appears.
+Users, API keys and usage events live in `DATA_DIR/wispralt.db` (SQLite). There is no pool to rebuild and no watcher.
 
-### Healthy state
-- `curl https://transcribe.integrateapi.ai/readyz/db` → 200 `{"status":"ok"}`
-- `tail -200 ~/Library/Logs/WisprAlt/wispralt.log | grep db_watcher` shows
-  EITHER nothing (steady-state) OR alternating `pool unhealthy` / `pool rebuilt`
-  pairs (transient recovery).
-
-### Stuck state (what we hit on 2026-05-17)
-- `/readyz/db` returns 503 for >2 consecutive probes.
-- Log shows `db_watcher: unexpected error; continuing loop` repeating
-  every 10s without an intervening `pool rebuilt`.
-
-### Inline grep recipe (run on the mini)
-```bash
-# Count "unexpected error" lines since last "pool rebuilt".
-# Healthy: small number. Stuck: counts grow without bound at ~6/min.
-tail -2000 ~/Library/Logs/WisprAlt/wispralt.log \
-  | awk '/db_watcher: pool rebuilt/{c=0; next} /db_watcher: unexpected error/{c++} END{print c+0}'
-```
-
-### Recovery
-1. `launchctl kickstart -k gui/501/co.wispralt.server` — restarts the server,
-   which rebuilds the pool on startup.
-2. Investigate WHY the watcher didn't self-heal — almost certainly a missed
-   exception class. Search `db.py` and `main.py` for `except asyncpg.PostgresError`
-   and consider broadening to `asyncpg.Error`.
-3. After the fix, confirm self-healing by watching `/readyz/db` go 503 → 200
-   within ~30 s after a real Postgres blip (the dev-only fault-injection probe
-   that used to automate this was removed in Part 2).
+- `curl https://transcribe.<your-domain>/readyz/db` → 200 `{"status":"ok","usage_write_failures":0,"dictation_save_failures":0}` when healthy.
+- 503 `reason: "db_error"` — the DB file is missing or unreadable (`ls -l "$DATA_DIR/wispralt.db"`; it should be 0600 and owned by the server user; check free disk). Every authenticated request returns 503 "Auth temporarily unavailable" meanwhile — there is no fallback admin.
+- 503 `reason: "schema_outdated"` — a migration is not applied; restart the server (it migrates at startup) and check its log for `MigrationError`.
+- `usage_write_failures` > 0 (also `usage_write_failures_total` in `/metrics`) — that many usage rows were lost to a `sqlite3.Error`; the requests themselves succeeded. The log line `usage write failed: <ErrorType>` names the cause (usually `OperationalError: database is locked` under heavy contention).
+- `dictation_save_failures` > 0 (also `dictation_save_failures_total` in `/metrics`) — that many dictations were returned to the client with `"saved": false` (log line `dictation save failed: <ErrorType>`). The client kept those recordings under Retry; a Retry with the same dictation id saves them once the DB is healthy.
 
 ### IMPORTANT: /readyz/db is observability-only
 Do NOT wire `/readyz/db` into Cloudflare origin health-check (use `/healthz`),
 launchd KeepAlive (uses process exit), or any liveness probe that RESTARTS
-the server on failure. A flaky pool causing cascading restarts would amplify
-the outage this endpoint is meant to detect.
+the server on failure.
 
----
+## History import
+
+`python -m wispralt.importer …` (runbook in [ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files)).
+
+- **Exit 3 / `BLOCKED.json`** — the Supabase project is paused or unreachable (DNS,
+  connection refused, timeout, "Tenant or user not found"). The snapshot folder holds
+  only `BLOCKED.json`. Nothing tried to unpause it: resume the project yourself in the
+  Supabase dashboard if you want the export, then run `export` again (a new `-2`
+  folder). Transcript-file import still works meanwhile.
+- **Exit 1 `ExportUnavailable`** — `psql` is missing (`brew install libpq` or
+  `postgresql`), no connection string (env `WISPRALT_IMPORT_PG_URL` or Keychain
+  `co.wispralt.import-pg`), or Postgres refused the query (e.g. permissions).
+- **Exit 4 integrity failure** — a `.jsonl` file no longer matches `counts.json`
+  (edited or truncated), the row count changed during the export twice in a row, a
+  first import found rows already present, or not every planned row was written.
+  Nothing from the failing batch was written; export a fresh snapshot rather than
+  editing one.
+- **Exit 2 refused** — no terminal and no `--yes`; the owner mapping is ambiguous
+  (more than one enabled admin on either side: use `--owner-map PG_ID=LOCAL_ID`); no
+  local admin yet (run `python -m wispralt.bootstrap`); or the server holds
+  `<DATA_DIR>.lock` (stop it first; until Part 4's lock lands the server does not
+  take it, so stop the service yourself).
+- **`unmatched` rows** — usage rows whose Supabase user is not in the snapshot (or was
+  malformed). They stay in the snapshot and are listed in the report.
+- **A crash mid-import** — just run the same command again: it resumes after the last
+  committed batch, and already-imported rows count as duplicates.
 
 ## Trust invariants, not flags — eviction & release checks
 
@@ -474,15 +473,14 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 
 **Diagnosis ladder:**
 
-1. **Was the token revoked?** Open `/admin/users` on the Mac mini admin UI. If their row has a non-null `revoked_at`, this is expected — text them a new token via the **Mint** flow.
-2. **Cache TTL window.** Token state is cached in-process for 60 seconds (`TokenCache._TTL_S`). If the row was just rotated, cache hits for the OLD hash will keep failing for up to 60s. Wait one minute, retry. For instant lockout: restart the launchd agent (`bash scripts/server-launchd.sh restart`).
-3. **Can the server reach Postgres?**
+1. **Was the token revoked, or the user disabled?** Open `/admin/users` on the Mac mini admin UI. If their row shows `revoked` (`disabled_at` is set), this is expected — text them a new token via the **Mint** flow (mint also re-enables the user). There is no token cache: every request looks the key up in `wispralt.db`, so a revoke, disable or mint applies to the very next request.
+2. **Is the local database healthy?**
    ```bash
-   curl -s --max-time 4 https://transcribe.<your-domain>/healthz
-   tail -100 ~/Library/Logs/WisprAlt/server.log | grep -i 'postgres\|asyncpg\|db_pool'
+   curl -s --max-time 4 https://transcribe.<your-domain>/readyz/db
+   tail -100 ~/Library/Logs/WisprAlt/wispralt.log | grep -i 'sqlite\|database\|migration'
    ```
-   If the log shows `Postgres unavailable at startup; only break-glass admin will work`, the asyncpg pool failed to initialize. Check `SUPABASE_DATABASE_URL` in `server/.env` (mode 0600), check Supabase project status, restart the agent.
-4. **Right token?** A token's plaintext is shown **once** by `/admin/users/<id>/mint`. If the employee misplaced it, mint a new one — there is no recovery for the old plaintext.
+   A DB error makes auth answer **503** (never 401, and there is no fallback admin). `/readyz/db` gives the reason (`db_error` / `schema_outdated`); see "Local database" above.
+3. **Right token?** A token's plaintext is shown **once** by `/admin/users/<id>/mint`. If the employee misplaced it, mint a new one — there is no recovery for the old plaintext.
 
 ---
 
@@ -498,8 +496,9 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 **Fix:**
 
 - For 401 from a browser: visit `/admin/login`, paste the admin token, submit. The cookie is set with `max_age=8h`.
-- For 403: use the admin token, not an employee token. If you don't have an admin token in hand, the env-var `WISPRALT_API_KEY` from `server/.env` is the break-glass admin and resolves to the seeded admin row (or to the synthetic `User(id=-1)` if Postgres is unreachable).
-- If you see **503** instead of 401/403 with body "Admin UI unavailable: Postgres degraded.": the asyncpg pool is `None`. The break-glass path lets you authenticate to `/transcribe/*`, but the admin UI requires Postgres. Fix the DB URL, restart the agent.
+- For 403: use the admin token, not an employee token. There is no env-var admin key and no break-glass admin. If the admin token is lost, mint a new one on the server's terminal: `cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin` (prints the new token once; add `--user-id N` when there are several admins).
+- **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Revoke, Mint, Rotate) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (the `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
+- **503** instead of 401/403: the account lookup hit a `sqlite3.Error`. Check `/readyz/db` and the "Local database" section; there is no fallback admin.
 
 ---
 
