@@ -195,6 +195,31 @@ def test_tampered_state_deletes_nothing_outside_the_root(
     assert code == 0 and outside.is_dir() and "skipped" in err
 
 
+def test_uninstall_resolves_dotdot_and_symlinked_parents(
+    installed: Paths, cli: CliFn, tmp_path: Path
+) -> None:
+    """R3 fix: containment is checked on resolved paths, not lexically."""
+    outside = tmp_path / "precious"
+    (outside / "victim").mkdir(parents=True)
+    escape = installed.root / "escape"
+    escape.symlink_to(outside)  # a parent inside the root that points out of it
+    link = installed.root / "link-out"
+    link.symlink_to(outside / "victim")  # an artifact that is itself a symlink
+    state = InstallState.load(installed.state_file)
+    assert state is not None
+    state.artifacts += [
+        str(escape / "victim"),
+        str(installed.root / ".." / "precious"),
+        str(installed.root / "." / "escape" / ".." / "precious" / "victim"),
+        str(link),
+    ]
+    state.save(installed.state_file)
+    code, _, err = cli("uninstall")
+    assert code == 0 and err.count("skipped") == 3
+    assert (outside / "victim").is_dir()
+    assert not link.is_symlink() and not link.exists()  # unlinked, its target untouched
+
+
 def test_purge_data_backs_up_then_deletes(installed: Paths, cli: CliFn, runner: FakeRunner) -> None:
     code, out, _ = cli("uninstall", "--purge-data")
     assert code == 0 and "backup written" in out

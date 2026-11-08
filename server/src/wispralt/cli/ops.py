@@ -581,12 +581,18 @@ def _update_phase2(ctx: Ctx, args: argparse.Namespace) -> int:
 # ── uninstall ────────────────────────────────────────────────────────────────
 
 
-def _removable(ctx: Ctx, path: Path) -> bool:
-    """Only paths under the install root or LaunchAgents (a tampered state file deletes nothing else)."""
+def _removable(ctx: Ctx, path: Path) -> Path | None:
+    """The resolved *path* if it is under the install root or LaunchAgents, else None.
+
+    A tampered state file deletes nothing else. Both sides are resolved, so ``..``
+    and symlinked parents cannot lead out. A symlink artifact is judged by where
+    it lives, not where it points: ``_delete`` unlinks it and never follows it.
+    """
     p = ctx.paths
-    return path not in {p.root, p.home} and (
-        path.is_relative_to(p.root) or path.is_relative_to(p.launch_agents)
-    )
+    real = path.parent.resolve() / path.name if path.is_symlink() else path.resolve()
+    root, home, agents = p.root.resolve(), p.home.resolve(), p.launch_agents.resolve()
+    inside = real.is_relative_to(root) or real.is_relative_to(agents)
+    return real if inside and real not in {root, home, agents} else None
 
 
 def _delete(path: Path) -> None:
@@ -669,8 +675,8 @@ def cmd_uninstall(ctx: Ctx, args: argparse.Namespace) -> int:
         if item == UV_TOOL:
             continue
         path = Path(item)
-        if _removable(ctx, path):
-            _delete(path)
+        if (target := _removable(ctx, path)) is not None:
+            _delete(target)
         else:
             print(f"skipped {path}: outside {p.root}", file=sys.stderr)
     if args.purge_data:
