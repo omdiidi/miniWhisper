@@ -29,7 +29,8 @@ public enum RetryEntries {
     /// `last.json` (`textSaved`), the server stored it and words came back
     /// (a failed save, empty text or `saved: false` keep the recording).
     public static func dropAfterRetry(_ result: DictationResult, textSaved: Bool) -> Bool {
-        textSaved && result.serverSaved && !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !SpoolDisposition.keepsAudio(truncated: false, serverSaved: result.serverSaved, textSaved: textSaved)
+            && !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// One id found in `retry/` (audio and/or sidecar).

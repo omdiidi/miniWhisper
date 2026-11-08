@@ -100,10 +100,11 @@ extension MenuBarController {
             if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 outcome = .emptyText
             } else {
-                LastTextStore.save(result, mode: s.snapshot.mode)   // recoverable before any paste
+                // Recoverable before any paste; a failed save keeps the recording under Retry.
+                let textSaved = LastTextStore.save(result, mode: s.snapshot.mode)
                 let tInj = clock.now
                 delivery = await TextInjector.inject(result.text, targetPID: targetPID)
-                outcome = .text(truncated: cut, serverSaved: result.serverSaved)
+                outcome = .text(truncated: cut, serverSaved: result.serverSaved, textSaved: textSaved)
                 Log.debug(
                     "dictation/timing: stop_ms=\(String(format: "%.1f", stopMs)) net_ms=\(String(format: "%.1f", netMs)) " +
                     "inject_ms=\(String(format: "%.1f", (clock.now - tInj).milliseconds))",
