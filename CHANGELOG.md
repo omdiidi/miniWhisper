@@ -2,6 +2,66 @@
 
 All notable changes to WisprAlt are documented here.
 
+## [Unreleased] - 2026-11-07 — Part 3: Online mode (OpenAI direct) + client modernization
+
+### For you (owner-facing)
+
+- **Online is now the default.** Add your key with
+  `security add-generic-password -U -s co.wispralt.openai -a default -w`
+  (works while the app runs) or in Settings → Advanced. Expect one Keychain
+  prompt per new app build. Without a key, FN shows a notice and opens the
+  key field. Use a project-scoped key with a monthly budget cap.
+- Pick the model in Settings → Advanced; prices are shown beside each.
+  Dictation stops at 10 minutes.
+- In Online mode nothing is sent to your Local server. A running Local file
+  job pauses when you switch to Online; switching back resumes watching it,
+  as after a relaunch (you get a completion notice and re-run it to download
+  the files).
+- If transcription fails, the audio is kept under "Retry" (last 2, for 7
+  days, compact 16 kHz) with Retry, Export… and Discard. If the text could not
+  be confirmed as pasted, it stays on the clipboard and under "Copy last
+  dictation"; no audio is kept. Dictating into a password field types and
+  copies nothing (use "Copy last dictation"). Both rely on FileVault.
+- Online file transcription sends supported files under 25 MB and 10 minutes
+  as is, and splits the rest. It saves TXT and JSON; subtitles need Local.
+  Quitting mid-file loses that job; pick the file again.
+- Not in this part: join link and invites, plain-http LAN hosts (use
+  `tailscale serve`), a history list, text-while-you-speak, resuming Online
+  file jobs.
+
+### Added
+
+- **Mode picker** (Online (OpenAI) / Local server) with a status line
+  (`Online · <model> · key saved|key missing` or `Local · <host>`,
+  "transcribing N"). A change applies to the next dictation.
+- **Online dictation**: 16 kHz mono WAV → `POST /v1/audio/transcriptions`,
+  one retry on transient errors, a deadline that cancels the request. Model
+  picker with $/min and retire dates (no diarize model).
+- **Online file jobs** (TXT + JSON): direct upload when possible, else
+  audio extraction, decode and quiet-point chunking (≤ 10 min per chunk,
+  previous chunk's tail as prompt); outputs written all or nothing.
+- **Client-side Mercury smart formatting** (opt-in, both modes, text only to
+  OpenRouter, key `co.wispralt.openrouter`).
+- **Spool + Retry list**, **last-text record** for "Copy last dictation".
+- `WisprAltCore` holds every testable decision; tests moved to Swift Testing
+  (`scripts/test-client.sh`), plus a log-privacy gate and the real-API probe
+  (`scripts/online-assumptions/run-all.sh`, exit 0 PASS / 1 FAIL / 2 BLOCKED).
+
+### Changed
+
+- Release logs are private; no log carries transcript text, server bodies or
+  reasons, paths, URLs or keys.
+- Local URLs: https, or http only to this Mac (`NSAllowsLocalNetworking`).
+- Every Local dictation request carries `X-Client-Dedup-Id`; the client no
+  longer sends `smart_format` / `X-Smart-Format`.
+- An unverified Cmd+V paste leaves the text on the clipboard (the previous
+  pasteboard is no longer restored).
+
+### Removed
+
+- Local API key export / import / "Copy API Key", the DEBUG `/tmp` WAV dump,
+  and the server call behind "Copy last dictation" (`GET /me/dictations/last`).
+
 ## [Unreleased] - 2026-11-07 — Part 2: removals (meetings, cloud fallback, Hugging Face token)
 
 WisprAlt is now dictation plus file transcription. Everything below is a

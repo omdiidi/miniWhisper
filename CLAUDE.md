@@ -58,6 +58,8 @@ If you just need to read state and the user is sitting at the mini, the fastest 
   committed, never logged. The legacy `sudo cloudflared service install` flow is
   abandoned because its plist is broken on macOS 14/15. Rotation: see
   docs/DEPLOYMENT-NOTES.md.
+- Client modes: Online (OpenAI, default) and Local (self-hosted server). Online never contacts the Local host; no OpenAI ↔ Local fallback. Testable client decisions live in `client/WisprAltCore` (Swift Testing, run by `scripts/test-client.sh`); app code only wires them.
+- Client logs: an `Error` reaches a `Log` call only via `ErrorLog.describe`; never log transcript text, response bodies, server reasons, paths, URLs or keys (`scripts/check-log-privacy.py` enforces it).
 - Secrets: `WISPRALT_API_KEY` (and the optional `OPENROUTER_API_KEY` for server Mercury, removed in Part 4) in `server/.env` (mode 0600). Client keys in the Keychain only: Local `co.wispralt`, OpenAI `co.wispralt.openai`, OpenRouter `co.wispralt.openrouter` (client-side Mercury smart formatting). Never commit any of them.
 
 @CLAUDE.local.md

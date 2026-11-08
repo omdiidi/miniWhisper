@@ -8,6 +8,15 @@ A self-hosted, privacy-first replacement for Wispr Flow. Sub-400ms dictation and
 
 ![Demo](docs/demo.gif)
 
+## Two modes
+
+The macOS client has a **Mode** picker in its popover:
+
+- **Online (OpenAI)** — the default. Dictation and file transcription go straight from your Mac to OpenAI (`gpt-transcribe` by default, $0.0045/min; other models with prices under Advanced), using your own key from the macOS Keychain. No server needed. Files are saved as TXT + JSON.
+- **Local server** — everything goes to the self-hosted server described below, and audio never leaves your infrastructure. Files are saved as JSON, SRT, VTT and TXT.
+
+Online sends nothing to your Local server. Optional smart formatting (Mercury via OpenRouter) runs in the client in both modes and sends text only. See [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md#mode-online-openai-or-local-server).
+
 ## What it is
 
 WisprAlt is a two-component system:
@@ -44,8 +53,8 @@ For the full architecture diagram and latency budget, see [docs/ARCHITECTURE.md]
 
 - **Sub-400ms dictation** — hold FN, speak, release; text injected at cursor
 - **File transcription** — any audio/video container (m4a, mp3, mp4, mov, wav, …); large files upload in chunks; cancel any time
-- **Four output formats** — JSON (segment timestamps), SRT, VTT, TXT
-- **Privacy-first** — your audio goes to your own Mac mini, not a cloud API
+- **Output formats** — Local: JSON (segment timestamps), SRT, VTT, TXT; Online: TXT + JSON
+- **Privacy-first** — in Local mode your audio goes to your own Mac mini, not a cloud API; logs never carry transcript text
 - **Free** — all models are open-source; no per-minute API fees
 - **Auto-updates** — never while a dictation or file job is in flight
 - **Cloudflare Tunnel** — access your Mac mini from anywhere; outbound-only, no port forwarding

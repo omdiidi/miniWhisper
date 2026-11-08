@@ -85,13 +85,13 @@ Required for AVAudioEngine dictation recording.
 
 ## Mode: Online (OpenAI) or Local server
 
-The top of the popover has a **Mode** picker: **Online (OpenAI)** sends dictation audio straight to OpenAI (`gpt-transcribe` by default) using your own OpenAI key; **Local server** uses your self-hosted WisprAlt server (configured below). The default is still **Local** until Online file transcription lands. A change applies to the next dictation; a dictation already recording finishes on the mode it started in. The picker is locked only while a Local file is converting or uploading ("Finish or cancel the upload first").
+The top of the popover has a **Mode** picker: **Online (OpenAI)** sends dictation audio straight to OpenAI (`gpt-transcribe` by default) using your own OpenAI key; **Local server** uses your self-hosted WisprAlt server (configured below). The default is **Online**, on fresh installs and on upgrade (no probe of a saved server URL); pick Local if you run your own server. A change applies to the next dictation; a dictation already recording finishes on the mode it started in. The picker is locked only while a Local file is converting or uploading ("Finish or cancel the upload first").
 
 Under the picker a status line shows `Online · gpt-transcribe · key saved` (or `key missing`) or `Local · <server host>` with `reachable` / `unreachable` (checked when the popover opens in Local or when you switch to Local), plus `transcribing N` while dictations are still being transcribed.
 
 **Model.** Show advanced settings → **OpenAI Model** lists every OpenAI transcription model with its price per minute in small text (`≈` marks an estimate for token-billed models) and, for older models, the date OpenAI retires them (e.g. "retires Feb 26, 2027"). The default is `gpt-transcribe` ($0.0045/min). The choice applies to the next dictation; file transcription always uses a file model, and dictation stops at 10 minutes. If OpenAI reports the chosen model does not exist, the app switches back to `gpt-transcribe` and tells you.
 
-In Online mode nothing is sent to your Local server, and the server-only rows are hidden (Connection / Test Connection, Server URL, API Key and its backup, Your name, Open Portal, Open My Dictations, the job Log button). **Transcribe file…** is disabled in Online for now. **Copy last dictation** works in both modes: it copies the last dictation's text, kept on this Mac for 7 days. If a dictation fails (or might be cut off) its audio is kept under **Retry** in the popover (last 2, 7 days, 16 kHz) with Retry, Export… and Discard. Both rely on FileVault for protection at rest. Switching to Online while a Local file job is being watched stops watching it without cancelling it on the server; switching back resumes watching it.
+In Online mode nothing is sent to your Local server, and the server-only rows are hidden (Connection / Test Connection, Server URL, API Key and its backup, Your name, Open Portal, Open My Dictations, the job Log button). **Transcribe file…** works in Online too (TXT + JSON only; see below). **Copy last dictation** works in both modes: it copies the last dictation's text, kept on this Mac for 7 days. If a dictation fails (or might be cut off) its audio is kept under **Retry** in the popover (last 2, 7 days, 16 kHz) with Retry, Export… and Discard. Both rely on FileVault for protection at rest. Switching to Online while a Local file job is being watched stops watching it without cancelling it on the server; switching back resumes watching it.
 
 ### OpenAI API key
 
@@ -101,7 +101,9 @@ Enter it in **Show advanced settings → OpenAI API Key** (Save / Remove), or fr
 security add-generic-password -U -s co.wispralt.openai -a default -w
 ```
 
-The key lives only in the Keychain (service `co.wispralt.openai`, account `default`), in memory, and in the `Authorization: Bearer` header sent to `api.openai.com`. A key created from Terminal trusts Terminal, so each newly signed build asks once for Keychain access; choose **Always Allow**. With Online selected and no key, holding FN does not record: a notice appears and the popover opens at the key field.
+The key lives only in the Keychain (service `co.wispralt.openai`, account `default`), in memory, and in the `Authorization: Bearer` header sent to `api.openai.com`. A key created from Terminal trusts Terminal, so each newly signed build asks once for Keychain access; choose **Always Allow**.
+
+Use a **project-scoped** OpenAI key (a project just for WisprAlt) with a **monthly budget cap** set in the OpenAI dashboard, so a lost key or a runaway loop has a ceiling. Online pricing: `gpt-transcribe` is $0.0045 per audio minute. With Online selected and no key, holding FN does not record: a notice appears and the popover opens at the key field.
 
 ## Server Configuration
 
@@ -133,7 +135,7 @@ After the permission wizard, the app is ready for server configuration (Local mo
 | Dictating | mic filled | While holding FN |
 | Converting | circular arrows | Preparing a file for upload |
 | Uploading | upload-cloud | While a file uploads ("Transcribe file…") |
-| Processing | waveform | While server is transcribing |
+| Processing | waveform | While the server transcribes a Local file, or while an Online file job runs |
 | Done | checkmark | Briefly, before returning to Idle |
 
 ### Picking your input mic
@@ -230,7 +232,16 @@ security add-generic-password -U -s co.wispralt.openai -a default -w
 
 ## File Transcription Usage
 
-1. (Local mode.) Click the WisprAlt menubar icon → **Transcribe file…** and pick any audio or video file (m4a, mp3, mp4, mov, wav, aac, flac, opus, ogg, webm, m4v, caf, aiff).
+**Online mode.** Click **Transcribe file…** and pick an audio or video file. Nothing is copied: the file is read where it is.
+
+1. Supported files (mp3, mp4, m4a, wav, webm, ogg, flac, mpeg, mpga) under 25 MB and 10 minutes go to OpenAI as is, in one request. Anything else (longer, larger, mov/caf/aiff/aac, video) is decoded on this Mac: the audio track is extracted from a video, then split at quiet moments into pieces of at most 10 minutes, each sent as 16 kHz mono with the end of the previous piece as context. The popover shows "Chunk i of n".
+2. Only when every piece succeeded, `<name>.txt` and `<name>.json` are saved together in a new `Custom Transcriptions/<name>__<timestamp>/` folder (see [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#online-json)). A failure or Cancel saves nothing. Subtitles (SRT/VTT) need Local mode.
+3. Quitting mid-file loses that job (its temp files are cleaned up at the next launch); pick the file again. A video with no audio track, or a file this Mac cannot decode, says so ("This file type needs Local mode").
+4. Switching modes never stops a running Online file job. If a Local file job was saved and you switch to Local during the Online job, the Local job is watched again once the Online job ends.
+
+**Local mode.**
+
+1. Click the WisprAlt menubar icon → **Transcribe file…** and pick any audio or video file (m4a, mp3, mp4, mov, wav, aac, flac, opus, ogg, webm, m4v, caf, aiff).
 2. The file is copied into its own folder under `Custom Transcriptions` and uploaded as-is (large files go up in chunks). The UI moves through **Uploading (with %)** → **Processing** → **Done**.
 3. The server transcribes it with MLX Whisper (one mono stream, no speaker labels). The model loads on the first file job, so the first one after an idle spell takes longer.
 4. `.json`, `.srt`, `.vtt` and `.txt` are downloaded next to the source file (see [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md)), then the server copy is deleted. **Copy last custom transcription** puts the newest TXT on the clipboard.

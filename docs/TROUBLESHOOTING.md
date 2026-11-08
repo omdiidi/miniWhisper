@@ -558,6 +558,18 @@ dictation/timing: inject_ms=18.7 total_ms=1873.5
 
 Client log messages are `.private` in release builds, so Console.app and `log stream` show `<private>` for them; DEBUG builds (`swift build`, `swift run`) log them in full. Either way the client never logs transcript text, server responses or reasons, file names, paths, URLs or keys; errors appear only as a type and code (for example `server(status: 500)` or `NSURLErrorDomain#-1009`). To see message text on a release build, run a DEBUG build from source.
 
+### Online: holding FN does nothing ("key missing")
+
+**Symptom:** in Online mode FN shows a notice and opens the popover at the OpenAI key field; the status line reads `Online · <model> · key missing`.
+
+**Fix:** paste the key in **Show advanced settings → OpenAI API Key**, or run `security add-generic-password -U -s co.wispralt.openai -a default -w` in Terminal (works while the app runs; the next FN press picks it up). After a new build, macOS asks once for Keychain access: choose **Always Allow**. "OpenAI rejected the API key" means the key itself is wrong or revoked; "quota exceeded" means the OpenAI project's budget is used up.
+
+### Online file transcription failed
+
+- "This file type needs Local mode": this Mac cannot decode the file (e.g. a video whose audio is not AAC). Use Local mode, or convert it to m4a first.
+- "This video has no usable audio track" / "Could not extract audio": the video has no sound, or the audio could not be copied out of it.
+- Nothing is written to the transcripts folder unless the whole file succeeded, and a job interrupted by quit is not resumed: pick the file again.
+
 ### A dictation failed: Retry, Export…, Discard
 
 **Symptom:** "Dictation Failed … Audio saved under Retry." or "N saved recordings from last session — see Retry".
