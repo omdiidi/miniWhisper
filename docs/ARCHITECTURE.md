@@ -428,7 +428,8 @@ The SIGTERM handler (registered in the lifespan when running on the main thread)
 
 1. sets `shutting_down` and awaits `file_runner.shutdown()` FIRST, while the DB is open: each worker is cancelled; a job it interrupts keeps its staged input (WAV or source) and `requeue_interrupted` sets the row back to `pending` with the attempt `set_running` took refunded, so a deploy never spends an attempt;
 2. cancels the daemon loops and streaming sessions, closes the insights client;
-3. drops the stores (`app.state.db` etc.).
+3. drops the stores (`app.state.db` etc.);
+4. releases the server lock (`<data_dir>.lock`) last.
 
 A worker that finished (`done`/`failed`) during shutdown cleans up its input as usual. The executor thread itself cannot be cancelled; it is abandoned (`shutdown(wait=False, cancel_futures=True)`).
 
@@ -557,7 +558,7 @@ render escaped, closing the stored-XSS hole on the admin UI.
 
 ## Background maintenance and logging
 
-`ops/background.py` hosts the lifespan's daemon loops. `daily_sweep_loop` runs every 24 h (in a worker thread): stale staging WAVs (>24 h, excluding WAVs of active jobs), stale chunked-upload dirs (>1 h), stale file-job output `.tmp` files, `sweep_transcripts` (below), and file-job retention (`sweep_old_meetings`, name kept) — finished (`done`/`failed`) job rows plus their `<id>.{txt,srt,vtt,json}` files older than `MEETING_JOB_RETENTION_DAYS` (default 90, 0 disables; pending/running and any job the runner still tracks as active are never touched; files are removed from each job's persisted `output_dir`, which must resolve inside `MEETING_OUTPUT_DIR`, and a job whose files fail to delete keeps its row for the next sweep). The same staging sweeps also run once at startup.
+`ops/background.py` hosts the lifespan's daemon loops. `daily_sweep_loop` runs every 24 h (in a worker thread): stale staging WAVs (>24 h, excluding WAVs of active jobs), stale chunked-upload dirs (>1 h), stale file-job output `.tmp` files, and `run_retention` (see "Retention" below). The staging sweeps and `run_retention` also run once at startup.
 
 Logging: launchd cannot rotate `server.log` / `server.err.log` without sudo, so `ops/logging_setup.configure_file_logging` sends root and uvicorn loggers to a `RotatingFileHandler` at `settings.server_log_path` (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). The launchd files now only capture crash output and the one-off `NEW_API_KEY=` print on key rotation. `/admin/server-log/{job_id}` reads `wispralt.log` plus its rotated backups (`.1`-`.5`).
 
@@ -583,6 +584,35 @@ Part 4 moves the Local-mode host onto **one SQLite file**, `data_dir/wispralt.db
 `0001_initial.sql` holds the full schema (users, api_keys, invites, usage_events,
 dictations, jobs, weekly_insights, settings). Callers move onto it task by task
 during Part 4; until then the sections below describe the current stores.
+
+**Server lock.** The lifespan takes `fcntl.flock(LOCK_EX | LOCK_NB)` on the
+sibling `<data_dir>.lock` (`ops.backup.server_lock`) before it opens the DB and
+releases it last; a second server on the same `DATA_DIR` refuses to start
+(`ServerRunning`). The lock lives beside, not inside, `DATA_DIR`, so a restore's
+directory swap never moves it. (In WAL mode an idle server holds no SQLite lock,
+so no SQLite probe can prove the server is stopped; only this flock can.)
+
+**Offline backup and restore** (`ops/backup.py`; the Part 5 CLI stops the service,
+runs them, and restarts it). Both take the server lock non-blocking and raise
+`ServerRunning` while a server runs, and both preflight disk first: the estimated
+bytes × 1.1 must fit in the target parent's free space, else `InsufficientSpace("need
+X GB, have Y GB")` before anything is written.
+
+- `backup(data_dir, dest)` refuses a `dest` that exists or overlaps `DATA_DIR`
+  (`BackupRefused`); takes a `VACUUM INTO` snapshot and switches it to
+  `journal_mode=DELETE` (so no `-wal`/`-shm` appears beside it); copies `outputs/`
+  and `staging/` (regular files only); writes `manifest.json` (relative POSIX paths,
+  sha256, bytes, per-table counts, `schema_version`). Dirs 0700, files 0600,
+  whatever the umask.
+- `restore(backup_dir, data_dir)` refuses (`RestoreRefused`, nothing changed) a
+  backup inside `DATA_DIR`, a symlink anywhere in it, a manifest path that is
+  absolute, has `..` or leaves the backup, any file not in the manifest (e.g. a
+  stray `wispralt.db-wal`), a missing database entry, a hash or size mismatch, or a
+  failed `integrity_check` (run on the staged copy opened `?mode=ro&immutable=1`, so
+  the backup is never written). Files are copied into a sibling `.restore-<ts>`
+  (0700/0600), `DATA_DIR` is moved aside to `.pre-restore-<ts>` and the staged tree
+  takes its place; a failed swap puts the original back. It returns the aside path,
+  which is never deleted (a refusal removes only its staged copy).
 
 **Repositories** are classes over `Database`, one transaction per method:
 
@@ -629,17 +659,18 @@ user and `/admin/data` groups by it (`JobStore.stats_by_user`, one query).
 
 - **No opt-in flag.** Deliberate product decision; do not re-introduce
   gating "to be safe."
-- **90-day retention.** `JobStore.sweep_transcripts(days)` zeros
-  `jobs.transcript_text` and deletes `dictations` rows older than
-  `transcript_retention_days` (default 90). TTL is measured from
-  `COALESCE(finished_at, created_at)` on jobs (the moment the transcript
-  actually existed, not job submission) and from `created_at` on dictations.
-  Sweep runs once at startup (`main.lifespan`) and on a daily 24 h asyncio
-  timer task (`_daily_transcript_sweep`) so a long-uptime server eventually
-  reaps.
-- **Asymmetric word-count survival.** `jobs.word_count` survives past sweep
-  because the row stays as audit history; `dictations` rows are deleted
-  entirely. This is intentional.
+- **Retention: keep forever by default.** One DB setting, `settings.retention_days`
+  (seeded `'0'` by `0001`; a missing row also reads 0 = forever; DESIGN §2.1).
+  `JobStore.retention_days()` / `set_retention_days(n)` / `retention_preview(n) →
+  {"dictations", "jobs"}` (what a purge would delete now; the Part 5 CLI shows it
+  before setting). When `n > 0`, `background.run_retention` (startup + daily)
+  calls `purge_dictations(n)` (by `created_at`) and `purge_expired_jobs`: finished
+  (`done`/`failed`) job rows older than `n` days by `COALESCE(finished_at,
+  created_at)` plus their `<id>.{txt,srt,vtt,json}` in `outputs/`. Pending/running
+  jobs and any job the runner still tracks as active are never touched; an id whose
+  output path would leave `outputs/` is skipped (files untouched), and a job whose
+  files fail to delete keeps its row for the next run. Imported rows (`source IS NOT
+  NULL`) and `usage_events` are never purged.
 - **File permissions.** `wispralt.db` is created 0600 (its `-wal`/`-shm`
   inherit the mode) and re-chmodded by every `migrate()`.
 - **Empty / whitespace-only dictations are skipped.** Avoids polluting

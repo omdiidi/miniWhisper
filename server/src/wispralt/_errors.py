@@ -24,6 +24,22 @@ class DictationDeleted(Exception):
     """The dictation stored under this dedup id was deleted by its owner (HTTP 410 ``dictation_deleted``)."""
 
 
+class ServerRunning(Exception):
+    """A server holds ``<data_dir>.lock``; backup/restore (and a second server) refuse."""
+
+
+class InsufficientSpace(Exception):
+    """Disk preflight failed: the message names the bytes needed and free (nothing written)."""
+
+
+class BackupRefused(Exception):
+    """Backup target is unusable (exists, or overlaps ``data_dir`` / its lock)."""
+
+
+class RestoreRefused(Exception):
+    """The backup failed a restore check (manifest, symlink, extra file, hash, integrity)."""
+
+
 class DiskFullError(Exception):
     """Raised when a write fails because the filesystem has no free space (ENOSPC)."""
 

@@ -118,7 +118,7 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 **Fix:**
 1. Check `GET /metrics` for `disk.free_gb` and `disk.staging_count`.
 2. Clean up stale staging files: `ls -lh $STAGING_DIR` and remove any files older than a few days.
-3. Clean up old file-job outputs from `MEETING_OUTPUT_DIR` (the retention sweep removes finished jobs after `MEETING_JOB_RETENTION_DAYS`).
+3. Clean up old file-job outputs from `$DATA_DIR/outputs`. Retention is the DB setting `retention_days` (default 0 = keep forever); when it is set, the daily purge removes finished jobs and dictations older than that. Also check for old `<DATA_DIR>.pre-restore-*` directories: a restore keeps the replaced tree aside and never deletes it.
 4. The disk guard requires free space ≥ 2× the upload size before accepting a file.
 
 ---

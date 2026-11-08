@@ -42,7 +42,7 @@ def sweep_staging(job_store: JobStore) -> tuple[int, int, int]:
     )
 
 
-def sweep_old_meetings(
+def purge_expired_jobs(
     job_store: JobStore,
     days: int,
     output_dir: Path,
@@ -50,19 +50,34 @@ def sweep_old_meetings(
 ) -> int:
     """Delete finished job rows older than *days* plus their output files in *output_dir*.
 
-    ``days <= 0`` disables. Jobs the runner still tracks as active
+    ``days <= 0`` keeps everything. Jobs the runner still tracks as active
     (*is_active*) are skipped (the watchdog can mark a job ``failed`` while
-    its executor thread still runs). If any file fails to delete, the row is
-    kept so the next sweep retries. Returns the number of rows deleted.
+    its executor thread still runs). A job id whose output paths would leave
+    *output_dir* is skipped with its files untouched, and if any file fails
+    to delete the row is kept so the next sweep retries. Returns rows deleted.
     """
-    if days <= 0:
-        return 0
+    root = output_dir.resolve()
     deletable = [
         jid
-        for jid in job_store.list_expired_finished_jobs(days)
-        if not (is_active is not None and is_active(jid)) and remove_job_outputs(output_dir, jid)
+        for jid in job_store.expired_jobs(days)
+        if not (is_active is not None and is_active(jid))
+        and (output_dir / f"{jid}.txt").resolve().parent == root
+        and remove_job_outputs(output_dir, jid)
     ]
     return job_store.delete_finished_jobs(deletable) if deletable else 0
+
+
+def run_retention(
+    job_store: JobStore, is_active: Callable[[str], bool] | None = None
+) -> tuple[int, int]:
+    """Apply the ``retention_days`` setting once. Returns ``(dictations, jobs)`` deleted."""
+    days = job_store.retention_days()
+    if days <= 0:
+        return 0, 0
+    return (
+        job_store.purge_dictations(days),
+        purge_expired_jobs(job_store, days, settings.outputs_dir, is_active),
+    )
 
 
 def run_daily_sweeps(
@@ -75,21 +90,15 @@ def run_daily_sweeps(
             "Daily staging sweep: wavs=%d, chunked_dirs=%d, tmp=%d",
             wavs, chunked, tmp,
         )
-    j, d = job_store.sweep_transcripts(days=settings.transcript_retention_days)
-    if j or d:
-        logger.info("Daily transcript sweep: jobs=%d, dictations=%d", j, d)
-    purged = sweep_old_meetings(
-        job_store, settings.meeting_job_retention_days, settings.outputs_dir,
-        is_active,
-    )
-    if purged:
-        logger.info("Daily meeting retention sweep: jobs deleted=%d", purged)
+    dicts, jobs = run_retention(job_store, is_active)
+    if dicts or jobs:
+        logger.info("Daily retention purge: dictations=%d, jobs=%d", dicts, jobs)
 
 
 async def daily_sweep_loop(
     app: FastAPI, job_store: JobStore, is_active: Callable[[str], bool] | None = None
 ) -> None:
-    """Re-run staging, transcript and meeting-retention sweeps every 24 h.
+    """Re-run the staging sweeps and the retention purge every 24 h.
 
     Daemon-loop pattern: broad-except + log so a transient SQLite/OS error
     never kills the task.

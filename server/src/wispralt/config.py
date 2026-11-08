@@ -93,22 +93,6 @@ class Settings(BaseSettings):
     # when None, the cron is a no-op.
     openrouter_api_key: str | None = None
 
-    # Transcript persistence TTL. After this many days, transcript text on
-    # `jobs` rows is zeroed (the row stays as audit metadata) and `dictations`
-    # rows are deleted entirely. Measured from COALESCE(finished_at, created_at)
-    # on jobs and from created_at on dictations — i.e. the moment the text
-    # actually existed, not job submission. Daily sweep runs in the lifespan
-    # background task. See docs/ARCHITECTURE.md "Transcript persistence".
-    transcript_retention_days: int = 90
-
-    # Finished (done/failed) meeting job rows and their output files
-    # (<id>.txt/.srt/.vtt/.json in outputs_dir) older than this many
-    # days are deleted by the daily sweep. 0 disables. Default matches
-    # transcript_retention_days so /me/history keeps meeting rows for as long
-    # as their transcript text is retained. Pending/running jobs are never
-    # deleted.
-    meeting_job_retention_days: int = 90
-
     # Application log (RotatingFileHandler). launchd's server.log /
     # server.err.log are left for crash output only. /admin/server-log reads
     # this file. 10 MB x (1 + 5 backups) = ~60 MB cap.

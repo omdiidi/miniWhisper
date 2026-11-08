@@ -366,7 +366,6 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 | Variable | Required | Notes |
 |---|---|---|
 | `DATA_DIR` | Yes | Absolute path of the data directory (`wispralt.db`, outputs, staging). `setup-server.sh` writes `$HOME/Library/Application Support/WisprAlt`. |
-| `MEETING_JOB_RETENTION_DAYS` | No | Default 90 (0 disables). Daily sweep deletes finished (done/failed) file job rows (the variable keeps its meeting-era name) and their `<id>.{txt,srt,vtt,json}` output files older than this. Pending/running jobs are never deleted. |
 | `SERVER_LOG_PATH` / `SERVER_LOG_MAX_BYTES` / `SERVER_LOG_BACKUP_COUNT` | No | Rotating application log (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). `/admin/server-log` reads it. launchd's `server.log` / `server.err.log` hold crash output only. |
 | `OPENROUTER_API_KEY` | No | Enables weekly insights. When unset, the insights cron is a no-op. (Server smart formatting was removed in Part 4.) Get a key at https://openrouter.ai/keys. |
 

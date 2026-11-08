@@ -17,15 +17,18 @@ Startup sequence (Phase 2 / Task 13b)
     (running jobs are NOT failed; the lifespan shutdown requeues them).
 9.  Expose state on app.state for routes and health endpoints.
 
-Before any of that, ``Database(settings.db_path).migrate()`` opens the one
-SQLite DB (``app.state.db``) and its ``accounts`` / ``usage`` repositories.
+Before any of that, the lifespan takes ``<data_dir>.lock`` (``ops.backup.
+server_lock``; a second server refuses to start), then
+``Database(settings.db_path).migrate()`` opens the one SQLite DB
+(``app.state.db``) and its ``accounts`` / ``usage`` repositories. After the
+staging sweep the ``retention_days`` purge runs once.
 
 Shutdown
 --------
 ``shutting_down = True`` → ``file_runner.shutdown()`` FIRST (an interrupted
 job keeps its input and is requeued with its attempt refunded), then the
 daemon loops, streaming sessions and insights client, then the stores are
-dropped.
+dropped, and the server lock is released last.
 """
 
 from __future__ import annotations
@@ -67,6 +70,7 @@ from wispralt.jobs.store import JobStore
 from wispralt.middleware import openai_errors
 from wispralt.middleware.rate_limit import RateLimitMiddleware
 from wispralt.ops import background, staging
+from wispralt.ops.backup import server_lock
 from wispralt.ops.env_writer import find_env_path
 from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.routes import (
@@ -96,12 +100,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI lifespan context manager.
+    """FastAPI lifespan: the server lock wraps everything, taken first, released last.
 
-    Everything before ``yield`` runs at startup; everything after at shutdown.
+    DATA_DIR must already exist (setup / bootstrap create it); the server
+    never creates it, so a server started against a missing or half-restored
+    tree fails instead of writing into it. ``<data_dir>.lock`` (a sibling,
+    see ``ops/backup.py``) is held for the server's life: a second server
+    refuses to start (``ServerRunning``), and offline backup/restore refuse
+    while this one runs.
     """
-    # ── startup ───────────────────────────────────────────────────────────────
-
     # Size-capped app log (launchd can't rotate without sudo). Done here, not
     # at import, so importing main in tests never touches ~/Library/Logs.
     configure_file_logging(
@@ -109,12 +116,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.server_log_max_bytes,
         settings.server_log_backup_count,
     )
-
-    # 0. The one SQLite DB. DATA_DIR must already exist (setup / bootstrap
-    #    create it); the server never creates it, so a server started against
-    #    a missing or half-restored tree fails instead of writing into it.
     if not settings.data_dir.is_dir():
         raise RuntimeError(f"DATA_DIR does not exist: {settings.data_dir}")
+    with server_lock(settings.data_dir):
+        async with _serve(app):
+            yield
+    logger.info("Shutdown: server lock released.")
+
+
+@asynccontextmanager
+async def _serve(app: FastAPI) -> AsyncIterator[None]:
+    """Startup before ``yield``, shutdown after (runs under the server lock)."""
+    # ── startup ───────────────────────────────────────────────────────────────
+
+    # 0. The one SQLite DB.
     database = Database(settings.db_path)
     applied = database.migrate()
     if applied:
@@ -185,25 +200,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if tmp_removed:
         logger.info("Startup tmp sweep removed %d stale .tmp file(s).", tmp_removed)
 
-    # 4c. Phase 1 transcript-storage: zero transcript text on `jobs` rows and
-    #     delete `dictations` rows older than transcript_retention_days. Same
-    #     sweep is re-run every 24 h by the daily timer registered below so a
-    #     long-uptime server eventually reaps.
+    # 4c. Retention purge (DB setting `retention_days`; 0 = keep forever).
+    #     Re-run every 24 h by the daily sweep loop below.
     try:
-        jobs_swept, dicts_deleted = job_store.sweep_transcripts(
-            days=settings.transcript_retention_days
-        )
-        if jobs_swept or dicts_deleted:
+        dicts_deleted, jobs_deleted = background.run_retention(job_store)
+        if dicts_deleted or jobs_deleted:
             logger.info(
-                "Startup transcript sweep: jobs.transcript_text zeroed=%d, "
-                "dictations deleted=%d",
-                jobs_swept,
+                "Startup retention purge: dictations=%d, jobs=%d",
                 dicts_deleted,
+                jobs_deleted,
             )
     except sqlite3.Error:
-        logger.exception(
-            "Startup transcript sweep failed; daily timer will retry"
-        )
+        logger.exception("Startup retention purge failed; daily timer will retry")
 
     # 5. File-job runner — re-enqueue any pending jobs that survived the restart.
     file_runner = FileJobRunner(job_store, app.state)
@@ -275,9 +283,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             background.eviction_loop(app, file_runner, files_pipeline)
         )
 
-    # 7d. Phase 1 transcript-storage: daily sweep loop. Re-runs the same
-    #     `sweep_transcripts` that ran at startup so a long-uptime server
-    #     eventually reaps. Daemon-loop pattern: broad-except + log so a
+    # 7d. Daily sweep loop: staging sweeps + the retention purge that ran at
+    #     startup, so a long-uptime server eventually reaps. Daemon-loop pattern: broad-except + log so a
     #     transient SQLite error never kills the task.
     app.state.transcript_sweep_task = asyncio.create_task(
         background.daily_sweep_loop(

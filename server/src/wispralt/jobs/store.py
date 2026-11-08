@@ -101,6 +101,13 @@ SELECT user_id,
 """
 
 
+_EXPIRED_DICTATIONS = "SELECT {cols} FROM dictations WHERE created_at < ? AND source IS NULL"
+_EXPIRED_JOBS = (
+    "SELECT {cols} FROM jobs WHERE status IN ('done','failed') AND source IS NULL"
+    " AND COALESCE(finished_at, created_at) < ?"
+)
+
+
 class JobStore:
     def __init__(self, db: Database, data_dir: Path) -> None:
         self.db = db
@@ -270,45 +277,66 @@ class JobStore:
             )
             return [(r["id"], self._abs(r["wav_path"])) for r in rows]
 
-    # ── retention (Task 7 replaces these with the retention setting) ─────────
+    # ── retention (DB setting ``retention_days``; 0 = keep forever) ──────────
+    # Imported rows (``source IS NOT NULL``) and ``usage_events`` are never purged.
 
-    def list_expired_finished_jobs(self, days: int) -> list[str]:
-        """Ids of finished (done/failed) jobs older than *days* (by finish, else creation)."""
+    def retention_days(self) -> int:
+        with self.db.read() as con:
+            r = con.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()
+        return int(r["value"]) if r else 0
+
+    def set_retention_days(self, days: int) -> None:
+        if days < 0:
+            raise ValueError("retention_days must be >= 0")
+        with self.db.write() as con:
+            con.execute(
+                "INSERT INTO settings(key, value) VALUES ('retention_days', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(days),),
+            )
+
+    def retention_preview(self, days: int) -> dict[str, int]:
+        """Rows a purge at *days* would delete now (0 → nothing)."""
+        if days <= 0:
+            return {"dictations": 0, "jobs": 0}
+        cutoff = time.time() - days * _DAY
+        with self.db.read() as con:
+            dicts = con.execute(_EXPIRED_DICTATIONS.format(cols="COUNT(*)"), (cutoff,)).fetchone()
+            jobs = con.execute(_EXPIRED_JOBS.format(cols="COUNT(*)"), (cutoff,)).fetchone()
+        return {"dictations": int(dicts[0]), "jobs": int(jobs[0])}
+
+    def expired_jobs(self, days: int) -> list[str]:
+        """Ids of finished (done/failed), non-imported jobs older than *days* (finish, else creation)."""
+        if days <= 0:
+            return []
         with self.db.read() as con:
             rows = con.execute(
-                "SELECT id FROM jobs WHERE status IN ('done','failed')"
-                " AND COALESCE(finished_at, created_at) < ?",
-                (time.time() - days * _DAY,),
-            )
-            return [r["id"] for r in rows]
+                _EXPIRED_JOBS.format(cols="id"), (time.time() - days * _DAY,)
+            ).fetchall()
+        return [r["id"] for r in rows]
 
     def delete_finished_jobs(self, job_ids: list[str]) -> int:
-        """Hard-delete the given jobs if still done/failed. Returns rows deleted."""
+        """Hard-delete the given jobs if still done/failed and not imported. Returns rows deleted."""
         deleted = 0
         with self.db.write() as con:
             for i in range(0, len(job_ids), 500):  # bound-variable limit
                 batch = job_ids[i : i + 500]
                 deleted += con.execute(
-                    "DELETE FROM jobs WHERE status IN ('done','failed')"
+                    "DELETE FROM jobs WHERE status IN ('done','failed') AND source IS NULL"
                     f" AND id IN ({','.join('?' * len(batch))})",
                     batch,
                 ).rowcount
         return deleted
 
-    def sweep_transcripts(self, days: int) -> tuple[int, int]:
-        """Zero ``jobs.transcript_text`` and delete ``dictations`` older than *days*.
-
-        Returns ``(jobs_rows_zeroed, dictations_rows_deleted)``.
-        """
-        cutoff = time.time() - days * _DAY
+    def purge_dictations(self, days: int) -> int:
+        """Delete non-imported dictations older than *days* (0 → none). Returns rows deleted."""
+        if days <= 0:
+            return 0
         with self.db.write() as con:
-            jobs = con.execute(
-                "UPDATE jobs SET transcript_text = NULL WHERE transcript_text IS NOT NULL"
-                " AND COALESCE(finished_at, created_at) < ?",
-                (cutoff,),
+            return con.execute(
+                "DELETE FROM dictations WHERE created_at < ? AND source IS NULL",
+                (time.time() - days * _DAY,),
             ).rowcount
-            dicts = con.execute("DELETE FROM dictations WHERE created_at < ?", (cutoff,)).rowcount
-        return jobs, dicts
 
     # ── startup recovery ──────────────────────────────────────────────────────
 
