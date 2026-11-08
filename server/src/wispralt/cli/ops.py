@@ -488,20 +488,32 @@ def cmd_update(ctx: Ctx, args: argparse.Namespace) -> int:
     backup_path: Path | None = None
     was_loaded = launchd.stop(ctx) if is_host else False
     try:
-        try:
-            if is_host and not args.no_backup:
-                backup_path = offline.backup(ctx.paths.data_dir, new_backup_dest(ctx))
-                print(f"backup written: {backup_path}")
-            reinstall_cli(ctx, source, extra=is_host, reinstall=True)
-        except _OFFLINE_ERRORS as exc:
-            raise CliError(1, f"{type(exc).__name__}: {exc}") from exc
-    except CliError:
-        if was_loaded:  # nothing changed in the venv yet, or the install failed: bring it back
-            launchd.start(ctx)
+        if is_host and not args.no_backup:
+            backup_path = offline.backup(ctx.paths.data_dir, new_backup_dest(ctx))
+            print(f"backup written: {backup_path}")
+        reinstall_cli(ctx, source, extra=is_host, reinstall=True)
+    except BaseException as exc:
+        # Whatever failed (a refused backup, disk full during VACUUM INTO, a failed
+        # install, Ctrl-C), the old code is still in place: bring the service back.
+        _phase1_failed(ctx, exc, restart=was_loaded)
         raise
     extra = ["--_backup", str(backup_path)] if backup_path else []
     exec_self(ctx, "--_phase2", *extra)
     return 0  # only reached when execv is faked
+
+
+def _phase1_failed(ctx: Ctx, exc: BaseException, *, restart: bool) -> None:
+    """Restart the stopped service after a phase-1 failure; expected errors become a CliError."""
+    if isinstance(exc, CliError):
+        why = exc.msg
+    elif isinstance(exc, (*_OFFLINE_ERRORS, sqlite3.Error, OSError)):
+        why = f"{type(exc).__name__}: {exc}"
+    else:  # KeyboardInterrupt, a bug: restart, then let the original propagate unchanged
+        if restart:
+            launchd.start(ctx)
+        return
+    note = f"\n{_start_after_failure(ctx)}" if restart else ""
+    raise CliError(1, f"update failed before the reinstall finished: {why}{note}") from exc
 
 
 def _start_after_failure(ctx: Ctx) -> str:
