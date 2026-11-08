@@ -193,6 +193,17 @@ class Ctx:
         return self.deps.ask(f"{question} [y/N] ").strip().lower() in {"y", "yes"}
 
 
+def find_source(ctx: Ctx, flag: Path | None) -> Path | None:
+    """The repo clone: ``--source``, else the recorded one, else the cwd if it is a clone."""
+    recorded = ctx.state.source_dir if ctx.state else None
+    for cand in (flag, Path(recorded) if recorded else None, Path.cwd()):
+        if cand and (cand / "server" / "pyproject.toml").is_file():
+            return cand.expanduser().absolute()
+        if cand is flag and flag is not None:
+            raise CliError(2, f"--source {flag} is not a WisprAlt clone (no server/pyproject.toml)")
+    return None
+
+
 def private_dir(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
 

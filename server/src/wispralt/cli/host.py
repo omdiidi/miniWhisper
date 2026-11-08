@@ -30,8 +30,15 @@ from typing import TYPE_CHECKING, Any, Protocol
 from wispralt._errors import MigrationError
 from wispralt.accounts import service
 from wispralt.accounts.store import AccountStore
-from wispralt.cli import launchd
-from wispralt.cli.paths import DB_NAME, InstallState, env_value, merge_missing, private_dir
+from wispralt.cli import client, launchd
+from wispralt.cli.paths import (
+    DB_NAME,
+    InstallState,
+    env_value,
+    find_source,
+    merge_missing,
+    private_dir,
+)
 from wispralt.cli.system import CliError, version
 from wispralt.database import Database
 from wispralt.jobs.store import JobStore
@@ -492,17 +499,6 @@ def has_host_extra() -> bool:
     return importlib.util.find_spec("parakeet_mlx") is not None
 
 
-def find_source(ctx: Ctx, flag: Path | None) -> Path | None:
-    """The repo clone: ``--source``, else the recorded one, else the cwd if it is a clone."""
-    recorded = ctx.state.source_dir if ctx.state else None
-    for cand in (flag, Path(recorded) if recorded else None, Path.cwd()):
-        if cand and (cand / "server" / "pyproject.toml").is_file():
-            return cand.expanduser().absolute()
-        if cand is flag and flag is not None:
-            raise CliError(2, f"--source {flag} is not a WisprAlt clone (no server/pyproject.toml)")
-    return None
-
-
 def reinstall_cli(ctx: Ctx, source: Path, *, extra: bool = True, reinstall: bool = False) -> None:
     """``uv tool install --force`` from the clone (never ``sudo``)."""
     target = f"{source}/server[host]" if extra else f"{source}/server"
@@ -628,8 +624,15 @@ def cmd_setup(ctx: Ctx, args: argparse.Namespace) -> int:
     state.label = ctx.paths.label
     state.port = args.port or state.port
     ctx.state = state
+    token = None
     if role in {"host", "both"}:
-        setup_host(ctx, args, state)
+        token = setup_host(ctx, args, state)
+    else:
+        failed = [c for c in platform_checks(ctx, host=False) if c.status == "fail"]
+        if failed:
+            raise CliError(1, f"{failed[0].name}: {failed[0].detail} -> {failed[0].fix}")
+    if role in {"client", "both"}:
+        client.setup_client(ctx, args, host_token=token)
     state.save(ctx.paths.state_file)
     print(f"setup complete ({role}); check it any time with `wispralt doctor`")
     return 0

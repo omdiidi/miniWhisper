@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
-from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-import pytest
 from dotenv import dotenv_values
 
 from wispralt.accounts.service import hash_token
@@ -20,68 +16,18 @@ from wispralt.database import Database
 from wispralt.dictate.parakeet import MODEL_ID as DICTATION_MODEL
 from wispralt.jobs.store import JobStore
 
+from .conftest import COMMIT
+
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
     from wispralt.cli.system import Deps
 
-    from .conftest import CliFn, Execs, FakeHttp, FakeRunner
+    from .conftest import CliFn, Execs, FakeHttp, FakeHub, FakeRunner
 
 _TOKEN = re.compile(r"\b[0-9a-f]{64}\b")
-COMMIT = "c0ffee" + "0" * 34
-
-
-@dataclass
-class FakeHub:
-    """Two tiny "models" (one LFS file with a sha256, one small file checked by size)."""
-
-    root: Path
-    corrupt: int = 0  # the next N downloads write bad bytes
-    offline: bool = False
-    downloads: list[tuple[str, bool]] = field(default_factory=list)
-
-    def _files(self, repo: str) -> dict[str, bytes]:
-        return {"weights.safetensors": repo.encode() * 100, "config.json": b"{}"}
-
-    def resolve(self, repo: str) -> tuple[str, list[host.RemoteFile]]:
-        if self.offline:
-            raise host.HubError("ConnectError: offline")
-        return COMMIT, [
-            host.RemoteFile(
-                n, len(b), hashlib.sha256(b).hexdigest() if n.endswith("tensors") else None
-            )
-            for n, b in self._files(repo).items()
-        ]
-
-    def snapshot(
-        self, repo: str, commit: str, *, download: bool, force: bool = False
-    ) -> Path | None:
-        path = self.root / repo / commit
-        if not download:
-            return path if path.is_dir() else None
-        self.downloads.append((repo, force))
-        path.mkdir(parents=True, exist_ok=True)
-        for name, data in self._files(repo).items():
-            bad = self.corrupt > 0 and name.endswith("tensors")
-            (path / name).write_bytes(data[::-1] if bad else data)
-        self.corrupt = max(0, self.corrupt - 1)
-        return path
-
-
-@pytest.fixture
-def hub(tmp_path: Path, deps: Deps) -> FakeHub:
-    fake = FakeHub(tmp_path / "hub")
-    deps.hub = fake
-    deps.load_fn = lambda _id: (lambda _samples: SimpleNamespace(text=""))
-    return fake
-
-
-@pytest.fixture
-def clone(tmp_path: Path) -> Path:
-    src = tmp_path / "clone"
-    (src / "server").mkdir(parents=True)
-    (src / "server" / "pyproject.toml").write_text("[project]\nname='wispralt'\n")
-    return src
 
 
 def _setup(cli: CliFn, clone: Path, *extra: str) -> tuple[int, str, str]:
