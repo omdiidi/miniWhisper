@@ -446,15 +446,14 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 
 **Diagnosis ladder:**
 
-1. **Was the token revoked?** Open `/admin/users` on the Mac mini admin UI. If their row has a non-null `revoked_at`, this is expected — text them a new token via the **Mint** flow.
-2. **Cache TTL window.** Token state is cached in-process for 60 seconds (`TokenCache._TTL_S`). If the row was just rotated, cache hits for the OLD hash will keep failing for up to 60s. Wait one minute, retry. For instant lockout: restart the launchd agent (`bash scripts/server-launchd.sh restart`).
-3. **Can the server reach Postgres?**
+1. **Was the token revoked, or the user disabled?** Open `/admin/users` on the Mac mini admin UI. If their row shows `revoked` (`disabled_at` is set), this is expected — text them a new token via the **Mint** flow (mint also re-enables the user). There is no token cache: every request looks the key up in `wispralt.db`, so a revoke, disable or mint applies to the very next request.
+2. **Is the local database healthy?**
    ```bash
-   curl -s --max-time 4 https://transcribe.<your-domain>/healthz
-   tail -100 ~/Library/Logs/WisprAlt/server.log | grep -i 'postgres\|asyncpg\|db_pool'
+   curl -s --max-time 4 https://transcribe.<your-domain>/readyz/db
+   tail -100 ~/Library/Logs/WisprAlt/wispralt.log | grep -i 'sqlite\|database\|migration'
    ```
-   If the log shows `Postgres unavailable at startup; only break-glass admin will work`, the asyncpg pool failed to initialize. Check `SUPABASE_DATABASE_URL` in `server/.env` (mode 0600), check Supabase project status, restart the agent.
-4. **Right token?** A token's plaintext is shown **once** by `/admin/users/<id>/mint`. If the employee misplaced it, mint a new one — there is no recovery for the old plaintext.
+   A DB error makes auth answer **503** (never 401, and there is no fallback admin). `/readyz/db` gives the reason (`db_error` / `schema_outdated`); see "Local database" above.
+3. **Right token?** A token's plaintext is shown **once** by `/admin/users/<id>/mint`. If the employee misplaced it, mint a new one — there is no recovery for the old plaintext.
 
 ---
 
@@ -470,8 +469,9 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 **Fix:**
 
 - For 401 from a browser: visit `/admin/login`, paste the admin token, submit. The cookie is set with `max_age=8h`.
-- For 403: use the admin token, not an employee token. If you don't have an admin token in hand, the env-var `WISPRALT_API_KEY` from `server/.env` is the break-glass admin and resolves to the seeded admin row (or to the synthetic `User(id=-1)` if Postgres is unreachable).
-- If you see **503** instead of 401/403 with body "Admin UI unavailable: Postgres degraded.": the asyncpg pool is `None`. The break-glass path lets you authenticate to `/transcribe/*`, but the admin UI requires Postgres. Fix the DB URL, restart the agent.
+- For 403: use the admin token, not an employee token. There is no env-var admin key and no break-glass admin. If the admin token is lost, mint a new one on the server's terminal: `cd server && .venv/bin/python -m wispralt.bootstrap --rotate-admin` (prints the new token once; add `--user-id N` when there are several admins).
+- **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Revoke, Mint, Rotate) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (the `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
+- **503** instead of 401/403: the account lookup hit a `sqlite3.Error`. Check `/readyz/db` and the "Local database" section; there is no fallback admin.
 
 ---
 

@@ -36,7 +36,7 @@ Sync transcription. Returns text in one of: json (default), text, verbose_json, 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `file` | file | (required) | Audio bytes. See "File formats" below. ≤25 MB. |
-| `model` | string | `whisper-1` | One of 5 listed models. `gpt-4o-transcribe-diarize` returns 404 — WisprAlt has no diarization. Unknown models still route to Parakeet but log a warning. |
+| `model` | string | `whisper-1` | One of the 6 listed models (incl. `gpt-transcribe`). Any other id, including `gpt-4o-transcribe-diarize` (WisprAlt has no diarization), returns 404 `model_not_found` listing the allowed ids, before any inference. |
 | `response_format` | string | `json` | One of: `json`, `text`, `verbose_json`, `srt`, `vtt`. |
 | `language` | string | — | ISO-639-1 (e.g. `en`). Accepted, ignored (Parakeet is English-only). |
 | `prompt` | string | — | Accepted, ignored (no Parakeet equivalent). |
@@ -130,7 +130,7 @@ Content-Type: `text/vtt`. Period decimal separator. `WEBVTT` magic line required
 
 ### `GET /v1/models`
 
-Returns the 5 model IDs WisprAlt advertises. Open WebUI and other clients gate on this endpoint.
+Returns the 6 model IDs WisprAlt advertises. Open WebUI and other clients gate on this endpoint.
 
 ```json
 {
@@ -140,7 +140,8 @@ Returns the 5 model IDs WisprAlt advertises. Open WebUI and other clients gate o
     { "id": "gpt-4o-transcribe", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
     { "id": "gpt-4o-mini-transcribe", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
     { "id": "gpt-4o-mini-transcribe-2025-12-15", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
-    { "id": "gpt-4o-mini-transcribe-2025-03-20", "object": "model", "created": 1677532384, "owned_by": "wispralt" }
+    { "id": "gpt-4o-mini-transcribe-2025-03-20", "object": "model", "created": 1677532384, "owned_by": "wispralt" },
+    { "id": "gpt-transcribe", "object": "model", "created": 1677532384, "owned_by": "wispralt" }
   ]
 }
 ```
@@ -204,7 +205,7 @@ All errors return the OpenAI shape:
 | 400 | `audio_too_long` | Audio > 15 min (after decode) |
 | 400 | `endpoint_not_supported` | Hit `/v1/audio/translations` |
 | 401 | `invalid_api_key` | Missing/invalid Bearer token, or cookie-only on /v1 |
-| 404 | `model_not_found` | Unknown model on `/v1/models/{id}` or `gpt-4o-transcribe-diarize` on transcriptions |
+| 404 | `model_not_found` | Unknown model on `/v1/models/{id}`, or any model id not in `/v1/models` (incl. `gpt-4o-transcribe-diarize`) on transcriptions |
 | 413 | `file_too_large` | File body > 25 MB |
 | 422 | `invalid_response_format` | `response_format` not in {json, text, verbose_json, srt, vtt} |
 | 429 | `rate_limit_exceeded` | 60 req/min/token exceeded |

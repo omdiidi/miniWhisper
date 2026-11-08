@@ -171,6 +171,38 @@ def require_admin(user: User = Depends(require_api_key)) -> User:
     return user
 
 
+CSRF_HEADER = "X-CSRF-Token"
+
+
+async def require_csrf(request: Request, user: User = Depends(require_api_key)) -> User:
+    """Auth, then CSRF for a mutation. Use as a PARAMETER dependency.
+
+    Auth is this dependency's own sub-dependency, so it always resolves first
+    and sets ``request.state.auth_via`` (a decorator-level ``dependencies=[…]``
+    entry would run before parameter dependencies). The token is skipped
+    **only** when that auth used a valid Bearer header: a non-Bearer
+    ``Authorization`` (e.g. ``Basic``) falls back to the cookie, so it must
+    carry the token like any cookie request. Otherwise the ``X-CSRF-Token``
+    header or the ``csrf_token`` form field must equal the CSRF cookie, else 403.
+    """
+    if getattr(request.state, "auth_via", None) == "bearer":
+        return user
+    token = request.headers.get(CSRF_HEADER)
+    if token is None:
+        value = (await request.form()).get("csrf_token")  # cached; route Form() params still work
+        token = value if isinstance(value, str) else ""
+    if not verify_csrf(request, token):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+    return user
+
+
+def require_admin_csrf(user: User = Depends(require_csrf)) -> User:
+    """:func:`require_csrf` + ``role='admin'`` (the admin portal's mutations)."""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return user
+
+
 # ── shared session-cookie + CSRF helpers ──────────────────────────────────────
 #
 # Both /admin/login (admin_ui.py) and /me/login (routes/me.py) issue the same

@@ -18,9 +18,11 @@
       <td>{{ key.last_seen_at.strftime("%Y-%m-%d %H:%M") if key.last_seen_at else "—" }}</td>
       <td>
         <form method="POST" action="/admin/keys/{{ key.id }}/rotate" style="display:inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit">Rotate</button>
         </form>
         <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline" onsubmit="return confirm('Revoke this key? Clients using it will fail immediately.')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit" class="btn-danger">Revoke</button>
         </form>
       </td>

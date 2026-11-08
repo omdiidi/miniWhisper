@@ -233,7 +233,10 @@ async def _run_weekly_insights_inner(
         except InsightsError as exc:
             person_failures["openrouter_error"] += 1
             logger.warning(
-                "Person insights failed for user_id=%s: %s", user.id, exc
+                "Person insights failed for user_id=%s: %s status=%s",
+                user.id,
+                type(exc).__name__,
+                exc.status_code,
             )
             continue
 
@@ -242,9 +245,9 @@ async def _run_weekly_insights_inner(
         except json.JSONDecodeError:
             person_failures["json_decode"] += 1
             logger.warning(
-                "Person insights returned non-JSON for user_id=%s; first 200 chars: %r",
+                "Person insights returned non-JSON for user_id=%s (%d chars)",
                 user.id,
-                resp.content[:200],
+                len(resp.content),
             )
             continue
 
@@ -294,16 +297,18 @@ async def _run_weekly_insights_inner(
                 max_tokens=2500,
             )
         except InsightsError as exc:
-            logger.warning("Team insights failed: %s", exc)
+            logger.warning(
+                "Team insights failed: %s status=%s", type(exc).__name__, exc.status_code
+            )
 
         if team_resp is not None:
             try:
                 team_insight = json.loads(team_resp.content)
             except json.JSONDecodeError:
                 logger.warning(
-                    "Team insights returned non-JSON; first 200 chars: %r —"
-                    " retrying once at temperature=0.0",
-                    team_resp.content[:200],
+                    "Team insights returned non-JSON (%d chars) — retrying once at"
+                    " temperature=0.0",
+                    len(team_resp.content),
                 )
                 team_insight = None
                 try:
@@ -316,12 +321,14 @@ async def _run_weekly_insights_inner(
                     team_insight = json.loads(team_resp.content)
                 except InsightsError as exc:
                     logger.warning(
-                        "Team insights retry failed at temperature=0.0: %s", exc
+                        "Team insights retry failed at temperature=0.0: %s status=%s",
+                        type(exc).__name__,
+                        exc.status_code,
                     )
                 except json.JSONDecodeError:
                     logger.warning(
-                        "Team insights still non-JSON after retry; first 200 chars: %r",
-                        team_resp.content[:200] if team_resp else "",
+                        "Team insights still non-JSON after retry (%d chars)",
+                        len(team_resp.content) if team_resp else 0,
                     )
             if team_insight is not None:
                 job_store.upsert_weekly_insight(

@@ -3,7 +3,7 @@ test_v1_models.py — Coverage for /v1/models (OpenAI-compat model listing).
 
 The route returns a hard-coded list (no DB). We exercise:
 
-  - the count + exclusion invariant (5 models; gpt-4o-transcribe-diarize
+  - the count + exclusion invariant (6 models incl. gpt-transcribe; gpt-4o-transcribe-diarize
     intentionally NOT advertised because we 404 on it at /v1/audio/transcriptions);
   - 404 on unknown ids (including the explicitly-excluded diarize id);
   - the Cache-Control + openai-version response headers;
@@ -62,7 +62,7 @@ def _build_app(*, override_auth: bool = True) -> FastAPI:
 # ── listing ───────────────────────────────────────────────────────────────────
 
 
-def test_list_returns_5_models() -> None:
+def test_list_returns_6_models() -> None:
     app = _build_app()
     with TestClient(app) as client:
         resp = client.get("/v1/models", headers={"Authorization": "Bearer test"})
@@ -70,7 +70,8 @@ def test_list_returns_5_models() -> None:
     body = resp.json()
     assert body["object"] == "list"
     assert isinstance(body["data"], list)
-    assert len(body["data"]) == 5
+    assert len(body["data"]) == 6
+    assert "gpt-transcribe" in {m["id"] for m in body["data"]}
 
 
 def test_list_no_diarize_model() -> None:

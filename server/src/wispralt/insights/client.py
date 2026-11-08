@@ -31,14 +31,21 @@ class InsightsResponse(BaseModel):
 
 
 class InsightsError(Exception):
-    pass
+    """An OpenRouter call failed. Never carries response text (it can echo transcripts).
+
+    ``status_code`` is the HTTP status, or None for a non-HTTP failure (timeout).
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class RateLimitedError(InsightsError):
     """OpenRouter 429. Cron handles separately by aborting the whole run."""
 
     def __init__(self, retry_after_s: float | None = None) -> None:
-        super().__init__(f"OpenRouter 429 (retry_after={retry_after_s})")
+        super().__init__(f"OpenRouter 429 (retry_after={retry_after_s})", status_code=429)
         self.retry_after_s = retry_after_s
 
 
@@ -154,7 +161,7 @@ class InsightsClient:
                 retry_after = None
             raise RateLimitedError(retry_after_s=retry_after)
         if r.status_code != 200:
-            raise InsightsError(f"OpenRouter {r.status_code}: {r.text[:200]}")
+            raise InsightsError(f"OpenRouter HTTP {r.status_code}", status_code=r.status_code)
 
         body = r.json()
         content = body["choices"][0]["message"]["content"]

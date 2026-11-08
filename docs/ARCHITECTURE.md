@@ -541,9 +541,17 @@ Three-router pattern (be720a1 split out `me_router`):
 
 Auth model: `Authorization: Bearer ...` (curl/Postman) or
 `wispralt_admin_token` cookie (browser, set by `POST /admin/login`).
-`auth._extract_bearer` falls back to the cookie when the header is
-absent. CSRF is mitigated by `SameSite=Strict` on the cookie — browsers
-refuse to attach it to cross-site POSTs.
+`auth._extract_bearer` falls back to the cookie when there is no Bearer
+header. Cookie-authenticated mutations are guarded by `auth.require_csrf`,
+a dependency that declares `require_api_key` as its own sub-dependency (so
+auth always resolves first and records `request.state.auth_via`) and skips
+the token only when `auth_via == "bearer"`; otherwise the `X-CSRF-Token`
+header or `csrf_token` form field must match the `wispralt_csrf` cookie, or
+403. The six admin mutations take it as a parameter through
+`require_admin_csrf`; `PATCH /me` and the `/me/history` mutations through
+`require_csrf` beside `forbid_integration_kind`. Pages that render those
+forms mint the token (`admin_ui._form_page`). `SameSite=Strict` stays as a
+second layer.
 
 The macOS client's menubar **Open Portal** button opens
 `<server>/admin/login` for everyone — the same install ships to admins
@@ -1013,10 +1021,11 @@ existed".
 
 ### CSRF + ownership
 
-Both mutating routes (`DELETE`, `POST /restore`) accept the standard form
-`csrf_token` field validated through the shared
-`auth.verify_csrf`/`set_csrf_cookie` helpers (same double-submit pattern
-as `/admin/login` and `/me/login`). Every read AND mutation re-checks
+Both mutating routes (`DELETE`, `POST /restore`) take the
+`auth.require_csrf` dependency: the `csrf_token` form field (or
+`X-CSRF-Token` header) must match the cookie set by the page render (same
+double-submit pattern as `/admin/login` and `/me/login`); a Bearer-authenticated
+request needs no token. Every read AND mutation re-checks
 ownership: `get_history_row(user_id, kind, row_id)` filters on
 `user_id` so a malicious or stale row_id from another user uniformly
 returns **404** — we never leak existence to non-owners.

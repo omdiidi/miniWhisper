@@ -301,6 +301,34 @@ class TestValidationErrors:
         body = resp.json()
         assert body["error"]["code"] == "model_not_found"
 
+    def test_post_gpt_transcribe_is_known(self) -> None:
+        app = _build_app()
+        with _client(app) as client:
+            resp = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("tiny.wav", _tiny_wav(), "audio/wav")},
+                data={"model": "gpt-transcribe"},
+                headers={"Authorization": "Bearer test"},
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["text"] == "hello world."
+
+    def test_post_unknown_model_is_404_without_inference(self) -> None:
+        app = _build_app()
+        with _client(app) as client:
+            resp = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("tiny.wav", _tiny_wav(), "audio/wav")},
+                data={"model": "foo"},
+                headers={"Authorization": "Bearer test"},
+            )
+        assert resp.status_code == 404, resp.text
+        error = resp.json()["error"]
+        assert error["code"] == "model_not_found"
+        assert error["type"] == "invalid_request_error"
+        assert "gpt-transcribe" in error["message"] and "whisper-1" in error["message"]
+        app.state.parakeet_service.transcribe_with_alignment.assert_not_called()
+
     def test_post_temperature_out_of_range(self) -> None:
         app = _build_app()
         with _client(app) as client:

@@ -444,3 +444,25 @@ def test_chunked_finalize_with_legacy_meeting_meta_finishes_as_file_job(
     assert job.user_id == OWNER.id
     assert job.client_app_version == "0.9.0"
     assert not chunked_dir.exists()
+
+
+@pytest.mark.parametrize("stray", ["chunk-0001.part.tmp", "chunk-0001-old.part"])
+def test_chunked_finalize_with_a_gap_is_409_naming_the_index(
+    make_app, staging_dir, plenty_of_ram, stray: str
+) -> None:
+    upload_id = "B" * 22
+    chunked_dir = staging_dir / "chunked" / upload_id
+    chunked_dir.mkdir(parents=True)
+    for name in ("chunk-0000.part", "chunk-0002.part", stray):  # index 1 never arrived
+        (chunked_dir / name).write_bytes(b"x" * 10)
+    (chunked_dir / "meta.json").write_text(json.dumps({
+        "total_bytes": 30,
+        "chunk_count": 3,
+        "original_filename": "a.wav",
+        "ext": ".wav",
+        "created_at": time.time(),
+        "user_id": OWNER.id,
+    }))
+    resp = TestClient(make_app(OWNER)).post(f"/transcribe/file/chunked/{upload_id}/finalize")
+    assert resp.status_code == 409, resp.text
+    assert "Missing chunk 1 of 3" in resp.json()["detail"]

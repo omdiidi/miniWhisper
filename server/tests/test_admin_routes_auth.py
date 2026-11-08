@@ -19,6 +19,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from starlette.testclient import TestClient
 
+from wispralt import auth as auth_mod
 from wispralt.accounts.service import hash_token
 from wispralt.accounts.store import User
 from wispralt.auth import SESSION_COOKIE_NAME, require_admin
@@ -256,3 +257,107 @@ def test_user_detail_and_usage_pages(
     resp = client.get("/admin/usage.csv", params={"user_id": seeded.id}, headers=admin[1])
     rows = list(csv.DictReader(io.StringIO(resp.text)))
     assert len(rows) == 5 and {r["user_label"] for r in rows} == {"alice"}
+
+
+# ── CSRF on every cookie-authenticated mutation (AUDIT #6/#7) ─────────────────
+
+_CSRF = "csrf-test-token"
+
+
+@pytest.fixture
+def csrf_client(wire: Wire) -> TestClient:
+    from wispralt.routes.me import router as me_router
+
+    app = FastAPI()
+    app.include_router(admin_ui.public_router)
+    app.include_router(admin_ui.me_router)
+    app.include_router(admin_ui.authed_router)
+    app.include_router(me_router)
+    return TestClient(wire(app), base_url="https://testserver")
+
+
+def _mutation(name: str, employee: User, integration: User) -> tuple[str, str, dict, int]:
+    """(method, path, body kwargs, success status) for each guarded mutation."""
+    return {
+        "users_new": ("POST", "/admin/users/new", {"data": {"label": "newbie"}}, 200),
+        "users_revoke": ("POST", f"/admin/users/{employee.id}/revoke", {"data": {}}, 303),
+        "users_mint": ("POST", f"/admin/users/{employee.id}/mint", {"data": {}}, 200),
+        "keys_new": ("POST", "/admin/keys/new", {"data": {"program_name": "Buzz"}}, 200),
+        "keys_revoke": ("POST", f"/admin/keys/{integration.id}/revoke", {"data": {}}, 303),
+        "keys_rotate": ("POST", f"/admin/keys/{integration.id}/rotate", {"data": {}}, 200),
+        "patch_me": ("PATCH", "/me", {"json": {"display_name": "Omid Z"}}, 200),
+    }[name]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["users_new", "users_revoke", "users_mint", "keys_new", "keys_revoke", "keys_rotate", "patch_me"],
+)
+@pytest.mark.parametrize(
+    "mode", ["cookie_no_token", "cookie_token", "bearer_only", "basic_plus_cookie", "bad_bearer_cookie"]
+)
+def test_csrf_matrix(
+    csrf_client: TestClient,
+    admin: tuple[User, dict[str, str]],
+    make_user: MakeUser,
+    name: str,
+    mode: str,
+) -> None:
+    admin_user, bearer = admin
+    token = bearer["Authorization"].removeprefix("Bearer ")
+    employee, _ = make_user(label="emp")
+    integration, _ = make_user(kind="integration", label="key-buzz")
+    method, path, body, ok = _mutation(name, employee, integration)
+
+    headers: dict[str, str] = {}
+    if mode == "bearer_only":
+        headers = dict(bearer)
+    else:
+        csrf_client.cookies.set(SESSION_COOKIE_NAME, token)
+    if mode == "basic_plus_cookie":
+        headers = {"Authorization": "Basic eDp5"}
+    if mode == "bad_bearer_cookie":
+        headers = {"Authorization": "Bearer " + "0" * 64}
+    if mode == "cookie_token":
+        csrf_client.cookies.set(auth_mod.CSRF_COOKIE_NAME, _CSRF)
+        if "json" in body:
+            headers[auth_mod.CSRF_HEADER] = _CSRF
+        else:
+            body = {"data": {**body["data"], "csrf_token": _CSRF}}
+
+    resp = csrf_client.request(method, path, headers=headers, follow_redirects=False, **body)
+
+    expected = {
+        "cookie_no_token": 403,
+        "cookie_token": ok,
+        "bearer_only": ok,
+        "basic_plus_cookie": 403,
+        "bad_bearer_cookie": 401,
+    }[mode]
+    assert resp.status_code == expected, resp.text
+
+
+def test_form_pages_embed_the_csrf_token_and_round_trip(
+    csrf_client: TestClient, admin: tuple[User, dict[str, str]], make_user: MakeUser
+) -> None:
+    make_user(kind="integration", label="key-buzz")  # so /admin/keys renders its forms
+    token = admin[1]["Authorization"].removeprefix("Bearer ")
+    csrf_client.cookies.set(SESSION_COOKIE_NAME, token)
+    for page in ("/admin/users", "/admin/keys", "/admin/users/new", "/admin/keys/new"):
+        resp = csrf_client.get(page)
+        assert resp.status_code == 200, page
+        assert auth_mod.CSRF_COOKIE_NAME in resp.headers.get("set-cookie", ""), page
+        assert re.search(r'name="csrf_token" value="[^"]+"', resp.text), page
+    form = csrf_client.get("/admin/keys/new")  # the browser keeps the cookie it just got
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', form.text).group(1)
+    resp = csrf_client.post("/admin/keys/new", data={"program_name": "Open WebUI", "csrf_token": csrf})
+    assert resp.status_code == 200, resp.text
+
+
+def test_key_added_shows_the_configured_server_url(
+    csrf_client: TestClient, admin: tuple[User, dict[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(admin_ui.settings, "server_url", "https://mini.example.test/")
+    resp = csrf_client.post("/admin/keys/new", data={"program_name": "Buzz"}, headers=admin[1])
+    assert "export OPENAI_BASE_URL=https://mini.example.test/v1" in resp.text
+    assert "integrateapi" not in resp.text

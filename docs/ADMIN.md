@@ -77,8 +77,9 @@ The macOS client's menubar **Open Portal** button targets
 and employees without a per-role configuration.
 
 The cookie is read by `auth._extract_bearer` as a fallback when no
-`Authorization` header is present. CSRF is mitigated by `SameSite=Strict`
-— browsers refuse to attach the cookie to cross-site POSTs.
+`Authorization: Bearer` header is present.
+
+**CSRF (Part 4).** Every cookie-authenticated mutation (Add employee, Add key, user Revoke / Mint, key Revoke / Rotate, `PATCH /me`, `/me/history` delete / restore) needs the double-submit token: the `X-CSRF-Token` header or the `csrf_token` form field must equal the `wispralt_csrf` cookie (set by the page that rendered the form), else **403**. A request that authenticated with a valid `Authorization: Bearer` header needs no token (a cross-site page cannot set that header). A non-Bearer `Authorization` header (e.g. `Basic`) falls back to the cookie and so needs the token; an invalid Bearer is a 401, never a cookie fallback. `SameSite=Strict` on the cookies is a second layer.
 
 ---
 

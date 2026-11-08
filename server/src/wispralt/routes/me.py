@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from wispralt.auth import (
     forbid_integration_kind,
+    require_csrf,
     resolve_token,
     set_csrf_cookie,
     set_session_cookie,
@@ -109,6 +110,7 @@ async def patch_me(
     request: Request,
     body: PatchMeRequest,
     user: User = Depends(forbid_integration_kind),
+    _csrf: User = Depends(require_csrf),
 ) -> MeResponse:
     accounts: AccountStore = request.app.state.accounts
     await asyncio.to_thread(accounts.update_display_name, user.id, body.display_name)
@@ -437,14 +439,12 @@ async def me_history_delete(
     request: Request,
     kind: str,
     row_id: str,
-    csrf_token: str = Form(...),
     user: User = Depends(forbid_integration_kind),
+    _csrf: User = Depends(require_csrf),
 ) -> Response:
     """Soft-delete one owned row. Returns an HTMX OOB delete fragment."""
     if kind not in ("dictation", "file"):
         raise HTTPException(status_code=404)
-    if not verify_csrf(request, csrf_token):
-        raise HTTPException(status_code=403)
 
     job_store: JobStore = request.app.state.job_store
     ok = await asyncio.to_thread(
@@ -464,14 +464,12 @@ async def me_history_restore(
     request: Request,
     kind: str,
     row_id: str,
-    csrf_token: str = Form(...),
     user: User = Depends(forbid_integration_kind),
+    _csrf: User = Depends(require_csrf),
 ) -> HTMLResponse:
     """Restore one soft-deleted owned row. Returns the compact row partial."""
     if kind not in ("dictation", "file"):
         raise HTTPException(status_code=404)
-    if not verify_csrf(request, csrf_token):
-        raise HTTPException(status_code=403)
 
     job_store: JobStore = request.app.state.job_store
     ok = await asyncio.to_thread(

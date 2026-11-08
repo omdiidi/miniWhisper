@@ -50,6 +50,7 @@ from ..accounts import service as account_service
 from ..accounts.store import AccountStore, User
 from ..auth import (
     require_admin,
+    require_admin_csrf,
     require_api_key,
     resolve_token,
     set_csrf_cookie,
@@ -66,6 +67,18 @@ logger = logging.getLogger(__name__)
 
 def _accounts(request: Request) -> AccountStore:
     return request.app.state.accounts
+
+
+def _form_page(
+    request: Request, template: str, ctx: dict[str, Any], status_code: int = 200
+) -> HTMLResponse:
+    """Render a page that holds a mutating form: mint a CSRF token, embed it, set its cookie."""
+    csrf = secrets.token_urlsafe(32)
+    response = templates.TemplateResponse(
+        template, {"request": request, "csrf_token": csrf, **ctx}, status_code=status_code
+    )
+    set_csrf_cookie(response, csrf)
+    return response
 
 
 def _usage(request: Request) -> UsageStore:
@@ -165,10 +178,7 @@ async def overview(request: Request) -> HTMLResponse:
 @authed_router.get("/users", response_class=HTMLResponse)
 async def users_list(request: Request) -> HTMLResponse:
     rows = await asyncio.to_thread(_accounts(request).list_people)
-    return templates.TemplateResponse(
-        "users.html.j2",
-        {"request": request, "users": rows},
-    )
+    return _form_page(request, "users.html.j2", {"users": rows})
 
 
 _VALID_ROLES = {"admin", "employee"}
@@ -229,15 +239,15 @@ def _build_install_command(server_url: str, plaintext: str) -> str:
 @authed_router.get("/users/new", response_class=HTMLResponse)
 async def users_add_form(request: Request) -> HTMLResponse:
     """Render the add-employee form."""
-    return templates.TemplateResponse(
+    return _form_page(
+        request,
         "add_employee.html.j2",
-        {
-            "request": request,
-            "form_label": "",
-            "form_role": "employee",
-            "form_display_name": "",
-        },
+        {"form_label": "", "form_role": "employee", "form_display_name": ""},
     )
+
+
+# The six admin mutations take their user through ``require_admin_csrf`` as a
+# PARAMETER dependency (auth first, then CSRF; a valid Bearer skips the token).
 
 
 @authed_router.post("/users/new", response_class=HTMLResponse)
@@ -246,6 +256,7 @@ async def users_add_submit(
     label: str = Form(...),
     role: str = Form("employee"),
     display_name: str = Form(""),
+    _admin: User = Depends(require_admin_csrf),
 ) -> HTMLResponse:
     """Create a new user, mint a token, and render the install one-liner.
 
@@ -259,10 +270,10 @@ async def users_add_submit(
     if err is not None or role not in _VALID_ROLES:
         if err is None:
             err = f"Invalid role: {role!r}."
-        return templates.TemplateResponse(
+        return _form_page(
+            request,
             "add_employee.html.j2",
             {
-                "request": request,
                 "error": err,
                 "form_label": label,
                 "form_role": role if role in _VALID_ROLES else "employee",
@@ -295,14 +306,18 @@ async def users_add_submit(
 
 
 @authed_router.post("/users/{user_id}/revoke")
-async def users_revoke(request: Request, user_id: int) -> RedirectResponse:
+async def users_revoke(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> RedirectResponse:
     """Disable *user_id*: none of its keys authenticate from the next request."""
     await asyncio.to_thread(_accounts(request).disable_user, user_id)
     return RedirectResponse("/admin/users", status_code=303)
 
 
 @authed_router.post("/users/{user_id}/mint", response_class=HTMLResponse)
-async def users_mint(request: Request, user_id: int) -> HTMLResponse:
+async def users_mint(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> HTMLResponse:
     """Revoke the user's keys, issue one new key (re-enabling the user); show it once."""
     new_plaintext = await _rotate_or_404(request, user_id)
     return templates.TemplateResponse(
@@ -356,25 +371,20 @@ def _slugify_program_name(raw: str) -> str:
 async def keys_list(request: Request) -> HTMLResponse:
     """List all non-revoked integration keys (kind='integration')."""
     rows = await asyncio.to_thread(_accounts(request).list_integrations)
-    return templates.TemplateResponse(
-        "keys.html.j2",
-        {"request": request, "keys": rows},
-    )
+    return _form_page(request, "keys.html.j2", {"keys": rows})
 
 
 @authed_router.get("/keys/new", response_class=HTMLResponse)
 async def keys_add_form(request: Request) -> HTMLResponse:
     """Render the add-integration-key form."""
-    return templates.TemplateResponse(
-        "add_key.html.j2",
-        {"request": request, "form_program_name": ""},
-    )
+    return _form_page(request, "add_key.html.j2", {"form_program_name": ""})
 
 
 @authed_router.post("/keys/new", response_class=HTMLResponse)
 async def keys_add_submit(
     request: Request,
     program_name: str = Form(...),
+    _admin: User = Depends(require_admin_csrf),
 ) -> HTMLResponse:
     """Mint an integration API key tied to a third-party program name.
 
@@ -390,25 +400,20 @@ async def keys_add_submit(
     """
     clean_name, err = _validate_optional_display_name(program_name)
     if err is not None or not clean_name:
-        return templates.TemplateResponse(
+        return _form_page(
+            request,
             "add_key.html.j2",
-            {
-                "request": request,
-                "error": err or "Program name is required.",
-                "form_program_name": program_name,
-            },
+            {"error": err or "Program name is required.", "form_program_name": program_name},
             status_code=400,
         )
 
     slug = _slugify_program_name(clean_name)
     if not slug:
-        return templates.TemplateResponse(
+        return _form_page(
+            request,
             "add_key.html.j2",
             {
-                "request": request,
-                "error": (
-                    "Program name must contain at least one letter or digit."
-                ),
+                "error": "Program name must contain at least one letter or digit.",
                 "form_program_name": program_name,
             },
             status_code=400,
@@ -435,19 +440,24 @@ async def keys_add_submit(
             "plaintext": plaintext,
             "label": label,
             "kind": user.kind,
+            "server_url": settings.server_url.rstrip("/"),
         },
     )
 
 
 @authed_router.post("/keys/{user_id}/revoke")
-async def keys_revoke(request: Request, user_id: int) -> RedirectResponse:
+async def keys_revoke(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> RedirectResponse:
     """Revoke an integration key (disables its user; applies to the next request)."""
     await asyncio.to_thread(_accounts(request).disable_user, user_id)
     return RedirectResponse("/admin/keys", status_code=303)
 
 
 @authed_router.post("/keys/{user_id}/rotate", response_class=HTMLResponse)
-async def keys_rotate(request: Request, user_id: int) -> HTMLResponse:
+async def keys_rotate(
+    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+) -> HTMLResponse:
     """Rotate an integration key in place; show the new plaintext once."""
     new_plaintext = await _rotate_or_404(request, user_id)
     # Re-fetch so we can show the original program name on the success page.
@@ -464,6 +474,7 @@ async def keys_rotate(request: Request, user_id: int) -> HTMLResponse:
             "plaintext": new_plaintext,
             "label": label,
             "kind": "integration",
+            "server_url": settings.server_url.rstrip("/"),
         },
     )
 

@@ -353,7 +353,7 @@ Return the calling user's own profile. Each user can only read their own row —
 
 ### `PATCH /me`
 
-**Auth:** Bearer required (any role).
+**Auth:** Bearer required (any role), or the session cookie **plus** the CSRF token (`X-CSRF-Token` header = `wispralt_csrf` cookie; otherwise 403). A Bearer request needs no CSRF token (the macOS client sends Bearer + JSON).
 
 Update the calling user's own `display_name`. The `label` and `role` are not user-editable; admin must change those via the admin UI.
 
@@ -524,7 +524,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ### `DELETE /me/history/{kind}/{row_id}`
 
-**Auth:** Bearer required + CSRF token. Ownership-checked.
+**Auth:** Session cookie + CSRF token, or a Bearer token (no CSRF token needed). Ownership-checked.
 
 Soft-delete one owned row. Flips `deleted_at = NOW()` on the underlying row; downstream read paths (`/me/history`, `compute_user_stats`, the weekly-insights cron) all filter `deleted_at IS NULL`, so the row disappears from every surface. Reversible via the `/restore` route below until the 90-day TTL sweep zeros the transcript text.
 
@@ -532,7 +532,7 @@ Soft-delete one owned row. Flips `deleted_at = NOW()` on the underlying row; dow
 
 | Field | Type | Notes |
 |---|---|---|
-| `csrf_token` | string | Double-submit value matched against the cookie set by the prior `GET /me/history*` render. Constant-time compare via `hmac.compare_digest`. |
+| `csrf_token` | string | Double-submit value matched against the cookie set by the prior `GET /me/history*` render (or send it as `X-CSRF-Token`). Constant-time compare via `hmac.compare_digest`. Not needed with a Bearer token. |
 
 **Response 200** — body is the OOB delete fragment `<tr id="row-{kind}-{row_id}" hx-swap-oob="delete"></tr>`. HTMX removes the row from the table without re-fetching the page.
 
@@ -550,7 +550,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 ### `POST /me/history/{kind}/{row_id}/restore`
 
-**Auth:** Bearer required + CSRF token. Ownership-checked.
+**Auth:** Session cookie + CSRF token, or a Bearer token (no CSRF token needed). Ownership-checked.
 
 Restore one soft-deleted row by clearing `deleted_at`. Returns the compact row partial (`_me_history_row.html.j2`) so HTMX can drop the row back into the table at its original position.
 
@@ -850,7 +850,7 @@ Verify all chunks are present, concatenate them into the staging dir, and hand t
 
 From this point the client polls `GET /transcribe/file/{job_id}` exactly as it would for a single-shot `/transcribe/file` upload.
 
-**Errors:** 403 (ownership), 404 (upload not found), 409 (missing chunks or size mismatch), 429 (same body and `code` as `POST /transcribe/file`; the assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
+**Errors:** 403 (ownership), 404 (upload not found), 409 (a chunk index in `0…chunk_count-1` is missing — the detail names it, e.g. `Missing chunk 1 of 3`; only `chunk-NNNN.part` files with those exact names count — or a size mismatch), 429 (same body and `code` as `POST /transcribe/file`; the assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
 
 **Stale-upload TTL:** chunked staging directories whose `meta.json` mtime is older than 1 h are reaped at server startup (and on demand by `ops.staging.sweep_chunked`). Each successful chunk write touches `meta.json` so actively-progressing uploads are never reaped.
 

@@ -527,11 +527,14 @@ async def finalize_chunked(
             headers={"Retry-After": "60"},
         )
 
-    parts = sorted(chunked_dir.glob("chunk-*.part"))
-    if len(parts) != chunk_count:
+    # Exactly chunk-0000 … chunk-(N-1), by name: never count whatever the
+    # directory holds (a stray or temp file must not stand in for a chunk).
+    parts = [chunked_dir / f"chunk-{i:04d}.part" for i in range(chunk_count)]
+    missing = [i for i, p in enumerate(parts) if not p.is_file()]
+    if missing:
         raise HTTPException(
             409,
-            f"Expected {chunk_count} chunks, got {len(parts)}",
+            f"Missing chunk {missing[0]} of {chunk_count}",
         )
     # R-G: pre-flight total size check before any I/O work — catches
     # truncation cheaply.

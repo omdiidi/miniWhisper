@@ -14,7 +14,7 @@
 
 <h2>How to use it (OpenAI-compatible)</h2>
 <p>In any program that speaks the OpenAI Whisper API, set these two environment variables:</p>
-<pre><code>export OPENAI_BASE_URL=https://transcribe.integrateapi.ai/v1
+<pre><code>export OPENAI_BASE_URL={{ server_url }}/v1
 export OPENAI_API_KEY={{ plaintext }}</code></pre>
 
 <p>Then any OpenAI Whisper client (Python <code>openai</code> SDK, Node <code>openai</code> SDK, Buzz, MacWhisper, Open WebUI voice mode, etc.) will route to WisprAlt instead of OpenAI's servers.</p>
