@@ -85,7 +85,9 @@ request (no cache).
    accepted** — the server routes by role.
 3. The server validates the token (`auth.resolve_token`, the same lookup), then
    sets a `wispralt_admin_token` cookie with `HttpOnly`, `Secure`,
-   `SameSite=Strict`, `max_age=8h`.
+   `SameSite=Strict`, `max_age=8h`. On plain `http://` to a loopback host
+   (`http://127.0.0.1:8000/admin` during setup) the session and CSRF cookies are sent
+   without `Secure` (Safari drops Secure cookies there); every other request keeps it.
 4. **Role-based redirect on success:**
    - `role='admin'` → 303 to `/admin/` (full overview dashboard).
    - `role='employee'` → 303 to `/admin/me` (the employee's own person page,

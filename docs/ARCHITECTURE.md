@@ -489,7 +489,7 @@ Key invariants:
 - **Plaintext tokens exist only in `accounts/service.py`** and the one page or terminal that shows them. Logs carry ids only.
 - **First admin:** `wispralt setup --role host` creates it and hands over the key once (terminal or a new `--token-file`); `wispralt keys rotate-admin` replaces a lost admin key (`python -m wispralt.bootstrap` remains as a TTY-only shim over the same code). There is no env admin key and no break-glass path.
 - **`request.state.user`** is set for every authenticated request; the usage middleware reads it.
-- **Cookie fallback:** `require_api_key` falls back to the `wispralt_admin_token` cookie when no Bearer header is present (`/v1` never does). Set by `POST /admin/login` / `POST /me/login`; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`.
+- **Cookie fallback:** `require_api_key` falls back to the `wispralt_admin_token` cookie when no Bearer header is present (`/v1` never does). Set by `POST /admin/login` / `POST /me/login`; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. `auth.cookie_secure(request)` drops `Secure` (session and CSRF cookies) only for plain http to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), so the setup URL `http://127.0.0.1:8000/admin` logs in on Safari; callers that pass no `request` stay Secure.
 
 #### `users` and `api_keys` (SQLite, `migrations/0001_initial.sql`)
 

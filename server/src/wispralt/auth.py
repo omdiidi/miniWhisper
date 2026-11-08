@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 import sqlite3
 from typing import TYPE_CHECKING
@@ -217,15 +218,32 @@ _CSRF_COOKIE_MAX_AGE_S = 30 * 60  # 30m — forms shouldn't sit open longer
 _LEGACY_PATHS = ("/admin/login",)  # historical paths to clear on new login
 
 
-def set_session_cookie(resp: Response, token: str) -> None:
-    """Set the unified session cookie and clear any legacy-path cookies."""
+def cookie_secure(request: Request | None) -> bool:
+    """``Secure`` flag for the portal cookies: False ONLY for a plain-http request to a
+    loopback host (``http://127.0.0.1:8000/admin`` during setup — Safari drops Secure
+    cookies there, which breaks login). Everything else, including no request and the
+    tunnel (its Host is the public name), stays Secure."""
+    if request is None or request.url.scheme != "http":
+        return True
+    host = (request.url.hostname or "").strip("[]").lower()
+    if host == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
+
+
+def set_session_cookie(resp: Response, token: str, request: Request | None = None) -> None:
+    """Set the unified session cookie and clear any legacy-path cookies.
+    Pass ``request`` so plain-http loopback gets a non-Secure cookie (``cookie_secure``)."""
     for legacy_path in _LEGACY_PATHS:
         resp.delete_cookie(SESSION_COOKIE_NAME, path=legacy_path)
     resp.set_cookie(
         SESSION_COOKIE_NAME,
         token,
         httponly=True,
-        secure=True,
+        secure=cookie_secure(request),
         samesite="strict",
         max_age=_SESSION_COOKIE_MAX_AGE_S,
         path="/",
@@ -239,8 +257,8 @@ def clear_session_cookie(resp: Response) -> None:
         resp.delete_cookie(SESSION_COOKIE_NAME, path=legacy_path)
 
 
-def set_csrf_cookie(resp: Response, csrf_token: str) -> None:
-    """Set the CSRF double-submit cookie.
+def set_csrf_cookie(resp: Response, csrf_token: str, request: Request | None = None) -> None:
+    """Set the CSRF double-submit cookie (``request``: see ``cookie_secure``).
 
     NOT HttpOnly: the form template echoes the value back as a hidden input,
     and the POST handler compares cookie vs form via ``hmac.compare_digest``.
@@ -250,7 +268,7 @@ def set_csrf_cookie(resp: Response, csrf_token: str) -> None:
         CSRF_COOKIE_NAME,
         csrf_token,
         httponly=False,
-        secure=True,
+        secure=cookie_secure(request),
         samesite="strict",
         max_age=_CSRF_COOKIE_MAX_AGE_S,
         path="/",

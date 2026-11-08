@@ -79,7 +79,7 @@ def _form_page(
     response = templates.TemplateResponse(
         template, {"request": request, "csrf_token": csrf, **ctx}, status_code=status_code
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -107,7 +107,7 @@ async def login_form(request: Request) -> HTMLResponse:
         "login.html.j2",
         {"request": request, "csrf_token": csrf},
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -121,7 +121,7 @@ def _render_admin_login_error(
         {"request": request, "error": error, "csrf_token": csrf},
         status_code=status_code,
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -153,7 +153,7 @@ async def login_submit(
     resp = RedirectResponse(target, status_code=303)
     # Shared helper clears the legacy /admin/login-scoped cookie and sets the
     # unified path="/" session cookie so it scopes across /admin/* AND /me/*.
-    set_session_cookie(resp, token)
+    set_session_cookie(resp, token, request)
     return resp
 
 
@@ -219,7 +219,7 @@ async def setup_submit(
          "server_url": settings.server_url},
         headers=NO_STORE,
     )
-    set_session_cookie(response, plaintext)
+    set_session_cookie(response, plaintext, request)
     return response
 
 

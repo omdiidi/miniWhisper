@@ -173,3 +173,59 @@ def test_settings_page_points_at_the_real_env_file_when_the_key_is_missing(
     html = client.get("/admin/settings", headers=_auth(token)).text
     assert "~/.config/wispralt/.env" in html and "wispralt restart" in html
     assert "server/.env" not in html and "the CLI does this" not in html
+
+
+# ── Secure cookies vs plain-http loopback (setup opens http://127.0.0.1:8000/admin) ──
+
+
+def _cookie_headers(resp, name: str) -> list[str]:  # noqa: ANN001
+    """The ``name`` cookies being SET (not the legacy-path deletions, which expire them)."""
+    return [h for h in resp.headers.get_list("set-cookie")
+            if h.startswith(f"{name}=") and "max-age=0" not in h.lower()]
+
+
+@pytest.mark.parametrize(
+    ("base_url", "secure"),
+    [
+        ("http://127.0.0.1:8000", False),
+        ("http://localhost:8000", False),
+        ("https://127.0.0.1:8000", True),
+        ("http://wispralt.example.com", True),
+        ("https://wispralt.example.com", True),
+    ],
+)
+def test_portal_cookies_drop_secure_only_on_plain_http_loopback(
+    wire: Wire, make_user, base_url: str, secure: bool,
+) -> None:
+    from wispralt.auth import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME
+
+    _admin, token = make_user(role="admin", label="root")
+    c = TestClient(wire(create_app()), base_url=base_url)
+    form = c.get("/admin/login")
+    [csrf_cookie] = _cookie_headers(form, CSRF_COOKIE_NAME)
+    assert ("secure" in csrf_cookie.lower()) is secure, csrf_cookie
+    if base_url.startswith("http://") and secure:
+        return  # a Secure cookie is (correctly) not sent back over plain http
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', form.text).group(1)
+    resp = c.post("/admin/login", data={"token": token, "csrf_token": csrf},
+                  follow_redirects=False)
+    assert resp.status_code == 303, resp.text[:300]
+    [session_cookie] = _cookie_headers(resp, SESSION_COOKIE_NAME)
+    assert ("secure" in session_cookie.lower()) is secure, session_cookie
+    assert "httponly" in session_cookie.lower() and "samesite=strict" in session_cookie.lower()
+
+
+@pytest.mark.parametrize(
+    ("scheme", "host", "secure"),
+    [("http", "[::1]:8000", False), ("http", "127.0.0.2", False), ("https", "[::1]", True),
+     ("http", "10.0.0.5:8000", True), ("http", "localhost.evil.example", True)],
+)
+def test_cookie_secure_by_scheme_and_host(scheme: str, host: str, secure: bool) -> None:
+    from starlette.requests import Request
+
+    from wispralt.auth import cookie_secure
+
+    req = Request({"type": "http", "scheme": scheme, "path": "/", "query_string": b"",
+                   "headers": [(b"host", host.encode())]})
+    assert cookie_secure(req) is secure
+    assert cookie_secure(None) is True

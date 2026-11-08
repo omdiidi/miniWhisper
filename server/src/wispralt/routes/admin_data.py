@@ -135,7 +135,7 @@ async def admin_data(
     ctx.update(await _runs_ctx(request, cfg))
     ctx["csrf_token"] = csrf
     response = templates.TemplateResponse(request, "data.html.j2", ctx)
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -331,7 +331,7 @@ async def _settings_page(request: Request, *, error: str | None = None, saved: b
         },
         status_code=status_code,
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
