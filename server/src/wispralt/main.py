@@ -308,26 +308,13 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
     #    event loop rather than interrupting arbitrary C-extension code via the raw
     #    signal module.
     #
-    #    The handler signals graceful shutdown via uvicorn's `should_exit` flag,
-    #    NOT `os._exit(0)`, which would skip the lifespan teardown.  We instead
-    #    let uvicorn run its normal shutdown
-    #    path (which invokes our lifespan ``finally`` block) and trust
-    #    launchd's ExitTimeout=15 to bound the wait.
+    #    It marks the app as shutting down, then raises SIGINT, which uvicorn's
+    #    own handler turns into its normal graceful shutdown (so the lifespan
+    #    teardown below runs). Never ``os._exit``: that skips the teardown.
+    #    launchd's ExitTimeOut=15 bounds the wait.
     def _sigterm_handler() -> None:
         logger.info("SIGTERM received — initiating graceful shutdown.")
         app.state.shutting_down = True
-
-        # Trigger uvicorn graceful shutdown so the lifespan teardown runs.
-        # Fallback to raising
-        # SIGINT in the same loop if no uvicorn server is registered (e.g.
-        # tests running the app via TestClient).
-        server_obj = getattr(app.state, "uvicorn_server", None)
-        if server_obj is not None:
-            server_obj.should_exit = True
-            return
-        # Last-resort: re-raise as SIGINT so asyncio's default handler triggers
-        # KeyboardInterrupt → uvicorn shutdown.  Never call os._exit — that
-        # bypasses the lifespan teardown.
         signal.raise_signal(signal.SIGINT)
 
     try:

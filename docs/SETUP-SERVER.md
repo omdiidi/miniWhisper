@@ -57,7 +57,10 @@ Run `scripts/setup-cloudflared.sh` after `wispralt setup --role host`. The tunne
 
 All configuration is read from `~/.config/wispralt/.env` (mode 0600; the
 LaunchAgent's working directory). `wispralt setup` creates it and only ever adds
-missing keys. `server/.env.example` lists every key:
+missing keys. The server reads `.env` from its working directory and nowhere else
+(real environment variables override it), and the startup permission check
+(`ops.env_writer.find_env_path`) looks at that same file; a dev run started
+elsewhere reads `./.env`. `server/.env.example` lists every key:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|

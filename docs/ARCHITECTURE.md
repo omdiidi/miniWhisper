@@ -435,7 +435,7 @@ The Mac mini M4 16 GB configuration leaves ~8.7 GB for the OS and other processe
 
 ### SIGTERM and graceful shutdown
 
-The SIGTERM handler (registered in the lifespan when running on the main thread) only sets `app.state.shutting_down = True` and asks uvicorn to exit; it no longer fails running jobs. The lifespan shutdown then:
+The SIGTERM handler (registered in the lifespan when running on the main thread) only sets `app.state.shutting_down = True` and raises SIGINT, which uvicorn's own handler turns into its graceful shutdown; it no longer fails running jobs. The lifespan shutdown then:
 
 1. sets `shutting_down` and awaits `file_runner.shutdown()` FIRST, while the DB is open: each worker is cancelled; a job it interrupts keeps its staged input (WAV or source) and `requeue_interrupted` sets the row back to `pending` with the attempt `set_running` took refunded, so a deploy never spends an attempt;
 2. cancels the daemon loops and streaming sessions, closes the insights client;
