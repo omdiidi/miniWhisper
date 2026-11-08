@@ -15,21 +15,26 @@ import os
 import plistlib
 import sqlite3
 import stat
-from contextlib import closing
+import sys
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from wispralt._errors import BackupRefused, InsufficientSpace, RestoreRefused, ServerRunning
 from wispralt.accounts.store import AccountStore
 from wispralt.cli import client, launchd
 from wispralt.cli.host import describe_retention, server_url
-from wispralt.cli.paths import LEGACY_LABEL, env_value
+from wispralt.cli.paths import LEGACY_LABEL, env_value, private_dir
 from wispralt.cli.system import EXIT_DOCTOR, CliError, version
 from wispralt.database import Database
 from wispralt.jobs.store import JobStore
+from wispralt.ops import backup as offline
 
 if TYPE_CHECKING:
     import argparse
+    from collections.abc import Iterator
 
     from wispralt.cli.paths import Ctx
 
@@ -430,3 +435,101 @@ def need_host(ctx: Ctx) -> None:
     state = ctx.need_state()
     if state.role not in {"host", "both"}:
         raise CliError(1, "this Mac has no WisprAlt host installed")
+
+
+# ── offline operations (backup / restore) ────────────────────────────────────
+
+_OFFLINE_ERRORS = (ServerRunning, BackupRefused, RestoreRefused, InsufficientSpace)
+
+
+@contextmanager
+def service_stopped(ctx: Ctx) -> Iterator[None]:
+    """Stop the service (proven by ``server_lock``) and start it again afterwards if it ran."""
+    was_loaded = launchd.service(ctx).loaded
+    if was_loaded:
+        launchd.stop(ctx)
+    try:
+        yield
+    except _OFFLINE_ERRORS as exc:
+        raise CliError(1, f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        if was_loaded:
+            launchd.start(ctx)
+            if not launchd.wait_healthy(ctx):
+                print(
+                    f"warning: the service restarted but {ctx.url}/healthz is not answering",
+                    file=sys.stderr,
+                )
+
+
+def new_backup_dest(ctx: Ctx) -> Path:
+    private_dir(ctx.paths.backup_dir)
+    return ctx.paths.backup_dir / f"wispralt-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+
+
+def run_backup(ctx: Ctx, dest: Path) -> Path:
+    """Offline backup with the service stopped; returns the backup dir."""
+    with service_stopped(ctx):
+        return offline.backup(ctx.paths.data_dir, dest)
+
+
+def _manifest(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads((path / MANIFEST).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _backup_row(path: Path) -> dict[str, Any]:
+    m = _manifest(path)
+    created = m.get("created_at")
+    tables = m.get("tables") or {}
+    return {
+        "path": str(path),
+        "created": datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M") if created else "-",
+        "bytes": allocated(path),
+        "users": tables.get("users", 0),
+        "dictations": tables.get("dictations", 0),
+        "jobs": tables.get("jobs", 0),
+    }
+
+
+def cmd_backup(ctx: Ctx, args: argparse.Namespace) -> int:
+    need_host(ctx)
+    dest = run_backup(ctx, args.dest or new_backup_dest(ctx))
+    row = _backup_row(dest)
+    print(
+        f"backup written: {dest} ({human(row['bytes'])}; {row['users']} users, "
+        f"{row['dictations']} dictations, {row['jobs']} file jobs)"
+    )
+    return 0
+
+
+def cmd_backup_list(ctx: Ctx, _args: argparse.Namespace) -> int:
+    rows = [_backup_row(p) for p in list_backups(ctx)]
+    if ctx.json:
+        print(json.dumps(rows, indent=2))
+    elif not rows:
+        print(f"no backups in {ctx.paths.backup_dir}")
+    for r in [] if ctx.json else rows:
+        print(
+            f"{r['created']}  {human(r['bytes']):>9}  {r['dictations']:>6} dictations  {r['path']}"
+        )
+    return 0
+
+
+def cmd_restore(ctx: Ctx, args: argparse.Namespace) -> int:
+    need_host(ctx)
+    src = args.backup.expanduser().absolute()
+    if not (src / MANIFEST).is_file():
+        raise CliError(2, f"{src} is not a WisprAlt backup (no {MANIFEST})")
+    print(f"restore {src} over {ctx.paths.data_dir}; the current data is kept aside")
+    if not ctx.confirm("Stop the service and restore this backup?"):
+        print("nothing changed")
+        return 0
+    with service_stopped(ctx):
+        aside = offline.restore(src, ctx.paths.data_dir)
+    print(f"restored {src}")
+    if aside is not None:
+        print(f"previous data kept at {aside} (delete it once you are sure)")
+    return 0

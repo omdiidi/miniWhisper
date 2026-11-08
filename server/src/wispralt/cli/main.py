@@ -118,11 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("set", host.cmd_retention_set, "set retention in days (0 keeps forever)", rs)
     p.add_argument("days", type=int)
 
-    b = cmd("backup", _todo, "offline backup of the host data (stops the service briefly)")
+    b = cmd("backup", ops.cmd_backup, "offline backup of the host data (stops the service briefly)")
     b.add_argument("--dest", type=Path, help="new directory (default: backup dir/wispralt-<ts>)")
     bs = b.add_subparsers(dest="action", metavar="ACTION")
-    cmd("list", _todo, "list backups", bs)
-    p = cmd("restore", _todo, "replace the host data with a backup (old data kept aside)")
+    cmd("list", ops.cmd_backup_list, "list backups", bs)
+    p = cmd("restore", ops.cmd_restore, "replace the host data with a backup (old data kept aside)")
     p.add_argument("backup", type=Path)
 
     p = cmd("update", _todo, "pull, back up, reinstall and restart")
