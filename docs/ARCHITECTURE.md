@@ -1086,7 +1086,10 @@ that's heavy on dictations doesn't starve file transcriptions off the next page 
 vice versa). Cursors are `(created_at, row_id)` tuples base64-urlsafe-encoded
 in the URL; malformed cursors decode to None and silently restart pagination.
 The "Load more" HTMX button posts back both cursors and the server appends
-the next 50 rows. Page size lives in `settings.history_page_size`
+the next 50 rows. Each leg fetches `limit + 1` rows and the two are merged in
+order; a leg's next cursor is the last row of that leg actually shown (its
+incoming cursor if it showed none), so a row the page limit cut appears on the
+next page. Both cursors are empty once nothing is left. Page size lives in `settings.history_page_size`
 (default **50**).
 
 `row_id` is included as a tie-breaker because two transcripts captured in

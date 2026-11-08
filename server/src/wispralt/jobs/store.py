@@ -20,6 +20,8 @@ Recovery and shutdown (Locked Decision 8):
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import json
 import logging
 import time
@@ -899,8 +901,12 @@ class JobStore:
     ) -> tuple[list[dict[str, Any]], tuple[float, str] | None, tuple[float, str] | None]:
         """Personal history with per-leg cursors: ``(rows, next_dict_cursor, next_jobs_cursor)``.
 
-        Each leg's cursor is set only when that leg returned ``limit`` rows. Text search is
-        :meth:`search_history` (FTS5), not a filter here.
+        Each leg fetches ``limit + 1`` rows in its own order and the two are merged
+        newest first (a ``created_at`` tie keeps the dictation first). A leg's next
+        cursor is the last row of that leg actually returned on this page, or its
+        incoming cursor when it returned none (``None`` = start of that leg), so a row
+        cut by the page limit is shown on the next page. Both are ``None`` once
+        nothing is left. Text search is :meth:`search_history` (FTS5), not a filter here.
         """
         dict_rows: list[dict[str, Any]] = []
         job_rows: list[dict[str, Any]] = []
@@ -919,7 +925,7 @@ class JobStore:
                     sql += " AND (created_at, id) < (?, CAST(? AS INTEGER))"
                     args.extend(dict_cursor)
                 sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
-                dict_rows = [dict(r) for r in con.execute(sql, (*args, limit))]
+                dict_rows = [dict(r) for r in con.execute(sql, (*args, limit + 1))]
             if kind != "dictation":
                 sql = (
                     "SELECT id AS row_id, 'file' AS kind, created_at,"
@@ -933,14 +939,25 @@ class JobStore:
                     sql += " AND (created_at, id) < (?, ?)"
                     args.extend(jobs_cursor)
                 sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
-                job_rows = [dict(r) for r in con.execute(sql, (*args, limit))]
+                job_rows = [dict(r) for r in con.execute(sql, (*args, limit + 1))]
 
-        merged = sorted(dict_rows + job_rows, key=lambda r: (-r["created_at"], r["row_id"]))[:limit]
+        # heapq.merge keeps each leg's SQL order, so a leg's returned rows are a prefix.
+        merged = list(
+            itertools.islice(
+                heapq.merge(dict_rows, job_rows, key=lambda r: -r["created_at"]), limit
+            )
+        )
+        n_dict = sum(1 for r in merged if r["kind"] == "dictation")
+        n_jobs = len(merged) - n_dict
+        if len(dict_rows) == n_dict and len(job_rows) == n_jobs:
+            return merged, None, None  # both legs fully shown
 
-        def _next(rows: list[dict[str, Any]]) -> tuple[float, str] | None:
-            return (rows[-1]["created_at"], rows[-1]["row_id"]) if len(rows) == limit else None
+        def _next(
+            rows: list[dict[str, Any]], shown: int, prev: tuple[float, str] | None
+        ) -> tuple[float, str] | None:
+            return (rows[shown - 1]["created_at"], rows[shown - 1]["row_id"]) if shown else prev
 
-        return merged, _next(dict_rows), _next(job_rows)
+        return merged, _next(dict_rows, n_dict, dict_cursor), _next(job_rows, n_jobs, jobs_cursor)
 
     # ── full-text history search (FTS5, migration 0002) ──────────────────────
 
