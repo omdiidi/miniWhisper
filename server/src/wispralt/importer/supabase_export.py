@@ -21,7 +21,8 @@ Supabase is the owner's only copy of old history, so this module can only read:
   ``<table>.jsonl`` (canonical JSON lines, 0600) and ``counts.json``. Files are created
   with ``O_EXCL`` in a fresh dir: nothing is ever overwritten or deleted.
 * ``JsonPagesSource(dir)`` is the manual fallback: ``<table>.json`` arrays saved from
-  the same allowlisted SELECTs run through the read-only Supabase MCP.
+  the same allowlisted SELECTs run through the read-only Supabase MCP. Every table
+  needs its file (an empty one is saved as ``[]``); a missing file is an error.
 """
 
 from __future__ import annotations
@@ -207,13 +208,27 @@ def _parse_dump(out: str, tables: list[str]) -> dict[str, TableDump]:
 
 
 class JsonPagesSource:
-    """Rows saved by hand from the read-only MCP: ``<dir>/<table>.json`` = a JSON array."""
+    """Rows saved by hand from the read-only MCP: ``<dir>/<table>.json`` = a JSON array.
+
+    Every table needs its file: a missing (or unreadable / non-array) file is an
+    incomplete export and raises ``ImportIntegrityError``. An empty table is
+    saved explicitly as ``[]``.
+    """
 
     def __init__(self, directory: Path) -> None:
         self._rows: dict[str, list[dict]] = {}
         for t in TABLES:
             f = Path(directory) / f"{t}.json"
-            rows = json.loads(f.read_text()) if f.exists() else []
+            if not f.is_file():
+                raise ImportIntegrityError(f"{f} is missing; save an empty table as []")
+            try:
+                rows = json.loads(f.read_text())
+            except ValueError as exc:  # also an empty (0-byte) file: never a table
+                raise ImportIntegrityError(f"{f} is not valid JSON: {exc}") from exc
+            if not isinstance(rows, list) or not all(
+                isinstance(r, dict) and "id" in r for r in rows
+            ):
+                raise ImportIntegrityError(f"{f} must be a JSON array of rows with an id")
             self._rows[t] = sorted(rows, key=lambda r: r["id"])
 
     def columns(self, table: str) -> list[str]:

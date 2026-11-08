@@ -8,14 +8,20 @@ from typing import TYPE_CHECKING
 import pytest
 
 from wispralt.cli import ops
+from wispralt.cli.host import installed_exe
 from wispralt.cli.paths import InstallState, Paths
+from wispralt.ops.backup import server_lock
 
 from .conftest import make_app
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from wispralt.cli.system import Deps
+
     from .conftest import CliFn, Execs, FakeHttp, FakeHub, FakeRunner
+
+EXE = installed_exe()
 
 
 @pytest.fixture
@@ -38,10 +44,10 @@ def test_update_order(
 ) -> None:
     assert cli("update")[0] == 0
     steps = [_short(c) for c in runner.calls if c[:2] != ["launchctl", "print"]]
-    assert steps == ["git -C", "git -C", "launchctl bootout", "uv tool"]
+    assert steps == ["git -C", "git -C", "launchctl bootout", "uv tool", f"{EXE} --version"]
     assert runner.calls[0][3:] == ["status", "--porcelain"]
     assert runner.calls[1][3:] == ["pull", "--ff-only"]
-    assert runner.calls[-1] == [
+    assert runner.calls[-2] == [
         "uv", "tool", "install", "--force", "--python", "3.11", "--reinstall", f"{clone}/server[host]",
     ]  # fmt: skip
     [bk] = _backups(installed)
@@ -113,6 +119,43 @@ def test_interrupted_phase1_still_restarts_the_old_service(
     assert runner.verbs()[-1] == "bootstrap" and execs.calls == []
 
 
+def test_stop_timeout_rebootstraps_the_agent(
+    installed: Paths, cli: CliFn, runner: FakeRunner, execs: Execs
+) -> None:
+    """R3 fix: the bootout happened, then the lock wait timed out: the agent comes back."""
+    with server_lock(installed.data_dir):  # the "old server" never lets go
+        code, _, err = cli("update", "--no-backup")
+    assert code == 1 and "still holds" in err and "restarted" in err
+    verbs = runner.verbs()
+    assert "bootout" in verbs and verbs[-1] == "bootstrap" and execs.calls == []
+    assert not any(c[:2] == ["uv", "tool"] for c in runner.calls)
+
+
+def test_missing_new_executable_restarts_the_service(
+    installed: Paths, cli: CliFn, runner: FakeRunner, deps: Deps
+) -> None:
+    """R3 fix: an execv that fails (binary gone) must not leave the host stopped."""
+
+    def missing(_argv: list[str]) -> None:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    deps.execv = missing
+    code, _, err = cli("update")
+    assert code == 1 and "cannot run" in err and "FileNotFoundError" in err
+    assert "restarted and is answering" in err and "wispralt restore" in err
+    assert runner.verbs()[-1] == "bootstrap"
+
+
+def test_broken_new_executable_restarts_without_exec(
+    installed: Paths, cli: CliFn, runner: FakeRunner, execs: Execs
+) -> None:
+    """R3 fix: a new install that cannot even print its version is never exec'd into."""
+    runner.on(EXE, rc=1, err="ModuleNotFoundError: No module named 'wispralt'")
+    code, _, err = cli("update", "--no-backup")
+    assert code == 1 and "ModuleNotFoundError" in err and "restarted" in err
+    assert runner.verbs()[-1] == "bootstrap" and execs.calls == []
+
+
 def test_unhealthy_phase2_points_at_the_backup(
     installed: Paths, cli: CliFn, http: FakeHttp, tmp_path: Path
 ) -> None:
@@ -150,6 +193,31 @@ def test_tampered_state_deletes_nothing_outside_the_root(
     state.save(installed.state_file)
     code, _, err = cli("uninstall")
     assert code == 0 and outside.is_dir() and "skipped" in err
+
+
+def test_uninstall_resolves_dotdot_and_symlinked_parents(
+    installed: Paths, cli: CliFn, tmp_path: Path
+) -> None:
+    """R3 fix: containment is checked on resolved paths, not lexically."""
+    outside = tmp_path / "precious"
+    (outside / "victim").mkdir(parents=True)
+    escape = installed.root / "escape"
+    escape.symlink_to(outside)  # a parent inside the root that points out of it
+    link = installed.root / "link-out"
+    link.symlink_to(outside / "victim")  # an artifact that is itself a symlink
+    state = InstallState.load(installed.state_file)
+    assert state is not None
+    state.artifacts += [
+        str(escape / "victim"),
+        str(installed.root / ".." / "precious"),
+        str(installed.root / "." / "escape" / ".." / "precious" / "victim"),
+        str(link),
+    ]
+    state.save(installed.state_file)
+    code, _, err = cli("uninstall")
+    assert code == 0 and err.count("skipped") == 3
+    assert (outside / "victim").is_dir()
+    assert not link.is_symlink() and not link.exists()  # unlinked, its target untouched
 
 
 def test_purge_data_backs_up_then_deletes(installed: Paths, cli: CliFn, runner: FakeRunner) -> None:

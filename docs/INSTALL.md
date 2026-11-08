@@ -118,7 +118,7 @@ Global flags work before or after the command: `--json`, `--non-interactive`,
 
 | Command | What it does |
 |---|---|
-| `setup [--role host\|client\|both]` | install or repair (safe to rerun). Flags: `--source DIR`, `--data-dir`, `--backup-dir`, `--server-url`, `--port`, `--admin-label`, `--token-file`, `--retention-days N`, `--no-open`, `--skip-warmup`, `--dmg PATH`, `--client-mode online\|local`, `--rebuild` |
+| `setup [--role host\|client\|both]` | install or repair (safe to rerun). Flags: `--source DIR`, `--data-dir` (new or empty, or an existing WisprAlt data dir with its `wispralt.db`; a folder holding other files is refused), `--backup-dir`, `--server-url`, `--port`, `--admin-label`, `--token-file`, `--retention-days N`, `--no-open`, `--skip-warmup`, `--dmg PATH`, `--client-mode online\|local`, `--rebuild` |
 | `status [--client]` | service state and pid, URL, version, allocated sizes (data, database, outputs, staging, models, backups with count and newest, `*.pre-restore-*` copies), retention and what it would purge now, admin count |
 | `doctor [--warmup] [--client]` | read-only checks with a fix per failure (exit 3 on any failure); `--warmup` also loads the dictation model |
 | `start` / `stop` / `restart` | the host service; `stop` waits until the server has released its data lock; `restart` reloads the plist only if it changed |
@@ -186,7 +186,9 @@ stay.
   `staging/`, `setup-code`) and `.env`, after taking a backup (skip it with
   `--no-backup`; with no database it copies the files to
   `wispralt-<ts>-files`). Other files in the data directory are kept, and the
-  directory goes only if it is then empty. It refuses when there is no
+  directory goes only if it is then empty. `outputs/` and `staging/` are
+  deleted whole: setup never adopts a folder that already holds other files
+  without a `wispralt.db`, so those subfolders are always WisprAlt's. It refuses when there is no
   `install-state.json` or when the backup directory is inside the data
   directory.
 - `--client` moves the app to the Trash. It never deletes your transcripts

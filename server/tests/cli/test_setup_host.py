@@ -212,3 +212,35 @@ def test_rerun_with_explicit_server_url_and_port_updates_env(
     before = paths.env_file.read_bytes()
     assert _setup(cli, clone, "--no-open")[0] == 0  # no flags: no byte changes
     assert paths.env_file.read_bytes() == before
+
+
+def test_shared_data_dir_is_refused_before_anything_is_written(
+    cli: CliFn, hub: FakeHub, clone: Path, tmp_path: Path
+) -> None:
+    """R3 fix: a data dir with other files and no DB (e.g. ~/Work) is never adopted.
+
+    Everything in a data dir is then WisprAlt's, so `uninstall --purge-data` may
+    delete its outputs/ and staging/ whole.
+    """
+    work = tmp_path / "Work"
+    (work / "outputs").mkdir(parents=True)
+    (work / "outputs" / "report.docx").write_text("mine")
+    code, _, err = _setup(
+        cli, clone, "--data-dir", str(work), "--token-file", str(tmp_path / "a.key"), "--no-open"
+    )
+    assert code == 2 and "no wispralt.db" in err and "outputs" in err
+    assert not Paths.resolve().state_file.exists() and hub.downloads == []
+    assert sorted(x.name for x in work.iterdir()) == ["outputs"]
+
+
+def test_empty_or_existing_install_data_dir_is_accepted(
+    cli: CliFn, hub: FakeHub, clone: Path, tmp_path: Path
+) -> None:
+    data = tmp_path / "fresh"
+    data.mkdir()
+    (data / ".DS_Store").write_bytes(b"")
+    args = ("--data-dir", str(data), "--no-open")
+    assert _setup(cli, clone, *args, "--token-file", str(tmp_path / "a.key"))[0] == 0
+    (data / "outputs").mkdir(exist_ok=True)
+    (data / "outputs" / "j.txt").write_text("t")
+    assert _setup(cli, clone, *args)[0] == 0  # its own DB is there: a rerun is fine

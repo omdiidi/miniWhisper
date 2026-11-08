@@ -32,6 +32,7 @@ from wispralt.cli.host import (
     ensure_models,
     exec_self,
     human,
+    installed_exe,
     platform_checks,
     reinstall_cli,
     server_url,
@@ -486,19 +487,36 @@ def cmd_update(ctx: Ctx, args: argparse.Namespace) -> int:
         r.run(["git", "-C", str(source), "pull", "--ff-only"])
     is_host = state.role in {"host", "both"}
     backup_path: Path | None = None
-    was_loaded = launchd.stop(ctx) if is_host else False
+    # Read before stopping: a stop that boots the agent out and then times out on the
+    # data lock must still bring it back, so the stop itself sits inside the guard.
+    was_loaded = is_host and launchd.service(ctx).loaded
     try:
+        if is_host:
+            launchd.stop(ctx)
         if is_host and not args.no_backup:
             backup_path = offline.backup(ctx.paths.data_dir, new_backup_dest(ctx))
             print(f"backup written: {backup_path}")
         reinstall_cli(ctx, source, extra=is_host, reinstall=True)
     except BaseException as exc:
-        # Whatever failed (a refused backup, disk full during VACUUM INTO, a failed
-        # install, Ctrl-C), the old code is still in place: bring the service back.
+        # Whatever failed (the stop timing out, a refused backup, disk full during
+        # VACUUM INTO, a failed install, Ctrl-C), the old code is still in place:
+        # bring the service back.
         _phase1_failed(ctx, exc, restart=was_loaded)
         raise
     extra = ["--_backup", str(backup_path)] if backup_path else []
-    exec_self(ctx, "--_phase2", *extra)
+    try:
+        # A missing or broken new install fails here, while this process can still
+        # restart the service; after a successful execv only phase 2 can.
+        ctx.runner.run([installed_exe(), "--version"])
+        exec_self(ctx, "--_phase2", *extra)
+    except (CliError, OSError) as exc:
+        why = exc.msg if isinstance(exc, CliError) else f"{type(exc).__name__}: {exc}"
+        note = f"\n{_start_after_failure(ctx)}" if was_loaded else ""
+        hint = f"\nto roll back the data: wispralt restore {backup_path}" if backup_path else ""
+        raise CliError(
+            1,
+            f"the newly installed wispralt cannot run ({why}); rerun ./install.sh{note}{hint}",
+        ) from exc
     return 0  # only reached when execv is faked
 
 
@@ -563,12 +581,18 @@ def _update_phase2(ctx: Ctx, args: argparse.Namespace) -> int:
 # ── uninstall ────────────────────────────────────────────────────────────────
 
 
-def _removable(ctx: Ctx, path: Path) -> bool:
-    """Only paths under the install root or LaunchAgents (a tampered state file deletes nothing else)."""
+def _removable(ctx: Ctx, path: Path) -> Path | None:
+    """The resolved *path* if it is under the install root or LaunchAgents, else None.
+
+    A tampered state file deletes nothing else. Both sides are resolved, so ``..``
+    and symlinked parents cannot lead out. A symlink artifact is judged by where
+    it lives, not where it points: ``_delete`` unlinks it and never follows it.
+    """
     p = ctx.paths
-    return path not in {p.root, p.home} and (
-        path.is_relative_to(p.root) or path.is_relative_to(p.launch_agents)
-    )
+    real = path.parent.resolve() / path.name if path.is_symlink() else path.resolve()
+    root, home, agents = p.root.resolve(), p.home.resolve(), p.launch_agents.resolve()
+    inside = real.is_relative_to(root) or real.is_relative_to(agents)
+    return real if inside and real not in {root, home, agents} else None
 
 
 def _delete(path: Path) -> None:
@@ -651,8 +675,8 @@ def cmd_uninstall(ctx: Ctx, args: argparse.Namespace) -> int:
         if item == UV_TOOL:
             continue
         path = Path(item)
-        if _removable(ctx, path):
-            _delete(path)
+        if (target := _removable(ctx, path)) is not None:
+            _delete(target)
         else:
             print(f"skipped {path}: outside {p.root}", file=sys.stderr)
     if args.purge_data:

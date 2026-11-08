@@ -236,6 +236,37 @@ def test_json_pages_source_round_trip(tmp_path: Path) -> None:
         assert (d / f"{t}.jsonl").read_bytes() == (ref / f"{t}.jsonl").read_bytes()
 
 
+def _pages(tmp_path: Path) -> Path:
+    pages = tmp_path / "pages"
+    pages.mkdir()
+    for t, rows in supabase_rows().items():
+        (pages / f"{t}.json").write_text(json.dumps(rows))
+    return pages
+
+
+def test_json_pages_missing_table_file_is_an_error(tmp_path: Path) -> None:
+    """R3 fix: an incomplete manual export never passes as an empty table."""
+    pages = _pages(tmp_path)
+    (pages / "fallback_events.json").rename(pages / "fallback_events.json.bak")
+    with pytest.raises(ImportIntegrityError, match="fallback_events.json is missing"):
+        sx.JsonPagesSource(pages)
+
+
+@pytest.mark.parametrize("body", ["", "{}", '{"rows": []}', "[1]", "[{}]", "[tru"])
+def test_json_pages_bad_file_is_an_error(tmp_path: Path, body: str) -> None:
+    pages = _pages(tmp_path)
+    (pages / "usage_events.json").write_text(body)
+    with pytest.raises(ImportIntegrityError, match="usage_events.json"):
+        sx.JsonPagesSource(pages)
+
+
+def test_json_pages_explicit_empty_table(tmp_path: Path) -> None:
+    pages = _pages(tmp_path)
+    (pages / "fallback_events.json").write_text("[]\n")
+    d = sx.export_snapshot(sx.JsonPagesSource(pages), tmp_path / "out", DAY)
+    assert json.loads((d / "counts.json").read_text())["fallback_events"]["source_count"] == 0
+
+
 def test_importer_never_deletes() -> None:
     """Grep gate: no rmtree anywhere in importer/, unlink only in files.py's temp cleanup."""
     pkg = Path(sx.__file__).parent
