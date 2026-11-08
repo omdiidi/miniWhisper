@@ -10,10 +10,11 @@ import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from wispralt.config import settings
 from wispralt.insights import cron
+from wispralt.insights import settings as insights_settings
 from wispralt.insights.client import InsightsResponse
 from wispralt.insights.timewindow import iso_week_epoch_bounds
+from wispralt.settings_store import SettingsStore
 
 if TYPE_CHECKING:
     from wispralt.accounts.store import AccountStore
@@ -22,6 +23,13 @@ if TYPE_CHECKING:
     from .conftest import MakeUser
 
 WEEK = (2026, 40)
+
+
+def _ai_on(job_store: JobStore) -> SettingsStore:
+    store = SettingsStore(job_store.db)
+    insights_settings.save(store, enabled=True, acknowledge=True, model="stub/model",
+                           cap_30d_usd=8.0, timezone=None)
+    return store
 
 
 class _StubClient:
@@ -45,7 +53,7 @@ async def test_file_only_week_produces_a_person_insight(
 ) -> None:
     alice, _ = make_user(label="alice")
     idle, _ = make_user(label="idle")
-    week_start, _week_end = iso_week_epoch_bounds(*WEEK, settings.insights_timezone)
+    week_start, _week_end = iso_week_epoch_bounds(*WEEK, insights_settings.resolve_timezone(None))
     jid = job_store.create("/tmp/meeting.m4a", user_id=alice.id)
     assert job_store.set_running(jid)
     assert job_store.set_done_if_not_cancelled(jid, "single", transcript_text="we shipped it")
@@ -54,9 +62,10 @@ async def test_file_only_week_produces_a_person_insight(
 
     client = _StubClient()
     app = SimpleNamespace(
-        state=SimpleNamespace(job_store=job_store, accounts=accounts, insights_client=client)
+        state=SimpleNamespace(job_store=job_store, accounts=accounts, insights_client=client,
+                              settings_store=_ai_on(job_store))
     )
-    await cron.run_weekly_insights(app, iso_override=WEEK)
+    await cron.run_weekly_insights(app, WEEK, trigger="manual")
 
     assert job_store.get_weekly_insight_person(alice.id, *WEEK) is not None  # no dictations needed
     assert job_store.get_weekly_insight_person(idle.id, *WEEK) is None
@@ -76,7 +85,7 @@ async def test_openrouter_error_text_never_reaches_the_error_or_logs(
 
     marker = "SECRET-TRANSCRIPT-ECHO-7f3a"
     alice, _ = make_user(label="alice")
-    week_start, _ = iso_week_epoch_bounds(*WEEK, settings.insights_timezone)
+    week_start, _ = iso_week_epoch_bounds(*WEEK, insights_settings.resolve_timezone(None))
     jid = job_store.create("/tmp/a.m4a", user_id=alice.id)
     assert job_store.set_running(jid)
     assert job_store.set_done_if_not_cancelled(jid, "single", transcript_text="hello")
@@ -97,10 +106,11 @@ async def test_openrouter_error_text_never_reaches_the_error_or_logs(
         assert marker not in str(exc.value) and exc.value.status_code == 500
 
         app = SimpleNamespace(
-            state=SimpleNamespace(job_store=job_store, accounts=accounts, insights_client=client)
+            state=SimpleNamespace(job_store=job_store, accounts=accounts, insights_client=client,
+                                  settings_store=_ai_on(job_store))
         )
         with caplog.at_level(logging.DEBUG):
-            await cron.run_weekly_insights(app, iso_override=WEEK)
+            await cron.run_weekly_insights(app, WEEK, trigger="manual")
     finally:
         await client._client.aclose()
 

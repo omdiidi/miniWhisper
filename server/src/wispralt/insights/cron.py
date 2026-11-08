@@ -1,46 +1,44 @@
-"""Weekly LLM insights cron — Phase 2.
+"""Weekly AI insights: runs, the hourly scheduler, backfill and the cost estimate.
 
-Sunday 23:00 host-local sweep. Walks the active people (``AccountStore``), pulls last-ISO-week
-transcripts from the local JobStore, calls OpenRouter once per qualifying
-person, then once more for the team aggregate, and upserts results to
-``weekly_insights``.
+AI is opt-in (``insights/settings.py``): nothing here calls OpenRouter unless an admin has
+enabled it after the disclosure, and an InsightsClient exists (``OPENROUTER_API_KEY``).
 
-Design invariants:
-- Rolling-30d cost guard at $8 (config-driven) — re-checked between users
-  using a baseline snapshot + accumulated-run-cost so the same iteration
-  doesn't double-count.
-- Idempotent on Sunday-night restart: if a person already has a row for
-  the target ISO week, skip them (no double OpenRouter charge).
-- Concurrency-safe: ``app.state.weekly_insights_lock`` (an ``asyncio.Lock``
-  set in lifespan) serializes scheduled fires vs catchup so a catchup that
-  overlaps the schedule doesn't double-bill OpenRouter.
-- Daemon loop wraps run_weekly_insights in a broad-except so a single
-  failure never kills the task.
-- DST-safe: ZoneInfo via insights/timewindow.py — single source of truth
-  for week math, shared with routes/me.py and routes/admin_data.py.
-- Startup catchup fail-CLOSED by default: requires explicit
-  WISPRALT_INSIGHTS_CATCHUP_ENABLED=1 to fire, so a fresh deploy on a
-  Wednesday doesn't burn $$ analyzing last week's stale data.
-- Per-team retry: on the team pass, a transient JSONDecodeError gets one
-  retry at temperature=0.0 before being logged + skipped.
+* ``scheduler_loop`` asks ``is_due`` once an hour: the last full ISO week (in the insights
+  timezone) has no ``done`` scheduled run, and no scheduled attempt started in the last
+  6 hours. Missed weeks self-heal and sleep/DST cannot skip a run. Older weeks are only
+  ever run explicitly (backfill).
+* ``run_weeks`` runs one or more weeks sequentially under ``app.state.weekly_insights_lock``;
+  ``run_weekly_insights`` is the one-week case. Every run writes an ``insight_runs`` row
+  (progress per person; ``failures`` = ``{user_id, error_class}``, never text) and ends
+  ``done``, ``failed`` (every person failed, or a crash), ``aborted`` (``budget`` or
+  ``rate_limit``) or ``skipped`` (AI off, no client).
+* The 30-day cost cap is checked before EVERY OpenRouter call, not once per run.
+* Each person's records go into the prompt behind their refs (``sources.assemble``); the
+  reply is parsed and cleaned by ``sources.validate_person``; the team pass may cite only
+  refs those person insights cite. Logs carry ids, classes and lengths, never text.
+* ``estimate_cost`` = words × 1.35 / 1000 × the model's input rate, shown before a run.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import json
 import logging
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from wispralt.config import settings
+from wispralt.insights import settings as insights_settings
 from wispralt.insights import sources
 from wispralt.insights.client import (
-    InsightsClient,  # noqa: F401 — re-exported for `__main__` smoke
+    InsightsClient,
     InsightsError,
     RateLimitedError,
+    input_rate_per_1k,
 )
 from wispralt.insights.prompts import (
     PERSON_SYSTEM_PROMPT,
@@ -48,55 +46,17 @@ from wispralt.insights.prompts import (
     TEAM_SYSTEM_PROMPT,
     TEAM_USER_PROMPT_TEMPLATE,
 )
-from wispralt.insights.timewindow import (
-    iso_week_epoch_bounds,
-    last_full_iso_week,
-)
+from wispralt.insights.timewindow import iso_week_epoch_bounds, last_full_iso_week
 
 logger = logging.getLogger(__name__)
 
+SCHEDULER_INTERVAL_S = 3600.0
+SCHEDULER_FIRST_CHECK_S = 60.0
+RETRY_AFTER_S = 6 * 3600.0
+TOKENS_PER_WORD = 1.35
+MAX_BACKFILL_WEEKS = 12
 
-async def run_weekly_insights(
-    app,
-    iso_override: tuple[int, int] | None = None,
-    *,
-    force: bool = False,
-) -> None:
-    """One full Sunday-night sweep. Idempotent — re-runs for the same week
-    are overwrites via the upsert.
-
-    Concurrency: holds ``app.state.weekly_insights_lock`` for the entire run
-    so an overlapping catchup or rescheduled fire never overlaps. If the
-    lock is already held, this returns immediately with a warning log.
-
-    ``iso_override`` (``(iso_year, iso_week)``) forces summarization of an
-    arbitrary week instead of the last full ISO week. Operator use only — the
-    scheduled cron always passes ``None``. Used by ``__main__ --week`` to
-    backfill or smoke-test against a specific window.
-
-    ``force=True`` bypasses the per-user idempotency skip so existing rows
-    for the target week are re-generated (UPSERT-replaced). Used by the
-    admin manual-run button so re-clicking always produces fresh insights.
-    The lock + 30d budget guard still apply, so the worst case is a few
-    extra dollars on rapid re-clicks. ``force=False`` (default) preserves
-    the Sunday cron's restart-safe behavior.
-    """
-    lock = getattr(app.state, "weekly_insights_lock", None)
-    if lock is None:
-        # Test / __main__ path — no FastAPI lifespan to install the lock.
-        # Concurrency isn't possible here so just run the inner body.
-        return await _run_weekly_insights_inner(
-            app, iso_override=iso_override, force=force,
-        )
-    if lock.locked():
-        logger.warning(
-            "Weekly insights skipped — another run still in progress"
-        )
-        return
-    async with lock:
-        return await _run_weekly_insights_inner(
-            app, iso_override=iso_override, force=force,
-        )
+Week = tuple[int, int]
 
 
 @dataclass
@@ -110,97 +70,204 @@ class RunOutcome:
     aborted: str | None = None  # 'rate_limit' | 'budget'
 
 
-async def _run_weekly_insights_inner(
-    app,
-    iso_override: tuple[int, int] | None = None,
-    *,
-    force: bool = False,
+def _qualifies(dictations: int, files: int) -> bool:
+    """Activity gate: enough dictations, or at least one file transcription."""
+    return dictations >= settings.insights_per_person_min_dictations or files >= 1
+
+
+# ── estimate ─────────────────────────────────────────────────────────────────
+
+
+def estimate_cost(job_store, accounts, weeks: list[Week], *, model: str, tz_name: str) -> dict[str, float]:  # noqa: ANN001
+    """Input-side estimate for running *weeks*: words actually sent (per person, after the
+    activity gate and the word cap) × 1.35 tokens/word × the model's input rate."""
+    active = {u.id for u in accounts.list_people(active=True)}
+    words = 0
+    for week in weeks:
+        since, until = iso_week_epoch_bounds(*week, tz_name)
+        for uid, w in job_store.words_by_user(since, until).items():
+            if uid in active and _qualifies(w["dictations"], w["files"]):
+                words += min(w["words"], settings.insights_input_word_cap)
+    usd = words * TOKENS_PER_WORD / 1000.0 * input_rate_per_1k(model)
+    return {"words": float(words), "usd": round(usd, 4)}
+
+
+def last_weeks(n: int, tz_name: str, now: float | None = None) -> list[Week]:
+    """The last *n* full ISO weeks, oldest first."""
+    newest = date.fromisocalendar(*last_full_iso_week(tz_name, now), 1)
+    return [(newest - timedelta(weeks=k)).isocalendar()[:2] for k in range(n - 1, -1, -1)]
+
+
+# ── scheduling ───────────────────────────────────────────────────────────────
+
+
+async def is_due(app, now: float | None = None) -> bool:  # noqa: ANN001
+    """True when AI is on, a client exists and the last full week needs its scheduled run."""
+    cfg = await insights_settings.load_for(app)
+    if not cfg.enabled or getattr(app.state, "insights_client", None) is None:
+        return False
+    now = time.time() if now is None else now
+    week = last_full_iso_week(cfg.timezone, now)
+    state = await asyncio.to_thread(app.state.job_store.scheduled_run_state, *week)
+    if state["done"]:
+        return False
+    last = state["last_started"]
+    return last is None or now - last >= RETRY_AFTER_S
+
+
+async def scheduler_loop(app, *, interval_s: float = SCHEDULER_INTERVAL_S) -> None:  # noqa: ANN001
+    """Hourly due-check (first check one minute after startup). Never dies on an error."""
+    await asyncio.sleep(SCHEDULER_FIRST_CHECK_S)
+    while not getattr(app.state, "shutting_down", False):
+        try:
+            if await is_due(app):
+                await run_weekly_insights(app, trigger="scheduled")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — daemon loop: log and try again next hour
+            logger.exception("Insights scheduler tick failed")
+        await asyncio.sleep(interval_s)
+
+
+# ── runs ─────────────────────────────────────────────────────────────────────
+
+
+async def run_weekly_insights(
+    app, week: Week | None = None, *, trigger: str = "scheduled", force: bool = False,  # noqa: ANN001
+    now: float | None = None,
 ) -> RunOutcome | None:
-    """Body of :func:`run_weekly_insights`. See its docstring."""
-    insights_client: InsightsClient | None = getattr(
-        app.state, "insights_client", None
+    """Run one week (default: the last full week). None if another run holds the lock."""
+    results = await run_weeks(app, [week] if week else None, trigger=trigger, force=force, now=now)
+    return None if results is None else results[0]
+
+
+async def run_weeks(
+    app, weeks: list[Week] | None, *, trigger: str, force: bool = False,  # noqa: ANN001
+    now: float | None = None,
+) -> list[RunOutcome | None] | None:
+    """Run *weeks* one after another under the insights lock; None if it is held.
+
+    ``force`` re-generates people who already have a row (rerun); otherwise a week is
+    restart-safe (people with a row are skipped, so nobody is paid for twice).
+    """
+    lock = getattr(app.state, "weekly_insights_lock", None)
+    if lock is not None and lock.locked():
+        logger.warning("Insights run skipped: another run holds the lock")
+        return None
+    async with lock if lock is not None else contextlib.nullcontext():
+        cfg = await insights_settings.load_for(app)
+        weeks = weeks or [last_full_iso_week(cfg.timezone, now)]
+        return [await _run_one(app, week, cfg, trigger=trigger, force=force) for week in weeks]
+
+
+async def _run_one(app, week: Week, cfg, *, trigger: str, force: bool) -> RunOutcome | None:  # noqa: ANN001
+    job_store = app.state.job_store
+    client: InsightsClient | None = getattr(app.state, "insights_client", None)
+    estimate = await asyncio.to_thread(
+        estimate_cost, job_store, app.state.accounts, [week], model=cfg.model, tz_name=cfg.timezone
     )
-    if insights_client is None:
-        logger.info(
-            "Weekly insights skipped — no InsightsClient (OPENROUTER_API_KEY unset)"
+    run_id = await asyncio.to_thread(
+        lambda: job_store.start_insight_run(
+            trigger=trigger, iso_year=week[0], iso_week=week[1],
+            estimated_usd=estimate["usd"], now=time.time(),
         )
+    )
+
+    async def finish(status: str, error_class: str | None) -> None:
+        await asyncio.to_thread(
+            lambda: job_store.finish_insight_run(
+                run_id, status=status, error_class=error_class, now=time.time()
+            )
+        )
+
+    if not cfg.enabled or client is None:
+        await finish("skipped", "ai_disabled" if not cfg.enabled else "no_client")
         return None
 
+    async def progress(outcome: RunOutcome) -> None:
+        await asyncio.to_thread(
+            lambda: job_store.update_insight_run(
+                run_id, people_total=outcome.people_total, people_done=outcome.people_done,
+                failures=outcome.failures, cost_usd=outcome.cost_usd,
+            )
+        )
+
+    try:
+        outcome = await _run_weekly_insights_inner(app, week, cfg, force=force, progress=progress)
+    except Exception as exc:
+        await finish("failed", type(exc).__name__)
+        raise
+    await progress(outcome)
+    if outcome.aborted:
+        await finish("aborted", outcome.aborted)
+    elif outcome.people_total and not outcome.people_done:
+        await finish("failed", "all_people_failed")
+    else:
+        await finish("done", None)
+    return outcome
+
+
+async def _run_weekly_insights_inner(
+    app, week: Week, cfg, *, force: bool = False, progress=None,  # noqa: ANN001
+) -> RunOutcome:
+    """One week: a person pass then a team pass. See the module docstring."""
+    client: InsightsClient = app.state.insights_client
     job_store = app.state.job_store
     accounts = app.state.accounts
     outcome = RunOutcome()
+    iso_year, iso_week = week
+    week_start, week_end = iso_week_epoch_bounds(iso_year, iso_week, cfg.timezone)
+    word_cap = int(settings.insights_input_word_cap)
+    baseline = await asyncio.to_thread(job_store.rolling_insights_cost_usd, 30)
 
-    BUDGET = float(settings.insights_max_30d_cost_usd)
-    INPUT_WORD_CAP = int(settings.insights_input_word_cap)
-    PER_PERSON_MIN_DICTATIONS = int(settings.insights_per_person_min_dictations)
+    def over_cap() -> bool:
+        return baseline + outcome.cost_usd >= cfg.cap_30d_usd
 
-    # 1. Budget gate
-    spent_30d = job_store.rolling_insights_cost_usd(days=30)
-    if spent_30d > BUDGET:
-        logger.warning(
-            "Weekly insights skipped — rolling 30d spend $%.2f > $%.2f cap", spent_30d, BUDGET
-        )
-        outcome.aborted = "budget"
-        return outcome
+    async def report() -> None:
+        if progress is not None:
+            await progress(outcome)
 
-    # 2. Target week — last full ISO week by default (timewindow.py is the one source
-    #    of week math, shared with the pages).
-    if iso_override is not None:
-        iso_year, iso_week = iso_override
-    else:
-        iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
-    week_start_epoch, week_end_epoch = iso_week_epoch_bounds(
-        iso_year, iso_week, settings.insights_timezone,
-    )
-
-    # 3. Per-person pass. Each person's records go into the prompt behind their refs;
-    #    the answer is parsed (pydantic) and cleaned (sources.validate_person).
     users = await asyncio.to_thread(accounts.list_people, active=True)
     person_insights: list[tuple[str, dict]] = []  # (name, validated insight)
-    baseline_30d_cost = job_store.rolling_insights_cost_usd(30)
 
     for user in users:
-        if baseline_30d_cost + outcome.cost_usd >= BUDGET:
-            logger.warning("Insights budget cap hit mid-run at user_id=%s; stopping", user.id)
-            outcome.aborted = "budget"
-            break
         if not force and job_store.get_weekly_insight_person(user.id, iso_year, iso_week):
             continue  # restart-safe: never pay twice for the same person and week
-
         transcripts = await asyncio.to_thread(
-            job_store.transcripts_in_range,
-            user.id,
-            since_epoch=week_start_epoch,
-            until_epoch=week_end_epoch,
+            job_store.transcripts_in_range, user.id, since_epoch=week_start, until_epoch=week_end
         )
-        dictations = [t for t in transcripts if t["kind"] == "dictation"]
-        files = [t for t in transcripts if t["kind"] == "file"]
-        if len(dictations) < PER_PERSON_MIN_DICTATIONS and not files:
-            continue  # activity gate: >= N dictations or >= 1 file transcription
+        dictations = sum(t["kind"] == "dictation" for t in transcripts)
+        files = sum(t["kind"] == "file" for t in transcripts)
+        if not _qualifies(dictations, files):
+            continue
+        if over_cap():
+            logger.warning("Insights 30-day cap reached before user_id=%s; aborting", user.id)
+            outcome.aborted = "budget"
+            break
         outcome.people_total += 1
+        await report()
 
-        assembled = sources.assemble(transcripts, cap=INPUT_WORD_CAP)
+        assembled = sources.assemble(transcripts, cap=word_cap)
         user_prompt = PERSON_USER_PROMPT_TEMPLATE.format(
             display_name=user.display_name or user.label,
             iso_year=iso_year,
             iso_week=iso_week,
             total_words=assembled.total_words,
-            dictation_count=len(dictations),
-            file_count=len(files),
-            input_word_cap=INPUT_WORD_CAP,
+            dictation_count=dictations,
+            file_count=files,
+            input_word_cap=word_cap,
             transcript_blob=assembled.blob,
         )
-
         try:
-            resp = await insights_client.analyze(
-                system_prompt=PERSON_SYSTEM_PROMPT, user_prompt=user_prompt, max_tokens=2000,
+            resp = await client.analyze(
+                system_prompt=PERSON_SYSTEM_PROMPT, user_prompt=user_prompt,
+                max_tokens=2000, model=cfg.model,
             )
         except RateLimitedError:
-            # 429: abort the whole run; hammering every person into the same limit
-            # produces nothing.
+            # 429: stop the whole run; every later person would hit the same limit.
             outcome.failures.append({"user_id": user.id, "error_class": "rate_limit"})
             outcome.aborted = "rate_limit"
-            logger.warning("OpenRouter 429 — aborting the insights run")
+            logger.warning("OpenRouter 429: aborting the insights run")
             return outcome
         except InsightsError as exc:
             outcome.failures.append({"user_id": user.id, "error_class": "openrouter_error"})
@@ -208,8 +275,9 @@ async def _run_weekly_insights_inner(
                 "Person insights failed for user_id=%s: %s status=%s",
                 user.id, type(exc).__name__, exc.status_code,
             )
+            await report()
             continue
-        outcome.cost_usd += resp.cost_usd  # billed even if the answer is unusable
+        outcome.cost_usd += resp.cost_usd  # billed even if the reply is unusable
 
         try:
             insight = sources.validate_person(json.loads(resp.content), assembled)
@@ -220,216 +288,117 @@ async def _run_weekly_insights_inner(
                 "Person insights unusable for user_id=%s: %s (%d chars)",
                 user.id, error_class, len(resp.content),
             )
+            await report()
             continue
 
-        job_store.upsert_weekly_insight(
-            iso_year=iso_year,
-            iso_week=iso_week,
-            user_id=user.id,
-            insight=insight,
-            input_tokens=resp.input_tokens,
-            output_tokens=resp.output_tokens,
-            cost_usd=resp.cost_usd,
-            model=insights_client.model,
+        await asyncio.to_thread(
+            functools.partial(
+                job_store.upsert_weekly_insight,
+                iso_year=iso_year, iso_week=iso_week, user_id=user.id, insight=insight,
+                input_tokens=resp.input_tokens, output_tokens=resp.output_tokens,
+                cost_usd=resp.cost_usd, model=cfg.model,
+            )
         )
         outcome.people_done += 1
         person_insights.append((user.display_name or user.label, insight))
+        await report()
 
-    # 4. Team pass over this run's person insights. Team items may cite only refs those
-    #    person insights cite.
     if person_insights and outcome.aborted is None:
-        allowed = set().union(*(sources.refs_in(i) for _, i in person_insights))
-        digests_jsonl = "\n".join(
-            json.dumps({"person": name, "insight": i}) for name, i in person_insights
-        )
-        user_prompt = TEAM_USER_PROMPT_TEMPLATE.format(
-            iso_year=iso_year, iso_week=iso_week, digests_jsonl=digests_jsonl,
-        )
-        team_insight = None
-        for temperature in (0.2, 0.0):  # one retry at 0.0 when the JSON is unusable
-            try:
-                team_resp = await insights_client.analyze(
-                    system_prompt=TEAM_SYSTEM_PROMPT, user_prompt=user_prompt,
-                    max_tokens=2500, temperature=temperature,
-                )
-            except InsightsError as exc:
-                logger.warning(
-                    "Team insights failed: %s status=%s", type(exc).__name__, exc.status_code
-                )
-                break
-            outcome.cost_usd += team_resp.cost_usd
-            try:
-                team_insight = sources.validate_team(json.loads(team_resp.content), allowed)
-                break
-            except (json.JSONDecodeError, sources.InsightShapeError):
-                logger.warning(
-                    "Team insights unusable at temperature=%.1f (%d chars)",
-                    temperature, len(team_resp.content),
-                )
-        if team_insight is not None:
-            job_store.upsert_weekly_insight(
-                iso_year=iso_year,
-                iso_week=iso_week,
-                user_id=None,
-                insight=team_insight,
-                input_tokens=team_resp.input_tokens,
-                output_tokens=team_resp.output_tokens,
-                cost_usd=team_resp.cost_usd,
-                model=insights_client.model,
-            )
+        await _team_pass(app, week, cfg, person_insights, outcome, over_cap)
 
     logger.info(
-        "Weekly insights complete — %d/%d people, cost $%.4f, failures=%s",
-        outcome.people_done, outcome.people_total, outcome.cost_usd,
-        [f["error_class"] for f in outcome.failures],
+        "Weekly insights W%02d — %d/%d people, cost $%.4f, failures=%s, aborted=%s",
+        iso_week, outcome.people_done, outcome.people_total, outcome.cost_usd,
+        [f["error_class"] for f in outcome.failures], outcome.aborted,
     )
     return outcome
 
 
-def _seconds_until_next_fire(
-    tz_name: str,
-    *,
-    iso_weekday: int = 7,
-    hour: int = 23,
-) -> float:
-    """Seconds until the next ``hour:00`` on ``iso_weekday`` in the named timezone.
-
-    ``iso_weekday`` follows ISO: Mon=1...Sun=7 (default 7 = Sunday).
-    ``hour`` is 0..23 local-time wall clock (default 23 = 23:00).
-
-    Returns ``>= 60.0`` always — safety lower-bound against negative drift
-    from clock skew. Returns ``<= 7 * 86400`` always — next-occurrence window.
-    """
-    if not 1 <= iso_weekday <= 7:
-        raise ValueError(f"iso_weekday must be 1..7, got {iso_weekday}")
-    if not 0 <= hour <= 23:
-        raise ValueError(f"hour must be 0..23, got {hour}")
-    tz = ZoneInfo(tz_name)
-    now = datetime.now(tz)
-    days_ahead = (iso_weekday - now.isoweekday()) % 7
-    if days_ahead == 0 and now.hour >= hour:
-        days_ahead = 7
-    target = (now + timedelta(days=days_ahead)).replace(
-        hour=hour, minute=0, second=0, microsecond=0,
+async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome, over_cap) -> None:  # noqa: ANN001
+    """Team insight over this run's person insights; it may cite only their refs."""
+    client: InsightsClient = app.state.insights_client
+    allowed = set().union(*(sources.refs_in(i) for _, i in person_insights))
+    digests_jsonl = "\n".join(
+        json.dumps({"person": name, "insight": i}) for name, i in person_insights
     )
-    delta = (target - now).total_seconds()
-    return max(60.0, delta)
-
-
-# Backward-compat alias retained for one release so external smoke scripts /
-# the implementation-reviewer rerun don't break. New code uses the parameterized
-# form above.
-def _seconds_until_sunday_23_local(tz_name: str) -> float:
-    return _seconds_until_next_fire(tz_name, iso_weekday=7, hour=23)
-
-
-async def _maybe_catchup(app) -> None:
-    """If the most-recent completed ISO week has no row in weekly_insights for
-    any user AND it ended within the last 72 h, run insights now.
-
-    Covers Sunday-22:59 reboots and any 1-2-day server outage that crossed
-    Sunday 23:00. Fail-closed by default:
-
-    - ``settings.insights_catchup_enabled`` defaults to FALSE — explicit opt-in
-      after Task 0 spike verification. Operator flips to TRUE in ``.env`` ONCE,
-      after confirming OpenRouter rates + model.
-    - Check ANY weekly_insights row for the target week — not just team row
-      (team only writes if >=2 people, so single-employee deployments would
-      re-fire every startup).
-    """
-    if not settings.insights_catchup_enabled:
-        logger.info(
-            "Startup catchup disabled — set WISPRALT_INSIGHTS_CATCHUP_ENABLED=1"
-            " to enable"
+    user_prompt = TEAM_USER_PROMPT_TEMPLATE.format(
+        iso_year=week[0], iso_week=week[1], digests_jsonl=digests_jsonl
+    )
+    for temperature in (0.2, 0.0):  # one retry at 0.0 when the reply is unusable
+        if over_cap():
+            outcome.aborted = "budget"
+            return
+        try:
+            resp = await client.analyze(
+                system_prompt=TEAM_SYSTEM_PROMPT, user_prompt=user_prompt, max_tokens=2500,
+                temperature=temperature, model=cfg.model,
+            )
+        except InsightsError as exc:
+            logger.warning("Team insights failed: %s status=%s", type(exc).__name__, exc.status_code)
+            return
+        outcome.cost_usd += resp.cost_usd
+        try:
+            team = sources.validate_team(json.loads(resp.content), allowed)
+        except (json.JSONDecodeError, sources.InsightShapeError):
+            logger.warning(
+                "Team insights unusable at temperature=%.1f (%d chars)", temperature, len(resp.content)
+            )
+            continue
+        await asyncio.to_thread(
+            functools.partial(
+                app.state.job_store.upsert_weekly_insight,
+                iso_year=week[0], iso_week=week[1], user_id=None, insight=team,
+                input_tokens=resp.input_tokens, output_tokens=resp.output_tokens,
+                cost_usd=resp.cost_usd, model=cfg.model,
+            )
         )
         return
 
-    tz = ZoneInfo(settings.insights_timezone)
-    now = datetime.now(tz)
-    days_since_monday = (now.isoweekday() - 1) % 7
-    this_monday = (now - timedelta(days=days_since_monday)).replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    )
-    if (now - this_monday).total_seconds() > 72 * 3600:
-        return
-    iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
-
-    job_store = app.state.job_store
-    # Check for ANY row this week — covers single-employee teams (no team row).
-    if job_store.has_any_insight_for_week(iso_year, iso_week):
-        return  # already analyzed for this week
-    logger.info(
-        "Catchup: running missed weekly insights for ISO %d-W%02d",
-        iso_year,
-        iso_week,
-    )
-    await run_weekly_insights(app)
-
 
 if __name__ == "__main__":
-    # Manual smoke gate (d) — run one cron pass without booting FastAPI/uvicorn.
-    # `python -m wispralt.insights.cron --manual`
+    # Operator entry point: one run now, without the server. Same rules as the portal:
+    # AI must be enabled in the DB and OPENROUTER_API_KEY set in server/.env.
+    #   python -m wispralt.insights.cron --manual [--week YYYY-WW] [--force]
     import argparse
     from types import SimpleNamespace
 
     from wispralt.accounts.store import AccountStore
     from wispralt.database import Database
     from wispralt.jobs.store import JobStore
+    from wispralt.settings_store import SettingsStore
 
-    parser = argparse.ArgumentParser(
-        description="Manual weekly-insights cron runner (smoke gate d)."
-    )
-    parser.add_argument(
-        "--manual",
-        action="store_true",
-        help="Run one cron pass immediately",
-    )
-    parser.add_argument(
-        "--week",
-        metavar="YYYY-WW",
-        help=(
-            "Override target ISO week (e.g. 2026-20). Operator backfill / "
-            "smoke-test only — the scheduled cron always uses last full ISO "
-            "week regardless of this flag."
-        ),
-    )
+    parser = argparse.ArgumentParser(description="Run weekly AI insights once.")
+    parser.add_argument("--manual", action="store_true", help="run now")
+    parser.add_argument("--week", metavar="YYYY-WW", help="ISO week (default: last full week)")
+    parser.add_argument("--force", action="store_true", help="regenerate existing rows")
     args = parser.parse_args()
     if not args.manual:
-        parser.error("--manual required (no-op without it)")
-
-    iso_override: tuple[int, int] | None = None
+        parser.error("--manual required")
+    target: Week | None = None
     if args.week:
         try:
             _y, _w = args.week.split("-", 1)
-            iso_override = (int(_y), int(_w))
-        except (ValueError, AttributeError):
-            parser.error(
-                f"--week must be YYYY-WW (got {args.week!r})"
-            )
+            target = (int(_y), int(_w))
+        except ValueError:
+            parser.error(f"--week must be YYYY-WW (got {args.week!r})")
 
     async def _main() -> None:
-        # Verify required config — fail loud, not with an obscure AttributeError.
         if not settings.openrouter_api_key:
-            parser.error(
-                "OPENROUTER_API_KEY not set in env — cannot run insights cron"
-            )
+            parser.error("OPENROUTER_API_KEY is not set in server/.env")
         database = Database(settings.db_path)
         database.migrate()
-
-        app = SimpleNamespace(
-            state=SimpleNamespace(
-                job_store=JobStore(database, settings.data_dir),
-                insights_client=InsightsClient(
-                    api_key=settings.openrouter_api_key,  # plain str, NOT SecretStr
-                    model=settings.insights_model,
-                    timeout_s=settings.insights_timeout_s,
-                ),
-                accounts=AccountStore(database),
-                # No lock — __main__ path is single-process and never overlaps.
-            )
-        )
+        app = SimpleNamespace(state=SimpleNamespace(
+            job_store=JobStore(database, settings.data_dir),
+            accounts=AccountStore(database),
+            settings_store=SettingsStore(database),
+            insights_client=InsightsClient(
+                api_key=settings.openrouter_api_key, model=settings.insights_model,
+                timeout_s=settings.insights_timeout_s,
+            ),
+        ))
         try:
-            await run_weekly_insights(app, iso_override=iso_override)
+            outcome = await run_weekly_insights(app, target, trigger="manual", force=args.force)
+            print("skipped (AI is off, or another run holds the lock)" if outcome is None else outcome)
         finally:
             await app.state.insights_client.aclose()
 

@@ -4,7 +4,6 @@
 {% block content %}
   <div class="page-head">
     <h1>Data · ISO {{ iso_year }}-W{{ "%02d" | format(iso_week) }}{% if target_user %} · {{ target_user.label }}{% endif %}</h1>
-    {% with running = weekly_insights_running %}{% include "_admin_run_insights_button.html.j2" %}{% endwith %}
   </div>
   <nav x-data="{ active: '{{ range }}' }" @range-changed.window="active = $event.detail" class="tabs" aria-label="Time range">
     {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
@@ -13,6 +12,6 @@
               hx-target="#insights-body" hx-swap="innerHTML" hx-push-url="true">{{ TAB_LABELS[r] }}</button>
     {% endfor %}
   </nav>
-  <div id="admin-run-insights-toast" aria-live="polite"></div>
   <div id="insights-body">{% include "_admin_data_body.html.j2" %}</div>
+  {% include "_runs_panel.html.j2" %}
 {% endblock %}

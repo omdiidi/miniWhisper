@@ -44,6 +44,7 @@ from wispralt.auth import (
 from wispralt.config import settings
 from wispralt.constants import MAX_DISPLAY_NAME_LEN
 from wispralt.insights import measured, sources
+from wispralt.insights import settings as insights_settings
 from wispralt.insights.settings import ai_enabled
 from wispralt.insights.timewindow import (
     epoch_for_range,
@@ -257,7 +258,7 @@ async def me_insights(
 
     """
 
-    tz = settings.insights_timezone
+    tz = await insights_settings.timezone_for(request.app)
     iso_year, iso_week = last_full_iso_week(tz)
     job_store: JobStore = request.app.state.job_store
     row = job_store.weekly_insight(user.id, iso_year, iso_week)
@@ -354,7 +355,7 @@ async def me_history(
     """
     if kind not in ("dictation", "file"):
         kind = None
-    tz = settings.insights_timezone
+    tz = await insights_settings.timezone_for(request.app)
     lo, hi = records.window(range, since, until, tz)
     query = records.wants_search(q)
     job_store: JobStore = request.app.state.job_store
@@ -433,7 +434,7 @@ async def me_history_row(
     if row is None:
         raise HTTPException(status_code=404)
 
-    decorated = _decorate_row(row, settings.insights_timezone)
+    decorated = _decorate_row(row, await insights_settings.timezone_for(request.app))
     decorated["kind"] = kind
     decorated["row_id"] = row_id
     csrf = secrets.token_urlsafe(32)
@@ -507,7 +508,7 @@ async def me_history_restore(
         # Race: deleted again between restore + read. Treat as 404.
         raise HTTPException(status_code=404)
 
-    decorated = _decorate_row(row, settings.insights_timezone)
+    decorated = _decorate_row(row, await insights_settings.timezone_for(request.app))
     decorated["kind"] = kind
     decorated["row_id"] = row_id
 
@@ -546,7 +547,7 @@ async def me_history_download(
 
     try:
         iso_date = datetime.fromtimestamp(
-            float(row["created_at"]), ZoneInfo(settings.insights_timezone),
+            float(row["created_at"]), ZoneInfo(await insights_settings.timezone_for(request.app)),
         ).date().isoformat()
     except (ValueError, OSError, KeyError, TypeError):
         iso_date = "unknown"

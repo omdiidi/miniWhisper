@@ -14,11 +14,12 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from starlette.testclient import TestClient
 
-from wispralt.config import settings
 from wispralt.insights import cron, sources
+from wispralt.insights import settings as insights_settings
 from wispralt.insights.client import InsightsResponse
 from wispralt.insights.timewindow import iso_week_epoch_bounds, last_full_iso_week
 from wispralt.main import create_app
+from wispralt.settings_store import SettingsStore
 
 if TYPE_CHECKING:
     from wispralt.accounts.store import AccountStore, User
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from .conftest import MakeUser, Wire
 
 WEEK = (2026, 40)
+TZ = insights_settings.resolve_timezone(None)
 SECRET = "zebra-quartz-transcript-marker"
 
 
@@ -69,13 +71,16 @@ def _file(store: JobStore, uid: int, text: str, at: float) -> str:
 
 
 def _app(job_store: JobStore, accounts: AccountStore, client: ScriptedClient) -> SimpleNamespace:
+    store = SettingsStore(job_store.db)
+    insights_settings.save(store, enabled=True, acknowledge=True, model="stub/model",
+                           cap_30d_usd=8.0, timezone=None)
     return SimpleNamespace(state=SimpleNamespace(job_store=job_store, accounts=accounts,
-                                                 insights_client=client))
+                                                 insights_client=client, settings_store=store))
 
 
 @pytest.fixture
 def week_start() -> float:
-    return iso_week_epoch_bounds(*WEEK, settings.insights_timezone)[0]
+    return iso_week_epoch_bounds(*WEEK, TZ)[0]
 
 
 @pytest.fixture
@@ -169,8 +174,8 @@ async def test_run_drops_other_users_refs_and_team_refs_outside_digests(
 
     client = ScriptedClient(person_answer, person_answer, team)
     with caplog.at_level(logging.DEBUG):
-        outcome = await cron._run_weekly_insights_inner(_app(job_store, accounts, client),
-                                                         iso_override=WEEK)
+        outcome = await cron.run_weekly_insights(_app(job_store, accounts, client), WEEK,
+                                                 trigger="manual")
     assert (outcome.people_total, outcome.people_done, outcome.failures) == (2, 2, [])
 
     alice_insight = job_store.get_weekly_insight_person(alice.id, *WEEK)
@@ -193,8 +198,8 @@ async def test_malformed_or_misshapen_json_is_a_person_failure(
     _file(job_store, alice.id, "alice text", week_start + 60)
     _file(job_store, bob.id, "bob text", week_start + 60)
     client = ScriptedClient("not json {", {"digest": [{"text": "x", "sources": "f:abc"}]})
-    outcome = await cron._run_weekly_insights_inner(_app(job_store, accounts, client),
-                                                     iso_override=WEEK)
+    outcome = await cron.run_weekly_insights(_app(job_store, accounts, client), WEEK,
+                                             trigger="manual")
     assert sorted(f["error_class"] for f in outcome.failures) == ["json_decode", "schema"]
     assert {f["user_id"] for f in outcome.failures} == {alice.id, bob.id}
     assert outcome.people_done == 0 and job_store.get_weekly_insight_team(*WEEK) is None
@@ -219,8 +224,8 @@ def test_pages_link_sources_hide_deleted_mark_stale_and_recurring(
 ) -> None:
     admin, admin_token = make_user(role="admin", label="omid")
     alice, token = make_user(label="alice")
-    week = last_full_iso_week(settings.insights_timezone)
-    start, _end = iso_week_epoch_bounds(*week, settings.insights_timezone)
+    week = last_full_iso_week(TZ)
+    start, _end = iso_week_epoch_bounds(*week, TZ)
     kept = _dictate(job_store, alice.id, "kept record", start + 60)
     gone = _dictate(job_store, alice.id, "to be deleted", start + 120)
     prev = (week[0], week[1] - 1) if week[1] > 1 else (week[0] - 1, 52)
@@ -259,7 +264,7 @@ def test_legacy_rows_and_ai_off(
     headers = {"Authorization": f"Bearer {token}"}
     off = page_client.get("/me/insights", headers=headers).text
     assert "AI interpretation is off" in off
-    week = last_full_iso_week(settings.insights_timezone)
+    week = last_full_iso_week(TZ)
     _store(job_store, alice.id, week, {"digest": ["old style"], "filler_word_count": 3})
     legacy = page_client.get("/me/insights", headers=headers).text
     assert "older format" in legacy and "old style" not in legacy

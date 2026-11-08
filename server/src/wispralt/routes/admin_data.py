@@ -1,33 +1,34 @@
-"""routes/admin_data.py — Admin Data tab.
+"""routes/admin_data.py — Data & Insights, team records and AI settings (admin only).
 
-Mounts at ``GET /admin/data`` on a dedicated APIRouter. Drill-down to a
-single employee via the ``?user_id=N`` query parameter; without it the page
-shows the team overview (leaderboards + team-scope insight).
+* ``GET /admin/data`` — measured stats (team, or ``?user_id=N``), the separate AI panel,
+  the per-person table and the runs panel.
+* ``GET /admin/records`` / ``/admin/records/{kind}/{id}`` — team transcripts (LD 15).
+* ``GET /admin/data/runs/current`` — the runs list partial (HTMX polls it every 2 s while a
+  run is going; it never rotates the CSRF cookie).
+* ``POST /admin/data/runs`` — ``weeks`` (1..12) + ``force``: without ``confirm`` it returns
+  the cost estimate and a confirm button; with ``confirm=1`` it starts the run(s) in the
+  background (``insights.cron.run_weeks``; 1 week = ``manual``, more = ``backfill``).
+* ``GET/POST /admin/settings`` — AI enablement (needs the disclosure ack), model, 30-day
+  cap, timezone. The OpenRouter key is shown as configured or not, never accepted here.
 
-Lives in its own module (separate from :mod:`routes.admin_ui`) to avoid
-merge contention with the existing 600-line admin UI file and to keep the
-Phase 2 surface area isolated.
-
-Auth: the handler param ``user: User = Depends(require_admin)`` is the single
-source of admin-role enforcement. The user list comes from ``AccountStore``.
+Auth: ``require_admin`` on every route; mutations take ``require_admin_csrf``.
 """
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import secrets
 import time
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ..auth import require_admin, set_csrf_cookie, verify_csrf
+from ..auth import require_admin, require_admin_csrf, set_csrf_cookie
 from ..config import settings
-from ..insights import measured, sources
-from ..insights.cron import run_weekly_insights
-from ..insights.settings import ai_enabled
+from ..insights import cron, measured, sources
+from ..insights import settings as insights_settings
 from ..insights.timewindow import epoch_for_range, iso_week_epoch_bounds, last_full_iso_week
 from ..web import records
 from ..web.htmx import is_htmx
@@ -54,7 +55,8 @@ async def admin_data(
     user_id: int | None = None,
 ):
     """Admin Data tab — team overview, leaderboards, drill-down by ?user_id."""
-    tz = settings.insights_timezone
+    cfg = await insights_settings.load_for(request.app)
+    tz = cfg.timezone
     iso_year, iso_week = last_full_iso_week(tz)
     job_store: JobStore = request.app.state.job_store
     accounts: AccountStore = request.app.state.accounts
@@ -98,13 +100,6 @@ async def admin_data(
             })
         leaderboard.sort(key=lambda r: (-r["words"], r["name"]))
 
-    # Lock state drives the button's enabled/disabled paint on first render.
-    # The lock is the same one `run_weekly_insights` holds for the duration of
-    # a run; `locked()` is True for the exact lifetime we want the button
-    # disabled. See `insights/cron.py:71-82`.
-    lock = getattr(request.app.state, "weekly_insights_lock", None)
-    weekly_insights_running = bool(lock is not None and lock.locked())
-
     ctx = {
         "request": request,
         "user": user,
@@ -112,7 +107,7 @@ async def admin_data(
         "iso_year": iso_year,
         "iso_week": iso_week,
         "ai": ai,
-        "ai_enabled": await ai_enabled(request.app),
+        "ai_enabled": cfg.enabled,
         "ai_team": user_id is None,
         "viewer_is_admin": True,
         "users": users,
@@ -122,21 +117,16 @@ async def admin_data(
         "link_base": "/admin/records",
         "link_params": {"user_id": user_id} if user_id is not None else {},
         "leaderboard": leaderboard,
-        "weekly_insights_running": weekly_insights_running,
     }
 
     if is_htmx(request):
-        # HTMX partial branch — do NOT mint/rotate the CSRF cookie. The button
-        # lives in the outer page wrapper (not in `_admin_data_body.html.j2`),
-        # and rotating the cookie here would invalidate the in-page button's
-        # already-rendered `hx-vals` token → silent 403 on next click.
-        return templates.TemplateResponse(
-            request, "_admin_data_body.html.j2", ctx,
-        )
+        # HTMX partial (range tabs): never mint or rotate the CSRF cookie, or the runs
+        # form already on the page would carry a stale token (silent 403).
+        return templates.TemplateResponse(request, "_admin_data_body.html.j2", ctx)
 
-    # Full-page render — mint a fresh CSRF token + set the double-submit cookie
-    # so the "Run insights now" button's `hx-vals` value matches the cookie.
+    # Full page: mint the CSRF token the runs form carries, plus the runs list.
     csrf = secrets.token_urlsafe(32)
+    ctx.update(await _runs_ctx(request, cfg))
     ctx["csrf_token"] = csrf
     response = templates.TemplateResponse(request, "data.html.j2", ctx)
     set_csrf_cookie(response, csrf)
@@ -161,7 +151,7 @@ async def admin_records(
     """Team search (``search_history_team``) or the newest-first team list, with owners."""
     if kind not in ("dictation", "file"):
         kind = None
-    tz = settings.insights_timezone
+    tz = await insights_settings.timezone_for(request.app)
     lo, hi = records.window(range, since, until, tz)
     query = records.wants_search(q)
     job_store: JobStore = request.app.state.job_store
@@ -219,172 +209,167 @@ async def admin_record(
     )
     if row is None:
         raise HTTPException(status_code=404)
-    row = {**records.decorate(row, settings.insights_timezone), "kind": kind, "row_id": row_id}
+    tz = await insights_settings.timezone_for(request.app)
+    row = {**records.decorate(row, tz), "kind": kind, "row_id": row_id}
     return templates.TemplateResponse(
         request, "record_detail.html.j2", {"request": request, "row": row, "admin_view": True}
     )
 
 
-# ── manual weekly-insights trigger ───────────────────────────────────────────
+# ── insight runs: estimate → confirm → background run; progress partial ─────
 
 
-def _toast_html(message: str) -> str:
-    """Inline toast fragment for HTMX swap into `#admin-run-insights-toast`.
-
-    `html.escape` keeps any future dynamic content from injecting markup.
-    """
-    safe = html.escape(message)
-    return (
-        f'<div role="status" aria-live="polite" class="admin-toast">'
-        f"{safe}</div>"
-    )
-
-
-def _render_button(running: bool, csrf_token: str, *, oob: bool) -> str:
-    """Render the run-insights button partial to a string.
-
-    Used both for inline composition in the POST response (OOB swap variant
-    with `oob=True`) and reachable as a callable for future server-side
-    composition needs. The initial page render goes through Jinja's `include`.
-    """
-    return templates.env.get_template(
-        "_admin_run_insights_button.html.j2"
-    ).render(
-        {
-            "running": running,
-            "csrf_token": csrf_token,
-            "oob": oob,
-        }
-    )
+async def _runs_ctx(request: Request, cfg: insights_settings.InsightsSettings) -> dict[str, Any]:
+    runs = await asyncio.to_thread(request.app.state.job_store.recent_insight_runs, 10)
+    return {
+        "runs": runs,
+        "running": any(r["status"] == "running" for r in runs),
+        "ai_enabled": cfg.enabled,
+        "client_ready": getattr(request.app.state, "insights_client", None) is not None,
+        "week_choices": list(range(1, cron.MAX_BACKFILL_WEEKS + 1)),
+    }
 
 
-def _make_done_callback(pending: set[asyncio.Task]):
-    """Factory for `add_done_callback` that discards + logs exceptions.
-
-    The bare `set.discard` form silently absorbs unhandled task exceptions
-    (asyncio only surfaces them at process-exit). The closure form here keeps
-    the strong-ref to `pending` without poking attributes onto the task.
-    """
-
-    def cb(task: asyncio.Task) -> None:
-        pending.discard(task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.exception(
-                "Manual insights task crashed", exc_info=exc,
-            )
-
-    return cb
+@router.get("/data/runs/current", response_class=HTMLResponse)
+async def runs_current(request: Request, _admin: User = Depends(require_admin)) -> HTMLResponse:
+    cfg = await insights_settings.load_for(request.app)
+    ctx = {"request": request, **await _runs_ctx(request, cfg)}
+    return templates.TemplateResponse(request, "_runs_list.html.j2", ctx)
 
 
-@router.post("/data/insights/run-now", response_class=HTMLResponse)
-async def admin_data_run_insights_now(
+def _track(app: Any, coro: Any) -> asyncio.Task:
+    """Start a background run with a strong reference; log (never swallow) a crash."""
+    tasks: set[asyncio.Task] | None = getattr(app.state, "insights_run_tasks", None)
+    if tasks is None:
+        tasks = set()
+        app.state.insights_run_tasks = tasks
+    task = asyncio.create_task(coro)
+    tasks.add(task)
+
+    def done(t: asyncio.Task) -> None:
+        tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("Insights run crashed: %s", type(t.exception()).__name__)
+
+    task.add_done_callback(done)
+    return task
+
+
+@router.post("/data/runs", response_class=HTMLResponse)
+async def runs_start(
     request: Request,
-    csrf_token: str = Form(...),
-    user: User = Depends(require_admin),
+    weeks: int = Form(1),
+    force: bool = Form(False),
+    confirm: bool = Form(False),
+    csrf_token: str = Form(""),
+    admin: User = Depends(require_admin_csrf),
 ) -> HTMLResponse:
-    """Admin-only manual trigger for `run_weekly_insights` against the current
-    in-progress ISO week. Fire-and-forget — returns immediately with a toast
-    + OOB button-swap fragment for HTMX.
-
-    The button's CSRF cookie is minted on the full-page render of
-    `GET /admin/data` (NOT on the HTMX partial branch — see `admin_data`).
-    Per-week double-billing safety lives in `cron.py:167-176`'s per-user
-    idempotency skip, NOT in `lock.locked()` — the pre-check here is purely
-    UX.
-    """
-    # CSRF — return 403 WITH a toast body so HTMX's `hx-target-403` swaps it.
-    if not verify_csrf(request, csrf_token):
-        return HTMLResponse(
-            _toast_html(
-                "Session expired. Refresh the page and try again."
-            ),
-            status_code=403,
-            media_type="text/html",
-        )
-
+    """Estimate first; start only on ``confirm``. Returns the ``#run-confirm`` fragment."""
     app = request.app
-
-    # Pre-check 1: insights_client must be available. Without it the cron
-    # silently early-exits with logger.info — the admin would see a "started"
-    # toast and nothing would happen. Surface it explicitly.
-    if getattr(app.state, "insights_client", None) is None:
-        return HTMLResponse(
-            _toast_html(
-                "Insights unavailable — OPENROUTER_API_KEY not configured."
-            ),
-            status_code=200,
-            media_type="text/html",
+    cfg = await insights_settings.load_for(app)
+    weeks = max(1, min(int(weeks), cron.MAX_BACKFILL_WEEKS))
+    ctx: dict[str, Any] = {"request": request, "csrf_token": csrf_token, "weeks": weeks,
+                           "force": force}
+    if not cfg.enabled or getattr(app.state, "insights_client", None) is None:
+        ctx["error"] = (
+            "AI interpretation is off. Turn it on in Settings first." if not cfg.enabled
+            else "OPENROUTER_API_KEY is not configured on the server."
         )
-
-    # Pre-check 2: 30-day budget. Mirrors `cron.py:108-120` exactly so the
-    # admin sees the same dollar amounts the cron would have logged.
-    job_store: JobStore = app.state.job_store
-    spent_30d = job_store.rolling_insights_cost_usd(days=30)
-    budget = float(settings.insights_max_30d_cost_usd)
-    if spent_30d > budget:
-        return HTMLResponse(
-            _toast_html(
-                f"Budget exceeded (${spent_30d:.2f} / ${budget:.2f} cap). "
-                "Run skipped."
-            ),
-            status_code=200,
-            media_type="text/html",
+        return templates.TemplateResponse(request, "_run_confirm.html.j2", ctx, status_code=409)
+    target = cron.last_weeks(weeks, cfg.timezone)
+    lock = getattr(app.state, "weekly_insights_lock", None)
+    if lock is not None and lock.locked():
+        ctx["error"] = "A run is already in progress. Watch it below."
+        return templates.TemplateResponse(request, "_run_confirm.html.j2", ctx, status_code=409)
+    if not confirm:
+        ctx["estimate"] = await asyncio.to_thread(
+            cron.estimate_cost, app.state.job_store, app.state.accounts, target,
+            model=cfg.model, tz_name=cfg.timezone,
         )
+        ctx["target"] = target
+        ctx["spent_30d"] = await asyncio.to_thread(app.state.job_store.rolling_insights_cost_usd, 30)
+        ctx["cap"] = cfg.cap_30d_usd
+        ctx["confirm_vals"] = {"weeks": weeks, "confirm": "1", "csrf_token": csrf_token,
+                               **({"force": "1"} if force else {})}
+        return templates.TemplateResponse(request, "_run_confirm.html.j2", ctx)
+    trigger = "manual" if weeks == 1 else "backfill"
+    _track(app, cron.run_weeks(app, target, trigger=trigger, force=force))
+    logger.info("Insights %s started by admin_id=%s for %d week(s)", trigger, admin.id, weeks)
+    ctx["started"] = True
+    return templates.TemplateResponse(request, "_run_confirm.html.j2", ctx)
 
-    # Pre-check 3: in-flight. Purely UX — TOCTOU is harmless because
-    # `run_weekly_insights` re-checks the lock and the per-user idempotency
-    # skip prevents any double-billing on overlapping spawns.
-    lock = app.state.weekly_insights_lock
-    if lock.locked():
-        return HTMLResponse(
-            _toast_html(
-                "A run is already in progress. Refresh in ~1 minute."
+
+# ── /admin/settings — AI enablement + disclosure, model, cap, timezone ──────
+
+
+async def _settings_page(request: Request, *, error: str | None = None, saved: bool = False,
+                         status_code: int = 200) -> HTMLResponse:
+    cfg = await insights_settings.load_for(request.app)
+    stored_tz = await asyncio.to_thread(
+        request.app.state.settings_store.get, insights_settings.TIMEZONE
+    )
+    csrf = secrets.token_urlsafe(32)
+    response = templates.TemplateResponse(
+        request,
+        "settings.html.j2",
+        {
+            "request": request,
+            "cfg": cfg,
+            "stored_tz": stored_tz,
+            "key_configured": bool(settings.openrouter_api_key),
+            "client_ready": getattr(request.app.state, "insights_client", None) is not None,
+            "error": error,
+            "saved": saved,
+            "csrf_token": csrf,
+        },
+        status_code=status_code,
+    )
+    set_csrf_cookie(response, csrf)
+    return response
+
+
+@router.get("/settings", response_class=HTMLResponse)
+async def settings_form(request: Request, _admin: User = Depends(require_admin)) -> HTMLResponse:
+    return await _settings_page(request, saved=request.query_params.get("saved") == "1")
+
+
+@router.post("/settings", response_class=HTMLResponse)
+async def settings_submit(
+    request: Request,
+    enabled: bool = Form(False),
+    acknowledge: bool = Form(False),
+    model: str = Form(""),
+    cap_30d_usd: str = Form(""),
+    timezone: str = Form(""),
+    admin: User = Depends(require_admin_csrf),
+) -> Any:
+    model = model.strip() or settings.insights_model
+    timezone = timezone.strip()
+    try:
+        cap = float(cap_30d_usd)
+    except ValueError:
+        cap = -1.0
+    error = None
+    if not (0 <= cap <= 1000):
+        error = "The 30-day cap must be a number of dollars between 0 and 1000."
+    elif len(model) > 100 or not all(c.isalnum() or c in "-_./:" for c in model):
+        error = "That model name is not valid (OpenRouter ids look like x-ai/grok-4.3)."
+    elif timezone:
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            error = f"Unknown timezone: {timezone!r} (use an IANA name like Europe/Berlin)."
+    if error is None:
+        try:
+            await asyncio.to_thread(
+                lambda: insights_settings.save(
+                    request.app.state.settings_store, enabled=enabled, acknowledge=acknowledge,
+                    model=model, cap_30d_usd=cap, timezone=timezone or None,
+                )
             )
-            + _render_button(running=True, csrf_token=csrf_token, oob=True),
-            status_code=200,
-            media_type="text/html",
-        )
-
-    # Target the LAST FULL ISO week — same week the page header displays via
-    # last_full_iso_week(). Targeting the in-progress week would produce rows
-    # that never appear on /admin/data because the page is keyed on the last
-    # full week. Sunday's natural cron will UPSERT-replace these rows when
-    # the next full week becomes available; no orphan-row risk.
-    iso_year, iso_week = last_full_iso_week(settings.insights_timezone)
-
-    # Spawn fire-and-forget with strong-ref. force=True bypasses the per-user
-    # idempotency skip in run_weekly_insights so re-clicking the button always
-    # produces fresh insights (and re-triggers the team-aggregate pass even
-    # when person rows already exist). Lock + 30d budget guard still apply.
-    pending: set[asyncio.Task] | None = getattr(
-        app.state, "weekly_insights_manual_tasks", None,
-    )
-    if pending is None:
-        pending = set()
-        app.state.weekly_insights_manual_tasks = pending
-    task = asyncio.create_task(
-        run_weekly_insights(
-            app, iso_override=(iso_year, iso_week), force=True,
-        ),
-    )
-    pending.add(task)
-    task.add_done_callback(_make_done_callback(pending))
-
-    logger.info(
-        "Manual insights run started by admin_id=%s for W%02d (user=%s)",
-        user.id,
-        iso_week,
-        user.label,
-    )
-
-    body = (
-        _toast_html(
-            f"Insights run started for W{iso_week:02d}. "
-            "Refresh page in ~1 minute to see results."
-        )
-        + _render_button(running=True, csrf_token=csrf_token, oob=True)
-    )
-    return HTMLResponse(body, status_code=200, media_type="text/html")
+        except ValueError as exc:
+            error = str(exc)
+    if error is not None:
+        return await _settings_page(request, error=error, status_code=400)
+    logger.info("Insights settings saved by admin_id=%s enabled=%s", admin.id, enabled)
+    return RedirectResponse("/admin/settings?saved=1", status_code=303)

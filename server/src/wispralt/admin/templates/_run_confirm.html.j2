@@ -1,0 +1,15 @@
+{# Response of POST /admin/data/runs, swapped into #run-confirm. #}
+{% if error %}
+  <p class="notice bad" role="alert">{{ error }}</p>
+{% elif started %}
+  <p class="notice">Started {{ weeks }} week{{ "s" if weeks != 1 }}. Progress shows below.</p>
+  <div id="runs-list" hx-swap-oob="outerHTML" hx-get="/admin/data/runs/current" hx-trigger="load delay:300ms" hx-swap="outerHTML"></div>
+{% else %}
+  <div class="notice">
+    <p>Runs {{ target | length }} week{{ "s" if target | length != 1 }} ({{ target[0][0] }}-W{{ "%02d" | format(target[0][1]) }}{% if target | length > 1 %} to {{ target[-1][0] }}-W{{ "%02d" | format(target[-1][1]) }}{% endif %}){% if force %}, regenerating existing insights{% endif %}.</p>
+    <p>Estimated input cost: <strong>${{ "%.4f" | format(estimate.usd) }}</strong> for about {{ "{:,}".format(estimate.words | int) }} words sent to OpenRouter.
+      Spent in the last 30 days: ${{ "%.2f" | format(spent_30d) }} of the ${{ "%.2f" | format(cap) }} cap (the run stops at the cap).</p>
+    <button class="primary" hx-post="/admin/data/runs" hx-target="#run-confirm" hx-swap="innerHTML"
+            hx-vals='{{ confirm_vals | tojson }}'>Start</button>
+  </div>
+{% endif %}

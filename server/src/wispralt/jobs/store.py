@@ -699,14 +699,97 @@ class JobStore:
                     counts[label] = counts.get(label, 0) + 1
         return counts
 
-    def rolling_insights_cost_usd(self, days: int = 30) -> float:
-        with self.db.read() as con:
-            return float(
-                con.execute(
-                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM weekly_insights WHERE generated_at >= ?",
-                    (time.time() - days * _DAY,),
-                ).fetchone()[0]
+    # ── insight runs (migration 0002): one row per run, progress polled by the portal ──
+
+    def start_insight_run(
+        self, *, trigger: str, iso_year: int, iso_week: int, estimated_usd: float | None,
+        now: float,
+    ) -> int:
+        with self.db.write() as con:
+            return con.execute(
+                "INSERT INTO insight_runs(trigger, iso_year, iso_week, status, estimated_usd,"
+                " started_at) VALUES (?, ?, ?, 'running', ?, ?) RETURNING id",
+                (trigger, iso_year, iso_week, estimated_usd, now),
+            ).fetchone()[0]
+
+    def update_insight_run(
+        self, run_id: int, *, people_total: int, people_done: int,
+        failures: list[dict[str, Any]], cost_usd: float,
+    ) -> None:
+        """Progress. ``failures`` holds ``{user_id, error_class}`` only (never text)."""
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE insight_runs SET people_total=?, people_done=?, failures_json=?,"
+                " cost_usd=? WHERE id=?",
+                (people_total, people_done, json.dumps(failures), cost_usd, run_id),
             )
+
+    def finish_insight_run(
+        self, run_id: int, *, status: str, error_class: str | None, now: float
+    ) -> None:
+        with self.db.write() as con:
+            con.execute(
+                "UPDATE insight_runs SET status=?, error_class=?, finished_at=? WHERE id=?",
+                (status, error_class, now, run_id),
+            )
+
+    def recent_insight_runs(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT * FROM insight_runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["failures"] = json.loads(d.pop("failures_json") or "[]")
+            out.append(d)
+        return out
+
+    def scheduled_run_state(self, iso_year: int, iso_week: int) -> dict[str, Any]:
+        """For the scheduler: whether a scheduled run of the week finished ``done``, and
+        when the latest scheduled attempt started."""
+        with self.db.read() as con:
+            r = con.execute(
+                "SELECT COALESCE(MAX(status = 'done'), 0) AS done, MAX(started_at) AS last_started"
+                " FROM insight_runs WHERE trigger = 'scheduled' AND iso_year = ? AND iso_week = ?",
+                (iso_year, iso_week),
+            ).fetchone()
+        return {"done": bool(r["done"]), "last_started": r["last_started"]}
+
+    def words_by_user(self, since: float, until: float) -> dict[int, dict[str, int]]:
+        """Per user in ``[since, until)``: dictation count, file count and words (estimates)."""
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT user_id, SUM(kind = 'dictation') AS dictations, SUM(kind = 'file') AS files,"
+                " COALESCE(SUM(word_count), 0) AS words FROM ("
+                " SELECT user_id, 'dictation' AS kind, word_count FROM dictations"
+                "  WHERE deleted_at IS NULL AND created_at >= :s AND created_at < :u"
+                " UNION ALL SELECT user_id, 'file', word_count FROM jobs"
+                "  WHERE deleted_at IS NULL AND transcript_text IS NOT NULL"
+                "  AND created_at >= :s AND created_at < :u) GROUP BY user_id",
+                {"s": since, "u": until},
+            )
+            return {
+                r["user_id"]: {"dictations": int(r["dictations"]), "files": int(r["files"]),
+                               "words": int(r["words"])}
+                for r in rows
+            }
+
+    def rolling_insights_cost_usd(self, days: int = 30) -> float:
+        """Insights spend in the last *days*: the larger of the stored insights' cost and the
+        runs' recorded spend (a forced rerun overwrites a row's cost; runs also count
+        replies that were billed but unusable)."""
+        since = time.time() - days * _DAY
+        with self.db.read() as con:
+            stored = con.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM weekly_insights WHERE generated_at >= ?",
+                (since,),
+            ).fetchone()[0]
+            runs = con.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM insight_runs WHERE started_at >= ?",
+                (since,),
+            ).fetchone()[0]
+        return float(max(stored, runs))
 
     # ── per-user stats + transcripts ──────────────────────────────────────────
 

@@ -6,15 +6,35 @@ boundaries (previously inlined 3x with subtle drift risk on DST).
 """
 from __future__ import annotations
 
+import os
 import time as _time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+LOCALTIME = Path("/etc/localtime")
 
 
-def last_full_iso_week(tz_name: str) -> tuple[int, int]:
-    """ISO (year, week) of the most recently completed week in ``tz_name``."""
+def host_timezone() -> str:
+    """The host's IANA zone from the ``/etc/localtime`` symlink, else ``"UTC"``."""
+    try:
+        target = os.readlink(LOCALTIME)
+    except OSError:
+        return "UTC"
+    _, sep, name = target.partition("zoneinfo/")
+    if not sep or not name:
+        return "UTC"
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return "UTC"
+    return name
+
+
+def last_full_iso_week(tz_name: str, now: float | None = None) -> tuple[int, int]:
+    """ISO (year, week) of the most recently completed week in ``tz_name`` (at ``now``)."""
     tz = ZoneInfo(tz_name)
-    now = datetime.now(tz)
+    now = datetime.now(tz) if now is None else datetime.fromtimestamp(now, tz)
     days_since_monday = (now.isoweekday() - 1) % 7
     this_monday = (now - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0,

@@ -105,21 +105,16 @@ class Settings(BaseSettings):
     # value before render. Load-more uses per-leg cursors.
     history_page_size: int = 50
 
-    # Weekly insights (Phase 2) — Sunday-night LLM analysis of last week's transcripts.
-    # Default model is grok-4.3 — verified existing + cheapest reasoning option on OpenRouter
-    # (Task 0 spike 2026-05-14, ~$0.65/week projected at our employee count).
+    # Weekly AI insights (opt-in). Runtime settings — enabled + disclosure, model, 30-day
+    # cost cap, timezone — live in the DB ``settings`` table and are edited at
+    # /admin/settings; these are the defaults it falls back to. ``insights_model`` was
+    # verified on OpenRouter 2026-05-14 (about $0.65/week at our size).
     insights_model: str = "x-ai/grok-4.3"
     insights_timeout_s: float = 30.0
-    insights_max_30d_cost_usd: float = 8.0
     insights_input_word_cap: int = 30000
     insights_per_person_min_dictations: int = 5
-    # ISO weekday: Mon=1...Sun=7. Default 7 = Sunday.
-    insights_schedule_weekday: int = 7
-    insights_schedule_hour_local: int = 23
-    insights_timezone: str = "America/Los_Angeles"
-    # Startup-catchup fail-closed by default. Operator opts in via .env AFTER verifying
-    # OpenRouter pricing/model in Task 0 spike. Prevents accidental Wednesday-deploy charge.
-    insights_catchup_enabled: bool = False
+    # None → the host's zone (/etc/localtime), else UTC. The DB setting wins over both.
+    insights_timezone: str | None = None
 
     @field_validator("data_dir", mode="before")
     @classmethod

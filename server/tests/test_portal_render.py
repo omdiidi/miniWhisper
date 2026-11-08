@@ -34,6 +34,7 @@ ADMIN_PAGES = [
     "/admin/records",
     "/admin/data",
     "/admin/system",
+    "/admin/settings",
 ]
 SELF_PAGES = ["/me/history", "/me/insights"]
 ADMIN_NAV_LINKS = (
@@ -44,6 +45,7 @@ ADMIN_NAV_LINKS = (
     'href="/admin/usage"',
     'href="/admin/system"',
     'href="/admin/records"',
+    'href="/admin/settings"',
 )
 
 

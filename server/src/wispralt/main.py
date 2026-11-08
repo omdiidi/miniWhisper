@@ -60,11 +60,7 @@ from wispralt.dictate.streaming_session import (
     _streaming_sweeper,
 )
 from wispralt.insights.client import InsightsClient
-from wispralt.insights.cron import (
-    _maybe_catchup,
-    _seconds_until_next_fire,
-    run_weekly_insights,
-)
+from wispralt.insights.cron import scheduler_loop
 from wispralt.jobs.runner import FileJobRunner
 from wispralt.jobs.store import JobStore
 from wispralt.middleware import openai_errors
@@ -249,8 +245,8 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
     streaming_sweeper_task = asyncio.create_task(_streaming_sweeper(app))
     app.state.streaming_sweeper_task = streaming_sweeper_task
 
-    # 6b. InsightsClient — fail-soft. None when OPENROUTER_API_KEY is unset;
-    #     the weekly cron is a no-op in that case.
+    # 6b. InsightsClient — fail-soft. None when OPENROUTER_API_KEY is unset; AI insights
+    #     then stay off whatever the portal setting says.
     app.state.insights_client = None
     if settings.openrouter_api_key:
         try:
@@ -299,57 +295,13 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
         )
     )
 
-    # 7e. Phase 2: weekly LLM insights cron. Sunday 23:00 mini-local. Sleeps
-    #     to next fire, runs, repeats. Robust to clock changes — recomputes
-    #     next-fire each iteration. Startup-catchup runs ONCE before the
-    #     sleep loop and is fail-CLOSED unless insights_catchup_enabled=True.
-    #
-    #     Concurrency: install an asyncio.Lock on app.state so a catchup that
-    #     overlaps the scheduled fire can short-circuit rather than double-bill
-    #     OpenRouter. The lock is read inside run_weekly_insights.
+    # 7e. Weekly AI insights (opt-in, Part 6): an hourly due-check
+    #     (``insights.cron.scheduler_loop``) replaces the Sunday sleep and the startup
+    #     catch-up. Runs, reruns and backfills share ``weekly_insights_lock`` so they never
+    #     overlap or double-bill OpenRouter.
     app.state.weekly_insights_lock = asyncio.Lock()
-
-    async def _weekly_insights_cron() -> None:
-        # Startup catchup runs once before the sleep loop. Wrapped in
-        # broad-except so a zoneinfo or SQLite hiccup doesn't kill the
-        # daemon task at boot.
-        try:
-            await _maybe_catchup(app)
-        except Exception:  # noqa: BLE001 — daemon-loop init must not crash startup
-            logger.exception(
-                "Startup catchup failed; continuing to normal schedule"
-            )
-
-        while not getattr(app.state, "shutting_down", False):
-            try:
-                sleep_s = _seconds_until_next_fire(
-                    settings.insights_timezone,
-                    iso_weekday=settings.insights_schedule_weekday,
-                    hour=settings.insights_schedule_hour_local,
-                )
-            except Exception:  # noqa: BLE001 — zoneinfo failure shouldn't kill the loop
-                logger.exception(
-                    "Weekly insights schedule compute failed; retrying in 1h"
-                )
-                sleep_s = 3600.0
-            logger.info(
-                "Weekly insights — sleeping %.0f s until next Sunday 23:00 local",
-                sleep_s,
-            )
-            try:
-                await asyncio.sleep(sleep_s)
-            except asyncio.CancelledError:
-                raise
-            if getattr(app.state, "shutting_down", False):
-                break
-            try:
-                await run_weekly_insights(app)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 — daemon loop
-                logger.exception("Weekly insights run failed; retrying next week")
-
-    app.state.weekly_insights_task = asyncio.create_task(_weekly_insights_cron())
+    app.state.insights_run_tasks = set()  # manual / backfill runs started from the portal
+    app.state.weekly_insights_task = asyncio.create_task(scheduler_loop(app))
 
     # 8. SIGTERM handler (P5#5 + P5#ExitTimeOut).
     #    I2: Use loop.add_signal_handler so the handler runs safely in the asyncio
@@ -413,6 +365,13 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
             _task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await _task
+
+    # Portal-started insights runs (manual / backfill): cancel; their insight_runs row
+    # stays 'running' only until the next run's row supersedes it on the page.
+    for _task in list(getattr(app.state, "insights_run_tasks", ()) or ()):
+        _task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _task
 
     # Cancel the idle-eviction loop first so it stops emitting log noise.
     eviction_task: asyncio.Task | None = getattr(app.state, "eviction_task", None)
