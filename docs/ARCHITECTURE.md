@@ -971,8 +971,11 @@ overlaps or double-bills). That lock is per process, so the run row is also the
 **DB run lock**: `JobStore.start_insight_run` checks for another `running` row and
 inserts its own in one `BEGIN IMMEDIATE` transaction, and returns None while one exists
 (`run_weeks` → None), so the server and a CLI run never both spend the same remaining
-budget. A `running` row older than `cron.RUN_LOCK_STALE_S` (2 h) is a crashed run and no
-longer counts; a cancelled run (shutdown) closes its row `aborted` / `cancelled`. Each
+budget. The lock is a heartbeat, not a start time: every progress step (before and after
+each person call, and before each team call) sets the row's `heartbeat_at`
+(migration 0004), and only a `running` row whose heartbeat is older than
+`cron.RUN_LOCK_STALE_S` (10 min, far above one call's 30 s timeout) is a crashed run and no
+longer counts, so a long live run never loses its lock to a CLI run; a cancelled run (shutdown) closes its row `aborted` / `cancelled`. Each
 week writes an `insight_runs` row:
 
 ```sql
@@ -984,6 +987,8 @@ CREATE TABLE insight_runs(
   failures_json TEXT NOT NULL DEFAULT '[]',   -- [{user_id, error_class}] only
   estimated_usd REAL, cost_usd REAL NOT NULL DEFAULT 0, error_class TEXT,
   started_at REAL NOT NULL, finished_at REAL);
+-- 0004: the run lock's heartbeat, touched on every progress step
+ALTER TABLE insight_runs ADD COLUMN heartbeat_at REAL;
 ```
 
 Progress is updated after every person; the portal polls it every 2 s. A run ends
