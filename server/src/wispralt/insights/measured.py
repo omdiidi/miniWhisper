@@ -23,6 +23,8 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from wispralt.usage.events import DICTATE, WHOLE_REQUEST_KINDS
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -120,8 +122,12 @@ def compute(
     points = job_store.activity_points(user_id, start, max(until, now))
     in_window = [p for p in points if since <= p[0] < until]
     fillers = count_fillers(text for _uid, text in job_store.iter_dictation_texts(user_id, since, until))
-    telemetry = usage.latency_error_summary(since, until, user_id=user_id)
-    latency = telemetry["by_kind"].get("dictate") or {}
+    # Whole requests only: a streamed dictation's chunk rows are pieces of the one
+    # finalize row, so counting them would skew the request count and error rate.
+    telemetry = usage.latency_error_summary(
+        since, until, user_id=user_id, kinds=WHOLE_REQUEST_KINDS
+    )
+    latency = telemetry["by_kind"].get(DICTATE) or {}
     return {
         "window": Window(since, until),
         "dictation_count": window["dictation_count"],

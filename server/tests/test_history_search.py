@@ -301,3 +301,39 @@ def test_empty_or_symbol_only_query_is_no_search(job_store: JobStore, make_user:
     _dictate(job_store, alice.id, "anything")
     assert job_store.search_history(alice.id, "") == []
     assert job_store.search_history(alice.id, "* ^") == []
+
+
+# ── merged history pagination (dictations + file jobs) ───────────────────────
+
+
+@pytest.mark.parametrize("limit", [50, 7])
+def test_history_pages_interleaved_legs_without_gaps_or_repeats(
+    job_store: JobStore, make_user: MakeUser, limit: int
+) -> None:
+    """50 dictations and 50 file jobs, interleaved in time: every row exactly once, in order."""
+    uid = make_user()[0].id
+    base = time.time() - 10_000
+    expected: list[tuple[str, str]] = []
+    for i in range(100):
+        at = base + i * 10
+        if i % 2 == 0:
+            expected.append(("dictation", _dictate(job_store, uid, f"dictation {i}", at)))
+        else:
+            jid = _file_job(job_store, uid, f"file {i}")
+            with job_store.db.write() as con:
+                con.execute("UPDATE jobs SET created_at=? WHERE id=?", (at, jid))
+            expected.append(("file", jid))
+    expected.reverse()  # newest first
+
+    seen: list[tuple[str, str]] = []
+    dc = jc = None
+    for _ in range(200):
+        rows, dc, jc = job_store.transcripts_in_range_filtered(
+            uid, since_epoch=0, until_epoch=time.time() + 60,
+            dict_cursor=dc, jobs_cursor=jc, limit=limit,
+        )
+        assert len(rows) <= limit
+        seen += [(r["kind"], r["row_id"]) for r in rows]
+        if dc is None and jc is None:
+            break
+    assert seen == expected

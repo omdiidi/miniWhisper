@@ -66,9 +66,9 @@ def _build_test_app(transcribe_side_effect: Any) -> FastAPI:
     app.include_router(dictate_router)
 
     # Override the bearer-auth dependency so we can hit the route without a key.
-    from wispralt.auth import require_api_key
+    from wispralt.auth import require_bearer
 
-    app.dependency_overrides[require_api_key] = _test_user
+    app.dependency_overrides[require_bearer] = _test_user
     return app
 
 
@@ -170,7 +170,7 @@ class TestSmartFormatRemoved:
         assert "smart_formatted" not in body
 
     def test_stream_finalize_ignores_smart_format_field(self) -> None:
-        from wispralt.auth import require_api_key
+        from wispralt.auth import require_bearer
         from wispralt.dictate.streaming_session import StreamingSessionStore
         from wispralt.routes.dictate_stream import router as stream_router
 
@@ -189,7 +189,7 @@ class TestSmartFormatRemoved:
             max_active=2, max_queue_depth=12, ttl_s=900, finalize_timeout_s=15
         )
         app.include_router(stream_router)
-        app.dependency_overrides[require_api_key] = _test_user
+        app.dependency_overrides[require_bearer] = _test_user
         sid = "11111111-2222-4333-8444-555555555555"
         dedup = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         wav = _silent_wav_bytes(0.05)

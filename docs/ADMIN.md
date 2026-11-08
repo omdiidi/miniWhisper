@@ -179,7 +179,7 @@ selected range (Today / 7d / 30d / 90d / 1y / All):
 - **Measured** — computed from the database, shown whether AI is on or off:
   dictations, file transcriptions, words, active days, file audio minutes, filler
   words (um, uh, like, you know), **time saved (an estimate against a 40 wpm typing
-  baseline)**, dictation latency p50/p95, error rate, an 8-week trend and an
+  baseline)**, dictation latency p50/p95 (one row per dictation: streamed chunks are not counted), error rate over whole requests, an 8-week trend and an
   hour-of-day chart. Every count tile opens the records behind it for the same
   window. The team view adds a per-person table (dictations, files, words, fillers,
   time saved).
@@ -481,7 +481,7 @@ expansion without further migrations:
   (SQLite rebuilds the table to change a CHECK). The auth middleware already returns
   the `role` string verbatim; the only place that gates on it today is
   `auth.require_admin`.
-- `usage_events.kind` — currently `'dictate' | 'file' | 'v1_dictate' | …` (older rows may carry `'meeting'`). New
+- `usage_events.kind` — currently `'dictate' | 'dictate_chunk' | 'file' | 'file_chunk' | 'v1_dictate' | 'v1_translations'` (see `usage.events.kind_for_path`) (older rows may carry `'meeting'`). New
   event types (`'export'`, `'login'`, `'crm_sync'`, …) just enqueue with
   a new string; no schema change needed.
 

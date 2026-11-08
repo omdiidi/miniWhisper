@@ -127,6 +127,30 @@ def test_own_record_page_and_htmx_partial(client: TestClient, team, job_store: J
     assert part.text.lstrip().startswith("<tr")
 
 
+def test_expanding_a_row_keeps_the_pages_csrf_token(
+    client: TestClient, team, job_store: JobStore
+) -> None:
+    """Expand / collapse must not rotate the cookie the page's other forms already hold."""
+    from wispralt.auth import CSRF_COOKIE_NAME
+
+    alice, headers = team["alice"]
+    first = _dictate(job_store, alice.id, "first row")
+    second = _dictate(job_store, alice.id, "second row")
+    assert client.get("/me/history", headers=headers).status_code == 200
+    token = client.cookies.get(CSRF_COOKIE_NAME)
+    assert token
+    for extra in ({"HX-Request": "true"}, {}):
+        resp = client.get(f"/me/history/dictation/{first}", headers={**headers, **extra})
+        assert resp.status_code == 200
+        assert client.cookies.get(CSRF_COOKIE_NAME) == token
+    # A form rendered before the expand still works (cookie auth, so CSRF applies).
+    client.cookies.set("wispralt_admin_token", headers["Authorization"].split()[1])
+    deleted = client.request(
+        "DELETE", f"/me/history/dictation/{second}", data={"csrf_token": token}
+    )
+    assert deleted.status_code == 200, deleted.text
+
+
 def test_employee_is_forbidden_on_team_records(client: TestClient, team, job_store: JobStore) -> None:
     _alice, headers = team["alice"]
     bob, _ = team["bob"]

@@ -27,7 +27,7 @@ from starlette.testclient import TestClient
 
 from wispralt._errors import FileJobInProgressError
 from wispralt.accounts.store import User
-from wispralt.auth import require_api_key
+from wispralt.auth import require_bearer
 from wispralt.config import settings
 from wispralt.files import output as files_output
 from wispralt.files import pipeline as files_pipeline
@@ -363,7 +363,7 @@ def test_submit_429_body_carries_code(monkeypatch: pytest.MonkeyPatch, code: str
         request.state.user = user
         return user
 
-    app.dependency_overrides[require_api_key] = _auth
+    app.dependency_overrides[require_bearer] = _auth
     app.state.file_runner = _RaisingRunner(code)
 
     with TestClient(app) as client:
@@ -512,6 +512,8 @@ def test_shutdown_mid_job_keeps_input_and_requeues(
             jid = resp.json()["job_id"]
             assert entered.wait(10)
             assert store.get(jid).attempts == 1
+            # The thread finishes while shutdown drains it (inside EXECUTOR_DRAIN_S).
+            threading.Timer(0.3, release.set).start()
     finally:
         release.set()
 
@@ -538,3 +540,182 @@ def test_shutdown_mid_job_keeps_input_and_requeues(
     assert final.status == "done", final.error
     assert final.attempts == 1
     assert not job.wav_path.exists()
+
+
+def test_shutdown_waits_for_executor_and_pins_lock_when_abandoned(
+    store: JobStore,
+    out_dir: Path,
+    staging_stubs: dict,
+    make_user: MakeUser,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread still running past the drain bound keeps the server lock held."""
+    import os
+
+    from wispralt import main
+    from wispralt._errors import ServerRunning
+    from wispralt.dictate.parakeet import ParakeetService
+    from wispralt.ops import backup
+
+    monkeypatch.setattr(main, "configure_file_logging", lambda *a: True)
+    monkeypatch.setattr(ParakeetService, "load", lambda self: None)
+    monkeypatch.setattr(main.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(main.subprocess, "check_output", lambda *a, **kw: "ffmpeg stub\n")
+    ram = SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=64 * 1024**3))
+    monkeypatch.setattr(transcribe_file_routes, "psutil", ram)
+    monkeypatch.setattr(runner_mod, "psutil", ram)
+    monkeypatch.setattr(runner_mod, "EXECUTOR_DRAIN_S", 0.2)
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def blocking_transcribe(wav_path, output_dir, job_id, **kw) -> dict:
+        entered.set()
+        release.wait(30)
+        finished.set()
+        return _transcript(job_id)
+
+    monkeypatch.setattr(files_pipeline, "transcribe_file", blocking_transcribe)
+    _user, token = make_user()
+    buf = io.BytesIO()
+    sf.write(buf, np.full(1600, 0.1, dtype=np.float32), 16_000, subtype="FLOAT", format="WAV")
+    pinned_before = len(backup._PINNED)
+    try:
+        with TestClient(main.create_app()) as c:
+            resp = c.post(
+                "/transcribe/file",
+                files={"file": ("a.m4a", buf.getvalue(), "audio/mp4")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 202, resp.text
+            assert entered.wait(10)
+        # Lifespan is over but the thread runs on: the lock must still be held.
+        assert not finished.is_set()
+        assert len(backup._PINNED) == pinned_before + 1
+        with pytest.raises(ServerRunning):
+            backup.server_lock(settings.data_dir).__enter__()
+    finally:
+        release.set()
+        finished.wait(10)
+        while len(backup._PINNED) > pinned_before:
+            os.close(backup._PINNED.pop())
+    with backup.server_lock(settings.data_dir):  # released once the pin is closed
+        pass
+
+
+async def test_shutdown_drains_an_idle_executor(store: JobStore) -> None:
+    assert await _runner(store).shutdown(drain_timeout_s=5) is True
+
+
+# (g) a DB error while failing a job keeps its input ---------------------------
+
+
+async def test_pipeline_error_with_db_error_keeps_wav_for_recovery(
+    tmp_path: Path, out_dir: Path, store: JobStore, staging_stubs: dict,
+    monkeypatch: pytest.MonkeyPatch, owner: int,
+) -> None:
+    import sqlite3
+
+    seen: list[Path] = []
+
+    def boom(wav_path, output_dir, job_id, **kw) -> dict:
+        seen.append(wav_path)
+        raise RuntimeError("pipeline blew up")
+
+    def locked(jid: str, error: str) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(files_pipeline, "transcribe_file", boom)
+    monkeypatch.setattr(store, "set_failed", locked)
+    src = _src(tmp_path, "h.m4a")
+    jid = store.create(src, user_id=owner)
+    await _runner(store)._run_source(jid, src)
+
+    assert store.get(jid).status == "running"  # not terminal: recover_orphans requeues it
+    assert seen and seen[0].exists()  # its input survived
+
+
+async def test_source_error_with_db_error_keeps_source(
+    tmp_path: Path, store: JobStore, staging_stubs: dict,
+    monkeypatch: pytest.MonkeyPatch, owner: int,
+) -> None:
+    import sqlite3
+
+    db_down = {"on": True}
+    real_set_failed = store.set_failed
+
+    def bad_duration(src: Path) -> float:
+        raise RuntimeError("ffprobe exploded")
+
+    def maybe_locked(jid: str, error: str) -> None:
+        if db_down["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        real_set_failed(jid, error)
+
+    monkeypatch.setattr(staging, "ffprobe_duration", bad_duration)
+    monkeypatch.setattr(store, "set_failed", maybe_locked)
+    src = _src(tmp_path, "i.m4a")
+    jid = store.create(src, user_id=owner)
+    await _runner(store)._run_source(jid, src)
+    assert store.get(jid).status == "running" and src.exists()
+
+    db_down["on"] = False  # a plain failure still removes the source
+    jid2 = store.create(src, user_id=owner)
+    await _runner(store)._run_source(jid2, src)
+    assert store.get(jid2).status == "failed" and not src.exists()
+
+
+# (h) ffmpeg stderr is drained -------------------------------------------------
+
+
+def test_transcode_drains_a_flood_of_ffmpeg_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """More stderr than a pipe holds must not stall the decode (it used to block)."""
+    import os
+    import stat
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "head -c 1000000 /dev/zero | tr '\\0' 'x' >&2\n"  # ~1 MB, far past 64 KB
+        'for last; do :; done\n'
+        'head -c 200 /dev/zero > "$last"\n'
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    src = tmp_path / "in.m4a"
+    src.write_bytes(b"not really audio")
+
+    started = time.monotonic()
+    out = staging.transcode_to_canonical_wav(
+        src, target_channels=1,
+        cancel_cb=lambda: time.monotonic() - started > 20,  # a stall fails, never hangs
+    )
+    assert out.exists() and out.stat().st_size == 200
+
+
+def test_transcode_failure_reports_the_stderr_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import stat
+
+    from fastapi import HTTPException
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' 'x' >&2\n"
+        "echo >&2\necho 'Invalid data found when processing input' >&2\nexit 1\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    src = tmp_path / "in.m4a"
+    src.write_bytes(b"junk")
+    with pytest.raises(HTTPException) as exc:
+        staging.transcode_to_canonical_wav(src, target_channels=1)
+    assert exc.value.status_code == 422
+    assert "Invalid data found" in exc.value.detail

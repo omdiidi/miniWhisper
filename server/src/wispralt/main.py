@@ -66,7 +66,7 @@ from wispralt.jobs.store import JobStore
 from wispralt.middleware import openai_errors
 from wispralt.middleware.rate_limit import RateLimitMiddleware
 from wispralt.ops import background, monitoring, staging
-from wispralt.ops.backup import server_lock
+from wispralt.ops.backup import pin_until_exit, server_lock
 from wispralt.ops.env_writer import find_env_path
 from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.routes import (
@@ -84,7 +84,7 @@ from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
 from wispralt.settings_store import SettingsStore
-from wispralt.usage.events import UsageEvent
+from wispralt.usage.events import UsageEvent, kind_for_path
 from wispralt.usage.store import UsageStore
 
 logging.basicConfig(
@@ -308,26 +308,13 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
     #    event loop rather than interrupting arbitrary C-extension code via the raw
     #    signal module.
     #
-    #    The handler signals graceful shutdown via uvicorn's `should_exit` flag,
-    #    NOT `os._exit(0)`, which would skip the lifespan teardown.  We instead
-    #    let uvicorn run its normal shutdown
-    #    path (which invokes our lifespan ``finally`` block) and trust
-    #    launchd's ExitTimeout=15 to bound the wait.
+    #    It marks the app as shutting down, then raises SIGINT, which uvicorn's
+    #    own handler turns into its normal graceful shutdown (so the lifespan
+    #    teardown below runs). Never ``os._exit``: that skips the teardown.
+    #    launchd's ExitTimeOut=15 bounds the wait.
     def _sigterm_handler() -> None:
         logger.info("SIGTERM received — initiating graceful shutdown.")
         app.state.shutting_down = True
-
-        # Trigger uvicorn graceful shutdown so the lifespan teardown runs.
-        # Fallback to raising
-        # SIGINT in the same loop if no uvicorn server is registered (e.g.
-        # tests running the app via TestClient).
-        server_obj = getattr(app.state, "uvicorn_server", None)
-        if server_obj is not None:
-            server_obj.should_exit = True
-            return
-        # Last-resort: re-raise as SIGINT so asyncio's default handler triggers
-        # KeyboardInterrupt → uvicorn shutdown.  Never call os._exit — that
-        # bypasses the lifespan teardown.
         signal.raise_signal(signal.SIGINT)
 
     try:
@@ -352,7 +339,11 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
     # interrupts keeps its staged input and goes back to pending with its
     # attempt refunded (Locked Decision 8).
     app.state.shutting_down = True
-    await file_runner.shutdown()
+    if not await file_runner.shutdown():
+        # A file-job thread is still writing under DATA_DIR and Python joins it
+        # at exit: keep the lock held until the process is really gone, so a
+        # restore cannot swap the tree under it.
+        pin_until_exit(settings.data_dir)
     logger.info("Shutdown: file runner stopped.")
 
     # Cancel the daily transcript sweep AND the weekly insights cron together.
@@ -429,30 +420,6 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
 # ── application factory ───────────────────────────────────────────────────────
 
 
-# Track only request-creating endpoints, NOT status-poll GETs that the
-# client may hammer every few seconds.  /transcribe/file POST creates a
-# job; the per-job GET is the poll path — exclude it by also filtering on
-# request.method.
-TRACKED_ROUTES = frozenset([
-    "transcribe/dictate",
-    "transcribe/file",
-    "v1/audio",
-    "v1/models",  # OpenAI-compat model-list probes
-    "v1/audio/translations",  # unsupported-endpoint stub probes (still want visibility)
-])
-TRACKED_METHODS = frozenset({"POST"})
-
-# Map a tracked route key to the canonical ``kind`` recorded on usage_events.
-# Keeps "v1/audio" from emitting an unhelpful "audio" kind via the default split.
-_KIND_MAP = {
-    "transcribe/dictate": "dictate",
-    "transcribe/file": "file",
-    "v1/audio": "v1_dictate",
-    "v1/models": "v1_models",
-    "v1/audio/translations": "v1_translations",
-}
-
-
 class _ObservabilityMiddleware(BaseHTTPMiddleware):
     """Times each request and records it in the observability singletons (G4).
 
@@ -480,15 +447,16 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
             observability.error_counter.increment(route_key, response.status_code)
         observability.latency_histogram.record(route_key, latency_ms)
 
-        # Record a usage row when auth resolved a user, the route is tracked,
-        # the method creates work (skip GET polls), and it was not a replay.
+        # Record a usage row when auth resolved a user, the request is a tracked
+        # work-creating POST (``kind_for_path``: chunks get their own kinds, GET
+        # polls none), and it was not a replay.
         user = getattr(request.state, "user", None)
         usage: UsageStore | None = getattr(request.app.state, "usage", None)
+        kind = kind_for_path(request.method, request.url.path)
         if (
             user is not None
             and usage is not None
-            and route_key in TRACKED_ROUTES
-            and request.method in TRACKED_METHODS
+            and kind is not None
             and not getattr(request.state, "dedup_replay", False)
         ):
             try:
@@ -499,7 +467,7 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
                 user_id=user.id,
                 key_id=user.key_id,
                 ts=time.time(),
-                kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
+                kind=kind,
                 status=response.status_code,
                 duration_ms=latency_ms,
                 bytes_in=bytes_in,

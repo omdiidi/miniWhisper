@@ -3,7 +3,7 @@ ratelimit_per_token.py — Post-auth per-token rate limit dependency for /v1.
 
 Why this lives here (not in middleware/rate_limit.py): middleware sees the
 raw Request before any auth dep resolves, so it can't bucket by user.id.
-This module exposes a FastAPI Depends that runs AFTER require_api_key_v1
+This module exposes a FastAPI Depends that runs AFTER require_bearer
 resolves the User, then maintains a per-user-id deque.
 
 Buckets live on app.state.v1_rate_buckets (NOT a module-level dict — test
@@ -21,7 +21,7 @@ import time
 from fastapi import Depends, HTTPException, Request
 
 from wispralt.accounts.store import User
-from wispralt.auth import require_api_key_v1
+from wispralt.auth import require_bearer
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +40,12 @@ def init_rate_limit_state(app) -> None:
 
 async def rate_limit_v1_per_token(
     request: Request,
-    user: User = Depends(require_api_key_v1),
+    user: User = Depends(require_bearer),
 ) -> User:
     """Enforce 60 req / 60s per user.id.
 
     Returns the User so the route can use this as the single auth dep
-    (FastAPI's dependency cache resolves `require_api_key_v1` exactly once
+    (FastAPI's dependency cache resolves `require_bearer` exactly once
     per request via this transitive chain).
 
     Defensive lazy-init: if lifespan didn't run (older TestClient usage

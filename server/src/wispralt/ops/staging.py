@@ -21,8 +21,10 @@ import shutil
 import signal
 import struct
 import subprocess
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -501,7 +503,7 @@ def transcode_to_canonical_wav(
 
     cmd = [
         "ffmpeg",
-        "-y", "-nostdin",
+        "-y", "-nostdin", "-hide_banner", "-nostats",
         "-i", str(source),
         "-map", "0:a:0",         # explicit: same audio track ffprobe inspected
         "-vn",
@@ -520,17 +522,22 @@ def transcode_to_canonical_wav(
     deadline = time.monotonic() + 30 * 60
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        text=True,
     )
+    # A thread drains stderr the whole time, keeping only a bounded tail: an
+    # undrained pipe fills (~64 KB) and blocks ffmpeg until the deadline.
+    stderr_tail_buf: deque[bytes] = deque(maxlen=_STDERR_TAIL_CHUNKS)
+    drainer = threading.Thread(
+        target=_drain_into, args=(proc.stderr, stderr_tail_buf),
+        name="ffmpeg-stderr", daemon=True,
+    )
+    drainer.start()
     cancelled = False
     timed_out = False
     try:
         # 500ms poll loop: check ffmpeg exit, caller's cancel flag, and the
-        # overall transcode deadline. We do NOT read stderr concurrently
-        # (ffmpeg's stderr buffer is small but tractable for our 30-min
-        # ceiling at default verbosity).
+        # overall transcode deadline.
         while True:
             rc = proc.poll()
             if rc is not None:
@@ -558,10 +565,10 @@ def transcode_to_canonical_wav(
                 raise StagingCancelled("cancelled mid-decode")
             raise HTTPException(422, "Audio transcode timed out (>30 min)")
 
-        # Drain remaining stderr for diagnostics.
-        _, stderr = proc.communicate(timeout=5)
+        drainer.join(timeout=5)  # ffmpeg exited: the pipe hits EOF
         if proc.returncode != 0:
-            stderr_tail = "\n".join((stderr or "").splitlines()[-5:])
+            stderr = b"".join(stderr_tail_buf).decode("utf-8", errors="replace")
+            stderr_tail = "\n".join(stderr.splitlines()[-5:])
             logger.error(
                 "ffmpeg transcode failed (rc=%d): %s",
                 proc.returncode, stderr_tail,
@@ -591,6 +598,20 @@ def transcode_to_canonical_wav(
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+
+
+_STDERR_TAIL_CHUNKS = 16  # × 4 KiB reads: the last ~64 KiB of ffmpeg stderr
+
+
+def _drain_into(stream, tail: deque[bytes]) -> None:
+    """Read *stream* to EOF, keeping the last ``tail.maxlen`` chunks."""
+    try:
+        for chunk in iter(lambda: stream.read(4096), b""):
+            tail.append(chunk)
+    except (OSError, ValueError):  # pipe closed under us (process killed)
+        pass
+    finally:
+        stream.close()
 
 
 def assert_same_filesystem(a: Path, b: Path) -> None:

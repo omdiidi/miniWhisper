@@ -258,7 +258,7 @@ Cloudflare's free / pro / business plans cap inbound request bodies at **100 MB*
 
 1. `POST /transcribe/file/chunked/init` with JSON `{total_bytes, chunk_count, original_filename}` → server returns `{upload_id, chunk_size}` (22-char `secrets.token_urlsafe(16)`) and creates `staging/chunked/<upload_id>/meta.json` recording the caller's `user.id`.
 2. `POST /transcribe/file/chunked/<upload_id>/<chunk_index>` with raw bytes (`application/octet-stream`, NOT multipart) for each 50 MiB chunk. The body is streamed via `request.stream()` to `chunk-NNNN.part.tmp`, then atomically renamed on success. `Content-Length` is mandatory and validated against bytes-written (corrupt chunks → 400). The path declares `{chunk_index:int}` — Starlette's `:int` converter constrains this segment to digits so `/finalize` cannot match the chunk route. Without this constraint, Starlette's registration-order matching sent every `/finalize` request into the wildcard chunk handler with `chunk_index="finalize"`; Pydantic int-coerce then produced a RequestValidationError → 422 with `{"detail":[…]}`, which the client surfaced as the misleading "appears incomplete or corrupted" banner.
-3. `POST /transcribe/file/chunked/<upload_id>/finalize` with an empty body. Server verifies all chunks present + `Σ(part.size) == total_bytes`, concatenates in `run_in_executor` (deletes each `.part` as it copies to halve peak disk), then hands the assembled file to the SAME `FileJobRunner.submit_source_or_429` that the single-shot route uses. Returns `{job_id, status: "pending"}` — from here the existing poll/download/delete loop is unchanged.
+3. `POST /transcribe/file/chunked/<upload_id>/finalize` with an empty body. Server verifies all chunks present + `Σ(part.size) == total_bytes`, concatenates in `run_in_executor` and deletes the `.part` files only once the assembled size checks out (a concat I/O error removes just the partial output, so finalize can be retried; the disk gate already requires room for one more copy), then hands the assembled file to the SAME `FileJobRunner.submit_source_or_429` that the single-shot route uses. Returns `{job_id, status: "pending"}` — from here the existing poll/download/delete loop is unchanged.
 
 **Resilience properties:**
 
@@ -435,14 +435,16 @@ The Mac mini M4 16 GB configuration leaves ~8.7 GB for the OS and other processe
 
 ### SIGTERM and graceful shutdown
 
-The SIGTERM handler (registered in the lifespan when running on the main thread) only sets `app.state.shutting_down = True` and asks uvicorn to exit; it no longer fails running jobs. The lifespan shutdown then:
+The SIGTERM handler (registered in the lifespan when running on the main thread) only sets `app.state.shutting_down = True` and raises SIGINT, which uvicorn's own handler turns into its graceful shutdown; it no longer fails running jobs. The lifespan shutdown then:
 
 1. sets `shutting_down` and awaits `file_runner.shutdown()` FIRST, while the DB is open: each worker is cancelled; a job it interrupts keeps its staged input (WAV or source) and `requeue_interrupted` sets the row back to `pending` with the attempt `set_running` took refunded, so a deploy never spends an attempt;
 2. cancels the daemon loops and streaming sessions, closes the insights client;
 3. drops the stores (`app.state.db` etc.);
 4. releases the server lock (`<data_dir>.lock`) last.
 
-A worker that finished (`done`/`failed`) during shutdown cleans up its input as usual. The executor thread itself cannot be cancelled; it is abandoned (`shutdown(wait=False, cancel_futures=True)`).
+A worker that finished (`done`/`failed`) during shutdown cleans up its input as usual. The executor thread itself cannot be cancelled: an ffmpeg decode stops at its next cancel poll, an mlx-whisper call runs to its end. `file_runner.shutdown()` waits up to `EXECUTOR_DRAIN_S` (10 s) for it; if the thread is still running, the lifespan calls `ops.backup.pin_until_exit`, which keeps the server lock held until the process really exits (Python joins the thread at exit), so a restore can never swap `DATA_DIR` under it.
+
+A job's staged input (source or WAV) is deleted only once its row reads back `done` / `failed`. If marking it failed hits a DB error, the row stays `running` with its input, and the next start's `recover_orphans` requeues it.
 
 ### Orphan Recovery (`recover_orphans`)
 
@@ -510,7 +512,7 @@ After `call_next`, `_ObservabilityMiddleware` (main.py) writes **one** `usage_ev
 
 Best-effort: a `sqlite3.Error` loses that row, increments `usage_write_failures_total` and logs only the error type; the response is unaffected. The counter is exposed in `/metrics` and in the `/readyz/db` body, so a loss is visible. There is no queue and no background drainer.
 
-Tracked routes: `transcribe/dictate`, `transcribe/file` (`kind = "file"`), `v1/audio/transcriptions` (`kind = "v1_dictate"`), plus the `/v1/models` and translations probes, **POST only**. Each stream chunk POST still records a row (request telemetry). The admin overview's Dictations 24h/7d/30d tiles count `dictations` rows (`JobStore.dictation_counts`), not requests; the person page's tiles still count that user's `usage_events` requests. Since Part 6 each row also records the authenticating `key_id`, which gives every device its own "last seen" and drives the active/recent client list on `/admin/system`.
+Tracked requests are POSTs only, classified by `usage.events.kind_for_path`: `dictate` = one whole dictation (`/transcribe/dictate` or a streamed `…/finalize`), `dictate_chunk` = one streamed chunk, `file` = one file job (`/transcribe/file` or the chunked `…/finalize`), `file_chunk` = chunked init / pieces, `v1_dictate` (`/v1/audio/transcriptions`), `v1_translations`. So `dictate` latency and error rates are per dictation; the measured stats (`insights/measured.py`) count only the whole-request kinds (`WHOLE_REQUEST_KINDS`). The admin overview's Dictations 24h/7d/30d tiles count `dictations` rows (`JobStore.dictation_counts`), not requests; the person page's tiles still count that user's `usage_events` requests. Since Part 6 each row also records the authenticating `key_id`, which gives every device its own "last seen" and drives the active/recent client list on `/admin/system`.
 
 ### Admin UI
 
@@ -670,7 +672,8 @@ raw with `\x02…\x03` sentinels and are rendered by `web.templates_env.highligh
 sibling `<data_dir>.lock` (`ops.backup.server_lock`) before it opens the DB and
 releases it last; a second server on the same `DATA_DIR` refuses to start
 (`ServerRunning`). The lock lives beside, not inside, `DATA_DIR`, so a restore's
-directory swap never moves it. (In WAL mode an idle server holds no SQLite lock,
+directory swap never moves it. `lock_path` resolves `DATA_DIR` first, so a
+symlinked `DATA_DIR` and its target share one lock. (In WAL mode an idle server holds no SQLite lock,
 so no SQLite probe can prove the server is stopped; only this flock can.)
 
 **Offline backup and restore** (`ops/backup.py`; the Part 5 CLI stops the service,
@@ -1083,7 +1086,10 @@ that's heavy on dictations doesn't starve file transcriptions off the next page 
 vice versa). Cursors are `(created_at, row_id)` tuples base64-urlsafe-encoded
 in the URL; malformed cursors decode to None and silently restart pagination.
 The "Load more" HTMX button posts back both cursors and the server appends
-the next 50 rows. Page size lives in `settings.history_page_size`
+the next 50 rows. Each leg fetches `limit + 1` rows and the two are merged in
+order; a leg's next cursor is the last row of that leg actually shown (its
+incoming cursor if it showed none), so a row the page limit cut appears on the
+next page. Both cursors are empty once nothing is left. Page size lives in `settings.history_page_size`
 (default **50**).
 
 `row_id` is included as a tie-breaker because two transcripts captured in

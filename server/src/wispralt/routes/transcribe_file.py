@@ -24,10 +24,10 @@ Ownership: the caller sees a job only if ``job.user_id == user.id`` or the
 caller is an admin. A job owned by someone else looks exactly like a missing
 one (404 on GET, 204 on DELETE), so existence never leaks.
 
-Auth: ``Bearer`` via ``Depends(require_api_key)``.
-Usage telemetry: route-key ``transcribe/file`` is registered in
-``main.TRACKED_ROUTES`` + ``_KIND_MAP``; the middleware emits the usage_events
-row, the route does not call any recorder.
+Auth: ``Bearer`` via ``Depends(require_bearer)``.
+Usage telemetry: ``usage.events.kind_for_path`` maps the submit and the
+chunked finalize to ``file`` and the chunked init / pieces to ``file_chunk``;
+the middleware emits the usage_events row, the route does not call any recorder.
 
 Resource gates (Phase 2):
 - Disk: free < content_length × 2 → 507 + Retry-After 300.
@@ -59,7 +59,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .._errors import FileJobInProgressError
-from ..auth import require_api_key
+from ..auth import require_bearer
 from ..config import settings
 from ..files.output import remove_job_outputs
 from ..jobs.runner import PHASE_LABELS, FileJobRunner
@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/transcribe/file",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_bearer)],
 )
 
 _4GiB = 4 * 1024**3
@@ -456,20 +456,17 @@ async def upload_chunk(
 
 
 def _concat_chunks(parts: list[Path], out_path: Path) -> None:
-    """Concatenate *parts* into *out_path*, deleting each part after copy.
+    """Concatenate *parts* into *out_path*; the parts are left in place.
 
     Runs in a thread executor (see finalize) to keep the event loop free
-    during the multi-GB I/O. Each chunk is unlinked immediately after its
-    contents are flushed to halve peak disk usage during the assemble window.
+    during the multi-GB I/O. Finalize deletes the parts only once the
+    assembled file is verified, so a failed concat can be retried without
+    re-uploading (the disk gate already requires room for one more copy).
     """
     with open(out_path, "wb") as out:
         for p in parts:
             with open(p, "rb") as inp:
                 shutil.copyfileobj(inp, out, length=8 * 1024 * 1024)
-            try:
-                p.unlink()
-            except OSError:
-                pass
 
 
 @router.post(
@@ -505,9 +502,8 @@ async def finalize_chunked(
     chunk_count = int(meta["chunk_count"])
     ext: str = meta["ext"]
 
-    # Re-check disk now (the concat is about to land another `total_bytes`
-    # beside the chunks for a brief window — even with delete-as-we-go the
-    # first chunk doubles up).
+    # Re-check disk now: the concat lands another `total_bytes` beside the
+    # chunks, which stay until the assembled file is verified.
     try:
         free = shutil.disk_usage(str(settings.staging_dir)).free
     except OSError:
@@ -554,15 +550,14 @@ async def finalize_chunked(
     # Cloudflare's 100s ceiling).
     out_path = settings.staging_dir / f"{upload_id}{ext}"
     loop = asyncio.get_running_loop()
-    # Snapshot per-part sizes BEFORE concat — `_concat_chunks` unlinks each
-    # part as it copies, so stat()ing afterward would return ENOENT.
     part_sizes_pre = [p.stat().st_size for p in parts]
     concat_started = time.monotonic()
     try:
         await loop.run_in_executor(None, _concat_chunks, parts, out_path)
     except OSError as exc:
+        # Drop only the partial output: the accepted chunks stay, so the
+        # client can retry finalize (the 1 h chunked sweep reaps abandons).
         out_path.unlink(missing_ok=True)
-        shutil.rmtree(chunked_dir, ignore_errors=True)
         logger.error("Chunked finalize concat failed: %s", exc)
         raise HTTPException(500, "Concat failed") from exc
     concat_elapsed_ms = int((time.monotonic() - concat_started) * 1000)
@@ -580,9 +575,10 @@ async def finalize_chunked(
     except OSError:
         actual = 0
     if actual != total_bytes:
-        out_path.unlink(missing_ok=True)
-        shutil.rmtree(chunked_dir, ignore_errors=True)
+        out_path.unlink(missing_ok=True)  # chunks kept: finalize can be retried
         raise HTTPException(500, "Assembled size mismatch")
+    for p in parts:  # verified: the assembled file replaces the chunks
+        p.unlink(missing_ok=True)
 
     # Submit to runner using the same path as the single-shot route. The
     # FileJobInProgressError branch mirrors submit_file so a 429 still cleans
@@ -605,8 +601,7 @@ async def finalize_chunked(
         shutil.rmtree(chunked_dir, ignore_errors=True)
         return _busy_response(exc)
 
-    # Success: chunked dir is now empty (parts already unlinked) — just rmtree
-    # to drop meta.json + the dir itself.
+    # Success: the parts are gone — rmtree drops meta.json + the dir itself.
     shutil.rmtree(chunked_dir, ignore_errors=True)
     logger.info(
         "Chunked upload %s finalized → job %s (bytes=%d).",

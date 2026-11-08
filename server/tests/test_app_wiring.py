@@ -170,3 +170,20 @@ def test_parakeet_load_fn_runs_without_parakeet_mlx() -> None:
     assert service.ready and text == "stub text" and ms >= 0
     assert seen == [(MODEL_ID, 16_000)]
     assert ("parakeet_mlx" in sys.modules) == had_parakeet  # never imported by this path
+
+
+def test_env_permission_check_targets_the_file_settings_reads(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``find_env_path`` is exactly Settings' ``.env`` (the cwd one; launchd's cwd is the
+    host config dir), never a ``server/.env`` that Settings would not load."""
+    from pathlib import Path
+
+    from wispralt.config import Settings
+    from wispralt.ops.env_writer import find_env_path
+
+    (tmp_path / "server").mkdir()
+    (tmp_path / "server" / ".env").write_text("SERVER_URL=http://ignored\n")
+    monkeypatch.chdir(tmp_path)
+    assert find_env_path() == tmp_path / ".env"
+    assert find_env_path() == Path.cwd() / Settings.model_config["env_file"]

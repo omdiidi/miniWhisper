@@ -14,7 +14,7 @@ FastAPI app composed of:
   - the OpenAI exception handlers installed via ``openai_errors.install``
     so 401/403/etc. ride the OpenAI envelope shape (matching production).
 
-Auth is handled by overriding ``require_api_key_v1`` via FastAPI's
+Auth is handled by overriding ``require_bearer`` via FastAPI's
 ``dependency_overrides`` — we don't go through Postgres.
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ from wispralt._errors import (
     AudioTooLongError,
     CorruptAudioError,
 )
-from wispralt.auth import require_api_key_v1
+from wispralt.auth import require_bearer
 from wispralt.middleware import openai_errors
 from wispralt.middleware.cors import install_cors
 from wispralt.ratelimit_per_token import (
@@ -108,11 +108,11 @@ class _StubParakeet:
 
 
 def _override_auth(app: FastAPI, *, user: User | None = None) -> User:
-    """Install a dependency override for ``require_api_key_v1`` that returns
+    """Install a dependency override for ``require_bearer`` that returns
     the supplied User (or a sensible default integration-kind one).
 
     NOTE: ``rate_limit_v1_per_token`` depends transitively on
-    ``require_api_key_v1`` — overriding the inner dep is enough to satisfy
+    ``require_bearer`` — overriding the inner dep is enough to satisfy
     both because FastAPI's dependency cache resolves each unique callable
     once per request.
     """
@@ -122,7 +122,7 @@ def _override_auth(app: FastAPI, *, user: User | None = None) -> User:
     async def _fake(_request: Any = None) -> User:
         return user
 
-    app.dependency_overrides[require_api_key_v1] = _fake
+    app.dependency_overrides[require_bearer] = _fake
     return user
 
 
@@ -499,7 +499,7 @@ class TestPayloadAndDecodeFailures:
 
 class TestAuth:
     def test_no_bearer_returns_401_envelope(self) -> None:
-        # Don't override auth — let the real require_api_key_v1 run.
+        # Don't override auth — let the real require_bearer run.
         app = _build_app(override_auth=False)
         with _client(app) as client:
             resp = client.post(
@@ -515,7 +515,7 @@ class TestAuth:
 
     def test_cookie_only_auth_rejected_on_v1(self) -> None:
         # Setting the admin session cookie WITHOUT a Bearer header MUST 401 on
-        # /v1 — cookie auth is intentionally not consulted by require_api_key_v1.
+        # /v1 — cookie auth is intentionally not consulted by require_bearer.
         app = _build_app(override_auth=False)
         with _client(app) as client:
             resp = client.post(
@@ -578,7 +578,7 @@ class TestTranslationsStub:
                 headers={"Authorization": "Bearer test"},
             )
         # Stub returns 400 / endpoint_not_supported. Auth dep
-        # (rate_limit_v1_per_token -> require_api_key_v1) is resolved via
+        # (rate_limit_v1_per_token -> require_bearer) is resolved via
         # the override installed by _build_app().
         assert resp.status_code == 400, resp.text
         body = resp.json()

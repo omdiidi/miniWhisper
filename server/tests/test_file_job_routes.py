@@ -31,7 +31,7 @@ from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 
 from wispralt.accounts.store import User
-from wispralt.auth import require_api_key
+from wispralt.auth import require_api_key, require_bearer
 from wispralt.config import settings
 from wispralt.files import output as files_output
 from wispralt.files import pipeline as files_pipeline
@@ -109,7 +109,8 @@ def make_app(store: JobStore) -> Callable[..., FastAPI]:
     def _make(user: User | None = OWNER, runner: object | None = None) -> FastAPI:
         app = FastAPI()
         app.include_router(transcribe_file_routes.router)
-        app.dependency_overrides[require_api_key] = _as(user)
+        app.dependency_overrides[require_bearer] = _as(user)
+        app.dependency_overrides[require_api_key] = _as(user)  # /me routes some tests mount
         app.state.job_store = store
         app.state.file_runner = runner if runner is not None else FileJobRunner(store, app.state)
         return app
@@ -443,6 +444,47 @@ def test_chunked_finalize_with_legacy_meeting_meta_finishes_as_file_job(
     assert job is not None
     assert job.user_id == OWNER.id
     assert job.client_app_version == "0.9.0"
+    assert not chunked_dir.exists()
+
+
+def test_chunked_finalize_concat_error_keeps_chunks_for_a_retry(
+    make_app, staging_dir, plenty_of_ram, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upload_id = "C" * 22
+    chunked_dir = staging_dir / "chunked" / upload_id
+    chunked_dir.mkdir(parents=True)
+    for i in range(3):
+        (chunked_dir / f"chunk-{i:04d}.part").write_bytes(b"x" * 10)
+    (chunked_dir / "meta.json").write_text(json.dumps({
+        "total_bytes": 30, "chunk_count": 3, "original_filename": "a.wav",
+        "ext": ".wav", "created_at": time.time(), "user_id": OWNER.id,
+    }))
+    real_concat = transcribe_file_routes._concat_chunks
+
+    def failing_concat(parts, out_path) -> None:
+        real_concat(parts[:2], out_path)  # partial output, then the disk errors
+        raise OSError("I/O error")
+
+    monkeypatch.setattr(transcribe_file_routes, "_concat_chunks", failing_concat)
+    resp = TestClient(make_app(OWNER)).post(f"/transcribe/file/chunked/{upload_id}/finalize")
+    assert resp.status_code == 500, resp.text
+    assert not (staging_dir / f"{upload_id}.wav").exists()  # partial output removed
+    assert sorted(p.name for p in chunked_dir.iterdir()) == [
+        "chunk-0000.part", "chunk-0001.part", "chunk-0002.part", "meta.json",
+    ]
+
+    # A retried finalize gets past the concat (the runner is not under test here).
+    monkeypatch.setattr(transcribe_file_routes, "_concat_chunks", real_concat)
+
+    async def fake_submit(path, *, user_id, client_version=None) -> str:
+        assert path.read_bytes() == b"x" * 30
+        return "job-1"
+
+    runner = SimpleNamespace(submit_source_or_429=fake_submit)
+    resp = TestClient(make_app(OWNER, runner)).post(
+        f"/transcribe/file/chunked/{upload_id}/finalize"
+    )
+    assert resp.status_code == 202, resp.text
     assert not chunked_dir.exists()
 
 

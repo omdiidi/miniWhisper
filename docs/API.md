@@ -28,7 +28,7 @@ The bearer is sha256-hashed and looked up in the local SQLite DB (`api_keys ⋈ 
 These are intentionally open so Kubernetes-style probes, Cloudflare health checks, and external monitoring can poll them without API credentials. The probes expose only ready-flag booleans + free RAM in MB — no user data, no audio, no model output.
 
 **Bearer required:**
-- `POST /transcribe/dictate`, `POST /transcribe/file` (+ chunked), `GET /transcribe/file/{id}`, `GET /transcribe/file/{id}/download/{fmt}`, `DELETE /transcribe/file/{id}`
+- `POST /transcribe/dictate` (+ streaming), `POST /transcribe/file` (+ chunked), `GET /transcribe/file/{id}`, `GET /transcribe/file/{id}/download/{fmt}`, `DELETE /transcribe/file/{id}` — **Bearer only** (`auth.require_bearer`): the session cookie is refused (401), so a browser carrying the portal cookie can never drive them and they need no CSRF token
 - `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/models/{id}` (OpenAI-compatible drop-in surface — see [OPENAI-COMPAT.md](OPENAI-COMPAT.md))
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
@@ -258,7 +258,7 @@ Close out a streaming session. The dedup id is claimed first and a stored dictat
 }
 ```
 
-`duration_ms` on streaming rows is **cumulative** per-chunk Parakeet inference time (sum of N chunks), not single-pass wall-clock. See [ARCHITECTURE.md → Known limitations](ARCHITECTURE.md#known-limitations) for the semantic drift versus single-shot dictation rows. The response envelope is otherwise byte-identical to `/transcribe/dictate` so the client's existing decoder is unchanged.
+`duration_ms` on streaming rows is **cumulative** per-chunk Parakeet inference time (sum of N chunks), not single-pass wall-clock. See [ARCHITECTURE.md → Known limitations](ARCHITECTURE.md#known-limitations) for the semantic drift versus single-shot dictation rows. The response envelope is otherwise byte-identical to `/transcribe/dictate` so the client's existing decoder is unchanged. As there, blank joined text is not stored and reports `"saved": true`.
 
 **Errors:**
 
@@ -296,7 +296,7 @@ canonical reference: **[OPENAI-COMPAT.md](OPENAI-COMPAT.md)**.
 
 **Key constraints that matter at the API contract level:**
 
-- **Bearer-only auth on `/v1/*`** — the `wispralt_admin_token` session
+- **Bearer-only auth on `/v1/*`** (`auth.require_bearer`, shared with `/transcribe/*`) — the `wispralt_admin_token` session
   cookie is NOT consulted, even if the browser carries it. Programs use
   Bearer; humans use cookies; the two surfaces stay separate.
 - **Per-token rate limit** (60 req/min/token), independent of the
@@ -495,7 +495,7 @@ Source: `server/src/wispralt/routes/me.py` (Plan A).
 
 **Auth:** Bearer required. Ownership-checked.
 
-One owned record. With `HX-Request: true` it returns the expanded row partial (or the compact one with `?compact=1`); a plain browser request returns a full **record page** (`record_detail.html.j2`, the target of AI source links). Unknown `kind`, unknown `row_id`, or a `row_id` owned by another user all uniformly return **404** so we never leak existence to non-owners.
+One owned record. With `HX-Request: true` it returns the expanded row partial (or the compact one with `?compact=1`); a plain browser request returns a full **record page** (`record_detail.html.j2`, the target of AI source links). Unknown `kind`, unknown `row_id`, or a `row_id` owned by another user all uniformly return **404** so we never leak existence to non-owners. It reuses the existing `wispralt_csrf` token (`auth.csrf_token_for`) instead of rotating it, so delete / restore forms already on the page keep working after an expand.
 
 **Path parameters:**
 
@@ -846,7 +846,7 @@ Upload a single chunk's raw bytes.
 
 **Auth:** Bearer required. **Owner must match the user that ran `/init`.**
 
-Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; on a busy 429 (`FileJobInProgressError`) it also cleans up the assembled file so a retry starts fresh. A `mode` key left in a pre-upgrade `meta.json` is ignored, so such uploads finish as ordinary file jobs.
+Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; a 500 (`Concat failed` / `Assembled size mismatch`) removes only the partial output and keeps the chunks, so finalize can be retried; on a busy 429 (`FileJobInProgressError`) it also cleans up the assembled file so a retry starts fresh. A `mode` key left in a pre-upgrade `meta.json` is ignored, so such uploads finish as ordinary file jobs.
 
 **Request:** Empty body (`{}`).
 

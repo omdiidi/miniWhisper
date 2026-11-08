@@ -13,23 +13,15 @@ logger = logging.getLogger(__name__)
 
 
 def find_env_path() -> Path:
-    """Locate the .env file used by the server.
+    """The dotenv file ``Settings`` reads: ``.env`` in the working directory.
 
-    Search order:
-    1. ``server/.env`` relative to CWD (typical when started from repo root).
-    2. ``.env`` in CWD (typical when started from the server/ directory).
-    3. Fall back to CWD/.env (let callers create it if needed).
-
-    M4: Single canonical implementation; used by both main.py and routes/admin.py
-    to avoid the duplicated _locate_env / _find_env_path functions.
+    ``Settings`` (``config.py``) loads ``env_file=".env"`` relative to the cwd,
+    and real environment variables override it. The host LaunchAgent runs with
+    ``WorkingDirectory`` = the config dir (``cli/launchd.py``), so for an
+    installed host this is ``~/.config/wispralt/.env`` (``cli.paths.Paths.env_file``);
+    a dev run reads ``./.env`` from wherever it starts. Only that one file is
+    permission-checked: any other ``.env`` is never loaded.
     """
-    candidates = [
-        Path.cwd() / "server" / ".env",
-        Path.cwd() / ".env",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
     return Path.cwd() / ".env"
 
 
