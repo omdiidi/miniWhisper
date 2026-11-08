@@ -641,6 +641,25 @@ and leaves `BLOCKED.json`; nothing ever calls a Supabase management API or
 unpauses it. `JsonPagesSource(dir)` reads `<table>.json` arrays saved by hand from
 the same SELECTs (read-only MCP fallback).
 
+**Snapshot import.** `importer/supabase_import.py` verifies every `<table>.jsonl`
+against `counts.json` (sha256 and line count) before anything is written, then maps
+each row into exactly one bucket — new, duplicate, linked, malformed or unmatched —
+and checks `source_count` equals their sum per table (fail closed). Users get new
+local ids (`source='supabase.users'`, `source_id` = the Postgres id), `revoked_at`
+becomes `disabled_at`, and no `api_keys` are created (people rejoin by invite);
+`last_seen_at` and the fallback `provider`/`provider_request_id`/`cost_micro_usd`
+stay in the snapshot only. The **owner** — the one enabled Supabase admin — is
+*linked* to the one enabled local admin (`link_existing`) instead of inserted; the
+mapping must be confirmed (`--yes` only when unambiguous, or `--owner-map PG=LOCAL`),
+an earlier link counts as confirmed, and with no local admin the import refuses
+until `python -m wispralt.bootstrap` has run. `usage_events` keep their kind
+(`meeting` → `file`), `fallback_events` land in `usage_events` as `fallback_<kind>`,
+and `user_id` is remapped through the imported users (unknown → unmatched). Rows go
+in batches of 500, each committed with its `import_runs` checkpoint, so a crashed
+run resumes the same run row; a first run with any duplicate, or a write that does
+not account for every planned row, marks the run `failed`. A dry run only reads and
+prints the counts and the owner proposal.
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output
