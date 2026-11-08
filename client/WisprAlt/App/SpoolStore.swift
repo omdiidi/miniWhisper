@@ -146,7 +146,7 @@ actor SpoolStore {
             switch sidecar.mode {
             case .online:
                 result = try await OpenAIFileProvider(model: OpenAIModels.fileModel(for: sidecar.model),
-                                                      keyProvider: { OpenAIKey.current() }).finish(recording)
+                                                      keyProvider: { OpenAIKey.current() }, onBilled: SpendStore.record).finish(recording)
             case .local:
                 let wav = try Mono16kWAV.make(from: audio)
                 result = try await LocalServerProvider(endpoint: ServerClient.shared.currentEndpoint(), dictationId: id)

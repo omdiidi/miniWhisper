@@ -16,9 +16,11 @@ import WisprAltCore
     }
 
     private func provider(_ t: FakeTransport, recovery: FakeRecovery? = FakeRecovery(), enabled: Bool = true,
-                          drain: Double = 2, commit: Double = 2) -> OpenAIRealtimeProvider {
+                          drain: Double = 2, commit: Double = 2,
+                          onBilled: (@Sendable (OpenAIModel, Double) -> Void)? = nil) -> OpenAIRealtimeProvider {
         OpenAIRealtimeProvider(model: live, keyProvider: { "sk-test" }, fileRecovery: recovery, recoveryEnabled: enabled,
-                               makeTransport: { _ in t }, drainSeconds: drain, commitDeadline: { _ in commit })
+                               makeTransport: { _ in t }, drainSeconds: drain, commitDeadline: { _ in commit },
+                               onBilled: onBilled)
     }
 
     private func samples(_ n: Int, value: Float = 0.25) -> [Float] { [Float](repeating: value, count: n) }
@@ -86,6 +88,24 @@ import WisprAltCore
         #expect(!t.sent.contains(RealtimeProtocol.commit))
         #expect(recovery.calls == 0)
         #expect(t.closeCount >= 1)
+    }
+
+    @Test func billing_liveCommitBillsTheLiveModel_recoveryDoesNot() async throws {
+        let billed = BilledLog()
+        let ok = provider(FakeTransport(reply: Self.happyReply), onBilled: billed.record)
+        ok.start()
+        ok.append(samples(4_800))
+        _ = try await ok.finish(recording)
+        #expect(billed.entries == ["gpt-live-transcribe 1.0"])
+
+        let failing = FakeTransport(reply: { msg in
+            msg.contains("session.update") ? [#"{"type":"error","error":{"type":"server_error"}}"#] : []
+        })
+        let p = provider(failing, onBilled: billed.record)
+        p.start()
+        p.append(samples(4_800))
+        _ = try await p.finish(recording)
+        #expect(billed.entries.count == 1)   // the recovery provider bills its own request
     }
 
     @Test func serverErrorReply_recovers() async throws {
@@ -211,4 +231,13 @@ import WisprAltCore
         #expect(!RealtimeRecovery.shouldRecover(URLError(.cancelled)))
         #expect(!RealtimeRecovery.shouldRecover(CancellationError()))
     }
+}
+
+
+/// Records `onBilled` calls as "model seconds".
+final class BilledLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _entries: [String] = []
+    var entries: [String] { lock.withLock { _entries } }
+    func record(_ model: OpenAIModel, _ seconds: Double) { lock.withLock { _entries.append("\(model.id) \(seconds)") } }
 }

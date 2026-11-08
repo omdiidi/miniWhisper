@@ -8,13 +8,14 @@ enum ProviderFactory {
         switch snapshot.kind {
         case .openAIFile:
             guard let model = snapshot.model else { return nil }
-            return OpenAIFileProvider(model: model, keyProvider: { OpenAIKey.current() })
+            return OpenAIFileProvider(model: model, keyProvider: { OpenAIKey.current() }, onBilled: SpendStore.record)
         case .openAIRealtime:
             guard let model = snapshot.model else { return nil }
             // A recoverable live failure re-sends the same audio to gpt-transcribe.
             let recovery = OpenAIFileProvider(model: OpenAIModels.fileModel(for: OpenAIModels.defaultFileModelID),
-                                              keyProvider: { OpenAIKey.current() })
-            return OpenAIRealtimeProvider(model: model, keyProvider: { OpenAIKey.current() }, fileRecovery: recovery)
+                                              keyProvider: { OpenAIKey.current() }, onBilled: SpendStore.record)
+            return OpenAIRealtimeProvider(model: model, keyProvider: { OpenAIKey.current() }, fileRecovery: recovery,
+                                          onBilled: SpendStore.record)
         case .local, .needKey:
             return nil
         }

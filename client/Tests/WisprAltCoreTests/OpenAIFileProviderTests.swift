@@ -7,9 +7,25 @@ extension StubURLSuites {
     @Suite struct OpenAIFileProviderTests {
         private let ok = StubURLProtocol.Reply.http(200, Data(#"{"text":"hello world","usage":{"output_tokens":3}}"#.utf8))
 
-        private func provider(key: String? = "sk-test", deadline: Double = 10) -> OpenAIFileProvider {
+        private func provider(key: String? = "sk-test", deadline: Double = 10,
+                              onBilled: (@Sendable (OpenAIModel, Double) -> Void)? = nil) -> OpenAIFileProvider {
             OpenAIFileProvider(model: OpenAIModels.resolve(id: nil), keyProvider: { key },
-                               session: StubURLProtocol.session(), deadline: { _ in deadline }, retryDelay: 0.01)
+                               session: StubURLProtocol.session(), deadline: { _ in deadline }, retryDelay: 0.01,
+                               onBilled: onBilled)
+        }
+
+        @Test func billing_onceOnSuccess_neverOnFailure() async throws {
+            let billed = BilledLog()
+            StubURLProtocol.reset([.http(503, Data()), ok])   // a retried success bills once
+            _ = try await provider(onBilled: billed.record).transcribe(audio: Data([1]), filename: "a.wav",
+                                                                     contentType: "audio/wav", prompt: nil,
+                                                                     durationSeconds: 90)
+            #expect(billed.entries == ["gpt-transcribe 90.0"])
+            StubURLProtocol.reset([.http(401, Data(#"{"error":{"code":"invalid_api_key"}}"#.utf8))])
+            _ = try? await provider(onBilled: billed.record).transcribe(audio: Data([1]), filename: "a.wav",
+                                                                       contentType: "audio/wav", prompt: nil,
+                                                                       durationSeconds: 90)
+            #expect(billed.entries.count == 1)
         }
 
         private func recording() throws -> Recording {

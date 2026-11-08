@@ -12,13 +12,17 @@ public final class OpenAIFileProvider: DictationProvider, @unchecked Sendable {
     private let deadline: @Sendable (Double) -> Double
     private let retryDelay: Double
     private let inFlight = URLTaskHolder()
+    /// Called once per successful request with the model and audio seconds (spend tracking).
+    private let onBilled: (@Sendable (OpenAIModel, Double) -> Void)?
 
     public static func defaultDeadline(_ durationSeconds: Double) -> Double { max(30, 10 + 0.5 * durationSeconds) }
 
     public init(model: OpenAIModel, keyProvider: @escaping @Sendable () -> String?, session: URLSession = .shared,
                 deadline: @escaping @Sendable (Double) -> Double = OpenAIFileProvider.defaultDeadline,
-                retryDelay: Double = 1.0) {
+                retryDelay: Double = 1.0,
+                onBilled: (@Sendable (OpenAIModel, Double) -> Void)? = nil) {
         self.model = model
+        self.onBilled = onBilled
         self.keyProvider = keyProvider
         self.session = session
         self.deadline = deadline
@@ -48,7 +52,7 @@ public final class OpenAIFileProvider: DictationProvider, @unchecked Sendable {
                                                    contentType: contentType, prompt: prompt,
                                                    responseFormat: "json", key: key)
         let holder = inFlight, session = session, modelID = model.id, delay = retryDelay
-        return try await withDeadline(seconds: deadline(durationSeconds), onTimeout: { holder.cancel() }) {
+        let result = try await withDeadline(seconds: deadline(durationSeconds), onTimeout: { holder.cancel() }) {
             do {
                 return try await Self.send(request, session: session, holder: holder, modelID: modelID)
             } catch let error where OpenAIErrors.isTransient(error) {
@@ -56,6 +60,8 @@ public final class OpenAIFileProvider: DictationProvider, @unchecked Sendable {
                 return try await Self.send(request, session: session, holder: holder, modelID: modelID)
             }
         }
+        onBilled?(model, durationSeconds)
+        return result
     }
 
     public func cancel() { inFlight.cancel() }

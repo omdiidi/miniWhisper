@@ -20,6 +20,8 @@ All notable changes to WisprAlt are documented here.
   host's `.env`, stopping and restarting the service around a real import.
 - **One server test runner** (`scripts/test-server.sh`) for local runs and CI.
 
+- **OpenAI spend in the menu**: the popover shows "OpenAI ≈ $X today · $Y this month", estimated on this Mac from audio minutes × each model's price.
+
 ### Fixed (found by the end-to-end run on a real Mac)
 
 - `backup`, `restore` and `update` could leave the host unloaded: `launchctl bootout`

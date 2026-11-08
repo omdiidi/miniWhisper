@@ -153,6 +153,7 @@ struct SettingsView: View {
             Text(statusLine)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            SpendLine()
         }
     }
 
@@ -1312,5 +1313,20 @@ private struct ServerLogSheet: View {
             loadError = "Failed to fetch log: \(error.localizedDescription)"
             Log.warning("ServerLogSheet fetch failed: \(ErrorLog.describe(error))", category: "ui")
         }
+    }
+}
+
+/// "OpenAI ≈ $0.03 today · $1.24 this month": estimated Online spend from
+/// `SpendStore` (audio minutes × the model's price; OpenAI's bill is authoritative).
+private struct SpendLine: View {
+    @ObservedObject private var spend = SpendStore.shared
+
+    var body: some View {
+        let now = Date()
+        Text("OpenAI ≈ \(SpendLedger.format(spend.ledger.today(now))) today · "
+             + "\(SpendLedger.format(spend.ledger.thisMonth(now))) this month")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .help("Estimated from audio length × each model's price. Your OpenAI bill is the exact figure.")
     }
 }

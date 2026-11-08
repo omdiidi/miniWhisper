@@ -33,6 +33,9 @@ public final class OpenAIRealtimeProvider: DictationProvider, LiveFrameSink, @un
     public static func defaultCommitDeadline(_ durationSeconds: Double) -> Double { max(15, 5 + 0.25 * durationSeconds) }
 
     public let model: OpenAIModel
+    /// Called after a live commit completes, with the model and audio seconds (spend
+    /// tracking). A recovered dictation is billed by `fileRecovery` instead.
+    private let onBilled: (@Sendable (OpenAIModel, Double) -> Void)?
     public let inputSampleRate = RealtimeProtocol.sampleRate
     public let recoveryEnabled: Bool
     private let keyProvider: @Sendable () -> String?
@@ -61,8 +64,10 @@ public final class OpenAIRealtimeProvider: DictationProvider, LiveFrameSink, @un
                 fileRecovery: DictationProvider?, recoveryEnabled: Bool = true,
                 makeTransport: @escaping @Sendable (URLRequest) -> WebSocketTransport = { URLSessionWebSocketTransport(request: $0) },
                 drainSeconds: Double = 5,
-                commitDeadline: @escaping @Sendable (Double) -> Double = OpenAIRealtimeProvider.defaultCommitDeadline) {
+                commitDeadline: @escaping @Sendable (Double) -> Double = OpenAIRealtimeProvider.defaultCommitDeadline,
+                onBilled: (@Sendable (OpenAIModel, Double) -> Void)? = nil) {
         self.model = model
+        self.onBilled = onBilled
         self.keyProvider = keyProvider
         self.fileRecovery = fileRecovery
         self.recoveryEnabled = recoveryEnabled
@@ -146,7 +151,9 @@ public final class OpenAIRealtimeProvider: DictationProvider, LiveFrameSink, @un
     public func finish(_ recording: Recording) async throws -> DictationResult {
         defer { close() }
         do {
-            return try await finishLive(recording)
+            let result = try await finishLive(recording)
+            onBilled?(model, recording.durationSeconds)
+            return result
         } catch let error where recoveryEnabled && RealtimeRecovery.shouldRecover(error) {
             guard let fileRecovery else { throw error }
             close()

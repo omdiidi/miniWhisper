@@ -51,7 +51,7 @@ struct OnlineFileJob: Sendable {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let provider = OpenAIFileProvider(model: model, keyProvider: { OpenAIKey.current() })
+        let provider = OpenAIFileProvider(model: model, keyProvider: { OpenAIKey.current() }, onBilled: SpendStore.record)
         let createdAt = Date()
         // Cancelling the task cancels the in-flight upload (the provider's
         // deadline wrapper handles task cancellation).
