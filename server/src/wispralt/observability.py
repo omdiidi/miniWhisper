@@ -210,6 +210,10 @@ eviction_failures_total = _MonotonicCounter()
 # in /metrics and /readyz/db) so the loss is visible. Resets on restart.
 usage_write_failures_total = _MonotonicCounter()
 
+# A dictation whose text was returned but whose row could not be saved
+# (``sqlite3.Error``; the response says ``"saved": false``). Same visibility.
+dictation_save_failures_total = _MonotonicCounter()
+
 
 def mlx_active_mb() -> int:
     """Return MLX active memory in MB; 0 on any failure.

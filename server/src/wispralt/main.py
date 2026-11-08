@@ -210,12 +210,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.file_runner = file_runner
     app.state.shutting_down = False
 
-    # Phase 1 transcript-storage: holds strong refs to in-flight
-    # `_persist_dictation` background tasks so asyncio doesn't GC them
-    # before they complete. The dictate route adds tasks here and removes
-    # them via add_done_callback. Drained on shutdown below.
-    app.state.pending_persists = set()
-
     # Re-enqueueing is deferred until after models load (done below via task).
 
     # 6. Load Parakeet (dictation model — warm + JIT pass).
@@ -394,30 +388,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.shutting_down = True
     await file_runner.shutdown()
     logger.info("Shutdown: file runner stopped.")
-
-    # Phase 1 transcript-storage: drain in-flight dictation persists FIRST so
-    # the SQLite write-lock isn't being released mid-INSERT below. The 2 s
-    # budget is total across all pending persists (gather waits for ALL),
-    # not 2 s each; under a SIGTERM burst some tasks may be abandoned and
-    # the warning log records the count.
-    pending: set[asyncio.Task[None]] | None = getattr(
-        app.state, "pending_persists", None
-    )
-    if pending:
-        logger.info(
-            "Awaiting %d pending dictation persist(s) on shutdown...",
-            len(pending),
-        )
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*pending, return_exceptions=True),
-                timeout=2.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Dictation persist drain timed out; %d task(s) abandoned",
-                len(pending),
-            )
 
     # Cancel the daily transcript sweep AND the weekly insights cron together.
     # Both are pure daemon loops; same cancel pattern. transcript_sweep_task

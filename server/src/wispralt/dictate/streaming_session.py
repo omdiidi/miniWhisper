@@ -61,8 +61,11 @@ class FinalizeGap(Exception):
 @dataclass
 class StreamingSession:
     session_id: str
-    owner_api_key_id: int
+    owner_user_id: int
     started_at: float
+    # The dictation's X-Client-Dedup-Id, recorded when the session opens; a
+    # later chunk or finalize with a different id is refused (409).
+    dedup_id: str | None
     last_seen: float
     # Index-aligned with chunk indices. Holes (None) mean "inference still
     # pending" while the corresponding task is in ``pending_tasks``; an
@@ -87,7 +90,7 @@ class StreamingSessionStore:
     Enforces:
       * ``max_active`` concurrent sessions (global cap, protects the single-
         thread Parakeet executor from queue depth blow-up).
-      * One active session per ``api_key_id`` (atomic via ``_store_lock``).
+      * One active session per user (atomic via ``_store_lock``).
       * TTL-based sweeping of idle sessions.
 
     Per-session queue-depth enforcement (``max_queue_depth``) is the route
@@ -113,16 +116,18 @@ class StreamingSessionStore:
         self._store_lock = asyncio.Lock()
 
     async def open_or_get(
-        self, session_id: str, owner_api_key_id: int
+        self, session_id: str, owner_user_id: int, dedup_id: str
     ) -> tuple[StreamingSession, str]:
         """Atomically open a new session or return an existing one.
 
         Status strings:
           * ``"new"`` — created on this call.
-          * ``"existing"`` — same ``(session_id, owner_api_key_id)`` already
+          * ``"existing"`` — same ``(session_id, owner_user_id)`` already
             owned by this caller; ``last_seen`` is refreshed.
           * ``"denied_owner_mismatch"`` — session id exists but belongs to a
-            different api_key.
+            different user.
+          * ``"denied_dedup_mismatch"`` — same owner, but the session was
+            opened under another dedup id.
           * ``"denied_user_busy"`` — caller already owns another active
             session (per-user single-session enforcement).
           * ``"denied_capacity"`` — global ``max_active`` reached.
@@ -130,20 +135,22 @@ class StreamingSessionStore:
         async with self._store_lock:
             existing = self._sessions.get(session_id)
             if existing is not None:
-                if existing.owner_api_key_id != owner_api_key_id:
+                if existing.owner_user_id != owner_user_id:
                     return existing, "denied_owner_mismatch"
+                if existing.dedup_id != dedup_id:
+                    return existing, "denied_dedup_mismatch"
                 # Same owner re-poking same session id — refresh last_seen.
                 existing.last_seen = time.time()
                 return existing, "existing"
 
             # Per-user single-session: scan for another active session owned
-            # by this api_key. Active = status == "active". "finalizing" is
+            # by this user. Active = status == "active". "finalizing" is
             # excluded so a client that fires /chunk while a previous
             # /finalize is in-flight gets owner_mismatch on a fresh sid,
             # NOT user_busy. (Plan: per-user concurrency cap = 1 active
             # transcription; finalize completes within ~15s.)
             for s in self._sessions.values():
-                if s.owner_api_key_id == owner_api_key_id and s.status == "active":
+                if s.owner_user_id == owner_user_id and s.status == "active":
                     return s, "denied_user_busy"
 
             # Capacity check across all non-terminal sessions.
@@ -155,25 +162,27 @@ class StreamingSessionStore:
                 # string and reject the request before using the session.
                 placeholder = StreamingSession(
                     session_id=session_id,
-                    owner_api_key_id=owner_api_key_id,
+                    owner_user_id=owner_user_id,
                     started_at=0.0,
                     last_seen=0.0,
+                    dedup_id=dedup_id,
                 )
                 return placeholder, "denied_capacity"
 
             now = time.time()
             session = StreamingSession(
                 session_id=session_id,
-                owner_api_key_id=owner_api_key_id,
+                owner_user_id=owner_user_id,
                 started_at=now,
                 last_seen=now,
+                dedup_id=dedup_id,
             )
             self._sessions[session_id] = session
             observability.streaming_sessions_opened_total.increment()
             return session, "new"
 
     async def get_for_owner(
-        self, session_id: str, owner_api_key_id: int
+        self, session_id: str, owner_user_id: int
     ) -> StreamingSession:
         """Look up an existing session. Raises ``HTTPException(404)`` if the
         session id is unknown (or was swept) and ``HTTPException(403)`` if the
@@ -184,7 +193,7 @@ class StreamingSessionStore:
             session = self._sessions.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="streaming session not found")
-        if session.owner_api_key_id != owner_api_key_id:
+        if session.owner_user_id != owner_user_id:
             raise HTTPException(status_code=403, detail="streaming session owner mismatch")
         return session
 
@@ -372,7 +381,7 @@ async def _streaming_sweeper(app) -> None:
                     "streaming sweeper aborted stale session sid=%s owner=%d"
                     " age_s=%.1f",
                     session.session_id,
-                    session.owner_api_key_id,
+                    session.owner_user_id,
                     now - session.started_at,
                 )
     except asyncio.CancelledError:

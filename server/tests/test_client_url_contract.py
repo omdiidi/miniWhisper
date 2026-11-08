@@ -1,8 +1,8 @@
-"""Client <-> server URL contract for uploaded-file transcription.
+"""Client <-> server URL contract for file jobs and Local dictation.
 
-Reads the Swift client sources that call the file-job API
-(``client/WisprAlt/Server/FileJobAPI.swift`` and ``ChunkedUploader.swift``),
-extracts every ``"/transcribe/..."`` string literal, replaces each Swift
+Reads the Swift client sources that call the server
+(``client/WisprAlt/Server/FileJobAPI.swift``, ``ChunkedUploader.swift`` and
+``client/WisprAltCore/LocalRequests.swift``), extracts every ``"/transcribe/..."`` string literal, replaces each Swift
 ``\\(...)`` interpolation with a concrete sample value, and asserts that the
 resulting path is served by a route in the real ``create_app()`` route table
 with the method the client sends.
@@ -10,7 +10,9 @@ with the method the client sends.
 The expected method comes from a small table keyed by the enclosing Swift
 function name, not from parsing the Swift (``httpMethod`` / ``method:``), so a
 client that moves a call to the wrong verb still fails here. A minimum literal
-count stops a regex miss from passing vacuously.
+count stops a regex miss from passing vacuously. Every Local dictation
+request (chunk, finalize, whole-file) must send ``X-Client-Dedup-Id`` (Part 4
+dedup contract).
 """
 from __future__ import annotations
 
@@ -26,10 +28,14 @@ from fastapi.routing import APIRoute
 
 from wispralt.main import create_app
 
-_CLIENT_SERVER_DIR = (
-    Path(__file__).resolve().parents[2] / "client" / "WisprAlt" / "Server"
+_CLIENT = Path(__file__).resolve().parents[2] / "client"
+_LOCAL_REQUESTS = _CLIENT / "WisprAltCore" / "LocalRequests.swift"
+_SWIFT_FILES = (
+    _CLIENT / "WisprAlt" / "Server" / "FileJobAPI.swift",
+    _CLIENT / "WisprAlt" / "Server" / "ChunkedUploader.swift",
+    _LOCAL_REQUESTS,
 )
-_SWIFT_FILES = ("FileJobAPI.swift", "ChunkedUploader.swift")
+_DICTATION_FUNCS = ("chunk", "finalize", "wholeFile")
 
 # Swift function name -> HTTP method the client sends from it.
 _EXPECTED_METHOD = {
@@ -40,6 +46,9 @@ _EXPECTED_METHOD = {
     "download": "GET",
     "delete": "DELETE",
     "cancel": "DELETE",
+    "chunk": "POST",           # LocalRequests: stream chunk
+    "finalize": "POST",        # LocalRequests: stream finalize
+    "wholeFile": "POST",       # LocalRequests: /transcribe/dictate (+ Retry)
 }
 
 # Interpolated Swift expression -> concrete sample value.
@@ -49,6 +58,8 @@ _SAMPLES = {
     "uploadID": _SAMPLE_UUID,
     "chunkIndex": "0",
     "format": "txt",
+    "sessionId": _SAMPLE_UUID,
+    "index": "0",
 }
 
 _LITERAL_RE = re.compile(r'"(/transcribe/[^"]*)"')
@@ -72,8 +83,9 @@ def _concrete(literal: str) -> str:
 def _client_calls() -> list[tuple[str, str, str, str]]:
     """Return (file, swift_func, raw_literal, concrete_path) for every literal."""
     calls: list[tuple[str, str, str, str]] = []
-    for name in _SWIFT_FILES:
-        source = (_CLIENT_SERVER_DIR / name).read_text(encoding="utf-8")
+    for path in _SWIFT_FILES:
+        name = path.name
+        source = path.read_text(encoding="utf-8")
         current_func: str | None = None
         for line in source.splitlines():
             stripped = line.strip()
@@ -97,8 +109,9 @@ def api_routes() -> list[APIRoute]:
 
 def test_enough_client_literals_found() -> None:
     calls = _client_calls()
-    # submit, chunked init/chunk/finalize, poll, download, delete (+ cancel).
-    assert len(calls) >= 7, calls
+    # submit, chunked init/chunk/finalize, poll, download, delete (+ cancel),
+    # and the three Local dictation requests.
+    assert len(calls) >= 10, calls
     funcs = {func for _, func, _, _ in calls}
     missing = set(_EXPECTED_METHOD) - funcs
     assert not missing, f"expected client funcs without a /transcribe literal: {missing}"
@@ -118,3 +131,23 @@ def test_every_client_path_is_served(api_routes: list[APIRoute]) -> None:
         if not served:
             failures.append(f"{file}:{func} {method} {path} (from {raw!r}) has no route")
     assert failures == [], "\n".join(failures)
+
+
+def _func_bodies(source: str) -> dict[str, str]:
+    """Swift func name -> its text up to the next ``func`` (good enough for one file)."""
+    parts = _FUNC_RE.split(source)
+    return {parts[i]: parts[i + 1] for i in range(1, len(parts) - 1, 2)}
+
+
+def test_every_local_dictation_request_sends_the_dedup_header() -> None:
+    bodies = _func_bodies(_LOCAL_REQUESTS.read_text(encoding="utf-8"))
+    # The shared builder sets the header from its dedup argument ...
+    assert re.search(
+        r'setValue\(dedupId\.lowercased\(\), forHTTPHeaderField: "X-Client-Dedup-Id"\)',
+        bodies["post"],
+    ), "LocalRequests.post no longer sets X-Client-Dedup-Id"
+    # ... and every dictation request goes through it with its dedupId.
+    for func in _DICTATION_FUNCS:
+        assert re.search(r"\bpost\([^\n]*\bdedupId\b", bodies[func]), (
+            f"LocalRequests.{func} does not pass dedupId to post()"
+        )

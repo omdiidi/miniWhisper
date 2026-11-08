@@ -26,6 +26,26 @@ from wispralt.config import settings
 from wispralt.routes.dictate import router as dictate_router
 
 
+class _StubJobStore:
+    """In-memory stand-in for the dictation half of ``JobStore``."""
+
+    def __init__(self) -> None:
+        self.saved: list[dict[str, Any]] = []
+
+    def find_dictation(self, dedup_id: str, user_id: int) -> str | None:
+        return None
+
+    def insert_dictation(self, **row: Any) -> tuple[str, bool]:
+        self.saved.append(row)
+        return row["text"], False
+
+
+def _test_user() -> Any:
+    from wispralt.accounts.store import User
+
+    return User(id=7, key_id=None, label="t", role="employee", kind="employee")
+
+
 def _build_test_app(transcribe_side_effect: Any) -> FastAPI:
     """Build a minimal FastAPI app with the dictate router and a stub Parakeet.
 
@@ -42,12 +62,13 @@ def _build_test_app(transcribe_side_effect: Any) -> FastAPI:
 
     app.state.parakeet_service = _StubParakeet()
     app.state.parakeet_last_inference_at = None
+    app.state.job_store = _StubJobStore()
     app.include_router(dictate_router)
 
     # Override the bearer-auth dependency so we can hit the route without a key.
     from wispralt.auth import require_api_key
 
-    app.dependency_overrides[require_api_key] = lambda: None
+    app.dependency_overrides[require_api_key] = _test_user
     return app
 
 
@@ -152,7 +173,6 @@ class TestSmartFormatRemoved:
         from wispralt.auth import require_api_key
         from wispralt.dictate.streaming_session import StreamingSessionStore
         from wispralt.routes.dictate_stream import router as stream_router
-        from wispralt.accounts.store import User
 
         texts = iter(["um hello", "world"])
 
@@ -160,23 +180,16 @@ class TestSmartFormatRemoved:
             async def transcribe(self, audio_bytes: bytes) -> tuple[str, float]:
                 return next(texts), 1.0
 
-        saved: list[dict[str, Any]] = []
-
-        class _StubJobStore:
-            def insert_streaming_dictation_idempotent(self, **kwargs: Any) -> int:
-                saved.append(kwargs)
-                return 1
-
+        job_store = _StubJobStore()
+        saved = job_store.saved
         app = FastAPI()
         app.state.parakeet_service = _StubParakeet()
-        app.state.job_store = _StubJobStore()
+        app.state.job_store = job_store
         app.state.streaming_sessions = StreamingSessionStore(
             max_active=2, max_queue_depth=12, ttl_s=900, finalize_timeout_s=15
         )
         app.include_router(stream_router)
-        app.dependency_overrides[require_api_key] = lambda: User(
-            id=7, key_id=None, label="t", role="employee", kind="employee"
-        )
+        app.dependency_overrides[require_api_key] = _test_user
         sid = "11111111-2222-4333-8444-555555555555"
         dedup = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         wav = _silent_wav_bytes(0.05)
@@ -184,6 +197,7 @@ class TestSmartFormatRemoved:
             chunk = client.post(
                 f"/transcribe/dictate/stream/{sid}/chunk/0",
                 files={"file": ("c.wav", wav, "audio/wav")},
+                headers={"X-Client-Dedup-Id": dedup},
             )
             assert chunk.status_code == 202, chunk.text
             resp = client.post(

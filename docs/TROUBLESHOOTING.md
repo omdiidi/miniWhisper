@@ -127,10 +127,11 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 Users, API keys and usage events live in `DATA_DIR/wispralt.db` (SQLite). There is no pool to rebuild and no watcher.
 
-- `curl https://transcribe.<your-domain>/readyz/db` → 200 `{"status":"ok","usage_write_failures":0}` when healthy.
+- `curl https://transcribe.<your-domain>/readyz/db` → 200 `{"status":"ok","usage_write_failures":0,"dictation_save_failures":0}` when healthy.
 - 503 `reason: "db_error"` — the DB file is missing or unreadable (`ls -l "$DATA_DIR/wispralt.db"`; it should be 0600 and owned by the server user; check free disk). Every authenticated request returns 503 "Auth temporarily unavailable" meanwhile — there is no fallback admin.
 - 503 `reason: "schema_outdated"` — a migration is not applied; restart the server (it migrates at startup) and check its log for `MigrationError`.
 - `usage_write_failures` > 0 (also `usage_write_failures_total` in `/metrics`) — that many usage rows were lost to a `sqlite3.Error`; the requests themselves succeeded. The log line `usage write failed: <ErrorType>` names the cause (usually `OperationalError: database is locked` under heavy contention).
+- `dictation_save_failures` > 0 (also `dictation_save_failures_total` in `/metrics`) — that many dictations were returned to the client with `"saved": false` (log line `dictation save failed: <ErrorType>`). The client kept those recordings under Retry; a Retry with the same dictation id saves them once the DB is healthy.
 
 ### IMPORTANT: /readyz/db is observability-only
 Do NOT wire `/readyz/db` into Cloudflare origin health-check (use `/healthz`),

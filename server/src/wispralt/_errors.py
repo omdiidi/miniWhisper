@@ -16,6 +16,14 @@ class AlreadyBootstrapped(Exception):
     """First-admin bootstrap refused: an enabled admin already exists."""
 
 
+class DedupConflict(Exception):
+    """The dictation dedup id is already stored for another user (HTTP 409 ``dedup_conflict``)."""
+
+
+class DictationDeleted(Exception):
+    """The dictation stored under this dedup id was deleted by its owner (HTTP 410 ``dictation_deleted``)."""
+
+
 class DiskFullError(Exception):
     """Raised when a write fails because the filesystem has no free space (ENOSPC)."""
 

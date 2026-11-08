@@ -21,7 +21,7 @@ The bearer is sha256-hashed and looked up in the local SQLite DB (`api_keys ⋈ 
 **Unauthenticated endpoints** (probe-style + admin login, no API key required):
 - `GET /healthz` — liveness probe
 - `GET /readyz/dictation` — dictation-pipeline readiness probe
-- `GET /readyz/db` — local SQLite DB readiness (`reason`: `db_error` / `schema_outdated`; body carries `usage_write_failures`)
+- `GET /readyz/db` — local SQLite DB readiness (`reason`: `db_error` / `schema_outdated`; body carries `usage_write_failures` and `dictation_save_failures`)
 - `GET /admin/login` and `POST /admin/login` — admin UI login form (chicken-and-egg: must be reachable without the cookie it sets)
 - `GET /me/login` and `POST /me/login` — employee portal login form (Phase 2; same chicken-and-egg reason)
 
@@ -32,7 +32,6 @@ These are intentionally open so Kubernetes-style probes, Cloudflare health check
 - `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/models/{id}` (OpenAI-compatible drop-in surface — see [OPENAI-COMPAT.md](OPENAI-COMPAT.md))
 - `GET /me`, `PATCH /me`, `GET /me/insights` (Phase 2 — employee self-view)
 - `GET /me/history`, `GET /me/history/{kind}/{row_id}`, `DELETE /me/history/{kind}/{row_id}`, `POST /me/history/{kind}/{row_id}/restore`, `GET /me/history/{kind}/{row_id}/download/{fmt}` (Plan A — personal transcript archive)
-- `GET /me/dictations/last` (v0.5.0 — caller's most recent non-deleted dictation; powers the "Copy last dictation" menubar button)
 - `GET /metrics`
 - All `/admin/*` routes **except** `/admin/login`. The admin UI also accepts a `wispralt_admin_token` cookie (set by `POST /admin/login`) as a fallback for browser navigation.
 - `/admin/*` (except login) additionally require `role='admin'` — an employee-role token gets **403**.
@@ -138,11 +137,16 @@ Transcribe a short audio clip using the warm Parakeet model.
 | Header | Values | Default | Notes |
 |---|---|---|---|
 | `X-Smart-Format` | — | — | **Removed (Part 4).** Server smart formatting (OpenRouter Mercury) is gone; the header is ignored and the raw transcript is always returned. Any formatting now happens in the client. |
-| `X-Client-Dedup-Id` | UUID v4 string | absent ⇒ off | **Optional, additive (Phase 5b streaming-dictation).** When present, must be a syntactically valid UUID v4. Forwarded to `JobStore.insert_dictation(..., client_dedup_id=...)`; the row participates in the `idx_dictations_client_dedup` partial-unique index, so a subsequent retry that sends the same UUID is silently de-duped (`ON CONFLICT(client_dedup_id) DO NOTHING`). Used by the safety-buffer fallback in `DictationStreamSession` to guarantee at most one persisted row per utterance when a streaming finalize loses to its local fallback. When the header is **absent**, behavior is bit-identical to the pre-streaming contract: the column is left NULL and the partial-unique index never applies. Malformed UUIDs are rejected at the validation boundary (422). |
+| `X-Client-Dedup-Id` | UUID string | absent ⇒ no dedup | Optional here (required on the stream routes). RFC-4122 shape, lowercased on read; malformed → 422. Names one dictation: the server claims the id for the whole request (concurrent requests with the same id, from any user, run inference once), replays a stored dictation without inference, and stores at most one `dictations` row per id. Absent ⇒ no claim, no replay, the row is stored with a NULL id. See [Client dedup contract](#client-dedup-contract). |
 
 #### Client dedup contract
 
-The macOS client (Core `LocalRequests`) sends `X-Client-Dedup-Id: <dictation id>` (lowercase UUID v4) on every Local dictation request: whole-file, every stream chunk, and finalize (which also carries the `client_dedup_id` field with the same value). It reads `"saved": true|false` from a 200 (absent ⇒ true): on `false` the text is delivered and the audio is kept. It treats 410 `{"error":"dictation_deleted"}` and 409 `{"error":"dedup_conflict"}` as terminal for that dictation (no fallback, no retry); a 409/410 without an `error` key is handled as today. The server side of `saved`, 409 and 410 lands in Part 4.
+Pinned in Part 4 (server `dedup.py`, Locked Decision 7); the macOS client (Core `LocalRequests`) implements it.
+
+1. Every Local dictation request (whole-file, every stream chunk, finalize, Retry) sends `X-Client-Dedup-Id: <dictation id>` (lowercase UUID). Finalize may also send the `client_dedup_id` form field; header and field present and unequal → 422.
+2. Every 200 dictation response carries `"saved": true|false` and `"replayed": true|false`. `"saved": false` means the server returned the text but could not store it (a `sqlite3.Error`; `dictation_save_failures_total` +1): the client delivers the text **and keeps the audio and its Retry entry**; a later Retry with the same id transcribes and saves again.
+3. `409 {"error":"dedup_conflict"}` (the id belongs to another user) and `410 {"error":"dictation_deleted"}` (the owner deleted that dictation; re-running would resurrect it) are **terminal**: no inference, no row; the client discards the entry. A 409/410 without an `error` key (e.g. `{"detail":"Session is aborted"}` from a stream route) is not terminal.
+4. `"replayed": true` means the stored text was returned without new inference (`duration_ms` is 0). A replay writes no `usage_events` row.
 
 **Audio format flexibility (server-side resampling):**
 
@@ -161,11 +165,13 @@ The macOS client (Core `LocalRequests`) sends `X-Client-Dedup-Id: <dictation id>
 {
   "text": "Hello world.",
   "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
-  "duration_ms": 143.7
+  "duration_ms": 143.7,
+  "replayed": false,
+  "saved": true
 }
 ```
 
-`duration_ms` is wall-clock Parakeet inference time (excludes queue wait).
+`duration_ms` is wall-clock Parakeet inference time (excludes queue wait). The row is saved synchronously before the response; blank text is not stored and reports `"saved": true` (nothing to keep).
 The `smart_formatted` key was removed in Part 4 along with server smart formatting.
 
 **Errors:**
@@ -174,8 +180,10 @@ The `smart_formatted` key was removed in Part 4 along with server smart formatti
 |---|---|
 | 401 | Missing or invalid bearer token |
 | 413 | Upload size exceeds `MAX_UPLOAD_BYTES` |
+| 409 | `{"error":"dedup_conflict"}` — the dedup id is another user's (terminal) |
+| 410 | `{"error":"dictation_deleted"}` — the owner deleted that dictation (terminal) |
 | 415 | `Content-Type` is not `audio/*` |
-| 422 | Audio bytes cannot be decoded (corrupt file). Includes `LibsndfileError` and `RuntimeError` raised by `soundfile.read` — the decode boundary in `parakeet.py:_sync_transcribe` converts both to `CorruptAudioError` and the route handler maps them to 422. Regression-locked by `server/tests/test_dictate_corrupt_audio.py`. |
+| 422 | Malformed `X-Client-Dedup-Id`, or audio bytes cannot be decoded (corrupt file). Includes `LibsndfileError` and `RuntimeError` raised by `soundfile.read` — the decode boundary in `parakeet.py:_sync_transcribe` converts both to `CorruptAudioError` and the route handler maps them to 422. Regression-locked by `server/tests/test_dictate_corrupt_audio.py`. |
 | 429 | Rate limit exceeded (60 req/min) — includes `Retry-After: 60` header |
 
 ---
@@ -193,13 +201,15 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 | `session_id` | UUID v4 string | Client-generated. Syntactically validated (422 on malformed). The same `session_id` is reused for every chunk + the finalize call. |
 | `index` | integer ≥ 0 | Zero-based monotonic chunk index. Out-of-order arrival is tolerated server-side (first arrival wins the slot via `partial_texts[index]`). |
 
-**Request:** `multipart/form-data` with a single `file` field; `Content-Type: audio/wav` (or `audio/*`).
+**Request:** `multipart/form-data` with a single `file` field; `Content-Type: audio/wav` (or `audio/*`). Header `X-Client-Dedup-Id` is **required** (422 if absent or malformed); the session records it when it opens.
 
 **Response 202:**
 
 ```json
 { "received_index": 0, "queue_depth": 1 }
 ```
+
+If a dictation with this dedup id is already stored for the caller, the chunk is not processed and no session is opened: `202 {"received_index": N, "queue_depth": 0, "finalized": true}`.
 
 `queue_depth` is the count of currently-pending Parakeet tasks for this session (≥1 because the just-ingested chunk is counted). The route returns as soon as the chunk is enqueued — actual Parakeet work runs asynchronously and lands in `partial_texts` when complete.
 
@@ -209,11 +219,11 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 |---|---|
 | 401 | Missing or invalid bearer token. |
 | 403 | The bearer resolves to a user who is not the session's owner (recorded at first-chunk open). |
-| 409 | `per_user_busy` — this user already owns a different active session. Either reuse its `session_id` or wait for it to finalize/expire. |
-| 410 | Session is no longer active (status ∈ {finalizing, done, aborted, expired}). The client should fall back to single-shot `/transcribe/dictate` with the safety-buffer WAV. |
+| 409 | `per_user_busy` — this user already owns a different active session. Either reuse its `session_id` or wait for it to finalize/expire. Also: the session was opened under a different dedup id (`{"detail": …}`), or `{"error":"dedup_conflict"}` (the id is another user's). |
+| 410 | `{"error":"dictation_deleted"}` for a deleted stored id; otherwise (`{"detail": …}`) session is no longer active (status ∈ {finalizing, done, aborted, expired}). The client should fall back to single-shot `/transcribe/dictate` with the safety-buffer WAV. |
 | 413 | Cumulative voiced audio for this session exceeds the 270 s mid-chunk ceiling. (Finalize allows up to 300 s.) |
 | 415 | `Content-Type` is not `audio/*`. |
-| 422 | `session_id` is not a valid UUID v4 OR audio bytes cannot be decoded. |
+| 422 | `session_id` is not a valid UUID, `X-Client-Dedup-Id` missing or malformed, OR audio bytes cannot be decoded. |
 | 429 | Per-session pending-task queue depth exceeded (defends against runaway clients). |
 | 503 | `capacity_exceeded` — the global 2-session cap is already saturated. Retry after the other sessions drain, or fall back to single-shot. |
 
@@ -223,7 +233,7 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 
 **Auth:** Bearer required; same per-user-owner gate as `/chunk`. **Opt-in, experimental.**
 
-Close out a streaming session. The server waits up to 15 s for all pending chunk tasks to drain, joins their texts in index order, persists the row to `dictations`, and returns the final text. The chunked-receive route stops accepting new chunks for this `session_id` (returns 410) the moment finalize starts.
+Close out a streaming session. The dedup id is claimed first and a stored dictation is replayed **before** the session lookup, so a Retry after the session expired still gets its text (`"replayed": true`). Otherwise the server waits up to 15 s for all pending chunk tasks to drain, joins their texts in index order, persists the row to `dictations`, and returns the final text. The chunked-receive route stops accepting new chunks for this `session_id` (returns 410) the moment finalize starts.
 
 **Path params:** `session_id` (UUID v4) — same as `/chunk`.
 
@@ -233,7 +243,7 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 |---|---|---|---|
 | `file` | UploadFile | Yes | The tail WAV — the trailing speech segment that was still being accumulated when FN was released. `Content-Type: audio/*`. May be empty (zero-byte) if the speaker happened to finish exactly on a silence cut. |
 | `smart_format` | — | — | **Removed (Part 4).** Ignored if an older client still sends it; the text is never post-processed on the server. |
-| `client_dedup_id` | UUID v4 | Yes | The same UUID the client will reuse on the safety-buffer fallback if this finalize loses. Persisted to `dictations.client_dedup_id`; combined with the `idx_dictations_client_dedup` partial-unique index, guarantees one row per utterance. |
+| `client_dedup_id` | UUID | No | Optional copy of the required `X-Client-Dedup-Id` header (the header wins; both present and unequal → 422). Must equal the id the session opened with (else 409). |
 | `speech_started_at` | float (Unix epoch, sub-second precision) | Yes | The local wall-clock time the *user* began speaking (NOT FN press) — sent so the server can compute end-to-end latency from speech start to text injection without depending on local clock-sync. Sub-second precision is preserved (don't round to int). |
 
 **Response 200:**
@@ -242,7 +252,9 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 {
   "text": "Hello world.",
   "model_id": "mlx-community/parakeet-tdt-0.6b-v2",
-  "duration_ms": 213.4
+  "duration_ms": 213.4,
+  "replayed": false,
+  "saved": true
 }
 ```
 
@@ -255,10 +267,11 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 | 401 | Missing or invalid bearer token. |
 | 403 | The bearer's user is not the session's owner. |
 | 409 | `gap_detected` — `partial_texts` contains a `None` entry between two ingested chunks (a chunk POST landed for index N but index N−1 never arrived). The client should fall back to single-shot. |
-| 410 | Session is not in `status="active"` (already finalizing, done, aborted, or expired). |
+| 409 | Also: the dedup id differs from the session's, or `{"error":"dedup_conflict"}`. |
+| 410 | `{"error":"dictation_deleted"}` (terminal), or `{"detail": …}`: session is not in `status="active"` (already finalizing, done, aborted, or expired). |
 | 413 | Cumulative voiced audio + tail exceeds 300 s. |
 | 415 | Tail `Content-Type` is not `audio/*`. |
-| 422 | `session_id` or `client_dedup_id` is not a valid UUID v4, OR tail audio cannot be decoded. |
+| 422 | `session_id` not a valid UUID; dedup id missing, malformed, or header ≠ form field; OR tail audio cannot be decoded. |
 | 502 | `inference_failed` — Parakeet raised on the tail or on a still-pending chunk during the 15 s drain. |
 | 504 | `timeout` — pending chunks did not drain inside 15 s. Session marked `aborted`; client safety-buffer fallback kicks in. |
 
@@ -370,38 +383,9 @@ Source: `server/src/wispralt/routes/me.py`.
 
 ---
 
-### `GET /me/dictations/last`
+### `GET /me/dictations/last` (removed)
 
-**Auth:** Bearer required (employee or admin token via `Authorization: Bearer <token>`).
-
-Returns the caller's most recent dictation as JSON. Powers the menubar
-"Copy last dictation" button (v0.5.0). Since Part 3 the macOS client no longer calls it (the button reads the client's own `last.json`); the route stays for other clients. The row is filtered by
-`deleted_at IS NULL` so a soft-deleted dictation is not returned; tie-break
-on identical `created_at` is `id DESC`.
-
-**Response 200** (`application/json`):
-
-```json
-{ "id": "4217", "text": "<dictation transcript>", "created_at": 1747700123.456 }
-```
-
-| Field | Type | Notes |
-|---|---|---|
-| `id` | string | The `dictations.id` row id, `CAST(id AS TEXT)` server-side so the value decodes cleanly into the Swift `LastDictationResponse.id: String` shape. |
-| `text` | string | Raw transcript text (no smart-format reapplication). |
-| `created_at` | number | Epoch seconds (float). |
-
-**Errors:**
-
-| Code | Condition |
-|---|---|
-| 401 | Missing / invalid bearer. |
-| 404 | Caller has zero non-deleted dictations. |
-| 503 | SQLite job store transiently unavailable. |
-
-Source: `server/src/wispralt/routes/me.py` +
-`JobStore.get_most_recent_dictation(user_id)` in
-`server/src/wispralt/jobs/store.py`.
+Removed in Part 4 with `JobStore.get_most_recent_dictation`: since Part 3 the macOS client's "Copy last dictation" reads its own `last.json`. The route now returns 404.
 
 ---
 
@@ -921,6 +905,7 @@ Structured server observability snapshot.
     "transcribe/file": {"p50": null, "p95": null, "p99": null}
   },
   "usage_write_failures_total": 0,
+  "dictation_save_failures_total": 0,
   "process_uptime_seconds": 3712.4
 }
 ```
@@ -949,6 +934,7 @@ Structured server observability snapshot.
 | `errors_total` | Error counts keyed by `"route:status"` for 4xx/5xx responses |
 | `latencies` | Per-route p50/p95/p99 latency in ms; `null` if fewer than 2 observations. **Recent-window only**: percentiles include only observations from the last 5 minutes (`LatencyHistogram._RECENT_WINDOW_S`). This protects p50 from being poisoned by a single old outlier (e.g. a hung 197-second upload). The full deque (last 1000 entries, all-time) remains queryable via `LatencyHistogram.percentiles(route, recent_only=False)` for callers that need the legacy view. Regression-locked by `server/tests/test_observability_time_window.py`. |
 | `usage_write_failures_total` | Usage rows lost because `UsageStore.record` raised `sqlite3.Error` (usage is best-effort; the request itself succeeded). Resets on restart. Also in the `/readyz/db` body as `usage_write_failures`. |
+| `dictation_save_failures_total` | Dictations whose text was returned but whose row could not be saved (`sqlite3.Error`; the response said `"saved": false`). Resets on restart. Also in the `/readyz/db` body as `dictation_save_failures`. |
 | `process_uptime_seconds` | Wall time since the FastAPI lifespan started (`time.monotonic() - observability.process_started_at_monotonic`). Useful as a deploy/restart sentinel: `< 60` immediately after `bash scripts/server-launchd.sh restart`. |
 
 ---

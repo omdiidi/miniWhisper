@@ -199,8 +199,8 @@ and `GET /metrics` are **admin-only** — previously they were behind
 `require_api_key` (any authenticated bearer), which leaked operator-level
 introspection to employee tokens. The dependency was tightened to
 `require_admin` in `routes/admin.py` so employees get a 403 on these surfaces
-and use the per-user `/me/*` routes (`/me`, `/me/insights`, `/me/history`,
-`/me/dictations/last`) for their own data instead. The client's "View server
+and use the per-user `/me/*` routes (`/me`, `/me/insights`, `/me/history`)
+for their own data instead. The client's "View server
 log" sheet handles the 403 with a friendly "Admin-only — ask your
 administrator" message rather than a raw error.
 
@@ -330,9 +330,11 @@ Both the streaming-finalize path and the single-shot fallback path (origin retry
 - Core `LocalRequests` sends it as `X-Client-Dedup-Id` on **every** chunk, finalize and whole-file request; `POST /finalize` also sends it as the `client_dedup_id` form field.
 - If finalize fails and the safety-buffer fallback wins, the same id goes to `POST /transcribe/dictate`.
 - Every Local request goes to the `ServerEndpoint` captured at FN press (URL + key), never `Settings.serverURL`, so changing the host mid-dictation leaves the in-flight one on its host. `LocalServerProvider` bounds the whole Local finish by `max(30, 10 + 0.5 × duration)`; on timeout it aborts the session and cancels the request.
-- Part 4 contract, already handled by the client: a 200 with `"saved": false` is delivered as usual and surfaces as `DictationResult.serverSaved == false` (`SpoolDisposition` keeps that audio and its Retry entry); 410 `{"error":"dictation_deleted"}` and 409 `{"error":"dedup_conflict"}` are terminal (`LocalDictationError`, `FailureKind.rejected`): no whole-file fallback, no retry, and the audio and Retry entry are discarded. A Local Retry reuses the entry's dictation id as `X-Client-Dedup-Id`. A 409/410 with a `detail` body (e.g. session not open) is not terminal.
-- The `idx_dictations_client_dedup` **partial unique index** (`WHERE client_dedup_id IS NOT NULL`, see `jobs/store.py`) combined with `ON CONFLICT (client_dedup_id) DO NOTHING` guarantees **at most one row per utterance** no matter which path wins.
-- When `X-Client-Dedup-Id` is absent (today's non-streaming clients, and `/v1/audio/transcriptions`), the column stays NULL and the partial index has no effect — backward compatibility is bit-identical.
+- Part 4 contract (server: `dedup.py`; client: `LocalRequests`): a 200 with `"saved": false` is delivered as usual and surfaces as `DictationResult.serverSaved == false` (`SpoolDisposition` keeps that audio and its Retry entry); 410 `{"error":"dictation_deleted"}` and 409 `{"error":"dedup_conflict"}` are terminal (`LocalDictationError`, `FailureKind.rejected`): no whole-file fallback, no retry, and the audio and Retry entry are discarded. A Local Retry reuses the entry's dictation id as `X-Client-Dedup-Id`. A 409/410 with a `detail` body (e.g. session not open) is not terminal.
+- **Server side (Part 4, `dedup.py`).** The header is canonical: RFC-4122 shape, lowercased, 422 if malformed; required on chunk and finalize, optional on `/transcribe/dictate` (third-party callers). Whole-file and finalize hold an in-process **claim** (`DedupLocks`: one refcounted `asyncio.Lock` per id, keyed by the id alone, across users) across replay check → inference → save, so concurrent requests with one id run inference once; one process serves the DB, so an in-process lock suffices.
+- **Replay before work.** `JobStore.find_dictation(id, user)` runs before the session lookup and inference: same user → 200 with the stored text and `"replayed": true` (no usage row: `request.state.dedup_replay`); another user → 409 `{"error":"dedup_conflict"}`; the owner soft-deleted it → 410 `{"error":"dictation_deleted"}` (no inference, no row; re-running would resurrect deleted text). A chunk for a stored id returns 202 `finalized: true` without opening a session. A session remembers its dedup id; a chunk or finalize with another id → 409.
+- **Synchronous save.** `JobStore.insert_dictation` is one `BEGIN IMMEDIATE` select-or-insert (the global `UNIQUE(client_dedup_id)` stays as the collision detector), so at most one row exists per id whichever path wins. A `sqlite3.Error` still returns the text with `"saved": false`, bumps `dictation_save_failures_total` (in `/metrics` and `/readyz/db`) and logs only the error type. The fire-and-forget persist and its shutdown drain are gone.
+- When `X-Client-Dedup-Id` is absent (third-party callers on `/transcribe/dictate`, and `/v1/audio/transcriptions`, which stores no row) there is no claim or replay and the column stays NULL.
 
 ### Honest fallback latency
 
@@ -358,8 +360,8 @@ The safety buffer is always written, so a streaming failure costs the user **at 
 | Endpoint registration | `main.py` lifespan after `parakeet_service.load()`; `include_router(dictate_stream_routes.router)` after `dictate.router` |
 | Sweeper lifecycle | `main.py` lifespan creates `_streaming_sweeper` task; shutdown cancels + aborts active sessions |
 | Per-session lock contract | `streaming_session.py` — every reader/writer of `status / partial_texts / pending_tasks / last_seen / cumulative_audio_ms` acquires `session.lock` before mutating; `finalize` snapshots under lock before releasing for the `asyncio.gather` await |
-| Dedup-id persistence | `jobs/store.py` — `dictations.client_dedup_id` column + `idx_dictations_client_dedup` partial-unique index (added in Plan A, reused here) |
-| Header passthrough on non-streaming | `routes/dictate.py` — additive read of `X-Client-Dedup-Id` (UUID v4 form), forwarded to `insert_dictation(..., client_dedup_id=...)` |
+| Dedup-id persistence | `jobs/store.py` — `dictations.client_dedup_id UNIQUE`; `find_dictation` / `insert_dictation` (atomic select-or-insert) |
+| Dedup contract | `dedup.py` — header parsing, `DedupLocks` claim, `replay_or_none`, `persist`; used by `routes/dictate.py` and `routes/dictate_stream.py` |
 
 ---
 
@@ -616,10 +618,9 @@ Both tables live in `DATA_DIR/wispralt.db` (`migrations/0001_initial.sql`).
   `transcript["segments"][*].text`; falls back to reading
   `DATA_DIR/outputs/<job_id>.txt` if the joined string is empty.
 - **Dictation transcripts** live in the `dictations` table. Dictation is
-  request-response (no job row), so the route's success path fires-and-forgets
-  an `asyncio.create_task` that calls the store via `asyncio.to_thread`. Tasks
-  are held in `app.state.pending_persists` and drained with a 2-second budget
-  at shutdown (Task 6 replaces this with a synchronous persist).
+  request-response (no job row); the route saves the row synchronously
+  (`dedup.persist` → `JobStore.insert_dictation` in a thread) before it
+  responds, and the response says `"saved": true|false` (see Idempotency).
 
 Both tables carry `user_id`, a real FK to `users`, so `/me/*` filters to one
 user and `/admin/data` groups by it (`JobStore.stats_by_user`, one query).
@@ -1078,7 +1079,7 @@ employees.
 - **"Copy last dictation"** — pinned at the very top of the popover. Since
   Part 3 it reads the client's own `last.json` (see "Spool, Retry and last
   text"), in both modes; the client no longer calls
-  `GET /me/dictations/last` (the server route still exists).
+  `GET /me/dictations/last` (the server route was removed in Part 4).
 - **"Open My Dictations"** — opens
   `<serverURL>/me/login?next=/me/history` in the default browser. The
   `?next=` parameter (server-side open-redirect-guarded to relative paths

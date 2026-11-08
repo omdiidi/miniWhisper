@@ -177,6 +177,9 @@ async def metrics(request: Request) -> JSONResponse:
                 ),
             },
             "usage_write_failures_total": observability.usage_write_failures_total.value,
+            "dictation_save_failures_total": (
+                observability.dictation_save_failures_total.value
+            ),
             "process_uptime_seconds": round(
                 time.monotonic() - observability.process_started_at_monotonic, 1
             ),

@@ -15,7 +15,8 @@ GET /readyz/dictation  (no auth)
 
 GET /readyz/db  (no auth)
     ``SELECT`` on the local SQLite DB plus "schema current" (observability only).
-    Also reports ``usage_write_failures`` (best-effort usage rows lost).
+    Also reports ``usage_write_failures`` (best-effort usage rows lost) and
+    ``dictation_save_failures`` (dictations returned with ``saved: false``).
 
 Auth note: readiness probes intentionally bypass bearer auth so that
 Kubernetes-style probes, Cloudflare health checks, and external monitoring
@@ -90,7 +91,10 @@ async def readyz_db(request: Request) -> JSONResponse:
 
     Observability only: do not wire this into a restart trigger.
     """
-    failures = {"usage_write_failures": observability.usage_write_failures_total.value}
+    failures = {
+        "usage_write_failures": observability.usage_write_failures_total.value,
+        "dictation_save_failures": observability.dictation_save_failures_total.value,
+    }
     db = getattr(request.app.state, "db", None)
     reason = "db_error" if db is None else await asyncio.to_thread(db.check)
     if reason is not None:

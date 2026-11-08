@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
 from wispralt.auth import (
@@ -116,34 +116,6 @@ async def patch_me(
     if profile is None:
         raise HTTPException(status_code=404, detail="user_not_found")
     return _profile_to_response(profile)
-
-
-@router.get("/dictations/last")
-async def me_last_dictation(
-    request: Request,
-    user: User = Depends(forbid_integration_kind),
-) -> JSONResponse:
-    """Return the most recent dictation row for the authenticated user.
-
-    Used by the menubar "Copy last dictation" button. The endpoint is
-    employee-scoped: every user gets their OWN last row, never anyone
-    else's. Admin role does not bypass this — admins also see their own
-    last dictation (for cross-user analytics they use /admin/data).
-
-    Returns 404 if the user has zero (non-deleted, non-empty) dictations.
-    """
-    job_store: JobStore = request.app.state.job_store
-    row = await asyncio.to_thread(
-        job_store.get_most_recent_dictation, user.id,
-    )
-    if row is None:
-        raise HTTPException(404, "No dictations yet")
-
-    return JSONResponse({
-        "id": row["id"],
-        "text": row["text"],
-        "created_at": row["created_at"],
-    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────

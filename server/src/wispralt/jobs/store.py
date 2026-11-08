@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from wispralt._errors import UploadTruncatedError
+from wispralt._errors import DedupConflict, DictationDeleted, UploadTruncatedError
 from wispralt.ops.staging import validate_wav_completeness
 
 if TYPE_CHECKING:
@@ -362,100 +362,64 @@ class JobStore:
 
     # ── dictations ────────────────────────────────────────────────────────────
 
-    def _insert_dictation(
+    @staticmethod
+    def _stored_text(con: sqlite3.Connection, dedup_id: str, user_id: int) -> str | None:
+        """Stored text for *dedup_id* owned by *user_id*, None if absent.
+
+        ``DedupConflict`` when another user owns the id; ``DictationDeleted``
+        when the owner soft-deleted it (re-running would resurrect it).
+        """
+        row = con.execute(
+            "SELECT user_id, text, deleted_at FROM dictations WHERE client_dedup_id = ?",
+            (dedup_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["user_id"] != user_id:
+            raise DedupConflict(dedup_id)
+        if row["deleted_at"] is not None:
+            raise DictationDeleted(dedup_id)
+        return row["text"]
+
+    def find_dictation(self, dedup_id: str, user_id: int) -> str | None:
+        """Replay lookup: the stored text, None, or ``DedupConflict`` / ``DictationDeleted``."""
+        with self.db.read() as con:
+            return self._stored_text(con, dedup_id, user_id)
+
+    def insert_dictation(
         self,
-        con: sqlite3.Connection,
         *,
         user_id: int,
         text: str,
         duration_ms: int | None,
         client_app_version: str | None,
         dedup_id: str | None,
-        created_at: float,
-    ) -> int | None:
-        cur = con.execute(
-            "INSERT INTO dictations(user_id, created_at, duration_ms, text, word_count,"
-            " client_app_version, client_dedup_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(client_dedup_id) DO NOTHING",
-            (user_id, created_at, duration_ms, text, len(text.split()), client_app_version, dedup_id),
-        )
-        return int(cur.lastrowid) if cur.rowcount == 1 else None
+        created_at: float | None = None,
+    ) -> tuple[str, bool]:
+        """Atomic select-or-insert in one ``BEGIN IMMEDIATE``. Returns ``(text, replayed)``.
 
-    def insert_dictation(
-        self, user_id: int, text: str, duration_ms: int | None, client_app_version: str | None
-    ) -> int:
-        """Persist one dictation row; returns its id."""
+        An existing row for *dedup_id* returns its stored text with
+        ``replayed=True`` (or raises as ``find_dictation``).
+        """
         with self.db.write() as con:
-            row_id = self._insert_dictation(
-                con,
-                user_id=user_id,
-                text=text,
-                duration_ms=duration_ms,
-                client_app_version=client_app_version,
-                dedup_id=None,
-                created_at=time.time(),
+            if dedup_id is not None:
+                stored = self._stored_text(con, dedup_id, user_id)
+                if stored is not None:
+                    return stored, True
+            con.execute(
+                "INSERT INTO dictations(user_id, created_at, duration_ms, text, word_count,"
+                " client_app_version, client_dedup_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    time.time() if created_at is None else created_at,
+                    duration_ms,
+                    text,
+                    len(text.split()),
+                    client_app_version,
+                    dedup_id,
+                ),
             )
-        assert row_id is not None  # no dedup id → no conflict possible
-        return row_id
-
-    def insert_dictation_idempotent(
-        self,
-        *,
-        user_id: int,
-        text: str,
-        duration_ms: int | None,
-        client_app_version: str | None,
-        client_dedup_id: str | None,
-    ) -> int:
-        """Whole-file dictation: insert, or return the existing row id for the dedup id."""
-        with self.db.write() as con:
-            row_id = self._insert_dictation(
-                con,
-                user_id=user_id,
-                text=text,
-                duration_ms=duration_ms,
-                client_app_version=client_app_version,
-                dedup_id=client_dedup_id,
-                created_at=time.time(),
-            )
-            if row_id is None:
-                row_id = con.execute(
-                    "SELECT id FROM dictations WHERE client_dedup_id = ?", (client_dedup_id,)
-                ).fetchone()["id"]
-        return row_id
-
-    def insert_streaming_dictation_idempotent(
-        self,
-        *,
-        user_id: int,
-        text: str,
-        duration_ms: int | None,
-        client_app_version: str | None,
-        client_dedup_id: str,
-        dictated_at: float,
-    ) -> int | None:
-        """Streaming finalize: insert with the speech-start time; None if the dedup id exists."""
-        with self.db.write() as con:
-            return self._insert_dictation(
-                con,
-                user_id=user_id,
-                text=text,
-                duration_ms=duration_ms,
-                client_app_version=client_app_version,
-                dedup_id=client_dedup_id,
-                created_at=dictated_at,
-            )
-
-    def get_most_recent_dictation(self, user_id: int) -> dict[str, Any] | None:
-        """Newest non-deleted, non-empty dictation of *user_id* (``id`` as text), or None."""
-        with self.db.read() as con:
-            r = con.execute(
-                "SELECT CAST(id AS TEXT) AS id, text, created_at FROM dictations"
-                " WHERE user_id = ? AND text != '' AND deleted_at IS NULL"
-                " ORDER BY created_at DESC, id DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
-        return None if r is None else dict(r)
+        return text, False
 
     def dictation_counts(self, now: float) -> dict[str, int]:
         """Non-deleted dictations in the last 24 h / 7 d / 30 d (portal tiles)."""

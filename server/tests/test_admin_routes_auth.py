@@ -203,13 +203,13 @@ def test_overview_numbers_match_the_stores(
 ) -> None:
     now = time.time()
     for age in (60, 3 * 86400):
-        job_store.insert_streaming_dictation_idempotent(
+        job_store.insert_dictation(
             user_id=seeded.id,
             text="hello",
             duration_ms=None,
             client_app_version=None,
-            client_dedup_id=f"00000000-0000-4000-8000-{age:012d}",
-            dictated_at=now - age,
+            dedup_id=f"00000000-0000-4000-8000-{age:012d}",
+            created_at=now - age,
         )
     html = client.get("/admin/", headers=admin[1]).text
     values = _tiles(html)
@@ -235,7 +235,10 @@ def test_streamed_dictation_counts_once(
     now = time.time()
     for _chunk_or_finalize in range(4):  # 3 stream chunks + 1 finalize
         usage.record(UsageEvent(user_id=bob.id, ts=now, kind="dictate", status=202))
-    job_store.insert_dictation(bob.id, "one dictation", 100, None)
+    job_store.insert_dictation(
+        user_id=bob.id, text="one dictation", duration_ms=100, client_app_version=None,
+        dedup_id=None,
+    )
     values = _tiles(client.get("/admin/", headers=admin[1]).text)
     assert values["Dictations 24h"] == "1"
 

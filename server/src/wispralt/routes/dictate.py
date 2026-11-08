@@ -9,33 +9,32 @@ Validation at this boundary (per backend-patterns rule):
 - Content-Type must be audio/*  (HTTP 415)
 - Content-Length must be <= settings.max_upload_bytes  (HTTP 413)
 - Corrupt audio reported by the audio layer  (HTTP 422)
+- Malformed ``X-Client-Dedup-Id`` (HTTP 422)
+
+Dedup (``dedup.py``, Locked Decision 7): the optional ``X-Client-Dedup-Id``
+is claimed for the whole request; a stored id replays its text without
+inference (``"replayed": true``) or returns the pinned 409/410 body. The row
+is saved synchronously; every 200 carries ``"saved": true|false``.
 """
 
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import logging
-import re
-import sqlite3
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
+from .. import dedup
+from ..accounts.store import User
 from ..audio import CorruptAudioError
 from ..auth import require_api_key
 from ..config import settings
 from ..dictate.parakeet import MODEL_ID
 from ..jobs.store import JobStore
-from ..accounts.store import User
 
 logger = logging.getLogger(__name__)
-
-# Streaming plan §7: optional client-supplied dedup id. Header is absent on
-# the legacy / non-streaming path, in which case behavior stays bit-identical
-# to the pre-streaming code (NULL is silently accepted by the partial unique
-# index).
-_UUID_RE = re.compile(r"^[0-9a-f-]{36}$", re.I)
 
 router = APIRouter()
 
@@ -59,13 +58,15 @@ async def transcribe_dictate(
     Returns
     -------
     200 JSON
-        ``{ "text": str, "model_id": str, "duration_ms": float }``
+        ``{ "text", "model_id", "duration_ms", "replayed": bool, "saved": bool }``
 
     Errors
     ------
     413  Content-Length exceeds MAX_UPLOAD_BYTES
     415  Content-Type is not audio/*
-    422  Bytes cannot be decoded as valid audio
+    409  ``{"error": "dedup_conflict"}`` — the dedup id is another user's
+    410  ``{"error": "dictation_deleted"}`` — the owner deleted that dictation
+    422  Bytes cannot be decoded as valid audio, or a malformed dedup id
     """
     # 1. Content-Type validation — must be audio/*
     content_type = (file.content_type or "").lower()
@@ -105,107 +106,71 @@ async def transcribe_dictate(
             ),
         )
 
-    # 4. Dispatch to ParakeetService (runs in single-thread executor)
-    parakeet_service = request.app.state.parakeet_service
-    inference_start = time.perf_counter()
+    # 4. Dedup: claim the id for the whole request, then replay if stored.
+    did = dedup.dedup_id(request, None, required=False)
+    job_store: JobStore = request.app.state.job_store
+    claim = dedup.locks(request).claim(did) if did else contextlib.nullcontext()
+    async with claim:
+        if did is not None:
+            stored = await dedup.replay_or_none(request, job_store, did, user.id)
+            if isinstance(stored, JSONResponse):
+                return stored
+            if stored is not None:
+                return _response(stored, 0.0, replayed=True, saved=True)
 
-    try:
-        text, inference_ms = await parakeet_service.transcribe(audio_bytes)
-    except CorruptAudioError as exc:
-        logger.warning("Corrupt audio upload: %s", exc)
-        raise HTTPException(status_code=422, detail=f"Corrupt audio: {exc}") from exc
+        # 5. Dispatch to ParakeetService (runs in single-thread executor)
+        try:
+            text, inference_ms = await request.app.state.parakeet_service.transcribe(
+                audio_bytes
+            )
+        except CorruptAudioError as exc:
+            logger.warning("Corrupt audio upload: %s", exc)
+            raise HTTPException(status_code=422, detail=f"Corrupt audio: {exc}") from exc
 
-    # Record timestamp of last successful inference for /metrics observability.
-    request.app.state.parakeet_last_inference_at = time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-    )
-
-    # Streaming plan §7: optional dedup id. Absent on legacy clients → None →
-    # insert_dictation_idempotent runs the same INSERT as today.
-    client_dedup_id = request.headers.get("X-Client-Dedup-Id")
-    if client_dedup_id is not None and not _UUID_RE.match(client_dedup_id):
-        client_dedup_id = None  # silently ignore malformed → preserve current behavior
-
-    # Single per-request timing line — the breakdown a future investigator
-    # needs to attribute latency to a stage without re-deriving it from
-    # request_id correlation. Order: how a request flows.
-    total_handler_ms = (time.perf_counter() - body_start) * 1_000.0
-    logger.info(
-        "dictate: body_read_ms=%.1f inference_ms=%.1f "
-        "total_handler_ms=%.1f bytes_in=%d chars=%d words=%d",
-        body_read_ms,
-        inference_ms,
-        total_handler_ms,
-        len(audio_bytes),
-        len(text),
-        len(text.split()),
-    )
-
-    # Phase 1 transcript-storage: fire-and-forget INSERT into the dictations
-    # table. Skip empty/whitespace-only text — it would pollute the
-    # weekly-insights cron with noise.
-    # The dictation HTTP response has already been computed above; this task
-    # runs after the route returns and never blocks the user-facing path.
-    if (
-        user is not None
-        and text
-        and text.strip()
-    ):
-        client_version = request.headers.get("X-WisprAlt-Client-Version")
-        job_store: JobStore | None = getattr(
-            request.app.state, "job_store", None
+        # Record timestamp of last successful inference for /metrics observability.
+        request.app.state.parakeet_last_inference_at = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
         )
-        # duration_ms here stores Parakeet inference latency (NOT audio
-        # length). Phase 2 weekly cron can use it for per-user latency
-        # trends; if we ever want true audio length, add a separate column.
-        captured_inference_ms = (
-            int(inference_ms) if inference_ms is not None else None
+        total_handler_ms = (time.perf_counter() - body_start) * 1_000.0
+        logger.info(
+            "dictate: body_read_ms=%.1f inference_ms=%.1f "
+            "total_handler_ms=%.1f bytes_in=%d chars=%d words=%d",
+            body_read_ms,
+            inference_ms,
+            total_handler_ms,
+            len(audio_bytes),
+            len(text),
+            len(text.split()),
         )
-        captured_text = text
-        captured_user_id = int(user.id)
-        captured_dedup_id = client_dedup_id
 
-        async def _persist_dictation() -> None:
-            if job_store is None:
-                logger.error("dictation persist skipped: job_store missing")
-                return
-            try:
-                # asyncio.to_thread is required: JobStore._exec acquires a
-                # threading.Lock (sync). Calling synchronously from the event
-                # loop would block under SQLite-WAL contention.
-                await asyncio.to_thread(
-                    job_store.insert_dictation_idempotent,
-                    user_id=captured_user_id,
-                    text=captured_text,
-                    duration_ms=captured_inference_ms,
-                    client_app_version=client_version,
-                    client_dedup_id=captured_dedup_id,
-                )
-            except (sqlite3.Error, OSError) as exc:
-                # Narrow typed errors — only the realistic failure modes for
-                # insert_dictation. Use logger.error (NOT .exception) so a
-                # custom traceback formatter can't include the transcript
-                # text via locals; log the exception type only.
-                logger.error(
-                    "dictation persist failed: %s", type(exc).__name__
-                )
-
-        # Task-leak guard: hold a strong reference until completion. Without
-        # this, asyncio.create_task tasks with no other reference can be
-        # garbage-collected before they run (documented asyncio behavior).
-        # request.app.state.pending_persists is initialized in lifespan().
-        pending: set[asyncio.Task[None]] | None = getattr(
-            request.app.state, "pending_persists", None
+        # 6. Save synchronously. Blank text is not stored (insights noise);
+        #    there is nothing to keep, so it reports saved=true.
+        #    duration_ms stores inference latency, not audio length.
+        if not text.strip():
+            return _response(text, inference_ms, replayed=False, saved=True)
+        saved = await dedup.persist(
+            request,
+            job_store,
+            user_id=user.id,
+            text=text,
+            duration_ms=int(inference_ms),
+            client_app_version=request.headers.get("X-WisprAlt-Client-Version"),
+            dedup_id=did,
         )
-        task = asyncio.create_task(_persist_dictation())
-        if pending is not None:
-            pending.add(task)
-            task.add_done_callback(pending.discard)
+        if isinstance(saved, JSONResponse):
+            return saved
+        stored_text, ok = saved
+        replayed = bool(getattr(request.state, "dedup_replay", False))
+        return _response(stored_text, inference_ms, replayed=replayed, saved=ok)
 
+
+def _response(text: str, inference_ms: float, *, replayed: bool, saved: bool) -> JSONResponse:
     return JSONResponse(
         content={
             "text": text,
             "model_id": MODEL_ID,
             "duration_ms": round(inference_ms, 2),
+            "replayed": replayed,
+            "saved": saved,
         }
     )

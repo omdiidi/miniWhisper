@@ -84,7 +84,9 @@ def test_unknown_user_is_integrity_error(job_store: JobStore) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         job_store.create("/tmp/a.m4a", user_id=999)
     with pytest.raises(sqlite3.IntegrityError):
-        job_store.insert_dictation(999, "hi", None, None)
+        job_store.insert_dictation(
+            user_id=999, text="hi", duration_ms=None, client_app_version=None, dedup_id=None
+        )
 
 
 def test_wav_path_relative_in_db_absolute_out(job_store: JobStore, uid: int) -> None:
@@ -155,29 +157,38 @@ def test_insert_dictation_while_a_job_is_running(job_store: JobStore, uid: int) 
     worker = threading.Thread(target=churn)
     worker.start()
     try:
-        ids = [job_store.insert_dictation(uid, f"text {i}", 10, "1.0") for i in range(20)]
+        for i in range(20):
+            job_store.insert_dictation(
+                user_id=uid, text=f"text {i}", duration_ms=10, client_app_version="1.0",
+                dedup_id=None,
+            )
     finally:
         stop.set()
         worker.join()
-    assert len(set(ids)) == 20
+    with job_store.db.read() as con:
+        assert con.execute("SELECT COUNT(*) FROM dictations").fetchone()[0] == 20
     assert job_store.get_status(jid) == "running"
 
 
-def test_dictation_counts_and_most_recent(job_store: JobStore, uid: int) -> None:
+def test_dictation_counts(job_store: JobStore, uid: int) -> None:
     now = time.time()
     for age in (60, 2 * DAY, 10 * DAY, 40 * DAY):
-        job_store.insert_streaming_dictation_idempotent(
+        job_store.insert_dictation(
             user_id=uid,
             text="hello",
             duration_ms=None,
             client_app_version=None,
-            client_dedup_id=f"00000000-0000-4000-8000-{int(age):012d}",
-            dictated_at=now - age,
+            dedup_id=f"00000000-0000-4000-8000-{int(age):012d}",
+            created_at=now - age,
         )
-    deleted = job_store.insert_dictation(uid, "gone", None, None)
+    job_store.insert_dictation(
+        user_id=uid, text="gone", duration_ms=None, client_app_version=None,
+        dedup_id="00000000-0000-4000-8000-00000000dead",
+    )
+    with job_store.db.read() as con:
+        deleted = con.execute("SELECT id FROM dictations WHERE text='gone'").fetchone()[0]
     job_store.soft_delete_history_row(uid, "dictation", str(deleted))
     assert job_store.dictation_counts(now) == {"24h": 1, "7d": 2, "30d": 3}
-    assert job_store.get_most_recent_dictation(uid)["text"] == "hello"
 
 
 # ── insights + stats ──────────────────────────────────────────────────────────
@@ -209,7 +220,10 @@ def test_stats_by_user_matches_per_user_stats(job_store: JobStore, make_user: Ma
     a, b, idle = (make_user()[0].id for _ in range(3))
     for user_id, n in ((a, 3), (b, 1)):
         for i in range(n):
-            job_store.insert_dictation(user_id, "one two three", 100 + i, None)
+            job_store.insert_dictation(
+                user_id=user_id, text="one two three", duration_ms=100 + i,
+                client_app_version=None, dedup_id=None,
+            )
     jid = job_store.create("/tmp/f.m4a", user_id=b)
     assert job_store.set_running(jid)
     assert job_store.set_done_if_not_cancelled(jid, "single", transcript_text="four five")
