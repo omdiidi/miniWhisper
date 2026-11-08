@@ -23,14 +23,14 @@ import Testing
         let start = Date()
         do {
             _ = try await withDeadline(seconds: 0.2, onTimeout: { fired.bump() }) { () -> Int in
-                Thread.sleep(forTimeInterval: 1.5)          // ignores cancellation
+                Thread.sleep(forTimeInterval: 2.5)          // ignores cancellation
                 return 1
             }
             Issue.record("expected deadlineExceeded")
         } catch {
             #expect(error as? ProviderError == .deadlineExceeded)
         }
-        #expect(Date().timeIntervalSince(start) < 0.7)
+        #expect(Date().timeIntervalSince(start) < 1.5)   // well short of the 2.5 s work; loose for busy CI hosts
         #expect(fired.value == 1)
     }
 

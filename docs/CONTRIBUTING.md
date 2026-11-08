@@ -97,7 +97,7 @@ From Claude Code, use `/docs-check` to diff the file-to-doc map against recent e
 
 `.github/workflows/ci.yml` runs on every pull request and on pushes to `main` that touch `server/**`, `client/**`, `scripts/test-client.sh`, `scripts/check-log-privacy.py` or the workflow itself. It has two jobs:
 
-- **server** (ubuntu-latest, Python 3.11): installs `ffmpeg` and the minimal test dependencies, stubs the Apple-Silicon-only MLX modules (`parakeet_mlx`, `mlx.core`), then runs `cd server && pytest tests/ -v`. No Hugging Face token is needed. `tmp/mission/part2/run-pytest.sh` reproduces this job locally.
+- **server** (ubuntu-latest, Python 3.11): installs `uv` and `ffmpeg`, then runs `scripts/test-server.sh -v` (minimal test deps, Apple-Silicon-only MLX modules stubbed). No Hugging Face token is needed; the same script runs locally.
 - **client** (macos-latest): `bash scripts/test-client.sh`: `swift build && swift test` in `client/` (Swift Testing; the Keychain tests are skipped because `CI` is set), then the log-privacy gate (`scripts/check-log-privacy.py`; see [TESTING.md](TESTING.md#log-privacy-gate)). New `Log.` calls must log counts, status codes or `ErrorLog.describe(error)`, never text, paths, URLs or error strings.
 
 `build-client.yml` (signed release build, on `v*` tags) and `lint-install.yml` are separate. The latter runs on macOS's bash 3.2 when `install.sh` or `scripts/**` change: `bash -n` on `install.sh` and every `scripts/*.sh`, a sourced-function smoke of `install.sh`, and a check that `install.sh` never calls `python3`.
