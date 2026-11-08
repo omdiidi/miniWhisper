@@ -17,7 +17,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from wispralt.auth import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME
+from wispralt.auth import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME, session_csrf_token
 from wispralt.insights import cron, timewindow
 from wispralt.insights import settings as insights_settings
 from wispralt.insights.client import INSIGHTS_PRICING_PER_1K, InsightsResponse, RateLimitedError
@@ -366,10 +366,10 @@ def test_settings_require_the_disclosure_and_csrf(
     c = _admin_cookie_client(app, token)
     page = c.get("/admin/settings")
     assert page.status_code == 200 and "Disclosure" in page.text and "not set" in page.text
-    form["csrf_token"] = _csrf(page.text)  # the page set a fresh CSRF cookie
+    form["csrf_token"] = _csrf(page.text)  # the session-bound token the page embeds
     no_ack = c.post("/admin/settings", data=form)
     assert no_ack.status_code == 400 and "disclosure" in no_ack.text  # no ack
-    form["csrf_token"] = _csrf(no_ack.text)  # every re-render mints a fresh token
+    form["csrf_token"] = _csrf(no_ack.text)  # every re-render embeds it again
     assert insights_settings.load(settings_store).enabled is False
     no_csrf = {k: v for k, v in form.items() if k != "csrf_token"}
     assert c.post("/admin/settings", data={**no_csrf, "acknowledge": "1"}).status_code == 403
@@ -398,7 +398,7 @@ def test_runs_post_is_csrf_guarded_admin_only_and_refused_while_ai_is_off(
     assert TestClient(app, base_url="https://testserver").post(
         "/admin/data/runs", data={"weeks": "1"}, headers={"Authorization": f"Bearer {emp}"}
     ).status_code == 403
-    off = c.post("/admin/data/runs", data={"weeks": "1", "csrf_token": "tok"})
+    off = c.post("/admin/data/runs", data={"weeks": "1", "csrf_token": session_csrf_token(token)})
     assert off.status_code == 409 and "off" in off.text
 
 
@@ -429,3 +429,95 @@ async def test_estimate_then_confirm_starts_a_backfill_and_the_partial_shows_pro
         assert partial.status_code == 200 and "3 / 3" in partial.text
         assert CSRF_COOKIE_NAME not in partial.headers.get("set-cookie", "")
         assert 'hx-trigger="every 2s"' not in partial.text  # nothing running: polling stops
+
+
+# ── review round 2: partial person failures, the DB run lock ─────────────────
+
+
+async def test_a_person_failure_skips_the_team_pass_and_the_retry_completes_it(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    from wispralt.insights.client import InsightsError
+
+    _ai_on(settings_store)
+    first = Stub(fail_with=(2, InsightsError("OpenRouter HTTP 500", status_code=500)))
+    outcome = await cron.run_weekly_insights(_app(job_store, accounts, settings_store, first), week,
+                                             trigger="scheduled")
+    assert first.calls == 3  # three people, no team call
+    assert outcome.people_done == 2
+    [run] = job_store.recent_insight_runs()
+    assert (run["status"], run["error_class"]) == ("failed", "some_people_failed")
+    assert job_store.get_weekly_insight_team(*week) is None
+    assert job_store.scheduled_run_state(*week)["done"] is False  # the scheduler retries
+
+    retry = Stub()
+    await cron.run_weekly_insights(_app(job_store, accounts, settings_store, retry), week,
+                                   trigger="scheduled")
+    assert retry.calls == 2  # the failed person, then the team pass
+    for p in busy_people:
+        assert f'"person": "{p.label}"' in retry.prompts[-1]
+    assert job_store.get_weekly_insight_team(*week) is not None
+    assert job_store.recent_insight_runs()[0]["status"] == "done"
+
+
+async def test_a_running_row_from_another_process_refuses_the_run(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    _ai_on(settings_store)
+    other = job_store.start_insight_run(  # e.g. the CLI, mid-run
+        trigger="manual", iso_year=week[0], iso_week=week[1], estimated_usd=None,
+        now=time.time(), stale_after_s=cron.RUN_LOCK_STALE_S,
+    )
+    assert other is not None
+    stub = Stub()
+    app = _app(job_store, accounts, settings_store, stub)  # its own (free) in-process lock
+    assert await cron.run_weekly_insights(app, week, trigger="manual") is None
+    assert await cron.run_weeks(app, cron.last_weeks(2, TZ), trigger="backfill") is None
+    assert stub.calls == 0
+    assert [r["id"] for r in job_store.recent_insight_runs()] == [other]
+
+    # A row left 'running' by a crash stops holding the lock once it is stale.
+    with job_store.db.write() as con:
+        con.execute("UPDATE insight_runs SET started_at = ? WHERE id = ?",
+                    (time.time() - cron.RUN_LOCK_STALE_S - 1, other))
+    outcome = await cron.run_weekly_insights(app, week, trigger="manual")
+    assert outcome is not None and outcome.people_done == 3
+
+
+async def test_a_cancelled_run_closes_its_row_and_releases_the_lock(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    _ai_on(settings_store)
+
+    def cancel(n: int) -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await cron.run_weekly_insights(
+            _app(job_store, accounts, settings_store, Stub(on_call=cancel)), week, trigger="manual"
+        )
+    [run] = job_store.recent_insight_runs()
+    assert (run["status"], run["error_class"]) == ("aborted", "cancelled")
+    outcome = await cron.run_weekly_insights(
+        _app(job_store, accounts, settings_store, Stub()), week, trigger="manual"
+    )
+    assert outcome is not None and outcome.people_done == 3
+
+
+async def test_an_empty_team_reply_is_never_saved(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    _ai_on(settings_store)
+
+    class EmptyTeam(Stub):
+        async def analyze(self, *, system_prompt: str, user_prompt: str, **kw: Any) -> InsightsResponse:
+            resp = await super().analyze(system_prompt=system_prompt, user_prompt=user_prompt, **kw)
+            return resp.model_copy(update={"content": "{}"}) if self.calls > 3 else resp
+
+    stub = EmptyTeam()
+    await cron.run_weekly_insights(_app(job_store, accounts, settings_store, stub), week,
+                                   trigger="manual")
+    assert stub.calls == 5  # three people, the team call and its one retry
+    [run] = job_store.recent_insight_runs()
+    assert (run["status"], run["error_class"]) == ("failed", "team_unusable")
+    assert job_store.get_weekly_insight_team(*week) is None

@@ -6,7 +6,7 @@ their own row — there is no path parameter.
 Phase 2 (insights): extends the existing router with three Jinja2-rendered
 employee-surface routes:
 
-- ``GET  /me/login``     — token-paste form (no auth required, mints CSRF token).
+- ``GET  /me/login``     — token-paste form (no auth required, embeds a CSRF token).
 - ``POST /me/login``     — verify CSRF, validate token, set session cookie, redirect.
 - ``GET  /me/insights``  — authed; per-employee weekly insight + stats dashboard.
 
@@ -22,7 +22,6 @@ import base64
 import binascii
 import json
 import logging
-import secrets
 import string
 import time
 from datetime import datetime
@@ -165,13 +164,13 @@ def _safe_next(raw: str | None) -> str | None:
 async def me_login_form(request: Request) -> HTMLResponse:
     """Token-paste login form for employees.
 
-    Mints a fresh CSRF token, embeds it in the form, and sets it as a
-    short-lived cookie. POST verifies cookie == form via constant-time compare.
+    Embeds a CSRF token (``csrf_token_for``) in the form and sets it as a
+    short-lived cookie. POST checks it with ``verify_csrf`` (constant time).
 
     Honors an optional ``?next=`` query param (e.g. ``?next=/me/history``) so
     the menubar "Open My Dictations" deep-link survives the login round-trip.
     """
-    csrf = secrets.token_urlsafe(32)
+    csrf = csrf_token_for(request)
     response = templates.TemplateResponse(
         request,
         "me_login.html.j2",
@@ -190,8 +189,8 @@ async def me_login_form(request: Request) -> HTMLResponse:
 def _render_me_login_error(
     request: Request, *, error: str, status_code: int
 ) -> HTMLResponse:
-    """Render the login form with an error and a freshly-minted CSRF token."""
-    csrf = secrets.token_urlsafe(32)
+    """Render the login form with an error and a CSRF token (``csrf_token_for``)."""
+    csrf = csrf_token_for(request)
     response = templates.TemplateResponse(
         request,
         "me_login.html.j2",
@@ -395,7 +394,7 @@ async def me_history(
     else:
         template_name = "me_history.html.j2"
 
-    csrf = secrets.token_urlsafe(32) if template_name == "me_history.html.j2" else csrf_token_for(request)
+    csrf = csrf_token_for(request)
     ctx = {
         "request": request,
         "user": user,

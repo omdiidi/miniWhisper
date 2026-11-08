@@ -8,7 +8,7 @@ Every AI claim must point at the records it came from:
 2. The LLM JSON is parsed with pydantic (``extra='ignore'``); a shape error is an
    ``InsightShapeError`` (the run records it as a person failure).
 3. ``validate_person`` / ``validate_team`` keep only refs from the allowed set and drop
-   any item left without one; ``quotable_line`` must be an exact substring of the record
+   any item left without one (a team reply left with no items at all is unusable); ``quotable_line`` must be an exact substring of the record
    it cites. Team insights may cite only refs present in the person insights they summarise.
 4. At render time ``build_view`` hides refs to records that were deleted (or that the
    viewer may not open), hides items left without refs, links each ref to its record,
@@ -184,12 +184,19 @@ def refs_in(insight: dict[str, Any]) -> set[str]:
 
 
 def validate_team(raw: Any, allowed: Iterable[str]) -> dict[str, Any]:
-    """Team items may cite only refs found in the person insights they summarise."""
+    """Team items may cite only refs found in the person insights they summarise.
+
+    A reply left with no items (``{}`` parses, since every list defaults to empty, or
+    every item cited refs it may not) is unusable: ``InsightShapeError``, so the run
+    retries it and never saves an empty team insight as the week's.
+    """
     t = _parse(TeamInsightV2, raw)
     allowed = set(allowed)
     out: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
     for name in TEAM_LISTS:
         out[name] = _keep(getattr(t, name), allowed)
+    if not any(out[name] for name in TEAM_LISTS):
+        raise InsightShapeError("team insight has no usable items")
     return out
 
 

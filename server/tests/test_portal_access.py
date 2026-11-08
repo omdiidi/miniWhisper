@@ -136,6 +136,8 @@ def test_expanding_a_row_keeps_the_pages_csrf_token(
     alice, headers = team["alice"]
     first = _dictate(job_store, alice.id, "first row")
     second = _dictate(job_store, alice.id, "second row")
+    # A browser carries the session cookie on every page it renders.
+    client.cookies.set("wispralt_admin_token", headers["Authorization"].split()[1])
     assert client.get("/me/history", headers=headers).status_code == 200
     token = client.cookies.get(CSRF_COOKIE_NAME)
     assert token
@@ -144,7 +146,6 @@ def test_expanding_a_row_keeps_the_pages_csrf_token(
         assert resp.status_code == 200
         assert client.cookies.get(CSRF_COOKIE_NAME) == token
     # A form rendered before the expand still works (cookie auth, so CSRF applies).
-    client.cookies.set("wispralt_admin_token", headers["Authorization"].split()[1])
     deleted = client.request(
         "DELETE", f"/me/history/dictation/{second}", data={"csrf_token": token}
     )

@@ -305,7 +305,15 @@ def _mutation(name: str, employee: User, integration: User) -> tuple[str, str, d
     ],
 )
 @pytest.mark.parametrize(
-    "mode", ["cookie_no_token", "cookie_token", "bearer_only", "basic_plus_cookie", "bad_bearer_cookie"]
+    "mode",
+    [
+        "cookie_no_token",
+        "cookie_token",
+        "injected_cookie_token",
+        "bearer_only",
+        "basic_plus_cookie",
+        "bad_bearer_cookie",
+    ],
 )
 def test_csrf_matrix(
     csrf_client: TestClient,
@@ -329,18 +337,23 @@ def test_csrf_matrix(
         headers = {"Authorization": "Basic eDp5"}
     if mode == "bad_bearer_cookie":
         headers = {"Authorization": "Bearer " + "0" * 64}
-    if mode == "cookie_token":
-        csrf_client.cookies.set(auth_mod.CSRF_COOKIE_NAME, _CSRF)
+    if mode in ("cookie_token", "injected_cookie_token"):
+        # cookie_token: the session-bound token the pages embed. injected: a
+        # cookie + matching token a sibling origin could plant (unsigned
+        # double-submit), which must not pass while a session exists.
+        csrf = auth_mod.session_csrf_token(token) if mode == "cookie_token" else _CSRF
+        csrf_client.cookies.set(auth_mod.CSRF_COOKIE_NAME, csrf)
         if "json" in body:
-            headers[auth_mod.CSRF_HEADER] = _CSRF
+            headers[auth_mod.CSRF_HEADER] = csrf
         else:
-            body = {"data": {**body["data"], "csrf_token": _CSRF}}
+            body = {"data": {**body["data"], "csrf_token": csrf}}
 
     resp = csrf_client.request(method, path, headers=headers, follow_redirects=False, **body)
 
     expected = {
         "cookie_no_token": 403,
         "cookie_token": ok,
+        "injected_cookie_token": 403,
         "bearer_only": ok,
         "basic_plus_cookie": 403,
         "bad_bearer_cookie": 401,
@@ -376,3 +389,33 @@ def test_key_added_shows_the_configured_server_url(
     monkeypatch.setattr(admin_ui.settings, "server_url", "https://mini.example.test/")
     resp = csrf_client.post("/admin/integrations/new", data={"program_name": "Buzz"}, headers=admin[1])
     assert "export OPENAI_BASE_URL=https://mini.example.test/v1" in resp.text
+
+
+def test_admin_cannot_revoke_their_own_last_active_key(
+    client: TestClient,
+    admin: tuple[User, dict[str, str]],
+    accounts: AccountStore,
+    make_user: MakeUser,
+) -> None:
+    admin_user, bearer = admin
+    resp = client.post(f"/admin/keys/{admin_user.key_id}/revoke", headers=bearer, follow_redirects=False)
+    assert resp.status_code == 400, resp.text
+    assert "last active key" in resp.json()["detail"]
+    assert client.get("/admin/", headers=bearer).status_code == 200  # still signed in
+
+    # With a second active device the first may go; the second is then the last.
+    with accounts.db.write() as con:
+        second = con.execute(
+            "INSERT INTO api_keys(user_id, token_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+            (admin_user.id, hash_token("b" * 64), time.time()),
+        ).fetchone()[0]
+    resp = client.post(f"/admin/keys/{admin_user.key_id}/revoke", headers=bearer, follow_redirects=False)
+    assert resp.status_code == 303, resp.text
+    second_bearer = {"Authorization": "Bearer " + "b" * 64}
+    resp = client.post(f"/admin/keys/{second}/revoke", headers=second_bearer, follow_redirects=False)
+    assert resp.status_code == 400, resp.text
+
+    # Another person's last key is still revocable (the guard is for yourself only).
+    employee, _ = make_user(label="emp-last")
+    resp = client.post(f"/admin/keys/{employee.key_id}/revoke", headers=second_bearer, follow_redirects=False)
+    assert resp.status_code == 303, resp.text

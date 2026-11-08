@@ -140,6 +140,19 @@ def test_validate_team_keeps_only_refs_from_the_person_insights() -> None:
     assert "wow_delta" not in out and "tool_mentions" not in out
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {},  # every list defaults to empty: parses, but says nothing
+        {"themes": [], "decisions": []},
+        {"themes": [{"label": "a", "sources": ["d:9"]}]},  # only refs it may not cite
+    ],
+)
+def test_a_team_reply_with_no_usable_items_is_unusable(raw: Any) -> None:
+    with pytest.raises(sources.InsightShapeError, match="no usable items"):
+        sources.validate_team(raw, allowed={"d:1"})
+
+
 # ── the run: refs checked against what was actually in the prompt ────────────
 
 

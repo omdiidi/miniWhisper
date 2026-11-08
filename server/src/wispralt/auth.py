@@ -18,6 +18,7 @@ it) and ``request.state.auth_via`` records ``"bearer"`` or ``"cookie"``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import ipaddress
 import logging
@@ -184,7 +185,8 @@ async def require_csrf(request: Request, user: User = Depends(require_api_key)) 
     **only** when that auth used a valid Bearer header: a non-Bearer
     ``Authorization`` (e.g. ``Basic``) falls back to the cookie, so it must
     carry the token like any cookie request. Otherwise the ``X-CSRF-Token``
-    header or the ``csrf_token`` form field must equal the CSRF cookie, else 403.
+    header or the ``csrf_token`` form field must pass :func:`verify_csrf` (the
+    session-bound token), else 403.
     """
     if getattr(request.state, "auth_via", None) == "bearer":
         return user
@@ -208,8 +210,9 @@ def require_admin_csrf(user: User = Depends(require_csrf)) -> User:
 #
 # Both /admin/login (admin_ui.py) and /me/login (routes/me.py) issue the same
 # ``wispralt_admin_token`` cookie. Centralizing here means flag changes
-# (max_age, samesite, etc.) hit both surfaces and the CSRF double-submit
-# scheme stays consistent across forms.
+# (max_age, samesite, etc.) hit both surfaces and the CSRF scheme (session-
+# bound when signed in, double-submit cookie on the signed-out forms) stays
+# consistent across forms.
 
 SESSION_COOKIE_NAME = "wispralt_admin_token"
 CSRF_COOKIE_NAME = "wispralt_csrf"
@@ -258,11 +261,13 @@ def clear_session_cookie(resp: Response) -> None:
 
 
 def set_csrf_cookie(resp: Response, csrf_token: str, request: Request | None = None) -> None:
-    """Set the CSRF double-submit cookie (``request``: see ``cookie_secure``).
+    """Set the CSRF cookie (``request``: see ``cookie_secure``).
 
-    NOT HttpOnly: the form template echoes the value back as a hidden input,
-    and the POST handler compares cookie vs form via ``hmac.compare_digest``.
-    SameSite=strict so a cross-origin POST can't carry the cookie alone.
+    NOT HttpOnly: the form template echoes the value back as a hidden input.
+    The cookie is only checked when there is no session cookie (the login and
+    setup forms); a signed-in request is checked against the session instead
+    (see :func:`verify_csrf`). SameSite=strict so a cross-origin POST can't
+    carry the cookie alone.
     """
     resp.set_cookie(
         CSRF_COOKIE_NAME,
@@ -275,23 +280,46 @@ def set_csrf_cookie(resp: Response, csrf_token: str, request: Request | None = N
     )
 
 
-def csrf_token_for(request: Request) -> str:
-    """The CSRF cookie's current token, else a new one.
+_CSRF_CONTEXT = b"wispralt-csrf-v1"
 
-    For partials rendered into a page that already carries forms: rotating
-    the cookie there would invalidate the tokens those forms hold.
+
+def session_csrf_token(session_token: str) -> str:
+    """The CSRF token bound to a session: HMAC-SHA256 keyed by the session token.
+
+    The session cookie is HttpOnly and secret, so a sibling origin that can
+    plant cookies on the parent domain still cannot compute this value (an
+    unsigned double-submit cookie it could simply overwrite). Works over
+    loopback http too, unlike a ``__Host-`` cookie, which needs Secure.
     """
+    return hmac.new(session_token.encode(), _CSRF_CONTEXT, hashlib.sha256).hexdigest()
+
+
+def csrf_token_for(request: Request) -> str:
+    """The token every form on this page must carry.
+
+    Signed in (session cookie present): the session-bound token, stable for
+    the session, so partials and full pages agree and nothing rotates.
+    Signed out (login / setup forms): the CSRF cookie's token, else a new one.
+    """
+    session = request.cookies.get(SESSION_COOKIE_NAME)
+    if session:
+        return session_csrf_token(session)
     return request.cookies.get(CSRF_COOKIE_NAME) or secrets.token_urlsafe(32)
 
 
 def verify_csrf(request: Request, form_token: str) -> bool:
-    """Constant-time compare of the form token vs the CSRF cookie.
+    """Constant-time check of the submitted token.
 
+    With a session cookie the token must equal the session-bound token (the
+    CSRF cookie is ignored, so an injected one changes nothing); without one
+    it must equal the CSRF cookie (double-submit, the signed-out forms only).
     Returns False (rather than raising) so the caller can render a friendly
-    "form expired, please reload" page in the same template as other login
-    errors. Empty / missing cookie returns False — no implicit pass-through.
+    "form expired, please reload" page. A missing token or cookie is False.
     """
-    cookie_token = request.cookies.get(CSRF_COOKIE_NAME, "")
-    if not cookie_token or not form_token:
+    if not form_token:
         return False
-    return hmac.compare_digest(cookie_token, form_token)
+    session = request.cookies.get(SESSION_COOKIE_NAME)
+    expected = session_csrf_token(session) if session else request.cookies.get(CSRF_COOKIE_NAME, "")
+    if not expected:
+        return False
+    return hmac.compare_digest(expected, form_token)

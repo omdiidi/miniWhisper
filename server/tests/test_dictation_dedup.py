@@ -412,3 +412,26 @@ def test_blank_text_is_never_stored_whole_or_streamed(
     assert streamed.status_code == 200, streamed.text
     assert streamed.json()["saved"] is True and not streamed.json()["text"].strip()
     assert _rows(db) == []
+
+
+def test_retried_finalize_of_a_blank_stream_replays_it(
+    client: TestClient, app: FastAPI, users: tuple, db: Database
+) -> None:
+    """Blank text is not stored, but a retried finalize still replays it (as a
+    retried non-blank finalize replays its stored row) instead of a 410."""
+    a, _ = users
+
+    async def silence(audio_bytes: bytes) -> tuple[str, float]:
+        return "  ", 5.0
+
+    app.state.parakeet_service.transcribe = silence
+    sid, dedup = _new(), _new()
+    assert _chunk(client, a, sid, dedup).status_code == 202
+    first = _finalize(client, a, sid, header=dedup)
+    assert first.status_code == 200, first.text
+    assert first.json()["replayed"] is False
+    again = _finalize(client, a, sid, header=dedup)
+    assert again.status_code == 200, again.text
+    assert again.json()["text"] == first.json()["text"]
+    assert again.json()["replayed"] is True and again.json()["saved"] is True
+    assert _rows(db) == []

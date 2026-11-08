@@ -37,6 +37,7 @@ Resource gates (Phase 2):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -460,13 +461,19 @@ def _concat_chunks(parts: list[Path], out_path: Path) -> None:
 
     Runs in a thread executor (see finalize) to keep the event loop free
     during the multi-GB I/O. Finalize deletes the parts only once the
-    assembled file is verified, so a failed concat can be retried without
+    runner has accepted the job, so a failed concat or a 429 can be retried without
     re-uploading (the disk gate already requires room for one more copy).
     """
     with open(out_path, "wb") as out:
         for p in parts:
             with open(p, "rb") as inp:
                 shutil.copyfileobj(inp, out, length=8 * 1024 * 1024)
+
+
+# Upload ids with a finalize in flight (finding: concurrent finalizes raced on
+# the same assembled path). Per-process is enough: the server is one uvicorn
+# process, like the runner's own submit lock.
+_finalizing: set[str] = set()
 
 
 @router.post(
@@ -482,16 +489,33 @@ async def finalize_chunked(
     Returns 202 with ``{"job_id": str, "status": "pending"}`` matching the
     single-shot route's response shape.
 
+    One finalize per upload at a time: a second one while the first is still
+    running gets 409 (it would write the same assembled path and could delete
+    the chunks, or the submitted job's source, under the first).
+
     Errors
     ------
     403  Ownership mismatch.
-    404  upload_id not found.
-    409  Missing chunks OR total-bytes mismatch.
-    429  A file job is already in progress (assembled file is cleaned up).
+    404  upload_id not found (also after a finalize that created its job).
+    409  Missing chunks, total-bytes mismatch, or a finalize already running.
+    429  A file job is already in progress. The chunks are kept, so the same
+         finalize can be retried; only the re-creatable assembled copy goes.
     503  RAM gate (<4 GiB available).
     507  Disk gate (free < total_bytes).
     """
     upload_id = _sanitize_upload_id(upload_id)
+    # Claim before the first await: one event loop, so check-and-add is atomic.
+    if upload_id in _finalizing:
+        raise HTTPException(409, "Finalize already in progress for this upload")
+    _finalizing.add(upload_id)
+    try:
+        return await _finalize_claimed(upload_id, request)
+    finally:
+        _finalizing.discard(upload_id)
+
+
+async def _finalize_claimed(upload_id: str, request: Request) -> JSONResponse:
+    """The finalize body, run while this request holds the upload's claim."""
     chunked_dir = _chunked_root() / upload_id
     if not chunked_dir.exists():
         raise HTTPException(404, "upload not found")
@@ -503,7 +527,7 @@ async def finalize_chunked(
     ext: str = meta["ext"]
 
     # Re-check disk now: the concat lands another `total_bytes` beside the
-    # chunks, which stay until the assembled file is verified.
+    # chunks, which stay until the runner has accepted the job.
     try:
         free = shutil.disk_usage(str(settings.staging_dir)).free
     except OSError:
@@ -577,13 +601,13 @@ async def finalize_chunked(
     if actual != total_bytes:
         out_path.unlink(missing_ok=True)  # chunks kept: finalize can be retried
         raise HTTPException(500, "Assembled size mismatch")
-    for p in parts:  # verified: the assembled file replaces the chunks
-        p.unlink(missing_ok=True)
 
-    # Submit to runner using the same path as the single-shot route. The
-    # FileJobInProgressError branch mirrors submit_file so a 429 still cleans
-    # up the assembled file (R-C). Any ``mode`` key in a pre-upgrade meta.json
-    # is ignored: every job is a file job.
+    # Submit to runner using the same path as the single-shot route. The chunks
+    # stay until the runner has accepted the job: a 429 drops only the
+    # assembled copy (R-C: no orphan beside a busy runner) and keeps the chunks
+    # + meta.json, so the client retries this finalize without re-uploading.
+    # Any ``mode`` key in a pre-upgrade meta.json is ignored: every job is a
+    # file job.
     runner = _runner(request)
     # Phase 1 transcript-storage: read client version that was captured at
     # /init (more robust than the live header — survives mid-upload client
@@ -598,10 +622,12 @@ async def finalize_chunked(
         )
     except FileJobInProgressError as exc:
         out_path.unlink(missing_ok=True)
-        shutil.rmtree(chunked_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):  # the upload is alive: restart its sweep TTL
+            (chunked_dir / "meta.json").touch()
         return _busy_response(exc)
 
-    # Success: the parts are gone — rmtree drops meta.json + the dir itself.
+    # Accepted: the job owns out_path now; rmtree drops the chunks, meta.json
+    # and the dir itself.
     shutil.rmtree(chunked_dir, ignore_errors=True)
     logger.info(
         "Chunked upload %s finalized → job %s (bytes=%d).",

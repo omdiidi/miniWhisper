@@ -10,15 +10,23 @@ enabled it after the disclosure, and an InsightsClient exists (``OPENROUTER_API_
 * ``run_weeks`` runs one or more weeks sequentially under ``app.state.weekly_insights_lock``;
   ``run_weekly_insights`` is the one-week case. Every run writes an ``insight_runs`` row
   (progress per person; ``failures`` = ``{user_id, error_class}``, never text) and ends
-  ``done``, ``failed`` (every person failed, or a crash), ``aborted`` (``budget`` or
-  ``rate_limit``) or ``skipped`` (AI off, no client).
+  ``done``, ``failed`` (every person failed, some person failed, a team error, or a crash),
+  ``aborted`` (``budget``, ``rate_limit`` or ``cancelled``) or ``skipped`` (AI off, no
+  client).
+* One run at a time across processes: ``JobStore.start_insight_run`` refuses while another
+  row is ``running`` (check + insert in one ``BEGIN IMMEDIATE``; a row older than
+  ``RUN_LOCK_STALE_S`` is a crash and is ignored). So the server and a CLI run never spend
+  the same remaining budget; the in-process lock only saves the DB round trip.
 * The 30-day cost cap is checked before EVERY OpenRouter call, not once per run, and the
   check reserves that call's worst case (``call_reserve_usd``: the prompt's tokens plus a
   full ``max_tokens`` reply at the rate card), so a call that could cross the cap is never
   made.
 * A rerun without ``force`` skips people who already have a row, but the team pass still
   reads every person insight of the week (saved or new). The team pass runs when there is
-  no team row yet, when anyone new was analysed, or with ``force``. A team call that fails
+  no team row yet, when anyone new was analysed, or with ``force``, and only when no
+  person failed: a team insight missing someone would be saved as complete. A person
+  failure ends the run ``failed`` (``some_people_failed``), so the scheduler retries it and
+  the retry pays only for the people still without a row. A team call that fails
   (OpenRouter error, or unusable twice) ends the run ``failed`` (``team_openrouter_error`` /
   ``team_unusable``), so the scheduler retries it.
 * Each person's records go into the prompt behind their refs (``sources.assemble``); the
@@ -62,6 +70,7 @@ logger = logging.getLogger(__name__)
 SCHEDULER_INTERVAL_S = 3600.0
 SCHEDULER_FIRST_CHECK_S = 60.0
 RETRY_AFTER_S = 6 * 3600.0
+RUN_LOCK_STALE_S = 2 * 3600.0  # a 'running' row older than this is a crashed run
 TOKENS_PER_WORD = 1.35
 MAX_BACKFILL_WEEKS = 12
 PERSON_MAX_TOKENS = 2000
@@ -81,6 +90,10 @@ class RunOutcome:
     cost_usd: float = 0.0
     aborted: str | None = None  # 'rate_limit' | 'budget'
     team_error: str | None = None  # 'team_openrouter_error' | 'team_unusable'
+
+
+class _RunBusy(Exception):  # noqa: N818 — internal signal, never escapes run_weeks
+    """Another run (this process or another) holds the DB run lock."""
 
 
 def _qualifies(dictations: int, files: int) -> bool:
@@ -167,7 +180,8 @@ async def run_weeks(
     app, weeks: list[Week] | None, *, trigger: str, force: bool = False,  # noqa: ANN001
     now: float | None = None,
 ) -> list[RunOutcome | None] | None:
-    """Run *weeks* one after another under the insights lock; None if it is held.
+    """Run *weeks* one after another under the insights lock; None if it is held (here
+    or, through the DB run lock, by another process) before the first week starts.
 
     ``force`` re-generates people who already have a row (rerun); otherwise a week is
     restart-safe (people with a row are skipped, so nobody is paid for twice).
@@ -179,7 +193,14 @@ async def run_weeks(
     async with lock if lock is not None else contextlib.nullcontext():
         cfg = await insights_settings.load_for(app)
         weeks = weeks or [last_full_iso_week(cfg.timezone, now)]
-        return [await _run_one(app, week, cfg, trigger=trigger, force=force) for week in weeks]
+        results: list[RunOutcome | None] = []
+        for week in weeks:
+            try:
+                results.append(await _run_one(app, week, cfg, trigger=trigger, force=force))
+            except _RunBusy:
+                logger.warning("Insights run skipped: another process is running insights")
+                return results or None
+        return results
 
 
 async def _run_one(app, week: Week, cfg, *, trigger: str, force: bool) -> RunOutcome | None:  # noqa: ANN001
@@ -191,9 +212,11 @@ async def _run_one(app, week: Week, cfg, *, trigger: str, force: bool) -> RunOut
     run_id = await asyncio.to_thread(
         lambda: job_store.start_insight_run(
             trigger=trigger, iso_year=week[0], iso_week=week[1],
-            estimated_usd=estimate["usd"], now=time.time(),
+            estimated_usd=estimate["usd"], now=time.time(), stale_after_s=RUN_LOCK_STALE_S,
         )
     )
+    if run_id is None:
+        raise _RunBusy
 
     async def finish(status: str, error_class: str | None) -> None:
         await asyncio.to_thread(
@@ -216,6 +239,10 @@ async def _run_one(app, week: Week, cfg, *, trigger: str, force: bool) -> RunOut
 
     try:
         outcome = await _run_weekly_insights_inner(app, week, cfg, force=force, progress=progress)
+    except asyncio.CancelledError:
+        # Shutdown: close the row so it stops holding the DB run lock.
+        await finish("aborted", "cancelled")
+        raise
     except Exception as exc:
         await finish("failed", type(exc).__name__)
         raise
@@ -224,6 +251,8 @@ async def _run_one(app, week: Week, cfg, *, trigger: str, force: bool) -> RunOut
         await finish("aborted", outcome.aborted)
     elif outcome.people_total and not outcome.people_done:
         await finish("failed", "all_people_failed")
+    elif outcome.failures:
+        await finish("failed", "some_people_failed")  # no team row: the scheduler retries
     elif outcome.team_error:
         await finish("failed", outcome.team_error)  # not done: the scheduler retries it
     else:
@@ -335,7 +364,9 @@ async def _run_weekly_insights_inner(
         person_insights.append((name, insight))
         await report()
 
-    if person_insights and outcome.aborted is None:
+    # Any person failure skips the team pass: a team insight without them would be saved
+    # as the week's complete one and never revisited (the run ends failed and is retried).
+    if person_insights and outcome.aborted is None and not outcome.failures:
         team_saved = await asyncio.to_thread(job_store.get_weekly_insight_team, iso_year, iso_week)
         if force or team_saved is None or outcome.people_done:
             await _team_pass(app, week, cfg, person_insights, outcome, over_cap)

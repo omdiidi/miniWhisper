@@ -101,7 +101,7 @@ and employees without a per-role configuration.
 The cookie is read by `auth._extract_bearer` as a fallback when no
 `Authorization: Bearer` header is present.
 
-**CSRF (Part 4).** Every cookie-authenticated mutation (Add employee, person Rotate / Disable, Revoke device, Invites create / revoke, integration Add / Rotate / Revoke, AI runs, Settings, `PATCH /me`, `/me/history` delete / restore) needs the double-submit token: the `X-CSRF-Token` header or the `csrf_token` form field must equal the `wispralt_csrf` cookie (set by the page that rendered the form), else **403**. A request that authenticated with a valid `Authorization: Bearer` header needs no token (a cross-site page cannot set that header). A non-Bearer `Authorization` header (e.g. `Basic`) falls back to the cookie and so needs the token; an invalid Bearer is a 401, never a cookie fallback. `SameSite=Strict` on the cookies is a second layer.
+**CSRF (Part 4).** Every cookie-authenticated mutation (Add employee, person Rotate / Disable, Revoke device, Invites create / revoke, integration Add / Rotate / Revoke, AI runs, Settings, `PATCH /me`, `/me/history` delete / restore) needs the CSRF token the page embedded in the form: the `X-CSRF-Token` header or the `csrf_token` form field must equal the token bound to the signed-in session (an HMAC of the session cookie, which a script on another site cannot compute or plant), else **403**. The signed-out login and setup forms use a double-submit `wispralt_csrf` cookie instead. A request that authenticated with a valid `Authorization: Bearer` header needs no token (a cross-site page cannot set that header). A non-Bearer `Authorization` header (e.g. `Basic`) falls back to the cookie and so needs the token; an invalid Bearer is a 401, never a cookie fallback. `SameSite=Strict` on the cookies is a second layer.
 
 ---
 
@@ -137,7 +137,7 @@ The three actions differ on purpose:
 | Action | Route | Effect |
 |---|---|---|
 | **Add device** | `POST /admin/invites` with `user_id` | A single-use invite for this person; redeeming adds a key. Existing devices keep working. |
-| **Revoke device** | `POST /admin/keys/{key_id}/revoke` | That one key stops working on its next request; the person's other devices keep working. |
+| **Revoke device** | `POST /admin/keys/{key_id}/revoke` | That one key stops working on its next request; the person's other devices keep working. Your own last active key is refused (400): you would lock yourself out, so add another device or use Rotate key instead. |
 | **Rotate key** | `POST /admin/people/{id}/rotate` | Revokes **every** key of the person, issues one new key shown **once** (`no-store`) and re-enables a disabled person. |
 | **Disable person** | `POST /admin/people/{id}/disable` | None of their keys authenticate from the next request (401). You cannot disable yourself. Rotate re-enables. |
 
@@ -202,10 +202,13 @@ weeks, optionally **Regenerate existing**, and click **Estimate cost**. The esti
 (words that would be sent × 1.35 tokens/word × the model's input rate, plus your
 30-day spend against the cap) appears with a **Start** button; nothing is sent until
 you press it. Progress (people done / total) updates every 2 seconds while a run is
-going. Each run ends as `done`, `failed` (every person failed, the team summary
-failed, or a crash), `aborted` (`budget`: the next call's worst-case cost would cross
-the 30-day cap, checked before every call; `rate_limit`: OpenRouter returned 429) or
-`skipped` (AI off). Running a week again (without Regenerate) skips people who already
+going. Each run ends as `done`, `failed` (every person failed, some person failed (then no
+team summary is written until a retry covers everyone), the team summary failed, or a
+crash), `aborted` (`budget`: the next call's worst-case cost would cross the 30-day
+cap, checked before every call; `rate_limit`: OpenRouter returned 429; `cancelled`: the
+server shut down mid-run) or `skipped` (AI off). Only one run goes at a time, also
+across the server and a `python -m wispralt.insights.cron --manual` run: a second one
+does not start. Running a week again (without Regenerate) skips people who already
 have an insight but still builds the team summary from all of them. Failures list only the person id and an error class.
 
 The scheduler checks once an hour and runs the **last full week** when it has no

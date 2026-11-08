@@ -258,7 +258,7 @@ Cloudflare's free / pro / business plans cap inbound request bodies at **100 MB*
 
 1. `POST /transcribe/file/chunked/init` with JSON `{total_bytes, chunk_count, original_filename}` → server returns `{upload_id, chunk_size}` (22-char `secrets.token_urlsafe(16)`) and creates `staging/chunked/<upload_id>/meta.json` recording the caller's `user.id`.
 2. `POST /transcribe/file/chunked/<upload_id>/<chunk_index>` with raw bytes (`application/octet-stream`, NOT multipart) for each 50 MiB chunk. The body is streamed via `request.stream()` to `chunk-NNNN.part.tmp`, then atomically renamed on success. `Content-Length` is mandatory and validated against bytes-written (corrupt chunks → 400). The path declares `{chunk_index:int}` — Starlette's `:int` converter constrains this segment to digits so `/finalize` cannot match the chunk route. Without this constraint, Starlette's registration-order matching sent every `/finalize` request into the wildcard chunk handler with `chunk_index="finalize"`; Pydantic int-coerce then produced a RequestValidationError → 422 with `{"detail":[…]}`, which the client surfaced as the misleading "appears incomplete or corrupted" banner.
-3. `POST /transcribe/file/chunked/<upload_id>/finalize` with an empty body. Server verifies all chunks present + `Σ(part.size) == total_bytes`, concatenates in `run_in_executor` and deletes the `.part` files only once the assembled size checks out (a concat I/O error removes just the partial output, so finalize can be retried; the disk gate already requires room for one more copy), then hands the assembled file to the SAME `FileJobRunner.submit_source_or_429` that the single-shot route uses. Returns `{job_id, status: "pending"}` — from here the existing poll/download/delete loop is unchanged.
+3. `POST /transcribe/file/chunked/<upload_id>/finalize` with an empty body. Server verifies all chunks present + `Σ(part.size) == total_bytes`, concatenates in `run_in_executor`, checks the assembled size, then hands the assembled file to the SAME `FileJobRunner.submit_source_or_429` that the single-shot route uses. The `.part` files are deleted only once the runner has accepted the job: a concat I/O error removes just the partial output and a busy 429 just the assembled copy, so finalize can be retried without re-uploading (the disk gate already requires room for one more copy). Finalize is serialized per upload id (an in-process claim set, taken before the first await; the server is one process): a concurrent second finalize gets 409 instead of racing the first on the same output path. Returns `{job_id, status: "pending"}` — from here the existing poll/download/delete loop is unchanged.
 
 **Resilience properties:**
 
@@ -345,6 +345,7 @@ Both the streaming-finalize path and the single-shot fallback path (origin retry
 - **Server side (Part 4, `dedup.py`).** The header is canonical: RFC-4122 shape, lowercased, 422 if malformed; required on chunk and finalize, optional on `/transcribe/dictate` (third-party callers). Whole-file and finalize hold an in-process **claim** (`DedupLocks`: one refcounted `asyncio.Lock` per id, keyed by the id alone, across users) across replay check → inference → save, so concurrent requests with one id run inference once; one process serves the DB, so an in-process lock suffices.
 - **Replay before work.** `JobStore.find_dictation(id, user)` runs before the session lookup and inference: same user → 200 with the stored text and `"replayed": true` (no usage row: `request.state.dedup_replay`); another user → 409 `{"error":"dedup_conflict"}`; the owner soft-deleted it → 410 `{"error":"dictation_deleted"}` (no inference, no row; re-running would resurrect deleted text). A chunk for a stored id returns 202 `finalized: true` without opening a session. A session remembers its dedup id; a chunk or finalize with another id → 409.
 - **Synchronous save.** `JobStore.insert_dictation` is one `BEGIN IMMEDIATE` select-or-insert (the global `UNIQUE(client_dedup_id)` stays as the collision detector), so at most one row exists per id whichever path wins. A `sqlite3.Error` still returns the text with `"saved": false`, bumps `dictation_save_failures_total` (in `/metrics` and `/readyz/db`) and logs only the error type. The fire-and-forget persist and its shutdown drain are gone.
+- **Blank text.** Neither path stores blank text (nothing to keep; both report `"saved": true`). A retried `/transcribe/dictate` simply re-runs inference on its audio; a streamed session cannot (its partials are consumed), so the session records the blank result (`StreamingSession.blank_text`) and a retried finalize with the same id replays it (`"replayed": true`) rather than hitting 410 `Session is finalized`. In-memory only: a server restart in between gives the retry a 404, which the client's whole-file fallback covers.
 - When `X-Client-Dedup-Id` is absent (third-party callers on `/transcribe/dictate`, and `/v1/audio/transcriptions`, which stores no row) there is no claim or replay and the column stays NULL.
 
 ### Honest fallback latency
@@ -563,11 +564,18 @@ header. Cookie-authenticated mutations are guarded by `auth.require_csrf`,
 a dependency that declares `require_api_key` as its own sub-dependency (so
 auth always resolves first and records `request.state.auth_via`) and skips
 the token only when `auth_via == "bearer"`; otherwise the `X-CSRF-Token`
-header or `csrf_token` form field must match the `wispralt_csrf` cookie, or
-403. Every admin mutation takes it as a parameter through
+header or `csrf_token` form field must pass `auth.verify_csrf`, or 403. The
+token is **bound to the session**: `auth.session_csrf_token(session)` =
+HMAC-SHA256 keyed by the (HttpOnly, secret) session token, so a sibling
+same-site origin that plants a parent-domain `wispralt_csrf` cookie still
+cannot forge it (an unsigned double-submit cookie could simply be
+overwritten). This works over loopback http, where a `__Host-` cookie would
+not (it needs Secure). With no session cookie (the login and setup forms
+only) the token must equal the `wispralt_csrf` cookie (double-submit). Every admin mutation takes it as a parameter through
 `require_admin_csrf`; `PATCH /me` and the `/me/history` mutations through
 `require_csrf` beside `forbid_integration_kind`. Pages that render those
-forms mint the token (`admin_ui._form_page`). `SameSite=Strict` stays as a
+forms embed `auth.csrf_token_for(request)` (`admin_ui._form_page`): stable
+for the session, so full pages and partials agree and nothing rotates. `SameSite=Strict` stays as a
 second layer.
 
 The macOS client's menubar **Open Portal** button opens
@@ -924,7 +932,9 @@ insights timezone (DB setting, else `INSIGHTS_TIMEZONE`, else the host zone from
    person's prompt), can never survive. `quotable_line` is kept only when its text is an
    exact substring of the record it cites. The team pass receives the validated person
    insights of the week (saved earlier or new in this run) and its items may cite only
-   refs those insights cite.
+   refs those insights cite. A team reply left with no items at all (`{}` parses, since
+   every list defaults to empty) is an `InsightShapeError` too: it is retried once, then
+   the run ends `team_unusable`, so an empty team insight is never saved.
 4. **Render.** `sources.build_view` re-checks refs at view time
    (`JobStore.refs_exist(refs, viewer, is_admin)`): refs to deleted records, or to
    records the viewer may not open, are hidden, and an item left with none is hidden.
@@ -956,7 +966,13 @@ run only by an explicit backfill.
 
 `run_weeks(app, weeks, trigger, force)` runs weeks one after another under
 `app.state.weekly_insights_lock` (a held lock → the call returns None; nothing
-overlaps or double-bills). Each week writes an `insight_runs` row:
+overlaps or double-bills). That lock is per process, so the run row is also the
+**DB run lock**: `JobStore.start_insight_run` checks for another `running` row and
+inserts its own in one `BEGIN IMMEDIATE` transaction, and returns None while one exists
+(`run_weeks` → None), so the server and a CLI run never both spend the same remaining
+budget. A `running` row older than `cron.RUN_LOCK_STALE_S` (2 h) is a crashed run and no
+longer counts; a cancelled run (shutdown) closes its row `aborted` / `cancelled`. Each
+week writes an `insight_runs` row:
 
 ```sql
 CREATE TABLE insight_runs(
@@ -970,14 +986,16 @@ CREATE TABLE insight_runs(
 ```
 
 Progress is updated after every person; the portal polls it every 2 s. A run ends
-`done`; `failed` (`all_people_failed`, `team_openrouter_error` / `team_unusable` when
-the team call errors or is unusable twice, or a crash with its exception class);
-`aborted` (`budget` or `rate_limit`); or `skipped` (`ai_disabled`, `no_client`). A
+`done`; `failed` (`all_people_failed`; `some_people_failed`, when any person call failed:
+the team pass is then skipped, since a team insight missing someone would be saved as
+complete and never revisited; `team_openrouter_error` / `team_unusable` when the team
+call errors or is unusable twice; or a crash with its exception class); `aborted`
+(`budget`, `rate_limit` or `cancelled`); or `skipped` (`ai_disabled`, `no_client`). A
 failed or aborted scheduled run is not `done`, so the scheduler retries it. Without
 `force` a week is restart-safe (people who already have a row are skipped, so nobody is
 paid for twice) but their saved insights still go into the team prompt; the team pass
-runs when the week has no team row, anyone new was analysed, or with `force`. `force`
-regenerates everyone.
+runs when the week has no team row, anyone new was analysed, or with `force`, and no
+person failed. `force` regenerates everyone.
 
 ### Cost control
 
@@ -1151,8 +1169,8 @@ existed".
 
 Both mutating routes (`DELETE`, `POST /restore`) take the
 `auth.require_csrf` dependency: the `csrf_token` form field (or
-`X-CSRF-Token` header) must match the cookie set by the page render (same
-double-submit pattern as `/admin/login` and `/me/login`); a Bearer-authenticated
+`X-CSRF-Token` header) must pass `auth.verify_csrf` (the session-bound token the page render
+embedded, see Auth above); a Bearer-authenticated
 request needs no token. Every read AND mutation re-checks
 ownership: `get_history_row(user_id, kind, row_id)` (=
 `get_record_scoped(kind, row_id, viewer_id, is_admin=False)`) filters on
