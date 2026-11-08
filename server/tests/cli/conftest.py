@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from wispralt.cli import main as cli_main
+from wispralt.cli.paths import Ctx, InstallState, Paths
 from wispralt.cli.system import CliError, Completed, Deps, failure
 
 if TYPE_CHECKING:
@@ -186,3 +187,17 @@ def cli(deps: Deps, capsys: pytest.CaptureFixture[str]) -> CliFn:
         return code, out, err
 
     return _run
+
+
+@pytest.fixture
+def ctx(deps: Deps) -> Ctx:
+    """An installed host: recorded state (default paths) and an existing data dir."""
+    paths = Paths.resolve()
+    state = InstallState(
+        role="host",
+        label=paths.label,
+        paths={"data_dir": str(paths.data_dir), "backup_dir": str(paths.backup_dir)},
+    )
+    state.save(paths.state_file)
+    paths.data_dir.mkdir(mode=0o700, parents=True)
+    return Ctx(paths=paths, state=state, deps=deps)

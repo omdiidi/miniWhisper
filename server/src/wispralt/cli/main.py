@@ -14,6 +14,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from wispralt.cli import launchd
 from wispralt.cli.paths import Ctx, InstallState, Paths
 from wispralt.cli.system import EXIT_USAGE, CliError, Deps
 
@@ -88,9 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("doctor", _todo, "check this Mac and the install (exit 3 on failures)")
     p.add_argument("--warmup", action="store_true", help="load the dictation model once")
     p.add_argument("--client", action="store_true", help="also check the client toolchain")
-    cmd("start", _todo, "start the host service")
-    cmd("stop", _todo, "stop the host service")
-    cmd("restart", _todo, "restart the host service (re-renders its plist)")
+    cmd("start", launchd.cmd_start, "start the host service")
+    cmd("stop", launchd.cmd_stop, "stop the host service")
+    cmd("restart", launchd.cmd_restart, "restart the host service (re-renders its plist)")
 
     users = cmd("users", _todo, "list, add, disable or enable users")
     us = users.add_subparsers(dest="action", required=True, metavar="ACTION")
