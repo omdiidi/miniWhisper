@@ -27,7 +27,9 @@ _TOKEN = re.compile(r"\b[0-9a-f]{64}\b")
 
 @pytest.fixture
 def env(tmp_path: Path) -> dict[str, str]:
-    base = {k: v for k, v in os.environ.items() if not k.startswith("WISPRALT_") and k != "DATA_DIR"}
+    base = {
+        k: v for k, v in os.environ.items() if not k.startswith("WISPRALT_") and k != "DATA_DIR"
+    }
     return {**base, "DATA_DIR": str(tmp_path / "data"), "SERVER_URL": "https://t.example"}
 
 
@@ -119,3 +121,15 @@ def test_bad_data_dir_creates_nothing(env: dict[str, str], cwd: Path, value: str
     code, out, err = _run_tty(["--label", "owner"], {**env, "DATA_DIR": value}, cwd)
     assert code != 0 and "DATA_DIR" in err and not _TOKEN.search(out)
     assert list(cwd.iterdir()) == []
+
+
+def test_one_copy_of_the_key_handover_text() -> None:
+    """Review fix: bootstrap.py and the wispralt CLI print the key through one function."""
+    from wispralt.cli import host
+
+    src = Path(host.__file__).resolve().parents[1]
+    owners = [f for f in src.rglob("*.py") if "shown ONCE" in f.read_text()]
+    assert owners == [Path(host.__file__).resolve()]
+    assert "host.client_config_text(" in (src / "bootstrap.py").read_text()
+    text = host.client_config_text("", "k" * 64, heading="First admin created.")
+    assert "not set yet" in text and "k" * 64 in text

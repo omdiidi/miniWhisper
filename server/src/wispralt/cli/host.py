@@ -193,9 +193,15 @@ def emit_secret(ctx: Ctx, token: str, token_file: Path | None, *, heading: str) 
             f.write(token + "\n")
         print(f"{heading} The key is in {token_file} (0600); delete it once it is in use.")
         return
-    print(
+    print(client_config_text(server_url(ctx), token, heading=heading))
+
+
+def client_config_text(url: str, token: str, *, heading: str) -> str:
+    """The one wording for handing over a key (the CLI and ``python -m wispralt.bootstrap``)."""
+    url = url or "(not set yet: the https:// URL you set as SERVER_URL)"
+    return (
         f"\n{heading}\nEnter these in the WisprAlt client (Settings > Server). The key is shown ONCE:\n\n"
-        f"  Server URL: {server_url(ctx)}\n"
+        f"  Server URL: {url}\n"
         f"  API key:    {token}\n"
     )
 
