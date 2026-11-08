@@ -151,9 +151,19 @@ def _keep(items: list[Any], allowed: Iterable[str]) -> list[dict[str, Any]]:
     return out
 
 
+def _require_usable(out: dict[str, Any], lists: Iterable[str], what: str) -> None:
+    """A cleaned insight with no items in any list (and no quote) is unusable: ``{}``
+    parses, since every field defaults to empty, and so does a reply whose every item
+    cited refs it may not. ``InsightShapeError``, so the run records a failure and
+    retries instead of saving an empty insight as the week's."""
+    if not any(out[name] for name in lists) and not out.get("quotable_line"):
+        raise InsightShapeError(f"{what} insight has no usable items")
+
+
 def validate_person(raw: Any, assembled: Assembled) -> dict[str, Any]:
     """Parse and clean a person insight: refs ∩ prompt refs, empty items dropped, the
-    quote kept only when it is an exact substring of the record it cites."""
+    quote kept only when it is an exact substring of the record it cites. Nothing usable
+    left (no item, no quote) → ``InsightShapeError`` (``_require_usable``)."""
     p = _parse(PersonInsightV2, raw)
     out: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
     for name in PERSON_LISTS:
@@ -166,6 +176,7 @@ def validate_person(raw: Any, assembled: Assembled) -> dict[str, Any]:
         and q.text.strip() in assembled.texts.get(q.source, "")
     )
     out["quotable_line"] = {"text": q.text.strip(), "source": q.source} if quote_ok else None
+    _require_usable(out, PERSON_LISTS, "person")
     return out
 
 
@@ -186,17 +197,15 @@ def refs_in(insight: dict[str, Any]) -> set[str]:
 def validate_team(raw: Any, allowed: Iterable[str]) -> dict[str, Any]:
     """Team items may cite only refs found in the person insights they summarise.
 
-    A reply left with no items (``{}`` parses, since every list defaults to empty, or
-    every item cited refs it may not) is unusable: ``InsightShapeError``, so the run
-    retries it and never saves an empty team insight as the week's.
+    A reply left with no items is unusable (``_require_usable``): the run retries it and
+    never saves an empty team insight as the week's.
     """
     t = _parse(TeamInsightV2, raw)
     allowed = set(allowed)
     out: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
     for name in TEAM_LISTS:
         out[name] = _keep(getattr(t, name), allowed)
-    if not any(out[name] for name in TEAM_LISTS):
-        raise InsightShapeError("team insight has no usable items")
+    _require_usable(out, TEAM_LISTS, "team")
     return out
 
 

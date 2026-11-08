@@ -10,8 +10,11 @@ Concurrency contract (mirrors plan §"Lock contract"):
     pending_tasks, last_seen, cumulative_audio_ms}`` MUST hold
     ``session.lock``.
   * The sweeper SKIPS sessions whose ``lock`` is already held OR whose
-    ``status`` is in ``{"finalizing", "finalized", "aborted"}`` — this is what
-    closes the sweeper-at-lock-boundary race.
+    ``status`` is ``"finalizing"`` — this is what closes the
+    sweeper-at-lock-boundary race. Finalized and aborted sessions are not
+    aborted again; they are EVICTED from the store one ``ttl_s`` after the
+    sweeper first sees them ended (``ended_at``), so the store stays bounded
+    while a retried finalize can still replay a blank result in that window.
   * ``finalize`` snapshots ``pending_tasks.values()`` and ``partial_texts``
     under the lock BEFORE awaiting ``asyncio.gather``. The sweeper cannot
     invalidate that snapshot.
@@ -82,6 +85,9 @@ class StreamingSession:
     # stored (so the dedup row replay cannot find it), and a retried finalize
     # replays this instead of getting "Session is finalized".
     blank_text: str | None = None
+    # When the sweeper first saw this session finalized or aborted (its own
+    # clock). The session is evicted ``ttl_s`` after this, never sooner.
+    ended_at: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -95,7 +101,8 @@ class StreamingSessionStore:
       * ``max_active`` concurrent sessions (global cap, protects the single-
         thread Parakeet executor from queue depth blow-up).
       * One active session per user (atomic via ``_store_lock``).
-      * TTL-based sweeping of idle sessions.
+      * TTL-based sweeping of idle sessions, and eviction of finalized /
+        aborted ones one TTL after they end (``sweep_once``).
 
     Per-session queue-depth enforcement (``max_queue_depth``) is the route
     layer's job — this store does not police chunk POSTs.
@@ -331,23 +338,75 @@ class StreamingSessionStore:
         async with self._store_lock:
             self._sessions.pop(session_id, None)
 
+    async def _evict(self, session: StreamingSession) -> None:
+        """Drop *session* from the registry, but only if that exact object is
+        still registered (a reopened id is a different session)."""
+        async with self._store_lock:
+            if self._sessions.get(session.session_id) is session:
+                del self._sessions[session.session_id]
+
+    async def sweep_once(self, now: float) -> None:
+        """One sweeper pass (see ``_streaming_sweeper`` for the contract).
+
+        * Active sessions idle longer than ``ttl_s`` → ``"aborted"``, their
+          pending inference cancelled.
+        * Finalized / aborted sessions → stamped ``ended_at`` on first sight,
+          evicted once ``now - ended_at > ttl_s``. The grace keeps the blank
+          result replay (``blank_text``) and the 410 for late chunks working
+          for a full TTL; after that the id is unknown (404).
+        """
+        for session in self.snapshot_all():
+            if session.lock.locked():
+                continue
+            if session.status in ("finalized", "aborted"):
+                if session.ended_at is None:
+                    session.ended_at = now
+                elif now - session.ended_at > self.ttl_s:
+                    await self._evict(session)
+                continue
+            if session.status == "finalizing":
+                continue
+            if now - session.last_seen <= self.ttl_s:
+                continue
+            # Stale. Re-check status under the lock to avoid racing a
+            # finalize that grabbed the lock between our locked() check
+            # and the acquire below.
+            async with session.lock:
+                if session.status not in ("active",):
+                    continue
+                session.status = "aborted"
+                session.last_error = "ttl_expired"
+                session.ended_at = now
+                for task in session.pending_tasks.values():
+                    task.cancel()
+            observability.streaming_sessions_aborted_total.increment(
+                "ttl_expired"
+            )
+            logger.info(
+                "streaming sweeper aborted stale session sid=%s owner=%d"
+                " age_s=%.1f",
+                session.session_id,
+                session.owner_user_id,
+                now - session.started_at,
+            )
+
 
 # ── sweeper ──────────────────────────────────────────────────────────────────
 
 
 async def _streaming_sweeper(app) -> None:
-    """Background coroutine — every 30 s mark stale sessions ``"aborted"`` and
-    cancel their pending inference tasks. Bound to the FastAPI lifespan;
-    cancellation on shutdown is silent.
+    """Background coroutine — every 30 s run ``store.sweep_once``: mark stale
+    sessions ``"aborted"`` (cancelling their pending inference) and evict
+    finalized / aborted ones one TTL after they ended. Bound to the FastAPI
+    lifespan; cancellation on shutdown is silent.
 
     Sweep contract (plan §"Lock contract"):
       * Skip sessions where ``lock.locked()`` is True — finalize / chunk POST
         is mid-flight and will move the session forward itself.
-      * Skip sessions whose status is already ``"finalizing"``, ``"finalized"``,
-        or ``"aborted"``.
-      * For survivors, check ``time.time() - last_seen > ttl_s`` and, if stale,
-        acquire the lock, set status to ``"aborted"``, cancel every task in
-        ``pending_tasks``.
+      * Skip sessions whose status is ``"finalizing"``.
+      * Finalized / aborted: evict once ``ended_at`` is older than ``ttl_s``.
+      * Active: if ``time.time() - last_seen > ttl_s``, acquire the lock, set
+        status to ``"aborted"``, cancel every task in ``pending_tasks``.
     """
     store: StreamingSessionStore | None = getattr(
         app.state, "streaming_sessions", None
@@ -360,34 +419,7 @@ async def _streaming_sweeper(app) -> None:
     try:
         while True:
             await asyncio.sleep(30)
-            now = time.time()
-            for session in store.snapshot_all():
-                if session.lock.locked():
-                    continue
-                if session.status in ("finalizing", "finalized", "aborted"):
-                    continue
-                if now - session.last_seen <= store.ttl_s:
-                    continue
-                # Stale. Re-check status under the lock to avoid racing a
-                # finalize that grabbed the lock between our locked() check
-                # and the acquire below.
-                async with session.lock:
-                    if session.status not in ("active",):
-                        continue
-                    session.status = "aborted"
-                    session.last_error = "ttl_expired"
-                    for task in session.pending_tasks.values():
-                        task.cancel()
-                observability.streaming_sessions_aborted_total.increment(
-                    "ttl_expired"
-                )
-                logger.info(
-                    "streaming sweeper aborted stale session sid=%s owner=%d"
-                    " age_s=%.1f",
-                    session.session_id,
-                    session.owner_user_id,
-                    now - session.started_at,
-                )
+            await store.sweep_once(time.time())
     except asyncio.CancelledError:
         # Clean lifespan shutdown — propagate so the gathering task notices.
         raise

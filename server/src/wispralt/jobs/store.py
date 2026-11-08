@@ -711,32 +711,36 @@ class JobStore:
 
         The DB-level run lock: the check and the insert share one ``BEGIN IMMEDIATE``
         transaction, so the server and a CLI run (separate processes) can never both
-        hold it and spend the same remaining budget. A ``running`` row older than
-        *stale_after_s* is a crashed run and no longer holds the lock.
+        hold it and spend the same remaining budget. A live run touches its row's
+        ``heartbeat_at`` on every progress step (``update_insight_run``); a ``running``
+        row whose heartbeat is older than *stale_after_s* is a crashed run and no longer
+        holds the lock, however long ago it started.
         """
         with self.db.write() as con:
             busy = con.execute(
-                "SELECT 1 FROM insight_runs WHERE status = 'running' AND started_at > ? LIMIT 1",
+                "SELECT 1 FROM insight_runs WHERE status = 'running'"
+                " AND COALESCE(heartbeat_at, started_at) > ? LIMIT 1",
                 (now - stale_after_s,),
             ).fetchone()
             if busy is not None:
                 return None
             return con.execute(
                 "INSERT INTO insight_runs(trigger, iso_year, iso_week, status, estimated_usd,"
-                " started_at) VALUES (?, ?, ?, 'running', ?, ?) RETURNING id",
-                (trigger, iso_year, iso_week, estimated_usd, now),
+                " started_at, heartbeat_at) VALUES (?, ?, ?, 'running', ?, ?, ?) RETURNING id",
+                (trigger, iso_year, iso_week, estimated_usd, now, now),
             ).fetchone()[0]
 
     def update_insight_run(
         self, run_id: int, *, people_total: int, people_done: int,
-        failures: list[dict[str, Any]], cost_usd: float,
+        failures: list[dict[str, Any]], cost_usd: float, now: float,
     ) -> None:
-        """Progress. ``failures`` holds ``{user_id, error_class}`` only (never text)."""
+        """Progress, and the run lock's heartbeat (``heartbeat_at = now``).
+        ``failures`` holds ``{user_id, error_class}`` only (never text)."""
         with self.db.write() as con:
             con.execute(
                 "UPDATE insight_runs SET people_total=?, people_done=?, failures_json=?,"
-                " cost_usd=? WHERE id=?",
-                (people_total, people_done, json.dumps(failures), cost_usd, run_id),
+                " cost_usd=?, heartbeat_at=? WHERE id=?",
+                (people_total, people_done, json.dumps(failures), cost_usd, now, run_id),
             )
 
     def finish_insight_run(

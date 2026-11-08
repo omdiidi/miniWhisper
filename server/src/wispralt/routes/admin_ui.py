@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import functools
 import io
 import logging
 import re
@@ -46,7 +47,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from .. import setup_code
-from .._errors import AlreadyBootstrapped
+from .._errors import AlreadyBootstrapped, LastActiveKey
 from ..accounts import service as account_service
 from ..accounts.store import AccountStore, User
 from ..auth import (
@@ -412,16 +413,16 @@ async def device_revoke(
     owner = await asyncio.to_thread(accounts.key_owner, key_id)
     if owner is None:
         raise HTTPException(status_code=404, detail="Key not found")
-    if owner == admin.id:
-        active = [k.id for k in await asyncio.to_thread(accounts.list_keys, admin.id)
-                  if k.revoked_at is None]
-        if active == [key_id]:
-            raise HTTPException(
-                status_code=400,
-                detail="You cannot revoke your own last active key: you would be locked out."
-                " Add another device first, or use Rotate key.",
-            )
-    await asyncio.to_thread(accounts.revoke_key, key_id)
+    try:  # the last-key check and the revoke are one transaction in the store
+        await asyncio.to_thread(
+            functools.partial(accounts.revoke_key, key_id, keep_last_of=admin.id)
+        )
+    except LastActiveKey as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot revoke your own last active key: you would be locked out."
+            " Add another device first, or use Rotate key.",
+        ) from exc
     return RedirectResponse(f"/admin/people/{owner}", status_code=303)
 
 

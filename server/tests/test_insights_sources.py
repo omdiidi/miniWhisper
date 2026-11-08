@@ -153,6 +153,21 @@ def test_a_team_reply_with_no_usable_items_is_unusable(raw: Any) -> None:
         sources.validate_team(raw, allowed={"d:1"})
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {},  # every field defaults to empty: parses, but says nothing
+        {"digest": [], "topics": [], "quotable_line": None},
+        {"digest": [{"text": "x", "sources": ["d:999"]}]},  # only refs not in the prompt
+        {"quotable_line": {"text": "We ship Monday.", "source": "d:1"}},  # quote not in record
+    ],
+)
+def test_a_person_reply_with_no_usable_items_or_quote_is_unusable(raw: Any) -> None:
+    a = sources.assemble([{"kind": "dictation", "row_id": "1", "text": "We ship Friday."}], cap=100)
+    with pytest.raises(sources.InsightShapeError, match="no usable items"):
+        sources.validate_person(raw, a)
+
+
 # ── the run: refs checked against what was actually in the prompt ────────────
 
 

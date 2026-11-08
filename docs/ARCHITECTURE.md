@@ -326,7 +326,7 @@ The server side is intentionally small and lives in two new modules:
 - **2 active sessions globally.** Returns `503 capacity_exceeded` on the 3rd open. Sized to match the mini's single-Parakeet-executor reality plus one buffer slot.
 - **1 active session per `api_key_id`.** Returns `409 per_user_busy` if the same user opens a second session while their first is still active. Forces clients to either reuse the existing `sid` (idempotent — `open_or_get` returns `existing`) or wait for the prior `finalize` to land.
 - **270 s cumulative voiced audio mid-chunk; 300 s at finalize.** Mid-chunk cap → `413`. Finalize cap → `413`. Keeps any single session inside Parakeet's comfortable VRAM working-set even under HOL contention.
-- **900 s session TTL.** A background sweeper task (`_streaming_sweeper`) reaps any session whose `last_seen` is older than 900 s, regardless of status. On reap, pending chunk tasks are cancelled and the slot is freed.
+- **900 s session TTL.** A background sweeper task (`_streaming_sweeper`, every 30 s, one `StreamingSessionStore.sweep_once` pass) aborts any `active` session whose `last_seen` is older than 900 s: pending chunk tasks are cancelled and the slot is freed. Finalized and aborted sessions are then evicted from the store 900 s after the sweeper first sees them ended (`ended_at`), so the process-wide store stays bounded; until then a retried finalize can still replay a blank result and a late chunk still gets 410. After eviction the id is unknown (404). Locked and `finalizing` sessions are never touched.
 - **15 s finalize timeout.** `finalize` waits up to 15 s for all `pending_tasks` to drain before snapshotting `partial_texts` and joining. Past 15 s the route returns `504 timeout` and the session is marked `aborted`; the client safety buffer kicks in.
 
 **Single Parakeet executor (no second instance).** Every chunk task is submitted to the same `ParakeetService` `run_in_executor` that `/transcribe/dictate` uses. There is no second model load, no second executor, no second thread pool. This means cross-session head-of-line blocking exists on a shared queue — see Known limitations below. With the 2-session cap, the worst case is 2 chunks contending and is acceptable for the experimental rollout.
@@ -933,9 +933,12 @@ insights timezone (DB setting, else `INSIGHTS_TIMEZONE`, else the host zone from
    person's prompt), can never survive. `quotable_line` is kept only when its text is an
    exact substring of the record it cites. The team pass receives the validated person
    insights of the week (saved earlier or new in this run) and its items may cite only
-   refs those insights cite. A team reply left with no items at all (`{}` parses, since
-   every list defaults to empty) is an `InsightShapeError` too: it is retried once, then
-   the run ends `team_unusable`, so an empty team insight is never saved.
+   refs those insights cite. A reply left with nothing usable (`{}` parses, since every
+   field defaults to empty; a person reply also needs no surviving quote) is an
+   `InsightShapeError` too, through one shared check (`_require_usable`): a person reply
+   counts as a `schema` failure (the run ends `failed`, so it is retried), and a team
+   reply is retried once, then the run ends `team_unusable`. An empty insight is never
+   saved.
 4. **Render.** `sources.build_view` re-checks refs at view time
    (`JobStore.refs_exist(refs, viewer, is_admin)`): refs to deleted records, or to
    records the viewer may not open, are hidden, and an item left with none is hidden.
@@ -971,8 +974,11 @@ overlaps or double-bills). That lock is per process, so the run row is also the
 **DB run lock**: `JobStore.start_insight_run` checks for another `running` row and
 inserts its own in one `BEGIN IMMEDIATE` transaction, and returns None while one exists
 (`run_weeks` → None), so the server and a CLI run never both spend the same remaining
-budget. A `running` row older than `cron.RUN_LOCK_STALE_S` (2 h) is a crashed run and no
-longer counts; a cancelled run (shutdown) closes its row `aborted` / `cancelled`. Each
+budget. The lock is a heartbeat, not a start time: every progress step (before and after
+each person call, and before each team call) sets the row's `heartbeat_at`
+(migration 0004), and only a `running` row whose heartbeat is older than
+`cron.RUN_LOCK_STALE_S` (10 min, far above one call's 30 s timeout) is a crashed run and no
+longer counts, so a long live run never loses its lock to a CLI run; a cancelled run (shutdown) closes its row `aborted` / `cancelled`. Each
 week writes an `insight_runs` row:
 
 ```sql
@@ -984,6 +990,8 @@ CREATE TABLE insight_runs(
   failures_json TEXT NOT NULL DEFAULT '[]',   -- [{user_id, error_class}] only
   estimated_usd REAL, cost_usd REAL NOT NULL DEFAULT 0, error_class TEXT,
   started_at REAL NOT NULL, finished_at REAL);
+-- 0004: the run lock's heartbeat, touched on every progress step
+ALTER TABLE insight_runs ADD COLUMN heartbeat_at REAL;
 ```
 
 Progress is updated after every person; the portal polls it every 2 s. A run ends

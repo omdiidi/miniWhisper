@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import threading
 import time
 from typing import TYPE_CHECKING
 
 import pytest
 
-from wispralt._errors import AlreadyBootstrapped
+from wispralt._errors import AlreadyBootstrapped, LastActiveKey
 from wispralt.accounts import service
 from wispralt.accounts.service import hash_token
 from wispralt.usage.events import UsageEvent
@@ -49,6 +50,50 @@ def test_lookup_valid_revoked_disabled_and_other_user(
     assert accounts.disable_user(bob.id)
     assert accounts.lookup_key(hash_token(bob_token)) is None  # disabled user
     assert not accounts.disable_user(bob.id)
+
+
+def test_revoke_keep_last_of_refuses_the_last_key_and_writes_nothing(
+    db: Database, accounts: AccountStore, make_user: MakeUser
+) -> None:
+    admin, _ = make_user(role="admin")
+    other, _ = make_user()
+    assert admin.key_id is not None and other.key_id is not None
+    with pytest.raises(LastActiveKey):
+        accounts.revoke_key(admin.key_id, keep_last_of=admin.id)
+    assert _active_keys(db, admin.id) == 1
+    # someone else's last key is not guarded
+    assert accounts.revoke_key(other.key_id, keep_last_of=admin.id)
+
+
+def test_concurrent_guarded_revokes_never_remove_the_last_key(
+    db: Database, accounts: AccountStore, make_user: MakeUser
+) -> None:
+    """Two revokes of an admin's last two keys at once: the check and the revoke are one
+    BEGIN IMMEDIATE, so exactly one wins and the other gets LastActiveKey."""
+    admin, _ = make_user(role="admin")
+    with db.write() as con:
+        second = con.execute(
+            "INSERT INTO api_keys(user_id, token_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+            (admin.id, hash_token("c" * 64), time.time()),
+        ).fetchone()[0]
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+
+    def revoke(key_id: int) -> None:
+        barrier.wait()
+        try:
+            results.append(accounts.revoke_key(key_id, keep_last_of=admin.id))
+        except LastActiveKey as exc:
+            results.append(exc)
+
+    threads = [threading.Thread(target=revoke, args=(k,)) for k in (admin.key_id, second)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(type(r).__name__ for r in results) == ["LastActiveKey", "bool"]
+    assert True in results
+    assert _active_keys(db, admin.id) == 1
 
 
 def test_rotate_leaves_exactly_one_active_key(

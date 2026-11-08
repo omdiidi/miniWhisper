@@ -258,7 +258,7 @@ Close out a streaming session. The dedup id is claimed first and a stored dictat
 }
 ```
 
-`duration_ms` on streaming rows is **cumulative** per-chunk Parakeet inference time (sum of N chunks), not single-pass wall-clock. See [ARCHITECTURE.md → Known limitations](ARCHITECTURE.md#known-limitations) for the semantic drift versus single-shot dictation rows. The response envelope is otherwise byte-identical to `/transcribe/dictate` so the client's existing decoder is unchanged. As there, blank joined text is not stored and reports `"saved": true`; the session remembers it, so a retried finalize with the same dedup id replays it (`"replayed": true`) instead of getting 410 `Session is finalized` (until a server restart, which drops in-memory sessions).
+`duration_ms` on streaming rows is **cumulative** per-chunk Parakeet inference time (sum of N chunks), not single-pass wall-clock. See [ARCHITECTURE.md → Known limitations](ARCHITECTURE.md#known-limitations) for the semantic drift versus single-shot dictation rows. The response envelope is otherwise byte-identical to `/transcribe/dictate` so the client's existing decoder is unchanged. As there, blank joined text is not stored and reports `"saved": true`; the session remembers it, so a retried finalize with the same dedup id replays it (`"replayed": true`) instead of getting 410 `Session is finalized`. Known limitation: that replay lives only in the in-memory session, so after a server restart, or once the sweeper evicts the session (900 s after it ended), the retry gets 404 and the client falls back to its whole-file `/transcribe/dictate` upload.
 
 **Errors:**
 
@@ -971,7 +971,7 @@ Browser users hit `/admin/login` once to set the `wispralt_admin_token` cookie; 
 | GET | `/admin/people/{id}` | admin | Person page: tiles, devices (per-key last seen), recent requests, actions |
 | POST | `/admin/people/{id}/rotate` | admin + CSRF | Revoke all the person's keys, issue one (re-enables); key shown once (`no-store`). 404 unknown. |
 | POST | `/admin/people/{id}/disable` | admin + CSRF | 303 → person page; every key 401s from the next request. 400 for yourself. |
-| POST | `/admin/keys/{key_id}/revoke` | admin + CSRF | Revoke one device; 303 → its person; 404 unknown key; 400 for the acting admin's own last active key. |
+| POST | `/admin/keys/{key_id}/revoke` | admin + CSRF | Revoke one device; 303 → its person; 404 unknown key; 400 for the acting admin's own last active key (checked in the same transaction as the revoke, so two concurrent revokes cannot both pass). |
 | GET/POST | `/admin/invites` | admin (+ CSRF on POST) | Invites list / create (new person `label`+`role`, or `user_id` = add device); link + code shown once (`no-store`). |
 | POST | `/admin/invites/{id}/revoke` | admin + CSRF | Expire a pending invite; 303 → `/admin/invites`. |
 | GET/POST | `/admin/integrations`, `/admin/integrations/new` | admin (+ CSRF on POST) | Integration keys list / create (key + OpenAI env snippet shown once, `no-store`). |

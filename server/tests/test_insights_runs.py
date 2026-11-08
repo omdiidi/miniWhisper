@@ -476,12 +476,62 @@ async def test_a_running_row_from_another_process_refuses_the_run(
     assert stub.calls == 0
     assert [r["id"] for r in job_store.recent_insight_runs()] == [other]
 
-    # A row left 'running' by a crash stops holding the lock once it is stale.
+    # A live run started long ago still holds the lock while its heartbeat is fresh.
     with job_store.db.write() as con:
         con.execute("UPDATE insight_runs SET started_at = ? WHERE id = ?",
+                    (time.time() - 3 * 3600, other))
+    assert await cron.run_weekly_insights(app, week, trigger="manual") is None
+    assert stub.calls == 0
+
+    # A row left 'running' by a crash stops holding the lock once its heartbeat is stale.
+    with job_store.db.write() as con:
+        con.execute("UPDATE insight_runs SET heartbeat_at = ? WHERE id = ?",
                     (time.time() - cron.RUN_LOCK_STALE_S - 1, other))
     outcome = await cron.run_weekly_insights(app, week, trigger="manual")
     assert outcome is not None and outcome.people_done == 3
+
+
+async def test_every_call_of_a_run_touches_the_run_lock_heartbeat(
+    job_store: JobStore, accounts: AccountStore, settings_store: SettingsStore, busy_people, week
+) -> None:
+    """The heartbeat moves before each OpenRouter call (people and team), so a run that
+    outlives RUN_LOCK_STALE_S in total never looks crashed to a second process."""
+    _ai_on(settings_store)
+    beats: list[float | None] = []
+
+    def record(n: int) -> None:
+        with job_store.db.read() as con:
+            beats.append(con.execute(
+                "SELECT heartbeat_at FROM insight_runs WHERE status = 'running'"
+            ).fetchone()[0])
+        with job_store.db.write() as con:  # age it: only a fresh beat may follow
+            con.execute("UPDATE insight_runs SET heartbeat_at = 0 WHERE status = 'running'")
+
+    stub = Stub(on_call=record)
+    t0 = time.time()
+    outcome = await cron.run_weekly_insights(_app(job_store, accounts, settings_store, stub), week,
+                                             trigger="manual")
+    assert outcome is not None and outcome.people_done == 3
+    assert stub.calls == 4  # three people + the team pass
+    assert len(beats) == 4 and all(b is not None and b >= t0 for b in beats)
+
+
+def test_start_insight_run_keys_staleness_on_the_heartbeat(job_store: JobStore) -> None:
+    now = time.time()
+    run = job_store.start_insight_run(trigger="manual", iso_year=2026, iso_week=1,
+                                      estimated_usd=None, now=now - 3 * 3600,
+                                      stale_after_s=cron.RUN_LOCK_STALE_S)
+    assert run is not None
+    job_store.update_insight_run(run, people_total=1, people_done=0, failures=[],
+                                 cost_usd=0.0, now=now)
+    blocked = job_store.start_insight_run(trigger="manual", iso_year=2026, iso_week=1,
+                                          estimated_usd=None, now=now,
+                                          stale_after_s=cron.RUN_LOCK_STALE_S)
+    assert blocked is None  # started 3 h ago, beating now: still holds the lock
+    later = now + cron.RUN_LOCK_STALE_S + 1
+    assert job_store.start_insight_run(trigger="manual", iso_year=2026, iso_week=1,
+                                       estimated_usd=None, now=later,
+                                       stale_after_s=cron.RUN_LOCK_STALE_S) is not None
 
 
 async def test_a_cancelled_run_closes_its_row_and_releases_the_lock(

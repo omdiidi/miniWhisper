@@ -14,9 +14,12 @@ enabled it after the disclosure, and an InsightsClient exists (``OPENROUTER_API_
   ``aborted`` (``budget``, ``rate_limit`` or ``cancelled``) or ``skipped`` (AI off, no
   client).
 * One run at a time across processes: ``JobStore.start_insight_run`` refuses while another
-  row is ``running`` (check + insert in one ``BEGIN IMMEDIATE``; a row older than
-  ``RUN_LOCK_STALE_S`` is a crash and is ignored). So the server and a CLI run never spend
-  the same remaining budget; the in-process lock only saves the DB round trip.
+  row is ``running`` (check + insert in one ``BEGIN IMMEDIATE``). The lock is a heartbeat:
+  every progress step (before and after each OpenRouter call, including the team pass)
+  touches the row's ``heartbeat_at``, and only a row whose heartbeat is older than
+  ``RUN_LOCK_STALE_S`` (10 min, far above one call's timeout) is a crash and is ignored,
+  so a long live run keeps its lock. The server and a CLI run never spend the same
+  remaining budget; the in-process lock only saves the DB round trip.
 * The 30-day cost cap is checked before EVERY OpenRouter call, not once per run, and the
   check reserves that call's worst case (``call_reserve_usd``: the prompt's tokens plus a
   full ``max_tokens`` reply at the rate card), so a call that could cross the cap is never
@@ -70,7 +73,7 @@ logger = logging.getLogger(__name__)
 SCHEDULER_INTERVAL_S = 3600.0
 SCHEDULER_FIRST_CHECK_S = 60.0
 RETRY_AFTER_S = 6 * 3600.0
-RUN_LOCK_STALE_S = 2 * 3600.0  # a 'running' row older than this is a crashed run
+RUN_LOCK_STALE_S = 10 * 60.0  # a 'running' row whose heartbeat is older is a crashed run
 TOKENS_PER_WORD = 1.35
 MAX_BACKFILL_WEEKS = 12
 PERSON_MAX_TOKENS = 2000
@@ -233,7 +236,7 @@ async def _run_one(app, week: Week, cfg, *, trigger: str, force: bool) -> RunOut
         await asyncio.to_thread(
             lambda: job_store.update_insight_run(
                 run_id, people_total=outcome.people_total, people_done=outcome.people_done,
-                failures=outcome.failures, cost_usd=outcome.cost_usd,
+                failures=outcome.failures, cost_usd=outcome.cost_usd, now=time.time(),
             )
         )
 
@@ -369,7 +372,7 @@ async def _run_weekly_insights_inner(
     if person_insights and outcome.aborted is None and not outcome.failures:
         team_saved = await asyncio.to_thread(job_store.get_weekly_insight_team, iso_year, iso_week)
         if force or team_saved is None or outcome.people_done:
-            await _team_pass(app, week, cfg, person_insights, outcome, over_cap)
+            await _team_pass(app, week, cfg, person_insights, outcome, over_cap, report)
 
     logger.info(
         "Weekly insights W%02d — %d/%d people, cost $%.4f, failures=%s, aborted=%s",
@@ -379,9 +382,10 @@ async def _run_weekly_insights_inner(
     return outcome
 
 
-async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome, over_cap) -> None:  # noqa: ANN001
+async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome, over_cap, report) -> None:  # noqa: ANN001
     """Team insight over every person insight of the week; it may cite only their refs.
-    Sets ``outcome.team_error`` when no usable team insight was saved (budget aside)."""
+    Sets ``outcome.team_error`` when no usable team insight was saved (budget aside).
+    ``report`` (progress) runs before each call: it is the run lock's heartbeat."""
     client: InsightsClient = app.state.insights_client
     allowed = set().union(*(sources.refs_in(i) for _, i in person_insights))
     digests_jsonl = "\n".join(
@@ -395,6 +399,7 @@ async def _team_pass(app, week: Week, cfg, person_insights, outcome: RunOutcome,
         if over_cap(reserve):
             outcome.aborted = "budget"
             return
+        await report()
         try:
             resp = await client.analyze(
                 system_prompt=TEAM_SYSTEM_PROMPT, user_prompt=user_prompt,

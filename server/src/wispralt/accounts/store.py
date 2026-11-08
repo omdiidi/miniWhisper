@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from wispralt._errors import AlreadyBootstrapped, InviteInvalid
+from wispralt._errors import AlreadyBootstrapped, InviteInvalid, LastActiveKey
 
 if TYPE_CHECKING:
     import sqlite3
@@ -348,9 +348,25 @@ class AccountStore:
                 before_commit()
         return _user(r, key_id)
 
-    def revoke_key(self, key_id: int) -> bool:
-        """Revoke one key (single-device removal). False if already revoked or unknown."""
+    def revoke_key(self, key_id: int, *, keep_last_of: int | None = None) -> bool:
+        """Revoke one key (single-device removal). False if already revoked or unknown.
+
+        ``keep_last_of``: a user id whose last active key must survive. If *key_id* is
+        that user's only active key, raise ``LastActiveKey`` and write nothing. The check
+        and the revoke share one ``BEGIN IMMEDIATE``, so two concurrent revokes of an
+        admin's last two keys cannot both pass the check.
+        """
         with self.db.write() as con:
+            if keep_last_of is not None:
+                active = [
+                    r[0]
+                    for r in con.execute(
+                        "SELECT id FROM api_keys WHERE user_id = ? AND revoked_at IS NULL",
+                        (keep_last_of,),
+                    )
+                ]
+                if active == [key_id]:
+                    raise LastActiveKey
             return (
                 con.execute(
                     "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
