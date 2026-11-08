@@ -34,9 +34,10 @@ _TABLES = {
 
 @pytest.fixture
 def migrations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A private copy of the migrations dir that a test may extend or edit."""
+    """A private copy of ``0001`` only (later real migrations stay out) to extend or edit."""
     copy = tmp_path / "migrations"
-    shutil.copytree(database_mod.MIGRATIONS_DIR, copy)
+    copy.mkdir()
+    shutil.copy(database_mod.MIGRATIONS_DIR / "0001_initial.sql", copy)
     monkeypatch.setattr(database_mod, "MIGRATIONS_DIR", copy)
     return copy
 
@@ -51,7 +52,7 @@ def _versions(db: Database) -> list[int]:
         return [r[0] for r in con.execute("SELECT version FROM schema_migrations ORDER BY 1")]
 
 
-def test_fresh_migrate_creates_schema_and_seeds_retention(tmp_path: Path) -> None:
+def test_fresh_migrate_creates_schema_and_seeds_retention(tmp_path: Path, migrations: Path) -> None:
     db = Database(tmp_path / "wispralt.db")
     assert db.migrate() == [1]
     assert _tables(db) == _TABLES
@@ -104,7 +105,7 @@ def test_db_file_is_0600_before_first_connect(
 
 def test_second_migrate_is_noop(db: Database) -> None:
     assert db.migrate() == []
-    assert _versions(db) == [1]
+    assert _versions(db) == sorted(database_mod._migration_files())
 
 
 def test_failing_migration_leaves_nothing(tmp_path: Path, migrations: Path) -> None:

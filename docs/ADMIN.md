@@ -397,6 +397,50 @@ should count toward "their usage" for billing/quota conversations.
 
 ---
 
+## Importing old history (Supabase + transcript files)
+
+The old host's database was wiped, so the only surviving history is the usage
+metadata in Supabase (who used it, when, how much: **no dictation text**) plus any
+transcript files you kept. Part 7's importer brings both into the local
+`wispralt.db`. Run every command from `server/` with the same `.env` the server uses
+(`DATA_DIR` set). Supabase is only ever read, and nothing it writes is ever deleted.
+
+1. **Export (read-only).** Put a Postgres connection string for the Supabase project
+   in the Keychain (`security add-generic-password -s co.wispralt.import-pg -a wispralt -w`
+   and paste it at the prompt) or in env `WISPRALT_IMPORT_PG_URL`, then:
+
+   ```bash
+   python -m wispralt.importer export
+   ```
+
+   This writes `~/WisprAlt-Backups/supabase-snapshot-YYYY-MM-DD/` (0700; `-2`, `-3`…
+   if you export again the same day) with one `.jsonl` file per table and
+   `counts.json`. Keep this folder: it is the durable backup, and nothing ever
+   deletes it. If the project is paused or unreachable the command exits `3` and
+   writes `BLOCKED.json` instead; it never unpauses or changes the project.
+2. **Dry run.** `python -m wispralt.importer snapshot ~/WisprAlt-Backups/supabase-snapshot-… --dry-run`
+   prints, per table, how many rows would be new / duplicate / linked / malformed /
+   unmatched, the earliest record, and the proposed **owner mapping** (the one active
+   Supabase admin → the one enabled local admin; that account is linked, not
+   copied). Nothing is written.
+3. **Import.** Stop the server, then run the same command without `--dry-run`. At a
+   terminal it shows the dry run and asks before writing; in a script use `--yes`
+   (accepted only when the owner proposal is unambiguous) or name the owner with
+   `--owner-map PG_ID=LOCAL_ID`. Run `python -m wispralt.bootstrap` first if no local
+   admin exists yet. Start the server again afterwards.
+4. **Transcript files (optional).** `python -m wispralt.importer files ~/Documents/WisprAlt… --owner LOCAL_USER_ID --dry-run`,
+   then again with `--yes`. Each transcript becomes a file job in that person's
+   history; the source files are copied, never moved. See
+   [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#importing-old-transcript-files-part-7).
+
+Imported people get no API key: they rejoin by a new invite/key as usual. Re-running
+any step is safe: rows already imported count as `duplicate`, never twice. Exit codes:
+`0` ok, `1` error, `2` refused (no `--yes` without a terminal, owner mapping needed,
+server running), `3` BLOCKED, `4` integrity failure (the snapshot does not match its
+`counts.json`). Problems are listed in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#history-import).
+
+---
+
 ## Future hooks (CRM)
 
 Two TEXT discriminators in the schema are pre-positioned for CRM

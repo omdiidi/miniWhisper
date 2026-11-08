@@ -22,6 +22,7 @@ from wispralt._errors import (
     RestoreRefused,
     ServerRunning,
 )
+from wispralt.database import _migration_files
 from wispralt.ops import backup as bk
 
 if TYPE_CHECKING:
@@ -178,7 +179,7 @@ def test_backup_contents_snapshot_and_modes(backup_dir: Path, job_store: JobStor
         for table, count in manifest["tables"].items():
             assert con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] == count
     assert manifest["tables"]["dictations"] == 1 and manifest["tables"]["jobs"] == 2
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == max(_migration_files())
     assert not (backup_dir / "wispralt.db-wal").exists()
     assert not (backup_dir / "wispralt.db-shm").exists()
     for f in manifest["files"]:

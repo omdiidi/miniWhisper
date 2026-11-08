@@ -138,6 +138,33 @@ Do NOT wire `/readyz/db` into Cloudflare origin health-check (use `/healthz`),
 launchd KeepAlive (uses process exit), or any liveness probe that RESTARTS
 the server on failure.
 
+## History import
+
+`python -m wispralt.importer …` (runbook in [ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files)).
+
+- **Exit 3 / `BLOCKED.json`** — the Supabase project is paused or unreachable (DNS,
+  connection refused, timeout, "Tenant or user not found"). The snapshot folder holds
+  only `BLOCKED.json`. Nothing tried to unpause it: resume the project yourself in the
+  Supabase dashboard if you want the export, then run `export` again (a new `-2`
+  folder). Transcript-file import still works meanwhile.
+- **Exit 1 `ExportUnavailable`** — `psql` is missing (`brew install libpq` or
+  `postgresql`), no connection string (env `WISPRALT_IMPORT_PG_URL` or Keychain
+  `co.wispralt.import-pg`), or Postgres refused the query (e.g. permissions).
+- **Exit 4 integrity failure** — a `.jsonl` file no longer matches `counts.json`
+  (edited or truncated), the row count changed during the export twice in a row, a
+  first import found rows already present, or not every planned row was written.
+  Nothing from the failing batch was written; export a fresh snapshot rather than
+  editing one.
+- **Exit 2 refused** — no terminal and no `--yes`; the owner mapping is ambiguous
+  (more than one enabled admin on either side: use `--owner-map PG_ID=LOCAL_ID`); no
+  local admin yet (run `python -m wispralt.bootstrap`); or the server holds
+  `<DATA_DIR>.lock` (stop it first; until Part 4's lock lands the server does not
+  take it, so stop the service yourself).
+- **`unmatched` rows** — usage rows whose Supabase user is not in the snapshot (or was
+  malformed). They stay in the snapshot and are listed in the report.
+- **A crash mid-import** — just run the same command again: it resumes after the last
+  committed batch, and already-imported rows count as duplicates.
+
 ## Trust invariants, not flags — eviction & release checks
 
 Two outages in May 2026 had the same shape: code trusted a return value or

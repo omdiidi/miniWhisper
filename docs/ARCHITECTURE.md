@@ -639,6 +639,85 @@ X GB, have Y GB")` before anything is written.
   drilldown and CSV). The p50 is the median of the window's `duration_ms` values,
   computed in Python.
 
+### History import writer (Part 7)
+
+`0003_import_runs.sql` adds `import_runs` (one row per source per run: `status`
+running/done/failed/blocked, `checkpoint`, `counts_json`). Numbering skips `0002`,
+which Part 6 owns: `migrate()` applies pending files in sorted order and does not
+need contiguous numbers (a DB that got `0003` first simply applies `0002` later).
+
+`wispralt.imports` is the one generic writer for imported history.
+`insert_rows(con, table, rows, source)` runs inside the caller's `write()` (so a
+batch and its `import_runs` checkpoint commit together); `import_rows(db, …)` wraps
+it in its own transaction. Tables and columns come from a fixed allowlist
+(`users`, `usage_events`, `dictations`, `jobs`; never `api_keys`/`invites`), every
+row needs a `source_id`, and bad input raises `ValueError` before anything is
+written. Each row runs in its own SAVEPOINT with
+`ON CONFLICT(source, source_id) WHERE source IS NOT NULL DO NOTHING RETURNING id`:
+it is inserted, a duplicate (its existing id is read in the same transaction), or
+a `RowError` naming the `source_id` and the failed constraint, while the rest of
+the batch commits. `link_existing` stamps an existing row (the owner's local admin)
+with a `(source, source_id)` once, idempotently. A real import holds the offline
+`<data_dir>.lock` via `ops.backup.server_lock`, so it refuses while the server runs.
+
+**Supabase export (read-only).** `importer/supabase_export.py` copies the old
+Postgres history (`users` without `token_hash`, `usage_events`, `fallback_events`)
+into `~/WisprAlt-Backups/supabase-snapshot-YYYY-MM-DD[-N]/` (dir 0700, files 0600):
+one canonical-JSON line per row in `<table>.jsonl`, plus `counts.json` per table
+(`source_count`, `exported`, `columns`, `max_id`, `sha256` of the JSONL bytes,
+`exported_at`). Supabase is never written: `PsqlSource` only sends
+`BEGIN TRANSACTION READ ONLY; <one allowlisted SELECT>; COMMIT;` through
+`psql -X -q -At -v ON_ERROR_STOP=1` with `PGOPTIONS=-c default_transaction_read_only=on`;
+table names are fixed, columns come from `information_schema` and are
+identifier-checked, and `_wrap` refuses any statement with a write verb. The
+connection string (env `WISPRALT_IMPORT_PG_URL`, else Keychain item
+`co.wispralt.import-pg`) reaches `psql` only as `PG*` env vars. Rows are paged by
+`id > after`; `count(*)`/`max(id)` are read before and after each table and must
+match the rows written, else the table is retried once and then fails. A fresh
+snapshot dir is created per run (`-2`, `-3`, … on the same day); files are created
+with `O_EXCL`, a failed attempt's `.partN` file is kept, and nothing is ever
+deleted or overwritten. An unreachable or paused project raises `ExportBlocked`
+and leaves `BLOCKED.json`; nothing ever calls a Supabase management API or
+unpauses it. `JsonPagesSource(dir)` reads `<table>.json` arrays saved by hand from
+the same SELECTs (read-only MCP fallback).
+
+**Snapshot import.** `importer/supabase_import.py` verifies every `<table>.jsonl`
+against `counts.json` (sha256 and line count) before anything is written, then maps
+each row into exactly one bucket — new, duplicate, linked, malformed or unmatched —
+and checks `source_count` equals their sum per table (fail closed). Users get new
+local ids (`source='supabase.users'`, `source_id` = the Postgres id), `revoked_at`
+becomes `disabled_at`, and no `api_keys` are created (people rejoin by invite);
+`last_seen_at` and the fallback `provider`/`provider_request_id`/`cost_micro_usd`
+stay in the snapshot only. The **owner** — the one enabled Supabase admin — is
+*linked* to the one enabled local admin (`link_existing`) instead of inserted; the
+mapping must be confirmed (`--yes` only when unambiguous, or `--owner-map PG=LOCAL`),
+an earlier link counts as confirmed, and with no local admin the import refuses
+until `python -m wispralt.bootstrap` has run. `usage_events` keep their kind
+(`meeting` → `file`), `fallback_events` land in `usage_events` as `fallback_<kind>`,
+and `user_id` is remapped through the imported users (unknown → unmatched). Rows go
+in batches of 500, each committed with its `import_runs` checkpoint, so a crashed
+run resumes the same run row; a first run with any duplicate, or a write that does
+not account for every planned row, marks the run `failed`. A dry run only reads and
+prints the counts and the owner proposal.
+
+**Transcript files.** `importer/files.py` imports TXT/JSON/SRT/VTT transcripts as
+`jobs` rows (`source='files'`, `status='done'`, `mode='file'`, `wav_path=''`, with
+`estimated=1` when the time is a file mtime); see
+[TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#importing-old-transcript-files-part-7).
+Each group's files are copied to `.import-<id><ext>.part` temps in `outputs/` before
+the batch commits and renamed to `<id><ext>` only for rows actually inserted; a
+duplicate, a row error or a failed write removes only those temps. The first-run
+duplicate abort does not apply here: the same file in two folders is an expected
+duplicate.
+
+**Entry point.** `wispralt.importer` exports `run_export`, `run_snapshot_import` and
+`run_file_import` (what the Part 5 `wispralt import …` CLI will wrap);
+`python -m wispralt.importer export | snapshot DIR | files PATH… --owner ID` is the
+interim operator command (`--dry-run`, `--yes`, `--owner-map PG=LOCAL`; exit codes
+0 ok, 1 error, 2 refused, 3 BLOCKED, 4 integrity). A real import needs `--yes` or an
+interactive confirmation after the dry-run report. Runbook:
+[ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files).
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output
