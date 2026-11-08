@@ -21,12 +21,18 @@ public struct DictationResult: Equatable, Sendable {
     public var modelUsed: String
     public var outputTokens: Int?
     public var formatting: Formatting
+    /// Local only: false when the server returned the text but could not
+    /// store it (Part 4 `"saved": false`). The text is delivered as usual;
+    /// Task 7 keeps the audio for Retry. Always true for Online.
+    public var serverSaved: Bool
 
-    public init(text: String, modelUsed: String, outputTokens: Int? = nil, formatting: Formatting = .off) {
+    public init(text: String, modelUsed: String, outputTokens: Int? = nil, formatting: Formatting = .off,
+                serverSaved: Bool = true) {
         self.text = text
         self.modelUsed = modelUsed
         self.outputTokens = outputTokens
         self.formatting = formatting
+        self.serverSaved = serverSaved
     }
 }
 

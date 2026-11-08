@@ -1,4 +1,5 @@
 import Foundation
+import WisprAltCore
 
 /// Central HTTP client for the WisprAlt server.
 ///
@@ -7,6 +8,7 @@ import Foundation
 ///   `ChunkedUploader`.
 ///
 /// Error mapping:
+///   - 410 `{"error":"dictation_deleted"}` / 409 `{"error":"dedup_conflict"}` → terminal `LocalDictationError`
 ///   - 401 → `.unauthorized`
 ///   - 413 → `.uploadTooLarge`
 ///   - 422 → `.uploadTruncated`
@@ -51,19 +53,19 @@ final class ServerClient {
 
     // MARK: - Request builder
 
-    /// Builds a `URLRequest` for the given path, method, and optional body.
-    ///
-    /// Reads `Settings.shared.serverURL` and `KeychainHelper.getAPIKey()`.
-    /// Adds `Authorization: Bearer <key>` header when a key is available.
-    ///
-    /// - Parameters:
-    ///   - path: Server path starting with `/`, e.g. `/healthz`.
-    ///   - method: HTTP method. Defaults to `"GET"`.
-    ///   - body: Optional request body data.
-    ///   - contentType: Value for the `Content-Type` header. Ignored when `body` is nil.
-    ///   - additionalHeaders: Any extra headers to merge in.
+    /// The configured Local server as an endpoint (URL + Local key), read
+    /// per call. The URL must pass `LocalURLPolicy` (https, or http to this Mac).
     /// - Throws: `ServerError.missingConfiguration` if `serverURL` is nil, or
-    ///   `ServerError.invalidServerURL` if the URL cannot be constructed.
+    ///   `ServerError.invalidServerURL` if the policy rejects it.
+    func currentEndpoint() throws -> ServerEndpoint {
+        guard let baseURL = Settings.shared.serverURL else {
+            throw ServerError.missingConfiguration
+        }
+        guard LocalURLPolicy.isAllowed(baseURL) else { throw ServerError.invalidServerURL }
+        return ServerEndpoint(baseURL: baseURL, apiKey: (try? KeychainHelper.getAPIKey()) ?? nil)
+    }
+
+    /// Builds a request against the configured server (`currentEndpoint()`).
     func buildRequest(
         path: String,
         method: String = "GET",
@@ -71,10 +73,34 @@ final class ServerClient {
         contentType: String? = nil,
         additionalHeaders: [String: String] = [:]
     ) throws -> URLRequest {
-        guard let baseURL = Settings.shared.serverURL else {
-            throw ServerError.missingConfiguration
-        }
-        guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
+        try buildRequest(endpoint: currentEndpoint(), path: path, method: method, body: body,
+                         contentType: contentType, additionalHeaders: additionalHeaders)
+    }
+
+    /// Builds a `URLRequest` for `path` on `endpoint`. Adds
+    /// `Authorization: Bearer <key>` when the endpoint has a key, and
+    /// `X-WisprAlt-Client-Version`.
+    ///
+    /// - Parameters:
+    ///   - endpoint: The server to call (Local dictations pass the one captured at FN press).
+    ///   - path: Server path starting with `/`, e.g. `/healthz`.
+    ///   - method: HTTP method. Defaults to `"GET"`.
+    ///   - body: Optional request body data.
+    ///   - contentType: Value for the `Content-Type` header. Ignored when `body` is nil.
+    ///   - additionalHeaders: Any extra headers to merge in.
+    /// - Throws: `ServerError.invalidServerURL` if the endpoint fails
+    ///   `LocalURLPolicy` or the URL cannot be constructed.
+    func buildRequest(
+        endpoint: ServerEndpoint,
+        path: String,
+        method: String = "GET",
+        body: Data? = nil,
+        contentType: String? = nil,
+        additionalHeaders: [String: String] = [:]
+    ) throws -> URLRequest {
+        guard LocalURLPolicy.isAllowed(endpoint.baseURL),
+              let url = URL(string: path, relativeTo: endpoint.baseURL)?.absoluteURL
+        else {
             throw ServerError.invalidServerURL
         }
 
@@ -82,7 +108,7 @@ final class ServerClient {
         request.httpMethod = method
 
         // Bearer auth — tolerate missing key gracefully (health check doesn't need it).
-        if let apiKey = try? KeychainHelper.getAPIKey() {
+        if let apiKey = endpoint.apiKey {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
@@ -170,6 +196,8 @@ final class ServerClient {
         body: Data
     ) throws {
         guard status >= 400 else { return }
+        // Part 4 dedup contract: 410 dictation_deleted / 409 dedup_conflict are terminal.
+        if let terminal = LocalRequests.terminalError(status: status, body: body) { throw terminal }
 
         let bodyString = String(data: body, encoding: .utf8)
 

@@ -114,7 +114,7 @@ After the permission wizard, the app is ready for server configuration (Local mo
    ```
 2. Click the WisprAlt menubar icon → toggle **Show advanced settings**.
    The advanced section reveals:
-   - **Server URL** — paste the `https://` URL and press Return.
+   - **Server URL** — paste the `https://` URL and press Return. Plain `http://` is accepted only for a server on this Mac (`127.0.0.1`, `::1`, `localhost`); any other host needs https ("Use https://, or http:// only for this Mac"). For a LAN or tailnet server, put https in front of it, e.g. `tailscale serve`. The app's ATS setting is `NSAllowsLocalNetworking` only. A dictation always finishes on the server URL that was set when you pressed FN, even if you change it mid-dictation.
    - **API Key** — paste the bearer token and press Return. Stored in the macOS Keychain under service `co.wispralt` and never written to disk as plain text.
 3. Collapse advanced settings (you don't need it for daily use). At the top:
    - **Open Portal** — opens `<server>/admin/login` in your browser. Admins land on the global dashboard; employees land on their own usage page. Same button for both roles.

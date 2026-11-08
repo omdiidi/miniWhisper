@@ -612,8 +612,8 @@ struct SettingsView: View {
             settings.serverURL = nil
             return
         }
-        guard let url = URL(string: trimmed), url.scheme == "https" else {
-            serverURLError = "URL must begin with https://"
+        guard let url = URL(string: trimmed), LocalURLPolicy.isAllowed(url) else {
+            serverURLError = LocalURLPolicy.hint
             return
         }
         settings.serverURL = url

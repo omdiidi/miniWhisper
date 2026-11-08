@@ -439,7 +439,9 @@ final class DictationRecorder {
         // Local streaming is armed only for a Local endpoint. The session's
         // init does no I/O, so a throw below simply drops it. A previous
         // dictation's session is never touched here: `stop()` handed it off.
-        let session = endpoint.map { _ in DictationStreamSession(speechStartedAt: Date()) }
+        let session = endpoint.map {
+            DictationStreamSession(endpoint: $0, dictationId: dictationId, speechStartedAt: Date())
+        }
         isLocalCapture = endpoint != nil
 
         // Write directly in the input format. The server (soundfile + librosa)

@@ -30,8 +30,8 @@ struct DictationSession {
             guard let provider else { throw ProviderError.keyMissing }
             return .openAIFile(provider)
         case .local:
-            guard let local else { throw ServerError.missingConfiguration }
-            return .local(local)
+            guard let local, let endpoint = snapshot.endpoint else { throw ServerError.missingConfiguration }
+            return .local(local, endpoint)
         case .needKey:
             throw ProviderError.keyMissing
         }
@@ -41,5 +41,5 @@ struct DictationSession {
 /// App-only route enum: `LocalCapture` never enters WisprAltCore.
 enum DictationRoute {
     case openAIFile(DictationProvider)
-    case local(LocalCapture)
+    case local(LocalCapture, ServerEndpoint)
 }

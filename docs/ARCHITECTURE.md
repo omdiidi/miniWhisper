@@ -316,9 +316,11 @@ The server side is intentionally small and lives in two new modules:
 
 Both the streaming-finalize path and the single-shot fallback path (origin retry) write to the SAME `dictations` row by reusing one `client_dedup_id` UUID v4 per utterance:
 
-- The client mints `clientDedupID` once when `DictationStreamSession` opens.
-- `POST /finalize` sends it as a form field; the route calls `JobStore.insert_dictation(..., client_dedup_id=...)`.
-- If finalize fails and the safety-buffer fallback wins, the same UUID is sent to `POST /transcribe/dictate` via the additive `X-Client-Dedup-Id` header.
+- The client's dedup id is the dictation id minted at FN press (`DictationSnapshot.id`, lowercase UUID v4); `DictationStreamSession(endpoint:dictationId:speechStartedAt:)` takes it, so there is no second id.
+- Core `LocalRequests` sends it as `X-Client-Dedup-Id` on **every** chunk, finalize and whole-file request; `POST /finalize` also sends it as the `client_dedup_id` form field.
+- If finalize fails and the safety-buffer fallback wins, the same id goes to `POST /transcribe/dictate`.
+- Every Local request goes to the `ServerEndpoint` captured at FN press (URL + key), never `Settings.serverURL`, so changing the host mid-dictation leaves the in-flight one on its host. `LocalServerProvider` bounds the whole Local finish by `max(30, 10 + 0.5 × duration)`; on timeout it aborts the session and cancels the request.
+- Part 4 contract, already handled by the client: a 200 with `"saved": false` is delivered as usual and surfaces as `DictationResult.serverSaved == false` (the spool step keeps that audio); 410 `{"error":"dictation_deleted"}` and 409 `{"error":"dedup_conflict"}` are terminal (`LocalDictationError`, `FailureKind.rejected`): no whole-file fallback, no retry. A 409/410 with a `detail` body (e.g. session not open) is not terminal.
 - The `idx_dictations_client_dedup` **partial unique index** (`WHERE client_dedup_id IS NOT NULL`, see `jobs/store.py`) combined with `ON CONFLICT (client_dedup_id) DO NOTHING` guarantees **at most one row per utterance** no matter which path wins.
 - When `X-Client-Dedup-Id` is absent (today's non-streaming clients, and `/v1/audio/transcriptions`), the column stays NULL and the partial index has no effect — backward compatibility is bit-identical.
 

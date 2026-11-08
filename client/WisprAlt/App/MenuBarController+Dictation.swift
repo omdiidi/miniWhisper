@@ -82,7 +82,9 @@ extension MenuBarController {
             let result: DictationResult
             switch try s.route(local: out.local) {
             case .openAIFile(let provider): result = try await provider.finish(out.recording)
-            case .local(let capture): result = try await LocalServerProvider().finish(capture: capture)
+            case .local(let capture, let endpoint):
+                result = try await LocalServerProvider(endpoint: endpoint, dictationId: s.snapshot.id)
+                    .finish(capture: capture, durationSeconds: out.recording.durationSeconds)
             }
             let netMs = (clock.now - tNet).milliseconds
 
@@ -94,7 +96,8 @@ extension MenuBarController {
                 category: "dictation"
             )
             Log.info(
-                "Dictation done: chars=\(result.text.count) model=\(result.modelUsed) mode=\(s.snapshot.mode.rawValue)",
+                "Dictation done: chars=\(result.text.count) model=\(result.modelUsed) mode=\(s.snapshot.mode.rawValue) " +
+                "saved=\(result.serverSaved)",
                 category: "dictation"
             )
 
@@ -148,6 +151,7 @@ extension MenuBarController {
             case .writeFailed: return "Could not write audio to disk."
             case .encodeFailed: return "Could not encode the recording."
             case .other: return "Something went wrong. Try again."
+            case .rejected: return "The server refused this dictation (deleted or not yours). It will not be retried."
             }
         }
     }
@@ -165,7 +169,7 @@ extension MenuBarController: FNKeyEventsDelegate {
         let mode = settings.mode
         // Online reads only the OpenAI key; Local reads only the Local server.
         let endpoint: ServerEndpoint? = mode == .local
-            ? settings.serverURL.map { ServerEndpoint(baseURL: $0, apiKey: (try? KeychainHelper.getAPIKey()) ?? nil) }
+            ? try? ServerClient.shared.currentEndpoint()
             : nil
         let snapshot = DictationSnapshot(
             mode: mode,
