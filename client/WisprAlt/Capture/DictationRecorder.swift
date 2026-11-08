@@ -51,8 +51,8 @@ extension Notification.Name {
 ///   thread. We dispatch each `AVAudioFile.write` onto a serial `ioQueue`
 ///   so disk I/O never blocks the render thread.
 /// - `stop()` sets a `stopRequested` fence so the tap drops in-flight
-///   buffers, removes the tap, stops the engine, then `ioQueue.sync`-drains
-///   pending writes before releasing the file. This closes the TOCTOU race
+///   new buffers, removes the tap, stops the engine, then `ioQueue.sync`-drains
+///   every already-queued write (none are skipped) before releasing the file. This closes the TOCTOU race
 ///   between engine teardown and the writer.
 /// - `frameCounter` and `writeError` are guarded by `OSAllocatedUnfairLock`
 ///   for safe access from the tap callback and `stop()`.
@@ -635,9 +635,11 @@ final class DictationRecorder {
             // Move the write off the realtime render thread onto our serial
             // I/O queue. AVAudioFile.write may block on disk I/O and Float→Int16
             // conversion; doing it inline can cause render-thread overruns.
+            // No stop check here: a buffer that passed the tap fence is written,
+            // so stop()'s ioQueue drain leaves the spool as complete as the
+            // live frame queue (Realtime recovery re-reads the spool).
             self.ioQueue.async { [weak self] in
                 guard let self, let file = self.audioFile else { return }
-                if self.stopRequested.withLock({ $0 }) { return }
                 do {
                     try file.write(from: buffer)
                     self.frameCounter.withLock { $0 &+= buffer.frameLength }
