@@ -444,16 +444,16 @@ should count toward "their usage" for billing/quota conversations.
 The old host's database was wiped, so the only surviving history is the usage
 metadata in Supabase (who used it, when, how much: **no dictation text**) plus any
 transcript files you kept. Part 7's importer brings both into the local
-`wispralt.db`. Run every command from `~/.config/wispralt` (the `.env` the server
-uses, with `DATA_DIR` set) with the Python `wispralt` is installed in
-(`"$(uv tool dir)/wispralt/bin/python" -m wispralt.importer …`). Supabase is only ever read, and nothing it writes is ever deleted.
+`wispralt.db`. Run each step as `wispralt import …` on the host: it reads the
+host's `.env`, and a real (non-dry-run) `snapshot` or `files` import stops the
+service first and starts it again afterwards. Supabase is only ever read, and nothing it writes is ever deleted.
 
 1. **Export (read-only).** Put a Postgres connection string for the Supabase project
    in the Keychain (`security add-generic-password -s co.wispralt.import-pg -a wispralt -w`
    and paste it at the prompt) or in env `WISPRALT_IMPORT_PG_URL`, then:
 
    ```bash
-   python -m wispralt.importer export
+   wispralt import export
    ```
 
    This writes `~/WisprAlt-Backups/supabase-snapshot-YYYY-MM-DD/` (0700; `-2`, `-3`…
@@ -461,17 +461,17 @@ uses, with `DATA_DIR` set) with the Python `wispralt` is installed in
    `counts.json`. Keep this folder: it is the durable backup, and nothing ever
    deletes it. If the project is paused or unreachable the command exits `3` and
    writes `BLOCKED.json` instead; it never unpauses or changes the project.
-2. **Dry run.** `python -m wispralt.importer snapshot ~/WisprAlt-Backups/supabase-snapshot-… --dry-run`
+2. **Dry run.** `wispralt import snapshot ~/WisprAlt-Backups/supabase-snapshot-… --dry-run`
    prints, per table, how many rows would be new / duplicate / linked / malformed /
    unmatched, the earliest record, and the proposed **owner mapping** (the one active
    Supabase admin → the one enabled local admin; that account is linked, not
    copied). Nothing is written.
-3. **Import.** Stop the server, then run the same command without `--dry-run`. At a
+3. **Import.** Run the same command without `--dry-run` (the service is stopped and restarted for you). At a
    terminal it shows the dry run and asks before writing; in a script use `--yes`
    (accepted only when the owner proposal is unambiguous) or name the owner with
    `--owner-map PG_ID=LOCAL_ID`. Run `wispralt setup --role host` first if no local
-   admin exists yet. Start the server again afterwards.
-4. **Transcript files (optional).** `python -m wispralt.importer files ~/Documents/WisprAlt… --owner LOCAL_USER_ID --dry-run`,
+   admin exists yet. 
+4. **Transcript files (optional).** `wispralt import files ~/Documents/WisprAlt… --owner LOCAL_USER_ID --dry-run`,
    then again with `--yes`. Each transcript becomes a file job in that person's
    history; the source files are copied, never moved. See
    [TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md#importing-old-transcript-files-part-7).

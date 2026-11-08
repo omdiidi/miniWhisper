@@ -17,7 +17,7 @@ import shutil
 import sqlite3
 import stat
 import sys
-from contextlib import closing, contextmanager, suppress
+from contextlib import chdir, closing, contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -492,6 +492,31 @@ def cmd_restore(ctx: Ctx, args: argparse.Namespace) -> int:
     if aside is not None:
         print(f"previous data kept at {aside} (delete it once you are sure)")
     return 0
+
+
+# ── import ───────────────────────────────────────────────────────────────────
+
+
+def cmd_import(ctx: Ctx, args: argparse.Namespace) -> int:
+    """``wispralt import export|snapshot|files …``: Part 7's importer on this host.
+
+    Runs from the host config dir so the importer reads the same ``.env`` as the
+    service. A real ``snapshot``/``files`` run needs the server stopped (it takes the
+    data lock), so it runs inside ``service_stopped``; dry runs and ``export`` leave
+    the service alone.
+    """
+    need_host(ctx)
+    argv = list(args.importer_args)
+    writes = bool(argv) and argv[0] in {"snapshot", "files"} and not (
+        {"--dry-run", "-h", "--help"} & set(argv)
+    )
+    with chdir(ctx.paths.config_dir):
+        from wispralt.importer.__main__ import main as importer_main  # loads wispralt.config
+
+        if not writes:
+            return importer_main(argv)
+        with service_stopped(ctx, "import failed"):
+            return importer_main(argv)
 
 
 # ── update ───────────────────────────────────────────────────────────────────

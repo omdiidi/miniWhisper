@@ -79,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--rebuild", action="store_true", help="rebuild the client even if current")
     s.add_argument("--_resumed", action="store_true", dest="resumed", help=argparse.SUPPRESS)
 
+    p = cmd("import", ops.cmd_import, "import old history: export | snapshot DIR | files PATH… (see ADMIN.md)")
+    p.add_argument("importer_args", nargs=argparse.REMAINDER, help="importer arguments")
     p = cmd("status", ops.cmd_status, "service state, URL, sizes and retention")
     p.add_argument("--client", action="store_true", help="also show the client app")
     p = cmd("doctor", ops.cmd_doctor, "check this Mac and the install (exit 3 on failures)")

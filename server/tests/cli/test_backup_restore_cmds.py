@@ -131,3 +131,33 @@ def test_client_only_install_has_nothing_to_back_up(ctx: Ctx, cli: CliFn) -> Non
     ctx.state.save(ctx.paths.state_file)
     code, _, err = cli("backup")
     assert code == 1 and "no WisprAlt host" in err
+
+
+def test_import_dry_run_leaves_the_service_alone(
+    running: Ctx, cli: CliFn, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import wispralt.importer.__main__ as imp
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(imp, "main", lambda argv: seen.append(argv) or 0)
+    code, _, _ = cli("import", "files", "/x", "--owner", "1", "--dry-run")
+    assert code == 0 and seen == [["files", "/x", "--owner", "1", "--dry-run"]]
+    assert "bootout" not in runner.verbs()
+
+
+def test_import_write_stops_then_restarts(
+    running: Ctx, cli: CliFn, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import wispralt.importer.__main__ as imp
+
+    held: list[bool] = []
+
+    def fake_main(argv: list[str]) -> int:
+        with server_lock(running.paths.data_dir):  # the server let go of the data lock
+            held.append(True)
+        return 0
+
+    monkeypatch.setattr(imp, "main", fake_main)
+    code, _, _ = cli("import", "files", "/x", "--owner", "1", "--yes")
+    assert code == 0 and held == [True]
+    assert [v for v in runner.verbs() if v in {"bootout", "bootstrap"}] == ["bootout", "bootstrap"]

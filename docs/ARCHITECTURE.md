@@ -815,7 +815,7 @@ duplicate.
 
 **Entry point.** `wispralt.importer` exports `run_export`, `run_snapshot_import` and
 `run_file_import` (what the Part 5 `wispralt import …` CLI will wrap);
-`python -m wispralt.importer export | snapshot DIR | files PATH… --owner ID` is the
+`wispralt import export | snapshot DIR | files PATH… --owner ID` (the CLI wrapper over `python -m wispralt.importer`) is the
 interim operator command (`--dry-run`, `--yes`, `--owner-map PG=LOCAL`; exit codes
 0 ok, 1 error, 2 refused, 3 BLOCKED, 4 integrity). A real import needs `--yes` or an
 interactive confirmation after the dry-run report. Runbook:

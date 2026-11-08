@@ -99,7 +99,7 @@ Multi-speaker transcripts written by older servers used `Speaker: text` (SRT), `
 
 ## Importing old transcript files (Part 7)
 
-`python -m wispralt.importer files PATH… --owner ID` (`importer/files.py`) turns
+`wispralt import files PATH… --owner ID` (`importer/files.py`) turns
 transcript files you already have into history rows (`jobs`, kind `file`) for one
 local user. It never moves or edits the source files.
 

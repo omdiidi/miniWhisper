@@ -170,7 +170,7 @@ the server on failure.
 
 ## History import
 
-`python -m wispralt.importer …` (runbook in [ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files)).
+`wispralt import …` (runbook in [ADMIN.md](ADMIN.md#importing-old-history-supabase--transcript-files)).
 
 - **Exit 3 / `BLOCKED.json`** — the Supabase project is paused or unreachable (DNS,
   connection refused, timeout, "Tenant or user not found"). The snapshot folder holds
