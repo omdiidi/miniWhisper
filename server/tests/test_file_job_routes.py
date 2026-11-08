@@ -508,3 +508,84 @@ def test_chunked_finalize_with_a_gap_is_409_naming_the_index(
     resp = TestClient(make_app(OWNER)).post(f"/transcribe/file/chunked/{upload_id}/finalize")
     assert resp.status_code == 409, resp.text
     assert "Missing chunk 1 of 3" in resp.json()["detail"]
+
+
+def _three_chunk_upload(staging_dir: Path, upload_id: str) -> Path:
+    """A complete 3 x 10-byte upload owned by OWNER; returns its chunked dir."""
+    chunked_dir = staging_dir / "chunked" / upload_id
+    chunked_dir.mkdir(parents=True)
+    for i in range(3):
+        (chunked_dir / f"chunk-{i:04d}.part").write_bytes(b"x" * 10)
+    (chunked_dir / "meta.json").write_text(json.dumps({
+        "total_bytes": 30, "chunk_count": 3, "original_filename": "a.wav",
+        "ext": ".wav", "created_at": time.time(), "user_id": OWNER.id,
+    }))
+    return chunked_dir
+
+
+_CHUNK_NAMES = ["chunk-0000.part", "chunk-0001.part", "chunk-0002.part", "meta.json"]
+
+
+async def test_concurrent_finalize_of_one_upload_is_409_and_leaves_the_first_intact(
+    make_app, staging_dir, plenty_of_ram,
+) -> None:
+    import asyncio
+
+    import httpx
+
+    upload_id = "D" * 22
+    chunked_dir = _three_chunk_upload(staging_dir, upload_id)
+    out_path = staging_dir / f"{upload_id}.wav"
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_submit(path, *, user_id, client_version=None) -> str:
+        started.set()
+        await release.wait()
+        assert path.read_bytes() == b"x" * 30  # nothing removed it under us
+        return "job-1"
+
+    app = make_app(OWNER, SimpleNamespace(submit_source_or_429=slow_submit))
+    url = f"/transcribe/file/chunked/{upload_id}/finalize"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        first = asyncio.create_task(c.post(url))
+        await asyncio.wait_for(started.wait(), 10)
+        second = await c.post(url)
+        assert second.status_code == 409, second.text
+        assert "already in progress" in second.json()["detail"]
+        assert sorted(p.name for p in chunked_dir.iterdir()) == _CHUNK_NAMES
+        assert out_path.read_bytes() == b"x" * 30
+        release.set()
+        resp = await asyncio.wait_for(first, 10)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["job_id"] == "job-1"
+    assert not chunked_dir.exists()
+    assert out_path.exists()  # the job's source survives
+    assert upload_id not in transcribe_file_routes._finalizing
+
+
+def test_chunked_finalize_429_keeps_the_chunks_so_a_retry_succeeds(
+    make_app, staging_dir, plenty_of_ram,
+) -> None:
+    from wispralt._errors import FileJobInProgressError
+
+    upload_id = "E" * 22
+    chunked_dir = _three_chunk_upload(staging_dir, upload_id)
+    url = f"/transcribe/file/chunked/{upload_id}/finalize"
+
+    async def busy(path, *, user_id, client_version=None) -> str:
+        raise FileJobInProgressError("busy", code="file_job_busy")
+
+    resp = TestClient(make_app(OWNER, SimpleNamespace(submit_source_or_429=busy))).post(url)
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["code"] == "file_job_busy"
+    assert sorted(p.name for p in chunked_dir.iterdir()) == _CHUNK_NAMES
+    assert not (staging_dir / f"{upload_id}.wav").exists()  # re-creatable copy dropped
+
+    async def ok(path, *, user_id, client_version=None) -> str:
+        assert path.read_bytes() == b"x" * 30
+        return "job-2"
+
+    resp = TestClient(make_app(OWNER, SimpleNamespace(submit_source_or_429=ok))).post(url)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["job_id"] == "job-2"
+    assert not chunked_dir.exists()

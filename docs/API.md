@@ -846,7 +846,7 @@ Upload a single chunk's raw bytes.
 
 **Auth:** Bearer required. **Owner must match the user that ran `/init`.**
 
-Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. Cleans up the chunked staging dir on success; a 500 (`Concat failed` / `Assembled size mismatch`) removes only the partial output and keeps the chunks, so finalize can be retried; on a busy 429 (`FileJobInProgressError`) it also cleans up the assembled file so a retry starts fresh. A `mode` key left in a pre-upgrade `meta.json` is ignored, so such uploads finish as ordinary file jobs.
+Verify all chunks are present, concatenate them into the staging dir, and hand the assembled file off to the job runner. The chunks are deleted only after the runner has accepted the job (the chunked staging dir is then removed). A 500 (`Concat failed` / `Assembled size mismatch`) removes only the partial output and a busy 429 (`FileJobInProgressError`) only the assembled copy: in both cases the chunks and `meta.json` stay, so the same finalize can be retried without re-uploading. One finalize per upload runs at a time: a second one while the first is still running gets 409 `Finalize already in progress for this upload` (after the first has created its job the upload is gone, so a later call gets 404). A `mode` key left in a pre-upgrade `meta.json` is ignored, so such uploads finish as ordinary file jobs.
 
 **Request:** Empty body (`{}`).
 
@@ -854,7 +854,7 @@ Verify all chunks are present, concatenate them into the staging dir, and hand t
 
 From this point the client polls `GET /transcribe/file/{job_id}` exactly as it would for a single-shot `/transcribe/file` upload.
 
-**Errors:** 403 (ownership), 404 (upload not found), 409 (a chunk index in `0…chunk_count-1` is missing — the detail names it, e.g. `Missing chunk 1 of 3`; only `chunk-NNNN.part` files with those exact names count — or a size mismatch), 429 (same body and `code` as `POST /transcribe/file`; the assembled file is unlinked, retry after 60 s), 503 (RAM <4 GiB), 507 (disk).
+**Errors:** 403 (ownership), 404 (upload not found), 409 (a chunk index in `0…chunk_count-1` is missing — the detail names it, e.g. `Missing chunk 1 of 3`; only `chunk-NNNN.part` files with those exact names count — or a size mismatch, or another finalize of the same upload still running), 429 (same body and `code` as `POST /transcribe/file`; the chunks are kept, retry the finalize after 60 s), 503 (RAM <4 GiB), 507 (disk).
 
 **Stale-upload TTL:** chunked staging directories whose `meta.json` mtime is older than 1 h are reaped at server startup (and on demand by `ops.staging.sweep_chunked`). Each successful chunk write touches `meta.json` so actively-progressing uploads are never reaped.
 
