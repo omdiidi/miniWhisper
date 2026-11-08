@@ -108,7 +108,7 @@ def test_disable_then_mint_gives_a_working_key(
     emp, old = make_user()
     accounts.disable_user(emp.id)
     with caplog.at_level(logging.DEBUG):
-        resp = client.post(f"/admin/users/{emp.id}/mint", headers=_bearer(admin_token))
+        resp = client.post(f"/admin/people/{emp.id}/rotate", headers=_bearer(admin_token))
     assert resp.status_code == 200, resp.text
     [new] = set(re.findall(r"\b[0-9a-f]{64}\b", resp.text))
     assert client.get("/whoami", headers=_bearer(new)).json()["id"] == emp.id

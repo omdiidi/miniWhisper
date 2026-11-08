@@ -76,6 +76,7 @@ from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.routes import (
     admin,
     admin_data,
+    admin_invites,
     admin_ui,
     dictate,
     health,
@@ -532,6 +533,7 @@ class _ObservabilityMiddleware(BaseHTTPMiddleware):
                 bytes_in = 0
             event = UsageEvent(
                 user_id=user.id,
+                key_id=user.key_id,
                 ts=time.time(),
                 kind=_KIND_MAP.get(route_key, route_key.split("/")[-1]),
                 status=response.status_code,
@@ -644,6 +646,9 @@ def create_app() -> FastAPI:
     app.include_router(admin_ui.public_router)
     app.include_router(admin_ui.me_router)
     app.include_router(admin_ui.authed_router)
+    # /admin/invites (admin) + the public POST /invites/redeem (Part 6).
+    app.include_router(admin_invites.router)
+    app.include_router(admin_invites.public_router)
     # /admin/data — Phase 2 admin Data tab (weekly insights + drill-down).
     app.include_router(admin_data.router)
     # /transcribe/file — container-agnostic submission (ffmpeg-transcoded),

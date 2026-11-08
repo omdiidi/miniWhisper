@@ -1,0 +1,53 @@
+{% extends "base.html.j2" %}
+{% import "_ui.html.j2" as ui %}
+{% block title %}Invites · WisprAlt{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div>
+      <h1>Invites</h1>
+      <p class="muted">A single-use link that signs a new person's app in. It expires after 10 minutes. To add a device for someone who already has an account, use <strong>Add device</strong> on their page.</p>
+    </div>
+  </div>
+  {% if error %}<p class="notice bad" role="alert">{{ error }}</p>{% endif %}
+  <form class="form card" method="post" action="/admin/invites">
+    {{ ui.csrf(csrf_token) }}
+    <h3>Invite a new person</h3>
+    <label for="label">Label</label>
+    <input id="label" name="label" type="text" required maxlength="80" placeholder="e.g. sarah">
+    <label for="role">Role</label>
+    <select id="role" name="role">
+      <option value="employee" selected>employee</option>
+      <option value="admin">admin</option>
+    </select>
+    <div class="actions"><button type="submit" class="primary">Create invite</button></div>
+  </form>
+
+  <h2>Recent invites</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>For</th><th>Role</th><th>By</th><th>Created</th><th>Expires</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody>
+        {% for i in invites %}
+          <tr>
+            <td>{% if i.user_id %}<a href="/admin/people/{{ i.user_id }}">{{ i.user_label }}</a> <span class="muted small">new device</span>{% else %}{{ i.label }}{% endif %}</td>
+            <td>{{ i.role }}</td>
+            <td>{{ i.created_by_label }}</td>
+            <td>{{ i.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td>{{ i.expires_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td>{{ ui.badge(i.status, "ok" if i.status == "redeemed" else ("warn" if i.status == "pending" else "")) }}</td>
+            <td>
+              {% if i.status == "pending" %}
+              <form class="inline" method="post" action="/admin/invites/{{ i.id }}/revoke">
+                {{ ui.csrf(csrf_token) }}
+                <button type="submit" class="danger">Revoke</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="7">{{ ui.empty_state("No invites yet.") }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

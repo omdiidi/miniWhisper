@@ -18,5 +18,5 @@
     <p>Any program that speaks the OpenAI Whisper API routes to WisprAlt with these two variables:</p>
     {{ ui.secret_once("export OPENAI_BASE_URL=" ~ server_url ~ "/v1\nexport OPENAI_API_KEY=" ~ plaintext, "env") }}
   {% endcall %}
-  <p><a href="/admin/keys">Back to integrations</a></p>
+  <p><a href="/admin/integrations">Back to integrations</a></p>
 {% endblock %}

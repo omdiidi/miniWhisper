@@ -1,5 +1,5 @@
 """
-test_admin_keys.py — /admin/keys/* (integration API keys) on a real tmp SQLite DB.
+test_admin_keys.py — /admin/integrations/* (integration API keys) on a real tmp SQLite DB.
 
 Auth is real: requests carry a Bearer token minted by ``make_user`` on the
 per-test DB, and the routes write through ``AccountStore``.
@@ -38,12 +38,12 @@ def admin_headers(make_user: MakeUser) -> dict[str, str]:
 
 def test_get_keys_requires_admin(client: TestClient, make_user: MakeUser) -> None:
     _emp, token = make_user()
-    resp = client.get("/admin/keys", headers={"Authorization": f"Bearer {token}"})
+    resp = client.get("/admin/integrations", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 403
 
 
 def test_get_new_form_renders(client: TestClient, admin_headers: dict[str, str]) -> None:
-    resp = client.get("/admin/keys/new", headers=admin_headers)
+    resp = client.get("/admin/integrations/new", headers=admin_headers)
     assert resp.status_code == 200
     assert "Add API key" in resp.text
 
@@ -51,7 +51,7 @@ def test_get_new_form_renders(client: TestClient, admin_headers: dict[str, str])
 def test_post_new_creates_integration_user_and_shows_token_once(
     client: TestClient, admin_headers: dict[str, str], accounts: AccountStore
 ) -> None:
-    resp = client.post("/admin/keys/new", data={"program_name": "Open WebUI"}, headers=admin_headers)
+    resp = client.post("/admin/integrations/new", data={"program_name": "Open WebUI"}, headers=admin_headers)
     assert resp.status_code == 200, resp.text
     assert "OPENAI_BASE_URL=" in resp.text and "OPENAI_API_KEY=" in resp.text
     [row] = accounts.list_integrations()
@@ -66,7 +66,7 @@ def test_post_new_creates_integration_user_and_shows_token_once(
 def test_post_new_invalid_program_name(
     client: TestClient, admin_headers: dict[str, str], accounts: AccountStore
 ) -> None:
-    resp = client.post("/admin/keys/new", data={"program_name": "   "}, headers=admin_headers)
+    resp = client.post("/admin/integrations/new", data={"program_name": "   "}, headers=admin_headers)
     assert resp.status_code == 400, resp.text
     assert accounts.list_integrations() == []
 
@@ -79,7 +79,7 @@ def test_revoke_disables_the_key_for_the_next_request(
 ) -> None:
     key_user, token = make_user(kind="integration", label="key-buzz")
     assert accounts.lookup_key(hash_token(token)) is not None
-    resp = client.post(f"/admin/keys/{key_user.id}/revoke", headers=admin_headers, follow_redirects=False)
+    resp = client.post(f"/admin/integrations/{key_user.id}/revoke", headers=admin_headers, follow_redirects=False)
     assert resp.status_code == 303
     assert accounts.lookup_key(hash_token(token)) is None
     assert accounts.list_integrations() == []
@@ -93,7 +93,7 @@ def test_rotate_replaces_the_key(
 ) -> None:
     key_user, old = make_user(kind="integration", label="key-buzz")
     accounts.update_display_name(key_user.id, "Buzz")
-    resp = client.post(f"/admin/keys/{key_user.id}/rotate", headers=admin_headers)
+    resp = client.post(f"/admin/integrations/{key_user.id}/rotate", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     assert "rotated" in resp.text.lower() and "Buzz" in resp.text
     assert accounts.lookup_key(hash_token(old)) is None
@@ -101,7 +101,7 @@ def test_rotate_replaces_the_key(
 
 
 def test_rotate_unknown_user_is_404(client: TestClient, admin_headers: dict[str, str]) -> None:
-    assert client.post("/admin/keys/9999/rotate", headers=admin_headers).status_code == 404
+    assert client.post("/admin/integrations/9999/rotate", headers=admin_headers).status_code == 404
 
 
 def test_overview_shows_integration_count(

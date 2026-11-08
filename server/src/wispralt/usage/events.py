@@ -27,3 +27,4 @@ class UsageEvent:
     bytes_out: int | None = None
     error_class: str | None = None
     request_id: str | None = None
+    key_id: int | None = None  # the api_keys row that authenticated (per-device last seen)

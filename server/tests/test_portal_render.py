@@ -24,16 +24,23 @@ _TEMPLATES = Path(__file__).resolve().parents[1] / "src" / "wispralt" / "admin" 
 
 ADMIN_PAGES = [
     "/admin/",
-    "/admin/users",
-    "/admin/users/new",
-    "/admin/users/{uid}",
-    "/admin/keys",
-    "/admin/keys/new",
+    "/admin/people",
+    "/admin/people/new",
+    "/admin/people/{uid}",
+    "/admin/integrations",
+    "/admin/integrations/new",
+    "/admin/invites",
     "/admin/usage",
     "/admin/data",
 ]
 SELF_PAGES = ["/me/history", "/me/insights"]
-ADMIN_NAV_LINKS = ('href="/admin/users"', 'href="/admin/keys"', 'href="/admin/data"', 'href="/admin/usage"')
+ADMIN_NAV_LINKS = (
+    'href="/admin/people"',
+    'href="/admin/integrations"',
+    'href="/admin/invites"',
+    'href="/admin/data"',
+    'href="/admin/usage"',
+)
 
 
 @pytest.fixture

@@ -108,8 +108,8 @@ class UsageStore:
         with self.db.write() as con:
             con.execute(
                 "INSERT INTO usage_events(user_id, ts, kind, status, chars, duration_ms,"
-                " bytes_in, bytes_out, error_class, request_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " bytes_in, bytes_out, error_class, request_id, key_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event.user_id,
                     event.ts,
@@ -121,6 +121,7 @@ class UsageStore:
                     event.bytes_out,
                     event.error_class,
                     event.request_id,
+                    event.key_id,
                 ),
             )
 

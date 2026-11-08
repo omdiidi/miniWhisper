@@ -7,7 +7,7 @@
       <h1>Integrations</h1>
       <p class="muted">Keys for third-party programs that call <code>/v1/audio/transcriptions</code>. They cannot open <code>/me</code>.</p>
     </div>
-    <a class="btn primary" href="/admin/keys/new">Add API key</a>
+    <a class="btn primary" href="/admin/integrations/new">Add API key</a>
   </div>
   <div class="table-wrap">
     <table>
@@ -20,11 +20,11 @@
             <td>{{ key.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
             <td>{{ key.last_seen_at.strftime("%Y-%m-%d %H:%M") if key.last_seen_at else "—" }}</td>
             <td class="row">
-              <form class="inline" method="post" action="/admin/keys/{{ key.id }}/rotate">
+              <form class="inline" method="post" action="/admin/integrations/{{ key.id }}/rotate">
                 {{ ui.csrf(csrf_token) }}
                 <button type="submit">Rotate</button>
               </form>
-              <form class="inline" method="post" action="/admin/keys/{{ key.id }}/revoke"
+              <form class="inline" method="post" action="/admin/integrations/{{ key.id }}/revoke"
                     onsubmit="return confirm('Revoke this key? Programs using it fail immediately.')">
                 {{ ui.csrf(csrf_token) }}
                 <button type="submit" class="danger">Revoke</button>

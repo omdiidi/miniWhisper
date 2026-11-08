@@ -9,7 +9,7 @@
     </div>
   </div>
   {% if error %}<p class="notice bad" role="alert">{{ error }}</p>{% endif %}
-  <form class="form card" method="post" action="/admin/keys/new">
+  <form class="form card" method="post" action="/admin/integrations/new">
     {{ ui.csrf(csrf_token) }}
     <label for="program_name">Program name</label>
     <input type="text" name="program_name" id="program_name" required maxlength="40" autofocus
@@ -17,7 +17,7 @@
     <p class="hint" id="pn-hint">Shown in the portal, e.g. "Buzz on Bob's MacBook" or "Open WebUI prod".</p>
     <div class="actions">
       <button type="submit" class="primary">Create key</button>
-      <a href="/admin/keys">Cancel</a>
+      <a href="/admin/integrations">Cancel</a>
     </div>
   </form>
 {% endblock %}

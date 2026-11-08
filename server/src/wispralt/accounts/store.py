@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from wispralt._errors import AlreadyBootstrapped
+from wispralt._errors import AlreadyBootstrapped, InviteInvalid
 
 if TYPE_CHECKING:
     import sqlite3
@@ -59,6 +59,34 @@ class UserProfile:
     role: str
     created_at: datetime
     last_seen_at: datetime | None
+    disabled_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class KeyRow:
+    """One api_keys row (a device) with its derived last use."""
+
+    id: int
+    label: str | None
+    created_at: datetime
+    revoked_at: datetime | None
+    last_seen_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class InviteRow:
+    """Admin-UI invite row. ``status``: pending | expired | redeemed."""
+
+    id: int
+    label: str | None
+    role: str
+    user_id: int | None
+    user_label: str | None
+    created_by_label: str
+    created_at: datetime
+    expires_at: datetime
+    redeemed_at: datetime | None
+    status: str
 
 
 def _dt(ts: float | None) -> datetime | None:
@@ -148,6 +176,60 @@ class AccountStore:
             )
             return [_user(r) for r in rows]
 
+    def list_keys_for_user(self, user_id: int) -> list[KeyRow]:
+        """Every key (device) of the user, active first then newest; last seen per key."""
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT k.id, k.label, k.created_at, k.revoked_at,"
+                " (SELECT MAX(e.ts) FROM usage_events e WHERE e.key_id = k.id) AS last_seen_at"
+                " FROM api_keys k WHERE k.user_id = ?"
+                " ORDER BY k.revoked_at IS NOT NULL, k.created_at DESC, k.id DESC",
+                (user_id,),
+            )
+            return [
+                KeyRow(
+                    id=r["id"],
+                    label=r["label"],
+                    created_at=datetime.fromtimestamp(r["created_at"], tz=UTC),
+                    revoked_at=_dt(r["revoked_at"]),
+                    last_seen_at=_dt(r["last_seen_at"]),
+                )
+                for r in rows
+            ]
+
+    def key_owner(self, key_id: int) -> int | None:
+        with self.db.read() as con:
+            r = con.execute("SELECT user_id FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+        return None if r is None else int(r[0])
+
+    def list_invites(self, now: float, limit: int = 100) -> list[InviteRow]:
+        """Newest first, with target and creator labels and a derived status."""
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT i.id, i.label, i.role, i.user_id, i.created_at, i.expires_at,"
+                " i.redeemed_at, t.label AS user_label, c.label AS created_by_label"
+                " FROM invites i JOIN users c ON c.id = i.created_by"
+                " LEFT JOIN users t ON t.id = i.user_id"
+                " ORDER BY i.created_at DESC, i.id DESC LIMIT ?",
+                (limit,),
+            )
+            return [
+                InviteRow(
+                    id=r["id"],
+                    label=r["label"],
+                    role=r["role"],
+                    user_id=r["user_id"],
+                    user_label=r["user_label"],
+                    created_by_label=r["created_by_label"],
+                    created_at=datetime.fromtimestamp(r["created_at"], tz=UTC),
+                    expires_at=datetime.fromtimestamp(r["expires_at"], tz=UTC),
+                    redeemed_at=_dt(r["redeemed_at"]),
+                    status="redeemed" if r["redeemed_at"] is not None
+                    else "expired" if r["expires_at"] <= now else "pending",
+                )
+                for r in rows
+            ]
+
     def profile(self, user_id: int) -> UserProfile | None:
         """Any user (disabled or not), with derived ``last_seen_at``."""
         with self.db.read() as con:
@@ -161,6 +243,7 @@ class AccountStore:
             role=r["role"],
             created_at=datetime.fromtimestamp(r["created_at"], tz=UTC),
             last_seen_at=_dt(r["last_seen_at"]),
+            disabled_at=_dt(r["disabled_at"]),
         )
 
     # ── writes ───────────────────────────────────────────────────────────────
@@ -274,3 +357,91 @@ class AccountStore:
                 ).rowcount
                 == 1
             )
+
+    # ── invites (single use; the token is stored only as its sha256) ─────────
+
+    def create_invite(
+        self,
+        *,
+        token_hash: str,
+        created_by: int,
+        user_id: int | None,
+        label: str | None,
+        role: str,
+        now: float,
+        expires_at: float,
+    ) -> int:
+        """Insert one invite. For "add device" (``user_id`` set) the target must be an
+        enabled employee-kind user, else ``LookupError``."""
+        with self.db.write() as con:
+            if user_id is not None and not con.execute(
+                "SELECT 1 FROM users WHERE id = ? AND kind = 'employee' AND disabled_at IS NULL",
+                (user_id,),
+            ).fetchone():
+                raise LookupError("invite target is not an enabled person")
+            return con.execute(
+                "INSERT INTO invites(token_hash, user_id, label, role, created_by, created_at,"
+                " expires_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                (token_hash, user_id, label, role, created_by, now, expires_at),
+            ).fetchone()[0]
+
+    def revoke_invite(self, invite_id: int, now: float) -> bool:
+        """Expire an unredeemed, unexpired invite now. False if it was not pending."""
+        with self.db.write() as con:
+            return (
+                con.execute(
+                    "UPDATE invites SET expires_at = ?"
+                    " WHERE id = ? AND redeemed_at IS NULL AND expires_at > ?",
+                    (now, invite_id, now),
+                ).rowcount
+                == 1
+            )
+
+    def redeem_invite(
+        self, *, invite_hash: str, key_hash: str, device_label: str | None, now: float
+    ) -> User:
+        """Redeem in ONE ``BEGIN IMMEDIATE``: validate, create the person if the invite is
+        for a new one, add a key, mark the invite used. Any failure → ``InviteInvalid`` and
+        nothing is written. Never revokes the user's other keys."""
+        with self.db.write() as con:
+            inv = con.execute(
+                "SELECT id, user_id, label, role, created_by, expires_at, redeemed_at"
+                " FROM invites WHERE token_hash = ?",
+                (invite_hash,),
+            ).fetchone()
+            if inv is None or inv["redeemed_at"] is not None or inv["expires_at"] <= now:
+                raise InviteInvalid
+            if not con.execute(
+                "SELECT 1 FROM users WHERE id = ? AND role = 'admin' AND disabled_at IS NULL",
+                (inv["created_by"],),
+            ).fetchone():
+                raise InviteInvalid
+            if inv["user_id"] is None:
+                user_id = con.execute(
+                    "INSERT INTO users(label, role, kind, created_at)"
+                    " VALUES (?, ?, 'employee', ?) RETURNING id",
+                    (inv["label"], inv["role"], now),
+                ).fetchone()[0]
+            else:
+                user_id = inv["user_id"]
+                if not con.execute(
+                    "SELECT 1 FROM users WHERE id = ? AND kind = 'employee'"
+                    " AND disabled_at IS NULL",
+                    (user_id,),
+                ).fetchone():
+                    raise InviteInvalid
+            key_id = con.execute(
+                "INSERT INTO api_keys(user_id, token_hash, label, created_at)"
+                " VALUES (?, ?, ?, ?) RETURNING id",
+                (user_id, key_hash, device_label, now),
+            ).fetchone()[0]
+            if con.execute(
+                "UPDATE invites SET redeemed_at = ?, api_key_id = ?"
+                " WHERE id = ? AND redeemed_at IS NULL",
+                (now, key_id, inv["id"]),
+            ).rowcount != 1:
+                raise InviteInvalid
+            r = con.execute(
+                "SELECT id, label, role, kind FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        return _user(r, key_id)

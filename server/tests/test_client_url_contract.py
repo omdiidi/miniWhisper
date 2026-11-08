@@ -151,3 +151,16 @@ def test_every_local_dictation_request_sends_the_dedup_header() -> None:
         assert re.search(r"\bpost\([^\n]*\bdedupId\b", bodies[func]), (
             f"LocalRequests.{func} does not pass dedupId to post()"
         )
+
+
+def test_invite_redeem_server_contract(api_routes: list[APIRoute]) -> None:
+    """Part 6 LD 6: the server half of ``wispralt://join?host=&invite=`` (the client handler
+    is Part 5). ``POST /invites/redeem`` is public: no auth dependency on the route."""
+    from wispralt.accounts.service import join_link
+
+    [route] = [r for r in api_routes if r.path == "/invites/redeem"]
+    assert route.methods == {"POST"}
+    assert route.dependant.dependencies == []
+    assert join_link("https://mini.example.com/", "tok-123") == (
+        "wispralt://join?host=https%3A%2F%2Fmini.example.com&invite=tok-123"
+    )
