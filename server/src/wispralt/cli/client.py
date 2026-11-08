@@ -3,7 +3,8 @@ cli/client.py — the WisprAlt menubar app on this Mac.
 
 ``setup --role client|both`` installs the app from a signed DMG (verified with
 ``codesign`` + ``spctl``; quarantine is never stripped) or builds it from the
-clone with ``scripts/build-client-local.sh``, then swaps it into place. Role
+clone with ``scripts/build-client-local.sh``, then swaps it into place (an
+interrupted swap's ``.old`` copy is restored on the next run, never erased). Role
 ``both`` also points the app at the local host (``defaults``) and stores the
 admin key in the Keychain through ``security -i`` on **stdin**, so the key is
 never in an argv; ``-T`` trusts the installed app so it reads the key without a prompt. The OpenAI key is never handled here.
@@ -51,23 +52,46 @@ def quit_app(ctx: Ctx) -> None:
     )
 
 
+def _swap_paths(app: Path) -> tuple[Path, Path]:
+    return app.with_name(f".{app.name}.new"), app.with_name(f".{app.name}.old")
+
+
+def recover_interrupted_install(app: Path) -> bool:
+    """An install that died after moving the app to ``.old``: put that copy back."""
+    _staged, old = _swap_paths(app)
+    if app.exists() or app.is_symlink() or not old.is_dir():
+        return False
+    os.replace(old, app)
+    print(f"restored {app} from an interrupted install")
+    return True
+
+
 def install_app(ctx: Ctx, built: Path) -> None:
-    """Quit the running app, copy *built* next to the target with ``ditto``, swap it in."""
+    """Quit the running app, copy *built* next to the target with ``ditto``, swap it in.
+
+    Crash-safe: an interrupted swap's ``.old`` copy is restored first (never deleted
+    while it is the only app), and ``.old`` goes only once the new app is in place.
+    """
     app = ctx.paths.app
     app.parent.mkdir(parents=True, exist_ok=True)
-    staged = app.with_name(f".{app.name}.new")
-    old = app.with_name(f".{app.name}.old")
-    for leftover in (staged, old):
-        shutil.rmtree(leftover, ignore_errors=True)
+    staged, old = _swap_paths(app)
+    recover_interrupted_install(app)
+    shutil.rmtree(staged, ignore_errors=True)
     quit_app(ctx)
     ctx.runner.run(["ditto", str(built), str(staged)])
     if app.exists():
+        shutil.rmtree(old, ignore_errors=True)  # stale: the installed app is the newer copy
         os.replace(app, old)
-    os.replace(staged, app)
+    try:
+        os.replace(staged, app)
+    except OSError:
+        recover_interrupted_install(app)
+        raise
     shutil.rmtree(old, ignore_errors=True)
 
 
 def install_dmg(ctx: Ctx, dmg: Path) -> None:
+    recover_interrupted_install(ctx.paths.app)  # even if this attempt fails, an app is back
     if not dmg.is_file():
         raise CliError(2, f"no DMG at {dmg}")
     mount = Path(tempfile.mkdtemp(prefix="wispralt-dmg-"))
@@ -86,6 +110,7 @@ def install_dmg(ctx: Ctx, dmg: Path) -> None:
 
 
 def build_and_install(ctx: Ctx, source: Path, *, rebuild: bool) -> None:
+    recover_interrupted_install(ctx.paths.app)
     current = app_version(ctx.paths.app)
     wanted = plist_version(source / "client" / "WisprAlt" / "Info.plist")
     if not rebuild and current and current == wanted:

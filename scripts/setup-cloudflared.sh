@@ -201,10 +201,14 @@ if [ "$SUPPORTS_TOKEN_FILE" = "true" ]; then
 EOF
 else
     # Legacy path: cloudflared < 2025.4.0 does not support --token-file.
-    # Inline the token into ProgramArguments. Plist gets mode 0600 to limit exposure.
+    # Inline the token into ProgramArguments. The plist is 0600 from the moment it
+    # exists: an old file is removed (a `>` redirect keeps an existing file's mode)
+    # and the new one is created under umask 077, so the token is never readable
+    # by others, not even before the chmod below.
     # Re-run this script after upgrading cloudflared to migrate to the --token-file path.
     TOKEN_VALUE="$(cat "$TOKEN_FILE")"
-    cat > "$PLIST" <<EOF
+    rm -f "$PLIST"
+    (umask 077 && cat > "$PLIST") <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

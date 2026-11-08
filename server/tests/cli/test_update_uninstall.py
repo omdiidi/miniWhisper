@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import TYPE_CHECKING
 
 import pytest
 
+from wispralt.cli import ops
 from wispralt.cli.paths import InstallState, Paths
 
 from .conftest import make_app
@@ -81,6 +83,33 @@ def test_failed_reinstall_restarts_the_old_service(
     runner.on("uv", "tool", "install", rc=1, err="resolution failed")
     code, _, err = cli("update")
     assert code == 1 and "resolution failed" in err
+    assert runner.verbs()[-1] == "bootstrap" and execs.calls == []
+
+
+def test_failed_backup_restarts_the_old_service(
+    installed: Paths, cli: CliFn, runner: FakeRunner, execs: Execs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any phase-1 error (here: disk full during VACUUM INTO), not only a CliError."""
+
+    def disk_full(*_a: object, **_k: object) -> Path:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(ops.offline, "backup", disk_full)
+    code, _, err = cli("update")
+    assert code == 1 and "database or disk is full" in err and "restarted" in err
+    assert runner.verbs()[-1] == "bootstrap" and execs.calls == []
+    assert not any(c[:2] == ["uv", "tool"] for c in runner.calls)
+
+
+def test_interrupted_phase1_still_restarts_the_old_service(
+    installed: Paths, cli: CliFn, runner: FakeRunner, execs: Execs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(*_a: object, **_k: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ops, "reinstall_cli", interrupted)
+    with pytest.raises(RuntimeError, match="boom"):
+        cli("update", "--no-backup")
     assert runner.verbs()[-1] == "bootstrap" and execs.calls == []
 
 

@@ -392,7 +392,10 @@ request):
 | `wispralt keys rotate-admin [--user-id N] [--token-file F]` | recover a lost admin key |
 
 A new key is printed only to a terminal; without one, pass `--token-file` (a
-new file, created 0600) or the command refuses (exit 2) before minting.
+new file, created 0600 before anything is minted) or the command refuses
+(exit 2) before minting. A rotation writes the file inside its database
+transaction: if the write fails (disk full, say), nothing is rotated, the old
+key keeps working and the file is removed.
 
 ---
 

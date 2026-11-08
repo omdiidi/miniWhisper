@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,8 @@ from wispralt.database import Database
 from .conftest import make_app
 
 if TYPE_CHECKING:
+    from wispralt.cli.paths import Ctx
+
     from .conftest import CliFn, FakeHub, FakeRunner
 
 
@@ -60,6 +63,42 @@ def test_failed_verification_still_detaches(cli: CliFn, runner: FakeRunner, tmp_
     assert code == 1 and "spctl" in err
     assert runner.calls[-1][:2] == ["hdiutil", "detach"]
     assert not Paths.resolve().app.exists()
+
+
+def test_interrupted_swap_is_restored_and_never_erased(
+    cli: CliFn, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """A crash left only ``.old``: a retry restores it and keeps it until the new app is in."""
+    app = Paths.resolve().app
+    old = make_app(app.with_name(f".{app.name}.old"), "0.4.0")
+    runner.on("spctl", rc=3, err="rejected")  # this retry fails too, before any swap
+    code, out, _ = _client(cli, "--dmg", str(_dmg(tmp_path, runner)))
+    assert code == 1 and "restored" in out
+    assert client.app_version(app) == "0.4.0" and not old.exists()
+
+    runner.rules.clear()
+    code, _, err = _client(cli, "--dmg", str(_dmg(tmp_path, runner)))
+    assert code == 0, err
+    assert client.app_version(app) == "0.6.0" and not old.exists()
+
+
+def test_failed_swap_puts_the_installed_app_back(
+    ctx: Ctx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = make_app(ctx.paths.app, "0.5.0")
+    built = make_app(tmp_path / "built" / "WisprAlt.app", "0.6.0")
+    real_replace = os.replace
+
+    def failing_replace(src: Path, dst: Path) -> None:
+        if Path(src).name.endswith(".new"):
+            raise OSError(28, "No space left on device")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(client.os, "replace", failing_replace)
+    with pytest.raises(OSError, match="No space"):
+        client.install_app(ctx, built)
+    assert client.app_version(app) == "0.5.0"
+    assert not app.with_name(f".{app.name}.old").exists()
 
 
 def test_no_dmg_builds_from_the_clone(cli: CliFn, runner: FakeRunner, clone: Path) -> None:

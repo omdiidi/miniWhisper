@@ -94,6 +94,27 @@ def test_rotate_admin(cli: CliFn, accounts: AccountStore, tmp_path: Path, deps: 
     assert code == 0 and rotated is not None and rotated.id == admin.id
 
 
+def test_failed_token_file_write_rolls_the_rotation_back(
+    cli: CliFn, accounts: AccountStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file is written inside the rotation: a failed write leaves the old key working."""
+    user, old = service.create_user(accounts, label="fay", role="employee", kind="employee")
+    tok = tmp_path / "f.key"
+
+    def disk_full(_fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as m, pytest.raises(OSError, match="No space"):
+        m.setattr(host.os, "fsync", disk_full)
+        cli("keys", "rotate", str(user.id), "--token-file", str(tok))
+    assert accounts.lookup_key(hash_token(old)) is not None  # not revoked
+    assert len(accounts.list_keys(user.id)) == 1 and not tok.exists()
+
+    assert cli("keys", "rotate", str(user.id), "--token-file", str(tok))[0] == 0
+    assert accounts.lookup_key(hash_token(tok.read_text().strip())) is not None
+    assert accounts.lookup_key(hash_token(old)) is None
+
+
 def test_users_list_disable_enable(cli: CliFn, accounts: AccountStore, tmp_path: Path) -> None:
     user, old = service.create_user(accounts, label="dave", role="employee", kind="employee")
     code, out, _ = cli("users", "list", "--json")

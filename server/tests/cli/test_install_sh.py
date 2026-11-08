@@ -85,3 +85,47 @@ def test_cloudflared_env_rewrite_is_never_world_readable(tmp_path: Path) -> None
     assert env_file.read_text() == 'API_KEY="secret"\nSERVER_URL=https://t.example.com\n'
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".env.tmp")] == []
+
+
+def test_cloudflared_legacy_plist_is_private_from_creation(tmp_path: Path) -> None:
+    """Review fix: the legacy plist inlines the tunnel token, so it is 0600 the moment it
+    exists, even under umask 000 and over an old 0644 plist. A ``chmod`` shim records the
+    plist's mode just before the script's own ``chmod 0600``. Every external effect
+    (sudo, launchctl, cloudflared, curl) is a shim; nothing reaches the real system."""
+    home = tmp_path / "home"
+    (home / ".config" / "wispralt").mkdir(parents=True)
+    (home / ".config" / "wispralt" / ".env").write_text('SERVER_URL="http://127.0.0.1:8000"\n')
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    plist = agents / "co.wispralt.cloudflared.plist"
+    plist.write_text("old")
+    plist.chmod(0o644)
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    log = tmp_path / "modes"
+    real_chmod = shutil.which("chmod")
+    shims = {
+        "sudo": "exit 0",
+        "launchctl": "exit 0",
+        "brew": "exit 1",
+        "curl": "printf 401",
+        "cloudflared": 'if [ "$1" = version ]; then echo "cloudflared 2024.1.0"; fi',  # no --token-file
+        "chmod": (
+            f'case "${{@: -1}}" in *.plist) {sys.executable} -c'
+            f" 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])'"
+            f' "${{@: -1}}" >> {log};; esac\nexec {real_chmod} "$@"'
+        ),
+    }
+    for name, body in shims.items():
+        (shim / name).write_text(f"#!/bin/bash\n{body}\n")
+        (shim / name).chmod(0o755)
+    script = _REPO / "scripts" / "setup-cloudflared.sh"
+    res = _REAL_RUN(
+        ["bash", "-c", f"umask 000; PATH={shim}:$PATH HOME={home} WISPRALT_ROOT={home} bash {script}"],
+        input="https://t.example.com\ntunnel-secret\n",
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "tunnel-secret" in plist.read_text()
+    assert log.read_text().split() == ["600"]
+    assert stat.S_IMODE(plist.stat().st_mode) == 0o600

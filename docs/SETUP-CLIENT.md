@@ -304,7 +304,9 @@ If you only need WisprAlt on your own Mac and don't plan to distribute it, use t
 
 **Build and install:** `wispralt setup --role client` runs the build script and
 swaps the result into `/Applications` (it skips the build when the installed
-version already matches; `--rebuild` forces it). To build by hand:
+version already matches; `--rebuild` forces it). The swap is crash-safe: the
+previous app is kept as `.WisprAlt.app.old` until the new one is in place, and
+a rerun after an interrupted swap restores it first. To build by hand:
 ```bash
 bash scripts/build-client-local.sh
 ```

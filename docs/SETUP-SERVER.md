@@ -49,7 +49,7 @@ way, put the public URL in `SERVER_URL` and run `wispralt restart`.
    - **Type**: `HTTP`; **URL**: `localhost:8000`
 8. Click **Save hostname**.
 
-Run `scripts/setup-cloudflared.sh` after `wispralt setup --role host`. The tunnel token is passed via stdin (silent read — not echoed). The script stores the token at `~/.config/wispralt/cloudflare-token` (mode 0600) and configures the cloudflared LaunchAgent to read it via `--token-file` (cloudflared ≥ 2025.4.0). On older cloudflared versions, the token is inlined in the plist (also mode 0600). See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for token rotation procedures for both paths.
+Run `scripts/setup-cloudflared.sh` after `wispralt setup --role host`. The tunnel token is passed via stdin (silent read — not echoed). The script stores the token at `~/.config/wispralt/cloudflare-token` (mode 0600) and configures the cloudflared LaunchAgent to read it via `--token-file` (cloudflared ≥ 2025.4.0). On older cloudflared versions, the token is inlined in the plist (also mode 0600, from creation: never readable by others, even briefly). See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for token rotation procedures for both paths.
 
 > **Network security model:** FastAPI binds exclusively to `127.0.0.1`; only `tailscale` or `cloudflared` has external network access. Rate limiting reads `CF-Connecting-IP` from Cloudflare's authoritative header. If you change the bind address for LAN testing, set `TRUST_FORWARDED_HEADERS=false` in `.env` to avoid IP spoofing in rate limiting.
 

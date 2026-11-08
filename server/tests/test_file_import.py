@@ -157,6 +157,25 @@ def test_copy_failure_rolls_back_that_row(
     assert not list((_data_dir / "outputs").glob(".import-*"))
 
 
+def test_partial_copy_is_removed(
+    db: Database, src: Path, owner: int, _data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy that dies midway (its ``.part`` already on disk) leaves no ``.part`` behind."""
+    real = fi.shutil.copy2
+
+    def dies_midway(a, b):  # noqa: ANN001, ANN202
+        if str(a).endswith("c.vtt"):
+            with open(b, "wb") as f:  # the half-written temp a real copy2 leaves
+                f.write(b"half")
+            raise OSError("disk full")
+        return real(a, b)
+
+    monkeypatch.setattr(fi.shutil, "copy2", dies_midway)
+    report = fi.import_files(db, [src], owner_id=owner, outputs_dir=_data_dir / "outputs")
+    assert report.tables["files"]["errors"] == 1
+    assert not list((_data_dir / "outputs").glob(".import-*"))
+
+
 def test_unknown_owner_refused(db: Database, src: Path, _data_dir: Path) -> None:
     with pytest.raises(OwnerMappingRequired):
         fi.import_files(db, [src], owner_id=999, outputs_dir=_data_dir / "outputs")

@@ -161,9 +161,10 @@ def _stage(g: Group, job_id: str, outputs: Path) -> list[tuple[Path, Path]]:
     try:
         for ext, src in sorted(g.files.items()):
             tmp = outputs / f".import-{job_id}{ext}.part"
+            # Tracked before the copy, so a copy that fails midway is dropped too.
+            pairs.append((tmp, outputs / f"{job_id}{ext}"))
             shutil.copy2(src, tmp)
             tmp.chmod(0o600)
-            pairs.append((tmp, outputs / f"{job_id}{ext}"))
     except OSError:
         _drop(pairs)
         raise
