@@ -598,6 +598,28 @@ during Part 4; until then the sections below describe the current stores.
   drilldown and CSV). The p50 is the median of the window's `duration_ms` values,
   computed in Python.
 
+### History import writer (Part 7)
+
+`0003_import_runs.sql` adds `import_runs` (one row per source per run: `status`
+running/done/failed/blocked, `checkpoint`, `counts_json`). Numbering skips `0002`,
+which Part 6 owns: `migrate()` applies pending files in sorted order and does not
+need contiguous numbers (a DB that got `0003` first simply applies `0002` later).
+
+`wispralt.imports` is the one generic writer for imported history.
+`insert_rows(con, table, rows, source)` runs inside the caller's `write()` (so a
+batch and its `import_runs` checkpoint commit together); `import_rows(db, …)` wraps
+it in its own transaction. Tables and columns come from a fixed allowlist
+(`users`, `usage_events`, `dictations`, `jobs`; never `api_keys`/`invites`), every
+row needs a `source_id`, and bad input raises `ValueError` before anything is
+written. Each row runs in its own SAVEPOINT with
+`ON CONFLICT(source, source_id) WHERE source IS NOT NULL DO NOTHING RETURNING id`:
+it is inserted, a duplicate (its existing id is read in the same transaction), or
+a `RowError` naming the `source_id` and the failed constraint, while the rest of
+the batch commits. `link_existing` stamps an existing row (the owner's local admin)
+with a `(source, source_id)` once, idempotently. A real import holds the offline
+`<data_dir>.lock` (`importer/lock.py`, replaced by Part 4's `ops.backup.server_lock`
+when that lands).
+
 ## Transcript persistence
 
 Phase 1 of the portal "weekly insights" effort: every transcribed output

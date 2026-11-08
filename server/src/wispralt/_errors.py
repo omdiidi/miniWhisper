@@ -59,3 +59,27 @@ class DecodeTimeoutError(Exception):
 
     NOT 408 — openai-python retries 408. Map to 400 so SDK doesn't retry.
     """
+
+
+class ImportIntegrityError(Exception):
+    """History import refused: a snapshot failed verification or the accounting does not add up."""
+
+
+class ExportUnavailable(Exception):
+    """The Supabase export cannot run here (no ``psql``, no connection string, bad SQL)."""
+
+
+class ExportBlocked(Exception):
+    """The Supabase project is unreachable or paused. Never unpaused by WisprAlt."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class OwnerMappingRequired(Exception):
+    """A local admin exists but no owner mapping was confirmed (``--owner-map`` or ``--yes``)."""
+
+
+class ServerRunning(Exception):
+    """An offline operation was refused because a server holds ``<data_dir>.lock``."""
