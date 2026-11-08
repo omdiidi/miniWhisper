@@ -36,7 +36,6 @@ import csv
 import io
 import logging
 import re
-import secrets
 import sqlite3
 import time
 import urllib.parse
@@ -51,6 +50,7 @@ from .._errors import AlreadyBootstrapped
 from ..accounts import service as account_service
 from ..accounts.store import AccountStore, User
 from ..auth import (
+    csrf_token_for,
     require_admin,
     require_admin_csrf,
     require_api_key,
@@ -74,8 +74,8 @@ def _accounts(request: Request) -> AccountStore:
 def _form_page(
     request: Request, template: str, ctx: dict[str, Any], status_code: int = 200
 ) -> HTMLResponse:
-    """Render a page that holds a mutating form: mint a CSRF token, embed it, set its cookie."""
-    csrf = secrets.token_urlsafe(32)
+    """Render a page that holds a mutating form: embed the CSRF token (``csrf_token_for``), set its cookie."""
+    csrf = csrf_token_for(request)
     response = templates.TemplateResponse(
         template, {"request": request, "csrf_token": csrf, **ctx}, status_code=status_code
     )
@@ -101,8 +101,8 @@ me_router = APIRouter(prefix="/admin")
 
 @public_router.get("/login", response_class=HTMLResponse)
 async def login_form(request: Request) -> HTMLResponse:
-    """Render the single-field login form with a fresh CSRF token."""
-    csrf = secrets.token_urlsafe(32)
+    """Render the single-field login form with a CSRF token (``csrf_token_for``)."""
+    csrf = csrf_token_for(request)
     response = templates.TemplateResponse(
         "login.html.j2",
         {"request": request, "csrf_token": csrf},
@@ -114,8 +114,8 @@ async def login_form(request: Request) -> HTMLResponse:
 def _render_admin_login_error(
     request: Request, *, error: str, status_code: int
 ) -> HTMLResponse:
-    """Render the admin login form with an error + freshly-minted CSRF token."""
-    csrf = secrets.token_urlsafe(32)
+    """Render the admin login form with an error + a CSRF token (``csrf_token_for``)."""
+    csrf = csrf_token_for(request)
     response = templates.TemplateResponse(
         "login.html.j2",
         {"request": request, "error": error, "csrf_token": csrf},
@@ -196,9 +196,9 @@ async def setup_submit(
     csrf_token: str = Form(...),
 ) -> HTMLResponse:
     """Create the first admin with the on-disk setup code; show its key once."""
+    await _setup_open(request)  # first: once closed, every POST is 404 (never the form)
     if not verify_csrf(request, csrf_token):
         return _setup_form(request, error="Form expired. Reload and try again.", status_code=403)
-    await _setup_open(request)
     clean_label, err = _validate_label(label)
     if err is not None:
         return _setup_form(request, error=err, label=label, status_code=400)

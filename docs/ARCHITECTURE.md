@@ -563,11 +563,18 @@ header. Cookie-authenticated mutations are guarded by `auth.require_csrf`,
 a dependency that declares `require_api_key` as its own sub-dependency (so
 auth always resolves first and records `request.state.auth_via`) and skips
 the token only when `auth_via == "bearer"`; otherwise the `X-CSRF-Token`
-header or `csrf_token` form field must match the `wispralt_csrf` cookie, or
-403. Every admin mutation takes it as a parameter through
+header or `csrf_token` form field must pass `auth.verify_csrf`, or 403. The
+token is **bound to the session**: `auth.session_csrf_token(session)` =
+HMAC-SHA256 keyed by the (HttpOnly, secret) session token, so a sibling
+same-site origin that plants a parent-domain `wispralt_csrf` cookie still
+cannot forge it (an unsigned double-submit cookie could simply be
+overwritten). This works over loopback http, where a `__Host-` cookie would
+not (it needs Secure). With no session cookie (the login and setup forms
+only) the token must equal the `wispralt_csrf` cookie (double-submit). Every admin mutation takes it as a parameter through
 `require_admin_csrf`; `PATCH /me` and the `/me/history` mutations through
 `require_csrf` beside `forbid_integration_kind`. Pages that render those
-forms mint the token (`admin_ui._form_page`). `SameSite=Strict` stays as a
+forms embed `auth.csrf_token_for(request)` (`admin_ui._form_page`): stable
+for the session, so full pages and partials agree and nothing rotates. `SameSite=Strict` stays as a
 second layer.
 
 The macOS client's menubar **Open Portal** button opens
@@ -1151,8 +1158,8 @@ existed".
 
 Both mutating routes (`DELETE`, `POST /restore`) take the
 `auth.require_csrf` dependency: the `csrf_token` form field (or
-`X-CSRF-Token` header) must match the cookie set by the page render (same
-double-submit pattern as `/admin/login` and `/me/login`); a Bearer-authenticated
+`X-CSRF-Token` header) must pass `auth.verify_csrf` (the session-bound token the page render
+embedded, see Auth above); a Bearer-authenticated
 request needs no token. Every read AND mutation re-checks
 ownership: `get_history_row(user_id, kind, row_id)` (=
 `get_record_scoped(kind, row_id, viewer_id, is_admin=False)`) filters on

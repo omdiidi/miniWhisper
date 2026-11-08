@@ -17,7 +17,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from wispralt.auth import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME
+from wispralt.auth import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME, session_csrf_token
 from wispralt.insights import cron, timewindow
 from wispralt.insights import settings as insights_settings
 from wispralt.insights.client import INSIGHTS_PRICING_PER_1K, InsightsResponse, RateLimitedError
@@ -366,10 +366,10 @@ def test_settings_require_the_disclosure_and_csrf(
     c = _admin_cookie_client(app, token)
     page = c.get("/admin/settings")
     assert page.status_code == 200 and "Disclosure" in page.text and "not set" in page.text
-    form["csrf_token"] = _csrf(page.text)  # the page set a fresh CSRF cookie
+    form["csrf_token"] = _csrf(page.text)  # the session-bound token the page embeds
     no_ack = c.post("/admin/settings", data=form)
     assert no_ack.status_code == 400 and "disclosure" in no_ack.text  # no ack
-    form["csrf_token"] = _csrf(no_ack.text)  # every re-render mints a fresh token
+    form["csrf_token"] = _csrf(no_ack.text)  # every re-render embeds it again
     assert insights_settings.load(settings_store).enabled is False
     no_csrf = {k: v for k, v in form.items() if k != "csrf_token"}
     assert c.post("/admin/settings", data={**no_csrf, "acknowledge": "1"}).status_code == 403
@@ -398,7 +398,7 @@ def test_runs_post_is_csrf_guarded_admin_only_and_refused_while_ai_is_off(
     assert TestClient(app, base_url="https://testserver").post(
         "/admin/data/runs", data={"weeks": "1"}, headers={"Authorization": f"Bearer {emp}"}
     ).status_code == 403
-    off = c.post("/admin/data/runs", data={"weeks": "1", "csrf_token": "tok"})
+    off = c.post("/admin/data/runs", data={"weeks": "1", "csrf_token": session_csrf_token(token)})
     assert off.status_code == 409 and "off" in off.text
 
 

@@ -526,7 +526,7 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 
 - For 401 from a browser: visit `/admin/login`, paste the admin token, submit. The cookie is set with `max_age=8h`.
 - For 403: use the admin token, not an employee token. There is no env-var admin key and no break-glass admin. If the admin token is lost, mint a new one on the host's terminal: `wispralt keys rotate-admin` (prints the new token once, or writes it to a new `--token-file`; add `--user-id N` when there are several admins).
-- **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Rotate, Disable, Revoke device, Invites, AI runs, Settings) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (the `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
+- **403 "CSRF token missing or invalid"** on a form submit (Add employee / key, Rotate, Disable, Revoke device, Invites, AI runs, Settings) or on `PATCH /me` from a browser: every cookie-authenticated mutation needs the CSRF token the page embedded (it is bound to the session, so it changes when you sign in again; the login form's own `wispralt_csrf` cookie lasts 30 min). Reload the page and submit again. Scripts should send `Authorization: Bearer <token>`, which needs no CSRF token; a `Basic` or other non-Bearer `Authorization` header does not count.
 - **503** instead of 401/403: the account lookup hit a `sqlite3.Error`. Check `/readyz/db` and the "Local database" section; there is no fallback admin.
 
 ---

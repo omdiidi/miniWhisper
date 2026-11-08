@@ -353,7 +353,7 @@ Return the calling user's own profile. Each user can only read their own row —
 
 ### `PATCH /me`
 
-**Auth:** Bearer required (any role), or the session cookie **plus** the CSRF token (`X-CSRF-Token` header = `wispralt_csrf` cookie; otherwise 403). A Bearer request needs no CSRF token (the macOS client sends Bearer + JSON).
+**Auth:** Bearer required (any role), or the session cookie **plus** the CSRF token (`X-CSRF-Token` header = the session-bound token the portal pages embed, `auth.session_csrf_token`; otherwise 403). A Bearer request needs no CSRF token (the macOS client sends Bearer + JSON).
 
 Update the calling user's own `display_name`. The `label` and `role` are not user-editable; admin must change those via the admin UI.
 
@@ -533,7 +533,7 @@ Soft-delete one owned row. Flips `deleted_at = NOW()` on the underlying row; dow
 
 | Field | Type | Notes |
 |---|---|---|
-| `csrf_token` | string | Double-submit value matched against the cookie set by the prior `GET /me/history*` render (or send it as `X-CSRF-Token`). Constant-time compare via `hmac.compare_digest`. Not needed with a Bearer token. |
+| `csrf_token` | string | The session-bound token the prior `GET /me/history*` render embedded (HMAC of the session cookie; or send it as `X-CSRF-Token`). Constant-time compare via `hmac.compare_digest`. Not needed with a Bearer token. |
 
 **Response 200** — body is the OOB delete fragment `<tr id="row-{kind}-{row_id}" hx-swap-oob="delete"></tr>`. HTMX removes the row from the table without re-fetching the page.
 

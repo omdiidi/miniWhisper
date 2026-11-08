@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 import time
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,7 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ..auth import require_admin, require_admin_csrf, set_csrf_cookie
+from ..auth import csrf_token_for, require_admin, require_admin_csrf, set_csrf_cookie
 from ..config import settings
 from ..insights import cron, measured, sources
 from ..insights import settings as insights_settings
@@ -130,8 +129,8 @@ async def admin_data(
         # form already on the page would carry a stale token (silent 403).
         return templates.TemplateResponse(request, "_admin_data_body.html.j2", ctx)
 
-    # Full page: mint the CSRF token the runs form carries, plus the runs list.
-    csrf = secrets.token_urlsafe(32)
+    # Full page: the CSRF token the runs form carries, plus the runs list.
+    csrf = csrf_token_for(request)
     ctx.update(await _runs_ctx(request, cfg))
     ctx["csrf_token"] = csrf
     response = templates.TemplateResponse(request, "data.html.j2", ctx)
@@ -315,7 +314,7 @@ async def _settings_page(request: Request, *, error: str | None = None, saved: b
     stored_tz = await asyncio.to_thread(
         request.app.state.settings_store.get, insights_settings.TIMEZONE
     )
-    csrf = secrets.token_urlsafe(32)
+    csrf = csrf_token_for(request)
     response = templates.TemplateResponse(
         request,
         "settings.html.j2",

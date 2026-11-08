@@ -18,7 +18,6 @@ import asyncio
 import collections
 import json
 import logging
-import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .._errors import InviteInvalid
 from ..accounts import service as account_service
-from ..auth import require_admin, require_admin_csrf, set_csrf_cookie
+from ..auth import csrf_token_for, require_admin, require_admin_csrf, set_csrf_cookie
 from ..config import settings
 from ..web.templates_env import templates
 from .admin_ui import NO_STORE, _validate_label
@@ -52,7 +51,7 @@ def _accounts(request: Request) -> AccountStore:
 
 async def _page(request: Request, *, error: str | None = None, status_code: int = 200) -> HTMLResponse:
     invites = await asyncio.to_thread(_accounts(request).list_invites, time.time())
-    csrf = secrets.token_urlsafe(32)
+    csrf = csrf_token_for(request)
     response = templates.TemplateResponse(
         "invites.html.j2",
         {"request": request, "invites": invites, "csrf_token": csrf, "error": error},

@@ -305,7 +305,15 @@ def _mutation(name: str, employee: User, integration: User) -> tuple[str, str, d
     ],
 )
 @pytest.mark.parametrize(
-    "mode", ["cookie_no_token", "cookie_token", "bearer_only", "basic_plus_cookie", "bad_bearer_cookie"]
+    "mode",
+    [
+        "cookie_no_token",
+        "cookie_token",
+        "injected_cookie_token",
+        "bearer_only",
+        "basic_plus_cookie",
+        "bad_bearer_cookie",
+    ],
 )
 def test_csrf_matrix(
     csrf_client: TestClient,
@@ -329,18 +337,23 @@ def test_csrf_matrix(
         headers = {"Authorization": "Basic eDp5"}
     if mode == "bad_bearer_cookie":
         headers = {"Authorization": "Bearer " + "0" * 64}
-    if mode == "cookie_token":
-        csrf_client.cookies.set(auth_mod.CSRF_COOKIE_NAME, _CSRF)
+    if mode in ("cookie_token", "injected_cookie_token"):
+        # cookie_token: the session-bound token the pages embed. injected: a
+        # cookie + matching token a sibling origin could plant (unsigned
+        # double-submit), which must not pass while a session exists.
+        csrf = auth_mod.session_csrf_token(token) if mode == "cookie_token" else _CSRF
+        csrf_client.cookies.set(auth_mod.CSRF_COOKIE_NAME, csrf)
         if "json" in body:
-            headers[auth_mod.CSRF_HEADER] = _CSRF
+            headers[auth_mod.CSRF_HEADER] = csrf
         else:
-            body = {"data": {**body["data"], "csrf_token": _CSRF}}
+            body = {"data": {**body["data"], "csrf_token": csrf}}
 
     resp = csrf_client.request(method, path, headers=headers, follow_redirects=False, **body)
 
     expected = {
         "cookie_no_token": 403,
         "cookie_token": ok,
+        "injected_cookie_token": 403,
         "bearer_only": ok,
         "basic_plus_cookie": 403,
         "bad_bearer_cookie": 401,
