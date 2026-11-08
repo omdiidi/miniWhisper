@@ -121,9 +121,6 @@ All configuration is read from `server/.env` (mode 0600). The template is `serve
 |---|---|---|---|
 | `DATA_DIR` | Yes | — | Absolute path of the data root that holds `wispralt.db`, `outputs/` and `staging/`; `setup-server.sh` writes `$HOME/Library/Application Support/WisprAlt`. An empty or relative value is rejected. The server never creates it (the bootstrap does) and refuses to start if it is missing. |
 | `SERVER_URL` | Yes | — | Full `https://` tunnel URL (e.g. `https://transcribe.yourdomain.com`) |
-| `MEETING_OUTPUT_DIR` | Yes | — | Directory for completed file-job transcript files (JSON/SRT/VTT/TXT); the name is kept from the meeting era |
-| `JOB_DB_PATH` | Yes | — | Path to SQLite job database file |
-| `STAGING_DIR` | Yes | — | Temporary directory for in-flight WAV uploads |
 | `OPENROUTER_API_KEY` | No | — | Enables the weekly insights cron (Sunday-night LLM summary via OpenRouter). When unset, the cron is a no-op. Server smart formatting (Mercury) was removed in Part 4. Get a key at https://openrouter.ai/keys. |
 | `FILE_MODEL_IDLE_EVICTION_SECONDS` | No | `60` | Seconds the file model (MLX Whisper) may sit idle before it is evicted to reclaim memory |
 | `MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum upload size in bytes (default 2 GiB) |
@@ -139,7 +136,7 @@ Never commit `server/.env`. The `.gitignore` excludes it. The file must remain m
 
 ### Migration
 
-On second startup, `jobs.db` is migrated to add the `attempts` column automatically (SQLite `ALTER TABLE`; idempotent — safe to restart multiple times).
+Jobs, dictations and insights now live in `DATA_DIR/wispralt.db` too (outputs in `DATA_DIR/outputs`, staged uploads in `DATA_DIR/staging`); `MEETING_OUTPUT_DIR`, `JOB_DB_PATH` and `STAGING_DIR` are gone and ignored if still in an old `.env`. There is no `jobs.db` upgrade path (the old host was wiped).
 
 #### Local database migrations
 

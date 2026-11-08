@@ -117,7 +117,7 @@ Readiness probe for the dictation (Parakeet) endpoint.
 
 ---
 
-There is no readiness probe for file transcription: the file model (MLX Whisper) loads lazily on the first file job and is evicted when idle, so it is normally cold. `GET /metrics` → `meeting.models_warm` reports its current state. (The meeting readiness probe was removed with the meeting pipeline and now returns 404.)
+There is no readiness probe for file transcription: the file model (MLX Whisper) loads lazily on the first file job and is evicted when idle, so it is normally cold. `GET /metrics` → `file.models_warm` reports its current state. (The meeting readiness probe was removed with the meeting pipeline and now returns 404.)
 
 ---
 
@@ -178,7 +178,7 @@ The `smart_formatted` key was removed in Part 4 along with server smart formatti
 
 ### `POST /transcribe/dictate/stream/{session_id}/chunk/{index}`
 
-**Auth:** Bearer required. **Break-glass / single-key admin callers are rejected (403)** — streaming dictation requires a real `api_key_id` for per-user session bookkeeping. **Opt-in, experimental** — see [ARCHITECTURE.md → Streaming dictation](ARCHITECTURE.md#streaming-dictation-opt-in-experimental) for the end-to-end design.
+**Auth:** Bearer required. Sessions are owned by the authenticated user. **Opt-in, experimental** — see [ARCHITECTURE.md → Streaming dictation](ARCHITECTURE.md#streaming-dictation-opt-in-experimental) for the end-to-end design.
 
 Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session. The first chunk for a given `session_id` opens a server-side `StreamingSession`; subsequent chunks reuse it. Chunks run on the same single-instance Parakeet executor as `/transcribe/dictate` — no second model is loaded.
 
@@ -204,8 +204,8 @@ Ingest one mid-utterance, silence-cut WAV chunk into an active streaming session
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer token. |
-| 403 | Break-glass admin caller, OR the bearer resolves to an `api_key_id` that does not match the session's owner (recorded at first-chunk open). |
-| 409 | `per_user_busy` — this `api_key_id` already owns a different active session. Either reuse its `session_id` or wait for it to finalize/expire. |
+| 403 | The bearer resolves to a user who is not the session's owner (recorded at first-chunk open). |
+| 409 | `per_user_busy` — this user already owns a different active session. Either reuse its `session_id` or wait for it to finalize/expire. |
 | 410 | Session is no longer active (status ∈ {finalizing, done, aborted, expired}). The client should fall back to single-shot `/transcribe/dictate` with the safety-buffer WAV. |
 | 413 | Cumulative voiced audio for this session exceeds the 270 s mid-chunk ceiling. (Finalize allows up to 300 s.) |
 | 415 | `Content-Type` is not `audio/*`. |
@@ -249,7 +249,7 @@ Close out a streaming session. The server waits up to 15 s for all pending chunk
 | Code | Condition |
 |---|---|
 | 401 | Missing or invalid bearer token. |
-| 403 | Bearer's `api_key_id` does not match the session's owner. |
+| 403 | The bearer's user is not the session's owner. |
 | 409 | `gap_detected` — `partial_texts` contains a `None` entry between two ingested chunks (a chunk POST landed for index N but index N−1 never arrived). The client should fall back to single-shot. |
 | 410 | Session is not in `status="active"` (already finalizing, done, aborted, or expired). |
 | 413 | Cumulative voiced audio + tail exceeds 300 s. |
@@ -396,7 +396,7 @@ on identical `created_at` is `id DESC`.
 | 503 | SQLite job store transiently unavailable. |
 
 Source: `server/src/wispralt/routes/me.py` +
-`JobStore.get_most_recent_dictation(api_key_id)` in
+`JobStore.get_most_recent_dictation(user_id)` in
 `server/src/wispralt/jobs/store.py`.
 
 ---
@@ -472,14 +472,14 @@ Source: `server/src/wispralt/routes/me.py` (Phase 2).
 
 **Auth:** Bearer or session cookie (any role; integration keys get 403).
 
-Personal transcript archive — the calling user's own dictations + file transcriptions (including legacy meeting rows) in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `api_key_id` AND `deleted_at IS NULL`).
+Personal transcript archive — the calling user's own dictations + file transcriptions in one chronological list. Filterable by time range, kind, and free-text search. Per-leg cursor pagination keeps heavy-on-one-side pages from starving the other. Backed by `JobStore.transcripts_in_range_filtered` (UNION of `dictations` + `jobs`, both filtered on `user_id` AND `deleted_at IS NULL`).
 
 **Query parameters:**
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `range` | enum | `30d` | One of `today`, `7d`, `30d`, `90d`, `1y`, `all`. Reuses `insights.timewindow.epoch_for_range`. |
-| `kind` | enum \| empty | unset | Either `dictation` or `meeting`. `meeting` is the stored value for every job row (file jobs included) and is **displayed** as "File transcriptions"; the value is migrated in a later schema pass. Empty string from a `<select>` is normalized to "no filter". |
+| `kind` | enum \| empty | unset | Either `dictation` or `file` (displayed as "File transcriptions"). Empty string from a `<select>` is normalized to "no filter". The row routes `/me/history/{kind}/{row_id}` take the same two kinds; `meeting` (pre-Part 4) now 404s. |
 | `search` | string | unset | Free-text LIKE filter on the transcript body. Strings shorter than **3 chars after `.strip()`** are silently dropped to keep the scan bounded. |
 | `dict_cursor` | opaque | unset | Base64-urlsafe encoded `(created_at, row_id)` tuple for the dictations leg. Malformed → silently restart pagination. |
 | `jobs_cursor` | opaque | unset | Same shape, for the jobs (file transcription) leg. |
@@ -512,8 +512,8 @@ Render one row's expanded (default) or compact (`?compact=1`) partial. Unknown `
 
 | Field | Type | Notes |
 |---|---|---|
-| `kind` | enum | `dictation` or `meeting` (the stored value for job rows; shown as "File transcription"). Anything else → 404. |
-| `row_id` | string | Job UUID for `meeting`, integer row id for `dictation`. |
+| `kind` | enum | `dictation` or `file` (shown as "File transcription"). Anything else (incl. the pre-Part 4 `meeting`) → 404. |
+| `row_id` | string | Job UUID for `file`, integer row id for `dictation`. |
 
 **Query parameters:**
 
@@ -639,7 +639,7 @@ Source: `server/src/wispralt/routes/admin_data.py` (Phase 2).
 
 Admin-only manual trigger for `insights.cron.run_weekly_insights` against the **current in-progress ISO week**. Fire-and-forget — the handler returns immediately with a tiny HTML body (toast + OOB-swap button fragment) for HTMX to render in place. The spawned task is strong-referenced in `app.state.weekly_insights_manual_tasks` (set of `asyncio.Task`) and removed by a closure-based done-callback that also logs any unhandled exception.
 
-Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip — if a `weekly_insights` row already exists for `(api_key_id, iso_year, iso_week, scope='person')`, the OpenRouter call is skipped. The in-flight lock pre-check is purely UX.
+Per-week double-billing is prevented by `cron.py`'s per-user idempotency skip — if a `weekly_insights` row already exists for `(iso_year, iso_week, scope_key='user:<id>')`, the OpenRouter call is skipped. The in-flight lock pre-check is purely UX.
 
 **Request:** `application/x-www-form-urlencoded`
 
@@ -709,7 +709,7 @@ The `code` field is what the macOS client branches on (`file_job_busy` → "prev
 
 ### `GET /transcribe/file/{job_id}`
 
-**Auth:** Bearer required. The caller sees a job only if it owns it (`job.api_key_id == user.id`) or is an admin; legacy jobs with no owner are admin-only. Anything else is **404**, exactly like a missing job, so existence never leaks.
+**Auth:** Bearer required. The caller sees a job only if it owns it (`job.user_id == user.id`) or is an admin. Anything else is **404**, exactly like a missing job, so existence never leaks.
 
 Poll job status. The client polls every few seconds.
 
@@ -719,7 +719,6 @@ Poll job status. The client polls every few seconds.
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "done",
   "mode": "single",
-  "request_mode": "file",
   "formats": ["json", "srt", "txt", "vtt"],
   "outputs": {
     "json": "/transcribe/file/550e8400-e29b-41d4-a716-446655440000/download/json",
@@ -733,7 +732,7 @@ Poll job status. The client polls every few seconds.
 | Field | Present when |
 |---|---|
 | `status` | Always. Values: `pending`, `running`, `done`, `failed`. |
-| `mode` / `request_mode` | When recorded on the row. Current jobs are `single` / `file`. |
+| `mode` | When recorded on the row (`single`). `request_mode` was removed in Part 4 (the client never read it). |
 | `error` | When `status == "failed"`. A cancelled job reads `cancelled by user`. |
 | `progress` | When `status == "running"`: `phase`, `phase_label`, `chunk_index`, `total_chunks`, optional `phase_elapsed_s`, `audio_duration_s`. |
 | `serverFinishing` | `true` when `status == "running"` and a cancel was requested: the Whisper call is still running and its result will be discarded. |
@@ -889,7 +888,7 @@ Structured server observability snapshot.
     "queue_depth": 0,
     "last_inference_at": "2026-04-24T15:43:01Z"
   },
-  "meeting": {
+  "file": {
     "active": false,
     "active_job_id": null,
     "completed_24h": 3,
@@ -927,15 +926,15 @@ Structured server observability snapshot.
 | `parakeet.p50_ms` / `p95_ms` | Percentiles of the last 100 Parakeet inference calls |
 | `parakeet.queue_depth` | Requests currently waiting for the single-thread executor |
 | `parakeet.last_inference_at` | ISO-8601 timestamp of most recent inference, or `null` |
-| `meeting.*` | The **file-job** block. The `meeting` key name is kept from the meeting era until a later schema pass. |
-| `meeting.active` | `true` while a file job is queued or running |
-| `meeting.active_job_id` | UUID of the currently running job, or `null` |
-| `meeting.completed_24h` / `failed_24h` | Job counts from the last 24 hours |
-| `meeting.current_eta_s` | Estimated seconds until active job completes, or `null` |
-| `meeting.models_warm` | `true` iff the file model (MLX Whisper) is resident. It loads lazily on the first file job and is evicted when idle. |
-| `meeting.models_loading` | `true` iff a lazy load is currently in flight. |
-| `meeting.idle_seconds` / `idle_eviction_threshold_s` | Seconds since the file model was last used, and the eviction threshold (`FILE_MODEL_IDLE_EVICTION_SECONDS`). |
-| `meeting.eviction_failures_total` | Count of eviction self-checks that found memory not returned. |
+| `file.*` | The **file-job** block (renamed from `meeting` in Part 4). |
+| `file.active` | `true` while a file job is queued or running |
+| `file.active_job_id` | UUID of the currently running job, or `null` |
+| `file.completed_24h` / `failed_24h` | Job counts from the last 24 hours |
+| `file.current_eta_s` | Estimated seconds until active job completes, or `null` |
+| `file.models_warm` | `true` iff the file model (MLX Whisper) is resident. It loads lazily on the first file job and is evicted when idle. |
+| `file.models_loading` | `true` iff a lazy load is currently in flight. |
+| `file.idle_seconds` / `idle_eviction_threshold_s` | Seconds since the file model was last used, and the eviction threshold (`FILE_MODEL_IDLE_EVICTION_SECONDS`). |
+| `file.eviction_failures_total` | Count of eviction self-checks that found memory not returned. |
 | `memory.rss_mb` | Server process RSS in MiB. **Does NOT include MLX/Metal allocations** on Apple Silicon — unified memory is tracked by Metal separately. Use `mlx_active_mb` + `mlx_cache_mb` to close the gap with what Activity Monitor's "Memory" column reports. |
 | `memory.available_mb` | System available RAM in MiB |
 | `memory.mlx_active_mb` | Bytes currently held by live MLX tensors (Parakeet weights ≈ 1218 MB warm, 0 if model not loaded). Returns 0 if MLX isn't initialized or the API is missing. |

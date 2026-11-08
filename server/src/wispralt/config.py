@@ -36,11 +36,6 @@ class Settings(BaseSettings):
     # writes it into .env; the server never creates it (bootstrap does).
     data_dir: Path
 
-    # Filesystem paths — resolved to absolute on access
-    meeting_output_dir: Path
-    job_db_path: Path
-    staging_dir: Path
-
     # Upload guard (default 2 GiB)
     max_upload_bytes: int = 2_147_483_648
 
@@ -60,12 +55,12 @@ class Settings(BaseSettings):
     # Eviction self-check thresholds (added by the 2026-05-19 invariant-gates plan).
     # Probe-verified 2026-05-19 that mx.metal.get_active_memory() is synchronous
     # with mx.clear_cache() — no async sampling needed.
-    meeting_eviction_delta_floor_mb: int = 1000
+    file_eviction_delta_floor_mb: int = 1000
     # A real eviction releases ~1500 MB of file-model (Whisper) active memory.
     # Today's bug had delta=0. Floor of 1000 catches the bug AND partial-release
     # regressions (e.g., a future library leaking 500 MB while clearing 1000).
 
-    meeting_eviction_pre_active_gate_mb: int = 1500
+    file_eviction_pre_active_gate_mb: int = 1500
     # Parakeet baseline (~1218) + 300 MB headroom = definitively file-model-loaded.
     # Excludes cold-start, partial-load failures. Gate prevents false-positives
     # when there was nothing meaningful to evict.
@@ -107,7 +102,7 @@ class Settings(BaseSettings):
     transcript_retention_days: int = 90
 
     # Finished (done/failed) meeting job rows and their output files
-    # (<id>.txt/.srt/.vtt/.json in meeting_output_dir) older than this many
+    # (<id>.txt/.srt/.vtt/.json in outputs_dir) older than this many
     # days are deleted by the daily sweep. 0 disables. Default matches
     # transcript_retention_days so /me/history keeps meeting rows for as long
     # as their transcript text is retained. Pending/running jobs are never
@@ -156,6 +151,10 @@ class Settings(BaseSettings):
     @property
     def outputs_dir(self) -> Path:
         return self.data_dir / "outputs"
+
+    @property
+    def staging_dir(self) -> Path:
+        return self.data_dir / "staging"
 
 
 # Module-level singleton — import as ``from wispralt.config import settings``

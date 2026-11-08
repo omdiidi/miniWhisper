@@ -89,10 +89,10 @@ Two modes, picked in the popover: **Online (OpenAI)** and **Local server** (`Set
 
 | Component | File | Responsibility |
 |---|---|---|
-| **FastAPI app** | `server/src/wispralt/main.py` | Single uvicorn worker. Lifespan: validates `.env` permissions (warns if not 0600), loads Parakeet, runs `JobStore.recover_orphans()`, sweeps staging, then `await file_runner.reenqueue_pending()` directly. **The file model is NOT loaded here** — MLX Whisper loads lazily on the first file job via `files.pipeline._ensure_models_loaded()` and the eviction loop unloads it when idle. Registers SIGTERM handler, mounts routers. |
+| **FastAPI app** | `server/src/wispralt/main.py` | Single uvicorn worker. Lifespan: requires `DATA_DIR`, migrates `wispralt.db`, validates `.env` permissions (warns if not 0600), runs `JobStore.recover_orphans()` BEFORE the staging sweep, loads Parakeet, then `await file_runner.reenqueue_pending()`. On exit it sets `shutting_down` and awaits `file_runner.shutdown()` first, before any loop cancel or store release. **The file model is NOT loaded here** — MLX Whisper loads lazily on the first file job via `files.pipeline._ensure_models_loaded()` and the eviction loop unloads it when idle. Registers SIGTERM handler, mounts routers. |
 | **ParakeetService** | `server/src/wispralt/dictate/parakeet.py` | Warm-resident `mlx-community/parakeet-tdt-0.6b-v2` (float32 — bfloat16 caused a `[matmul] (128,257) vs (514,51)` shape error on first inference). Single `ThreadPoolExecutor(max_workers=1)` serializes all inference (MLX is not thread-safe per model instance). Warmup JIT pass at startup. Defensive return-type handling: checks `hasattr(result, 'text')` vs list of `AlignedToken`. Tracks p50/p95 latency percentiles over last 100 calls. **Audio decode boundary**: `_sync_transcribe` wraps `soundfile.read` in `try/except (LibsndfileError, RuntimeError) → CorruptAudioError` so malformed uploads convert to HTTP 422 (via the route handler) instead of leaking as 500. |
-| **FileJobRunner** | `server/src/wispralt/jobs/runner.py` | `asyncio.Semaphore(1)` serialises execution; admission is decided by the set of spawned-but-unfinished worker tasks (`_workers`), so a second submit is refused even before the first worker has acquired the semaphore. Dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="wispralt-files")` isolates file-job work from the default asyncio thread pool. Busy or low-memory (< 2 GiB) submissions raise `FileJobInProgressError` with `code` `file_job_busy` / `insufficient_memory`, which the routes turn into a coded 429. `_run_source` owns the single `set_running` per attempt; `set_running` and `set_done` are conditional (`AND cancel_requested=0`), so a cancelled job can neither start nor finish `done` — it ends `failed: cancelled by user` with its outputs removed. The exception path also removes partial outputs. Staging files always cleaned up in `finally`. `reenqueue_pending()` called at startup for jobs whose sources survived a restart. |
-| **JobStore** | `server/src/wispralt/jobs/store.py` | SQLite WAL mode (`PRAGMA journal_mode=WAL; synchronous=NORMAL`). Thread-safe via `threading.Lock`. Job lifecycle: `pending → running → done | failed`. `recover_orphans()`: marks `running` jobs as `failed`; marks `pending` jobs with missing WAV as `failed`; leaves `pending` jobs with existing WAV for `reenqueue_pending()`. |
+| **FileJobRunner** | `server/src/wispralt/jobs/runner.py` | `asyncio.Semaphore(1)` serialises execution; admission is decided by the set of spawned-but-unfinished worker tasks (`_workers`), so a second submit is refused even before the first worker has acquired the semaphore. Dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="wispralt-files")` isolates file-job work from the default asyncio thread pool. Busy or low-memory (< 2 GiB) submissions raise `FileJobInProgressError` with `code` `file_job_busy` / `insufficient_memory`, which the routes turn into a coded 429. `_run_source` owns the single `set_running` per attempt; `set_running` and `set_done` are conditional (`AND cancel_requested=0`), so a cancelled job can neither start nor finish `done` — it ends `failed: cancelled by user` with its outputs removed. The exception path also removes partial outputs. Staging files are cleaned up when the job ends, except when shutdown interrupted it (`CancelledError`, or `shutting_down` and the row still `running`): the input is kept and `requeue_interrupted` puts the row back to `pending` with its attempt refunded. `FileJobRunner(store, app.state)`; `shutdown()` cancels and awaits the workers, then `executor.shutdown(wait=False, cancel_futures=True)`. `reenqueue_pending()` called at startup for jobs whose inputs survived a restart (`MAX_ATTEMPTS = 3`). |
+| **JobStore** | `server/src/wispralt/jobs/store.py` | `JobStore(db, data_dir)` on the one SQLite DB (`Database`: connection per call, `BEGIN IMMEDIATE` writes), so it is safe from any thread. `user_id` is a real FK to `users`; `wav_path` is stored relative to `data_dir` and returned absolute; outputs always live in `DATA_DIR/outputs`. Job lifecycle: `pending → running → done | failed`. `recover_orphans()` — see Failure Handling. |
 | **files.pipeline** | `server/src/wispralt/files/pipeline.py` | `transcribe_file(...)`: `_ensure_models_loaded()` (lazy first-call load) → read the canonical WAV and average any channels to mono → resample to 16 kHz → **mlx-whisper turbo** (`mlx_whisper_loader.py`, `word_timestamps=False` hard-coded) → label every segment "Speaker 1" (`segments.py`) → atomic output write (`output.py`). Emits `phase_start`/`phase_done` structured logs at every seam; threads `progress_cb`/`cancel_cb` from the runner into the loader. Returns the v3 transcript dict (`mode="single"`, `model` lists the ASR model only). |
 | **RateLimitMiddleware** | `server/src/wispralt/middleware/rate_limit.py` | In-memory per-IP rolling-window limiter. Two windows: `/transcribe/dictate` 60 req/60s; `/readyz/*` + `/healthz` 120 req/60s. Returns 429 with `Retry-After` header and no `code` field. File jobs are bounded by the runner, not the limiter. |
 | **staging / env_writer** | `server/src/wispralt/ops/` | `staging.py` manages the staging directory; startup sweep removes orphaned WAVs older than 24h. `env_writer.py` atomically rewrites `.env` key-value pairs via tempfile-in-same-dir + `os.replace`, preserving mode 0600. |
@@ -112,7 +112,7 @@ There are two paths. Meetings (dual-channel recording + diarization) were remove
 | **Dictation** | `POST /transcribe/dictate` | mono (server downmixes) | n/a | Parakeet TDT 0.6B v2 (MLX, resident) | n/a |
 | **File** | `POST /transcribe/file` (+ chunked) | any container; ffmpeg-decoded, channels averaged to mono | **no** | mlx-whisper large-v3-turbo (lazy, idle-evicted) | `False` (hard-coded) |
 
-There is no `mode` field. `jobs.request_mode` stays on the row (defaults to `"file"`; old rows may read `meeting`) and is migrated in a later schema pass.
+There is no `mode` field. The `jobs.request_mode` / `force_single_channel` / `output_dir` columns are gone (Part 4): every job is a file job, and its outputs are in `DATA_DIR/outputs`.
 
 ---
 
@@ -179,7 +179,7 @@ Phase names are the canonical keys used in `runner.PHASE_BUDGETS` / `PHASE_LABEL
 
 ### Admin endpoints
 
-- `GET /admin/active` — rich projection of the currently in-flight job: `id, status, request_mode, mode, phase, phase_label, phase_elapsed_s, chunk_index, total_chunks, started_at, wav_path, audio_duration_s, attempts, cancel_requested, current_rss_mb`. Same auth dependency as `/metrics`.
+- `GET /admin/active` — rich projection of the currently in-flight job: `id, status, mode, phase, phase_label, phase_elapsed_s, chunk_index, total_chunks, started_at, wav_path, audio_duration_s, attempts, cancel_requested, current_rss_mb`. Same auth dependency as `/metrics`.
 - `GET /admin/server-log/{job_id}` — plain-text response: the 100 lines bracketing the job's first and last appearance in `settings.server_log_path` (resolved from settings, NOT hardcoded). Includes intervening lines (ffmpeg stderr, model warnings) for full-context diagnosis. The client's "View server log" sheet polls this every 5s.
 
 **Role gate (v0.5.0).** `GET /admin/active`, `GET /admin/server-log/{job_id}`,
@@ -406,23 +406,23 @@ The Mac mini M4 16 GB configuration leaves ~8.7 GB for the OS and other processe
 
 ## Failure Handling
 
-### SIGTERM Handler
+### SIGTERM and graceful shutdown
 
-Registered in `main.py` lifespan. On SIGTERM:
+The SIGTERM handler (registered in the lifespan when running on the main thread) only sets `app.state.shutting_down = True` and asks uvicorn to exit; it no longer fails running jobs. The lifespan shutdown then:
 
-1. Sets `app.state.shutting_down = True`.
-2. Calls `job_store.fail_all_running("server shutdown")` to mark in-flight jobs as failed.
-3. Calls `sys.exit(0)` so launchd's `ExitTimeout=15` applies cleanly.
+1. sets `shutting_down` and awaits `file_runner.shutdown()` FIRST, while the DB is open: each worker is cancelled; a job it interrupts keeps its staged input (WAV or source) and `requeue_interrupted` sets the row back to `pending` with the attempt `set_running` took refunded, so a deploy never spends an attempt;
+2. cancels the daemon loops and streaming sessions, closes the insights client;
+3. drops the stores (`app.state.db` etc.).
 
-The client's `GET /transcribe/file/{job_id}` poll sees `status: "failed"` and surfaces the error to the user.
+A worker that finished (`done`/`failed`) during shutdown cleans up its input as usual. The executor thread itself cannot be cancelled; it is abandoned (`shutdown(wait=False, cancel_futures=True)`).
 
 ### Orphan Recovery (`recover_orphans`)
 
-Called once at startup (before the event loop accepts requests). Policy from `jobs/store.py:157`:
+Called once at startup, BEFORE the staging sweep (so a requeued input is never swept):
 
-- `running` → `failed` (server restarted mid-job; job is dead)
-- `pending` + staged source exists → left as `pending`; `FileJobRunner.reenqueue_pending()` re-submits it
-- `pending` + WAV file missing → `failed` (staging file disappeared between crashes)
+- `running` (the server died mid-job) → `pending` (phase cleared) when its input exists, no cancel was requested and `attempts < 3`; otherwise `failed` with `cancelled by user`, `staging file missing after restart` or `max retries exceeded`. A crash still spends the attempt.
+- `pending` + input missing → `failed`; `pending` + truncated WAV → `failed` and the WAV unlinked.
+- every surviving `pending` row is re-submitted by `FileJobRunner.reenqueue_pending()` on its absolute input path.
 
 ### Staging Sweep
 
@@ -482,7 +482,7 @@ After `call_next`, `_ObservabilityMiddleware` (main.py) writes **one** `usage_ev
 
 Best-effort: a `sqlite3.Error` loses that row, increments `usage_write_failures_total` and logs only the error type; the response is unaffected. The counter is exposed in `/metrics` and in the `/readyz/db` body, so a loss is visible. There is no queue and no background drainer.
 
-Tracked routes: `transcribe/dictate`, `transcribe/file` (`kind = "file"`), `v1/audio/transcriptions` (`kind = "v1_dictate"`), plus the `/v1/models` and translations probes, **POST only**. Each stream chunk POST still records a row (request telemetry). The admin overview tiles (Dictations 24h/7d/30d) currently sum `usage_events` rows across all kinds.
+Tracked routes: `transcribe/dictate`, `transcribe/file` (`kind = "file"`), `v1/audio/transcriptions` (`kind = "v1_dictate"`), plus the `/v1/models` and translations probes, **POST only**. Each stream chunk POST still records a row (request telemetry). The admin overview's Dictations 24h/7d/30d tiles count `dictations` rows (`JobStore.dictation_counts`), not requests; the user-detail page's tiles still count that user's `usage_events` requests.
 
 ### Admin UI
 
@@ -594,23 +594,21 @@ Zero behavior change for end users.
 
 ### Where the data lives
 
-- **File-job transcripts** are stored on the existing `jobs` row (including rows from the meeting era).
-  Four new columns added by an idempotent `ALTER TABLE` in `JobStore.__init__`:
-  `transcript_text`, `word_count`, `client_app_version`, `api_key_id`. The
-  derivation happens inside `FileJobRunner._run_pipeline_inner` right before
-  `set_done`: joins `transcript["segments"][*].text`; falls back to reading
-  `<output_dir>/<job_id>.txt` if the joined string is empty.
-- **Dictation transcripts** live in a separate `dictations` table created in
-  the same `__init__`. Dictation is request-response (no job row), so the
-  route's normal success path fires-and-forgets an `asyncio.create_task` that
-  calls `JobStore.insert_dictation` via `asyncio.to_thread` (the `_exec`
-  lock is sync, so we must hop off the event loop). Tasks are held in
-  `app.state.pending_persists` to defeat the documented `asyncio.create_task`
-  GC race, and drained with a 2-second budget at shutdown.
+Both tables live in `DATA_DIR/wispralt.db` (`migrations/0001_initial.sql`).
 
-Both tables carry `api_key_id`, the existing per-user FK to `wispralt.users`.
-This makes the Phase 2 per-employee filter trivial: `/me/insights` will filter
-to one `api_key_id`; `/admin/data` will union all of them.
+- **File-job transcripts** are stored on the `jobs` row: `transcript_text`,
+  `word_count`, `client_app_version`, `user_id`. The derivation happens inside
+  `FileJobRunner._run_pipeline_inner` right before `set_done`: joins
+  `transcript["segments"][*].text`; falls back to reading
+  `DATA_DIR/outputs/<job_id>.txt` if the joined string is empty.
+- **Dictation transcripts** live in the `dictations` table. Dictation is
+  request-response (no job row), so the route's success path fires-and-forgets
+  an `asyncio.create_task` that calls the store via `asyncio.to_thread`. Tasks
+  are held in `app.state.pending_persists` and drained with a 2-second budget
+  at shutdown (Task 6 replaces this with a synchronous persist).
+
+Both tables carry `user_id`, a real FK to `users`, so `/me/*` filters to one
+user and `/admin/data` groups by it (`JobStore.stats_by_user`, one query).
 
 ### Privacy posture
 
@@ -627,11 +625,8 @@ to one `api_key_id`; `/admin/data` will union all of them.
 - **Asymmetric word-count survival.** `jobs.word_count` survives past sweep
   because the row stays as audit history; `dictations` rows are deleted
   entirely. This is intentional.
-- **File permissions.** `jobs.db`, `jobs.db-wal`, and `jobs.db-shm` are
-  `chmod 0600` on every startup so a restored backup is auto-tightened.
-  When the mode actually changes, the new mode is logged at INFO.
-- **Break-glass admin (user.id < 0) is skipped everywhere.** No orphaned
-  `-1` rows ever appear in either table.
+- **File permissions.** `wispralt.db` is created 0600 (its `-wal`/`-shm`
+  inherit the mode) and re-chmodded by every `migrate()`.
 - **Empty / whitespace-only dictations are skipped.** Avoids polluting
   Phase 2 word counts with silence-only audio.
 - **All transcripts stay on the mini.** Nothing is sent to OpenRouter
@@ -738,23 +733,20 @@ gives more than enough recovery time.
 ### Data shapes
 
 ```sql
-CREATE TABLE weekly_insights (
-    iso_year     INTEGER NOT NULL,
-    iso_week     INTEGER NOT NULL,
-    scope        TEXT NOT NULL,         -- 'person' or 'team'
-    api_key_id   INTEGER,                -- NULL for team scope
-    insight_json TEXT NOT NULL,
-    input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    cost_usd     REAL NOT NULL,
-    model        TEXT NOT NULL,         -- e.g. 'x-ai/grok-4.3'
-    generated_at REAL NOT NULL,
-    PRIMARY KEY (iso_year, iso_week, scope, api_key_id)
-);
-CREATE INDEX idx_weekly_insights_generated ON weekly_insights(generated_at);
+CREATE TABLE weekly_insights(
+  iso_year INTEGER NOT NULL, iso_week INTEGER NOT NULL,
+  scope_key TEXT NOT NULL,                       -- 'team' or 'user:<id>'
+  user_id INTEGER REFERENCES users(id),           -- NULL for the team row
+  insight_json TEXT NOT NULL, input_tokens INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL, cost_usd REAL NOT NULL,
+  model TEXT NOT NULL, generated_at REAL NOT NULL,
+  PRIMARY KEY (iso_year, iso_week, scope_key),
+  CHECK (scope_key = CASE WHEN user_id IS NULL THEN 'team' ELSE 'user:' || user_id END));
 ```
 
-`upsert_weekly_insight` uses `ON CONFLICT (iso_year, iso_week, scope, api_key_id)
+The non-null `scope_key` closes the old duplicate-team-row hole (a nullable
+column in the primary key never conflicted). `upsert_weekly_insight(user_id=…)`
+derives the key and uses `ON CONFLICT (iso_year, iso_week, scope_key)
 DO UPDATE` so a re-run for the same week overwrites the previous row
 idempotently — useful for catchup, manual re-runs via the
 `python -m wispralt.insights.cron --manual` entrypoint, and prompt
@@ -805,10 +797,10 @@ Team `insight_json` schema:
 ### Scope semantics
 
 - **`scope = 'person'`** rows are emitted per employee that hit the
-  data-floor gate: at least **5 dictations OR at least 1 file job** in
+  data-floor gate: at least **5 dictations OR at least 1 file job** (history kind `file`) in
   the week. Users below the floor are skipped silently (no row written) to
   avoid charging for thin-data summaries.
-- **`scope = 'team'`** is one row per week with `api_key_id = NULL`. It's
+- **The team row** (`scope_key = 'team'`, `user_id = NULL`) is one row per week. It's
   written **only when at least 2 employees had successful person-scope
   insights** — a one-person team aggregate would just be a re-rendering of
   that person's row.
@@ -916,8 +908,8 @@ _me_history_page, _me_history_row, _me_history_row_expanded}.html.j2`
 ### Two-leg union
 
 A "history row" is either a dictation (from the `dictations` table) or a
-job-style transcript (from the `jobs` table — every file job, plus legacy meeting rows). Both legs
-carry `api_key_id` already, so per-user scoping is free. `JobStore.transcripts_in_range_filtered`
+file transcript (from the `jobs` table). Both legs carry `user_id`, so
+per-user scoping is free. `JobStore.transcripts_in_range_filtered`
 runs two parameterized SQL queries — one per leg — applies the range +
 optional kind + optional `LIKE` search filter, ORDERs each by
 `(created_at DESC, row_id DESC)`, then merge-sorts the two streams in
@@ -928,7 +920,7 @@ Filters live entirely server-side:
 - `range` (default `30d`) — one of `today`, `7d`, `30d`, `90d`, `1y`, `all`,
   reusing `insights/timewindow.epoch_for_range` so the history page and the
   insights page agree on what "30d" means.
-- `kind` (optional) — `dictation` or `meeting` (the synthetic kind for every `jobs` row; the portal displays it as "File transcription"). Empty string from the
+- `kind` (optional) — `dictation` or `file` (every `jobs` row; displayed as "File transcriptions"). `meeting` URLs from before Part 4 404. Empty string from the
   `<select>` element is normalized to None at the handler.
 - `search` (optional) — minimum **3 characters** after `.strip()`; shorter
   strings are silently dropped to keep the `LIKE '%…%'` scan bounded.
@@ -950,15 +942,13 @@ covers this.
 
 ### Soft delete
 
-`dictations.deleted_at` and `jobs.deleted_at` (REAL, NULL = live) were
-added by idempotent `ALTER TABLE` calls in `JobStore.__init__`. Two new
-partial indexes (`idx_dictations_api_key_active`,
-`idx_jobs_api_key_active`) keep the live-row scan fast:
+`dictations.deleted_at` and `jobs.deleted_at` (REAL, NULL = live). Two
+partial indexes keep the live-row scan fast:
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_dictations_api_key_active
-  ON dictations(api_key_id, created_at DESC)
-  WHERE deleted_at IS NULL;
+CREATE INDEX dictations_user_created ON dictations(user_id, created_at) WHERE deleted_at IS NULL;
+CREATE INDEX jobs_user_active ON jobs(user_id, created_at)
+  WHERE deleted_at IS NULL AND transcript_text IS NOT NULL;
 ```
 
 `DELETE /me/history/{kind}/{row_id}` flips `deleted_at = NOW()`; the row
@@ -980,11 +970,9 @@ Both mutating routes (`DELETE`, `POST /restore`) accept the standard form
 `csrf_token` field validated through the shared
 `auth.verify_csrf`/`set_csrf_cookie` helpers (same double-submit pattern
 as `/admin/login` and `/me/login`). Every read AND mutation re-checks
-ownership: `get_history_row(api_key_id, kind, row_id)` filters on
-`api_key_id` so a malicious or stale row_id from another user uniformly
-returns **404** — we never leak existence to non-owners. Break-glass
-admin (`user.id < 0`) is rejected from every history route (no person
-row to scope to).
+ownership: `get_history_row(user_id, kind, row_id)` filters on
+`user_id` so a malicious or stale row_id from another user uniformly
+returns **404** — we never leak existence to non-owners.
 
 ### HTMX render contract
 

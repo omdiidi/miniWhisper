@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 PERSON_SYSTEM_PROMPT = """You are an analyst summarizing one employee's transcribed
-dictations and meeting transcripts from the past week. Output strict JSON with this schema:
+dictations and file transcripts from the past week. Output strict JSON with this schema:
 
 {
   "digest": ["3 sentences summarizing what this person worked on this week"],
@@ -35,10 +35,10 @@ Rules:
 If the week is too thin (<200 words total), return empty arrays for action_items/projects/decisions/blockers and a one-sentence digest. Never invent content."""
 
 
-PERSON_USER_PROMPT_TEMPLATE = """Employee: {display_name} (api_key_id={api_key_id})
+PERSON_USER_PROMPT_TEMPLATE = """Employee: {display_name} (user_id={user_id})
 Week: ISO {iso_year}-W{iso_week:02d}
 Total words this week: {total_words}
-Source mix: {dictation_count} dictations, {meeting_count} meetings/files
+Source mix: {dictation_count} dictations, {file_count} file transcriptions
 
 TRANSCRIPTS (newest first, capped at {input_word_cap} words):
 ---

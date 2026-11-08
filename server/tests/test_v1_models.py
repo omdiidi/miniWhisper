@@ -17,9 +17,6 @@ from typing import Any
 # Pydantic Settings reads these at import time — set defaults BEFORE any
 # wispralt import so the tests work on a bare dev box without a .env.
 os.environ.setdefault("SERVER_URL", "http://test.local")
-os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
-os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
-os.environ.setdefault("STAGING_DIR", "/tmp/wispralt-test-staging")
 
 from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware

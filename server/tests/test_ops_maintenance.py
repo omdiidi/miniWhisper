@@ -1,7 +1,7 @@
 """
 test_ops_maintenance.py — retention sweep and staging sweeps.
 
-No MLX, no network: JobStore runs on a tmp SQLite file.
+No MLX, no network: the conftest JobStore runs on the per-test SQLite DB.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from wispralt.config import settings
 from wispralt.jobs.store import JobStore
 from wispralt.ops import background, staging
 
@@ -23,25 +24,27 @@ def _age(path: Path, seconds: float) -> None:
     os.utime(path, (t, t))
 
 
+@pytest.fixture
+def store(job_store: JobStore, make_user) -> JobStore:
+    job_store.owner = make_user()[0].id  # type: ignore[attr-defined]
+    return job_store
+
+
 def _job(store: JobStore, tmp: Path, *, status: str, age_days: float) -> str:
-    wav = tmp / "x.wav"
-    jid = store.create(str(wav))
+    jid = store.create(tmp / "x.wav", user_id=store.owner)  # type: ignore[attr-defined]
     ts = time.time() - age_days * DAY
-    store._exec(
-        "UPDATE jobs SET status=?, created_at=?, finished_at=? WHERE id=?",
-        status,
-        ts,
-        None if status in ("pending", "running") else ts,
-        jid,
-    )
+    with store.db.write() as con:
+        con.execute(
+            "UPDATE jobs SET status=?, created_at=?, finished_at=? WHERE id=?",
+            (status, ts, None if status in ("pending", "running") else ts, jid),
+        )
     return jid
 
 
 # ── meeting retention ─────────────────────────────────────────────────────────
 
 
-def test_retention_deletes_only_old_finished_jobs_and_outputs(tmp_path: Path) -> None:
-    store = JobStore(tmp_path / "jobs.db")
+def test_retention_deletes_only_old_finished_jobs_and_outputs(tmp_path: Path, store: JobStore) -> None:
     out = tmp_path / "out"
     out.mkdir()
 
@@ -67,15 +70,13 @@ def test_retention_deletes_only_old_finished_jobs_and_outputs(tmp_path: Path) ->
     assert len(list(out.glob(f"{new_done}.*"))) == 4
 
 
-def test_retention_zero_days_disabled(tmp_path: Path) -> None:
-    store = JobStore(tmp_path / "jobs.db")
+def test_retention_zero_days_disabled(tmp_path: Path, store: JobStore) -> None:
     jid = _job(store, tmp_path, status="done", age_days=999)
     assert background.sweep_old_meetings(store, 0, tmp_path) == 0
     assert store.get(jid) is not None
 
 
-def test_delete_finished_jobs_rechecks_status(tmp_path: Path) -> None:
-    store = JobStore(tmp_path / "jobs.db")
+def test_delete_finished_jobs_rechecks_status(tmp_path: Path, store: JobStore) -> None:
     running = _job(store, tmp_path, status="running", age_days=99)
     assert store.delete_finished_jobs([running]) == 0
     assert store.get(running) is not None
@@ -107,16 +108,13 @@ def test_staging_sweeps_remove_stale_but_keep_active(tmp_path: Path) -> None:
 
 
 def test_run_daily_sweeps_invokes_staging_and_retention(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: JobStore
 ) -> None:
-    staging_dir, out = tmp_path / "staging", tmp_path / "out"
+    staging_dir, out = settings.staging_dir, settings.outputs_dir
     staging_dir.mkdir()
     out.mkdir()
-    monkeypatch.setattr(background.settings, "staging_dir", staging_dir)
-    monkeypatch.setattr(background.settings, "meeting_output_dir", out)
     monkeypatch.setattr(background.settings, "meeting_job_retention_days", 30)
 
-    store = JobStore(tmp_path / "jobs.db")
     old = _job(store, tmp_path, status="done", age_days=40)
     (out / f"{old}.txt").write_text("x")
     stale_tmp = out / "a.tmp"
@@ -137,8 +135,7 @@ def test_run_daily_sweeps_invokes_staging_and_retention(
 # ── retention safeguards ──────────────────────────────────────────────────────
 
 
-def test_retention_skips_runner_active_job(tmp_path: Path) -> None:
-    store = JobStore(tmp_path / "jobs.db")
+def test_retention_skips_runner_active_job(tmp_path: Path, store: JobStore) -> None:
     zombie = _job(store, tmp_path, status="failed", age_days=99)  # watchdog-failed
     gone = _job(store, tmp_path, status="failed", age_days=99)
     n = background.sweep_old_meetings(store, 30, tmp_path, lambda j: j == zombie)
@@ -147,36 +144,31 @@ def test_retention_skips_runner_active_job(tmp_path: Path) -> None:
 
 
 def test_retention_keeps_row_when_file_removal_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: JobStore
 ) -> None:
-    store = JobStore(tmp_path / "jobs.db")
     jid = _job(store, tmp_path, status="done", age_days=99)
     monkeypatch.setattr(background, "remove_job_outputs", lambda *_: False)
     assert background.sweep_old_meetings(store, 30, tmp_path) == 0
     assert store.get(jid) is not None
 
 
-def test_retention_uses_persisted_dir_and_blocks_traversal(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    sub = root / "sub"
-    outside = tmp_path / "outside"
-    sub.mkdir(parents=True)
-    outside.mkdir()
-    store = JobStore(tmp_path / "jobs.db")
-    inside_job = _job(store, tmp_path, status="done", age_days=99)
-    evil_job = _job(store, tmp_path, status="done", age_days=99)
-    store._exec("UPDATE jobs SET output_dir=? WHERE id=?", str(sub), inside_job)
-    store._exec(
-        "UPDATE jobs SET output_dir=? WHERE id=?",
-        str(root / ".." / "outside"), evil_job,
-    )
-    (sub / f"{inside_job}.txt").write_text("x")
-    (outside / f"{evil_job}.txt").write_text("x")
+def test_recovery_before_sweep_keeps_the_requeued_input(store: JobStore) -> None:
+    """A job running at a crash is requeued, so the startup sweep keeps its (old) WAV."""
+    import numpy as np
+    import soundfile as sf
 
-    background.sweep_old_meetings(store, 30, root)
+    settings.staging_dir.mkdir()
+    wav = settings.staging_dir / "in.wav"
+    sf.write(str(wav), np.zeros(1600, dtype=np.float32), 16_000, subtype="FLOAT", format="WAV")
+    _age(wav, 2 * DAY)  # older than the 24 h staging TTL
+    jid = store.create(wav, user_id=store.owner)  # type: ignore[attr-defined]
+    assert store.set_running(jid)
 
-    assert not (sub / f"{inside_job}.txt").exists()  # persisted dir honoured
-    assert (outside / f"{evil_job}.txt").exists()  # traversal blocked
+    assert store.recover_orphans()["requeue"] == [jid]  # startup order: recover, then sweep
+    background.sweep_staging(store)
+
+    assert wav.exists()
+    assert store.get(jid).status == "pending"
 
 
 # ── logging idempotence ───────────────────────────────────────────────────────

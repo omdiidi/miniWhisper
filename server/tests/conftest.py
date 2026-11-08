@@ -7,12 +7,9 @@ import tempfile
 from typing import TYPE_CHECKING
 
 # Must run before the first ``wispralt`` import: config.py builds ``settings`` at import.
-# DATA_DIR is forced (never a real host's data); the rest only default, as the test files do.
+# DATA_DIR is forced (never a real host's data); SERVER_URL only defaults.
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="wispralt-test-data-")
 os.environ.setdefault("SERVER_URL", "http://test.local")
-os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
-os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
-os.environ.setdefault("STAGING_DIR", "/tmp/wispralt-test-staging")
 
 import pytest  # noqa: E402
 
@@ -20,6 +17,7 @@ from wispralt.accounts import service as account_service  # noqa: E402
 from wispralt.accounts.store import AccountStore  # noqa: E402
 from wispralt.config import settings  # noqa: E402
 from wispralt.database import Database  # noqa: E402
+from wispralt.jobs.store import JobStore  # noqa: E402
 from wispralt.usage.store import UsageStore  # noqa: E402
 
 if TYPE_CHECKING:
@@ -59,6 +57,11 @@ def usage(db: Database) -> UsageStore:
 
 
 @pytest.fixture
+def job_store(db: Database, _data_dir: Path) -> JobStore:
+    return JobStore(db, _data_dir)
+
+
+@pytest.fixture
 def make_user(accounts: AccountStore) -> MakeUser:
     """``make_user(role="employee", kind="employee", label=None) -> (User, plaintext)``."""
     counter = iter(range(1, 10_000))
@@ -79,6 +82,7 @@ def wire(db: Database, accounts: AccountStore, usage: UsageStore) -> Wire:
 
     def _wire(app: FastAPI) -> FastAPI:
         app.state.db = db
+        app.state.job_store = JobStore(db, settings.data_dir)
         app.state.accounts = accounts
         app.state.usage = usage
         return app

@@ -1,10 +1,11 @@
 """
 test_file_job_routes.py — /transcribe/file/{job_id} poll, download, delete.
 
-TestClient over the transcribe_file router with a real tmp JobStore. Auth is
-replaced by a dependency that SETS ``request.state.user`` (the ownership
-check reads it), with one user each for the owner (id=1), a non-owner
-(id=2) and an admin.
+TestClient over the transcribe_file router with the conftest JobStore on the
+per-test SQLite DB. Auth is replaced by a dependency that SETS
+``request.state.user`` (the ownership check reads it); the three users exist
+as real rows (jobs have a ``user_id`` FK): owner (id=1), non-owner (id=2),
+admin (id=3).
 
 The end-to-end case runs the real staging (ffprobe + ffmpeg transcode) and
 output writers; only the mlx-whisper loader is stubbed. It is skipped when
@@ -14,7 +15,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import shutil
 import subprocess
 import threading
@@ -22,12 +22,7 @@ import time
 import wave
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
-
-os.environ.setdefault("SERVER_URL", "http://test.local")
-os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
-os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
-os.environ.setdefault("STAGING_DIR", "/tmp/wispralt-test-staging")
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import pytest
@@ -35,6 +30,7 @@ import soundfile as sf
 from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 
+from wispralt.accounts.store import User
 from wispralt.auth import require_api_key
 from wispralt.config import settings
 from wispralt.files import output as files_output
@@ -44,7 +40,9 @@ from wispralt.jobs.runner import FileJobRunner
 from wispralt.jobs.store import JobStore
 from wispralt.ops import staging
 from wispralt.routes import transcribe_file as transcribe_file_routes
-from wispralt.accounts.store import User
+
+if TYPE_CHECKING:
+    from .conftest import MakeUser
 
 _FORMATS = ("json", "srt", "vtt", "txt")
 OWNER = User(id=1, key_id=None, label="owner", role="employee", kind="employee")
@@ -55,25 +53,29 @@ ADMIN = User(id=3, key_id=None, label="admin", role="admin", kind="employee")
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _users(make_user: MakeUser) -> None:
+    """OWNER / OTHER / ADMIN as real rows (ids 1-3 on the fresh per-test DB)."""
+    made = [make_user(label="owner")[0], make_user(label="other")[0], make_user("admin", label="admin")[0]]
+    assert [u.id for u in made] == [OWNER.id, OTHER.id, ADMIN.id]
+
+
 @pytest.fixture
-def out_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    d = tmp_path / "outputs"
-    d.mkdir()
-    monkeypatch.setattr(settings, "meeting_output_dir", d)
+def out_dir() -> Path:
+    d = settings.outputs_dir
+    d.mkdir(parents=True)
     return d
 
 
 @pytest.fixture
-def staging_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    d = tmp_path / "staging"
-    monkeypatch.setattr(settings, "staging_dir", d)
+def staging_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "max_upload_bytes", 50_000_000)
-    return d
+    return settings.staging_dir
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> JobStore:
-    return JobStore(tmp_path / "jobs.db")
+def store(job_store: JobStore) -> JobStore:
+    return job_store
 
 
 @pytest.fixture
@@ -109,7 +111,7 @@ def make_app(store: JobStore) -> Callable[..., FastAPI]:
         app.include_router(transcribe_file_routes.router)
         app.dependency_overrides[require_api_key] = _as(user)
         app.state.job_store = store
-        app.state.file_runner = runner if runner is not None else FileJobRunner(store)
+        app.state.file_runner = runner if runner is not None else FileJobRunner(store, app.state)
         return app
     return _make
 
@@ -126,11 +128,11 @@ def _transcript(jid: str) -> dict:
     }
 
 
-def _done_job(store: JobStore, out_dir: Path, owner: int | None) -> str:
-    jid = store.create("/tmp/src.m4a", api_key_id=owner)
+def _done_job(store: JobStore, out_dir: Path, owner: int) -> str:
+    jid = store.create("/tmp/src.m4a", user_id=owner)
     assert store.set_running(jid)
     files_output.write_outputs_atomic(_transcript(jid), out_dir, jid)
-    assert store.set_done_if_not_cancelled(jid, "single", str(out_dir), transcript_text="hello there")
+    assert store.set_done_if_not_cancelled(jid, "single", transcript_text="hello there")
     return jid
 
 
@@ -198,12 +200,6 @@ def test_admin_polls_another_users_job(make_app, store, out_dir) -> None:
     assert resp.json()["status"] == "done"
 
 
-def test_null_owner_job_is_admin_only(make_app, store, out_dir) -> None:
-    jid = _done_job(store, out_dir, owner=None)
-    assert TestClient(make_app(OWNER)).get(f"/transcribe/file/{jid}").status_code == 404
-    assert TestClient(make_app(ADMIN)).get(f"/transcribe/file/{jid}").status_code == 200
-
-
 # ── validation / missing outputs ──────────────────────────────────────────────
 
 
@@ -235,7 +231,7 @@ def test_delete_missing_job_is_204(make_app) -> None:
 
 @pytest.mark.parametrize("running", [False, True])
 def test_delete_active_job_is_202_and_sets_cancel(make_app, store, running: bool) -> None:
-    jid = store.create("/tmp/src.m4a", api_key_id=OWNER.id)
+    jid = store.create("/tmp/src.m4a", user_id=OWNER.id)
     if running:
         assert store.set_running(jid)
     resp = TestClient(make_app(OWNER)).delete(f"/transcribe/file/{jid}")
@@ -248,14 +244,14 @@ def test_delete_active_job_is_202_and_sets_cancel(make_app, store, running: bool
 def test_delete_job_that_finishes_during_cancel_is_removed(
     make_app, store, out_dir, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    jid = store.create("/tmp/src.m4a", api_key_id=OWNER.id)
+    jid = store.create("/tmp/src.m4a", user_id=OWNER.id)
     assert store.set_running(jid)
     files_output.write_outputs_atomic(_transcript(jid), out_dir, jid)
     real_cancel = store.set_cancel_requested
 
     def finish_then_cancel(job_id: str) -> None:
         # The runner wins the race: done lands before the cancel flag.
-        assert store.set_done_if_not_cancelled(job_id, "single", str(out_dir))
+        assert store.set_done_if_not_cancelled(job_id, "single")
         real_cancel(job_id)
 
     monkeypatch.setattr(store, "set_cancel_requested", finish_then_cancel)
@@ -285,7 +281,7 @@ def test_delete_keeps_row_when_outputs_cannot_be_removed(
 
 
 def test_delete_failed_job_removes_leftovers_from_default_root(make_app, store, out_dir) -> None:
-    jid = store.create("/tmp/src.m4a", api_key_id=OWNER.id)
+    jid = store.create("/tmp/src.m4a", user_id=OWNER.id)
     store.set_failed(jid, "boom")  # failed jobs have no output_dir
     (out_dir / f"{jid}.txt").write_text("partial")
     resp = TestClient(make_app(OWNER)).delete(f"/transcribe/file/{jid}")
@@ -333,8 +329,7 @@ def test_real_staging_end_to_end(
         assert "stub words" in txt.text
 
     job = store.get(jid)
-    assert job is not None and job.api_key_id == OWNER.id
-    assert job.request_mode == "file"
+    assert job is not None and job.user_id == OWNER.id
 
 
 def test_submit_while_running_is_429_file_job_busy(
@@ -407,7 +402,7 @@ def test_chunked_finalize_with_legacy_meeting_meta_finishes_as_file_job(
         "original_filename": "old.wav",
         "ext": ".wav",
         "created_at": time.time(),
-        "api_key_id": OWNER.id,
+        "user_id": OWNER.id,
         "client_app_version": "0.9.0",
         "mode": "meeting",  # pre-upgrade key: ignored
     }))
@@ -421,7 +416,6 @@ def test_chunked_finalize_with_legacy_meeting_meta_finishes_as_file_job(
 
     job = store.get(jid)
     assert job is not None
-    assert job.request_mode == "file"
-    assert job.api_key_id == OWNER.id
+    assert job.user_id == OWNER.id
     assert job.client_app_version == "0.9.0"
     assert not chunked_dir.exists()

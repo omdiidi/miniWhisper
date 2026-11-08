@@ -6,14 +6,15 @@ Startup sequence (Phase 2 / Task 13b)
 1.  Validate .env file permissions (warn loudly if not 0600/owned by us).
 2.  Assert staging and output dirs are on the same filesystem (R1#15 + P4#11).
 3.  Sweep old staging WAVs (> 24 h) left over from a previous run.
-4.  Instantiate JobStore (SQLite WAL, P4#4) and run orphan recovery (P5#2).
+4.  JobStore on the same DB; orphan recovery BEFORE the staging sweep (a
+    running job whose input survived goes back to pending, Locked Decision 8).
     Log {"requeue": [...], "failed": [...]}.
 5.  Instantiate FileJobRunner; re-enqueue surviving pending jobs.
 6.  Instantiate ParakeetService and call .load() (loads weights + warmup JIT).
 7.  Re-enqueue pending jobs (the file model loads lazily on the first job,
     not at startup).
-8.  Register SIGTERM handler (P5#5): mark running jobs failed, set shutting_down,
-    call sys.exit(0) so launchd ExitTimeOut=15 can observe a clean exit code.
+8.  Register SIGTERM handler (P5#5): set shutting_down and ask uvicorn to exit
+    (running jobs are NOT failed; the lifespan shutdown requeues them).
 9.  Expose state on app.state for routes and health endpoints.
 
 Before any of that, ``Database(settings.db_path).migrate()`` opens the one
@@ -21,8 +22,10 @@ SQLite DB (``app.state.db``) and its ``accounts`` / ``usage`` repositories.
 
 Shutdown
 --------
-Logs "clean shutdown" message.  The SIGTERM handler handles graceful job
-failure before the process is killed by launchd.
+``shutting_down = True`` → ``file_runner.shutdown()`` FIRST (an interrupted
+job keeps its input and is requeued with its attempt refunded), then the
+daemon loops, streaming sessions and insights client, then the stores are
+dropped.
 """
 
 from __future__ import annotations
@@ -34,7 +37,6 @@ import shutil
 import signal
 import sqlite3
 import subprocess
-import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -62,23 +64,23 @@ from wispralt.insights.cron import (
 )
 from wispralt.jobs.runner import FileJobRunner
 from wispralt.jobs.store import JobStore
-from wispralt.ops import background
-from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.middleware import openai_errors
 from wispralt.middleware.rate_limit import RateLimitMiddleware
-from wispralt.ops import staging
+from wispralt.ops import background, staging
 from wispralt.ops.env_writer import find_env_path
+from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.routes import (
     admin,
     admin_data,
     admin_ui,
     dictate,
     health,
+    v1_models,
+    v1_transcriptions,
 )
 from wispralt.routes import dictate_stream as dictate_stream_routes
 from wispralt.routes import me as me_routes
 from wispralt.routes import transcribe_file as transcribe_file_routes
-from wispralt.routes import v1_models, v1_transcriptions
 from wispralt.usage.events import UsageEvent
 from wispralt.usage.store import UsageStore
 
@@ -132,9 +134,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 2. R1#15 + P4#11: assert staging and output dirs share one filesystem so
     #    that os.replace in output.py is truly atomic (POSIX rename(2)).
     try:
-        staging.assert_same_filesystem(
-            settings.staging_dir, settings.meeting_output_dir
-        )
+        staging.assert_same_filesystem(settings.staging_dir, settings.outputs_dir)
     except RuntimeError as exc:
         # Log as ERROR — server can still start, but atomicity is compromised.
         logger.error("Filesystem check failed: %s", exc)
@@ -158,7 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    WAV files still exist are observed and their paths can be excluded from
     #    the sweep.  If sweep ran first it could delete WAVs that orphan recovery
     #    would later try to re-queue (C7 fix).
-    job_store = JobStore(settings.job_db_path)
+    job_store = JobStore(database, settings.data_dir)
     recovery = job_store.recover_orphans()
     logger.info(
         "Orphan recovery: requeue=%s failed=%s",
@@ -206,7 +206,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
     # 5. File-job runner — re-enqueue any pending jobs that survived the restart.
-    file_runner = FileJobRunner(job_store)
+    file_runner = FileJobRunner(job_store, app.state)
     app.state.file_runner = file_runner
     app.state.shutting_down = False
 
@@ -356,12 +356,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     def _sigterm_handler() -> None:
         logger.info("SIGTERM received — initiating graceful shutdown.")
         app.state.shutting_down = True
-        try:
-            n = job_store.fail_running_jobs("server shutdown")
-            if n:
-                logger.info("Marked %d running job(s) as failed on SIGTERM.", n)
-        except (OSError, RuntimeError) as exc:
-            logger.warning("Could not mark running jobs failed on SIGTERM: %s", exc)
 
         # Trigger uvicorn graceful shutdown so the lifespan teardown runs.
         # Fallback to raising
@@ -376,8 +370,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # bypasses the lifespan teardown.
         signal.raise_signal(signal.SIGINT)
 
-    loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _sigterm_handler)
+    except (NotImplementedError, RuntimeError, ValueError) as exc:
+        # Not the main thread (e.g. TestClient's portal): uvicorn's own
+        # handler still triggers the lifespan shutdown below.
+        logger.warning("SIGTERM handler not installed: %s", exc)
 
     # Initialize per-token rate-limit state for /v1/* routes. Idempotent.
     # Imported locally to avoid a top-of-module cycle with the auth/users modules.
@@ -389,6 +387,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # ── shutdown ──────────────────────────────────────────────────────────────
+
+    # Stop the file runner FIRST, while the DB is still open: a job it
+    # interrupts keeps its staged input and goes back to pending with its
+    # attempt refunded (Locked Decision 8).
+    app.state.shutting_down = True
+    await file_runner.shutdown()
+    logger.info("Shutdown: file runner stopped.")
 
     # Phase 1 transcript-storage: drain in-flight dictation persists FIRST so
     # the SQLite write-lock isn't being released mid-INSERT below. The 2 s
@@ -472,6 +477,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("insights_client.aclose failed: %s", exc)
 
+    app.state.job_store = app.state.accounts = app.state.usage = app.state.db = None
+    logger.info("Shutdown: database released.")
     logger.info("WisprAlt server clean shutdown.")
 
 

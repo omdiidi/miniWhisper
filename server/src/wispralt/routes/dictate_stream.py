@@ -231,7 +231,7 @@ async def stream_finalize(
         client_version = request.headers.get("X-WisprAlt-Client-Version")
         await asyncio.to_thread(
             job_store.insert_streaming_dictation_idempotent,
-            api_key_id=int(user.id),
+            user_id=int(user.id),
             text=text,
             duration_ms=int(total_inference_ms),
             client_app_version=client_version,

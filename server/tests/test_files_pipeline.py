@@ -14,9 +14,6 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("SERVER_URL", "http://test.local")
-os.environ.setdefault("MEETING_OUTPUT_DIR", "/tmp/wispralt-test-meeting")
-os.environ.setdefault("JOB_DB_PATH", "/tmp/wispralt-test-jobs.db")
-os.environ.setdefault("STAGING_DIR", "/tmp/wispralt-test-staging")
 
 import numpy as np
 import pytest
@@ -154,7 +151,7 @@ def test_evict_if_idle_releases_whisper_and_runs_self_check(
     monkeypatch.setattr(p, "_last_job_finished_at", time.monotonic() - 600.0)
     # Memory reader reports a loaded model that did NOT drop after release:
     # the self-check must fire (pre above the gate, delta below the floor).
-    high = settings.meeting_eviction_pre_active_gate_mb + 500
+    high = settings.file_eviction_pre_active_gate_mb + 500
     monkeypatch.setattr(observability, "mlx_active_mb", lambda: high)
     before = observability.eviction_failures_total.value
 
@@ -172,7 +169,7 @@ def test_evict_if_idle_self_check_quiet_on_real_release(
 ) -> None:
     monkeypatch.setattr(p, "_models_ready", True)
     monkeypatch.setattr(p, "_last_job_finished_at", time.monotonic() - 600.0)
-    readings = iter([settings.meeting_eviction_pre_active_gate_mb + 1500, 100])
+    readings = iter([settings.file_eviction_pre_active_gate_mb + 1500, 100])
     monkeypatch.setattr(observability, "mlx_active_mb", lambda: next(readings))
     before = observability.eviction_failures_total.value
 

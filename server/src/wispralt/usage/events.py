@@ -5,7 +5,7 @@ A single per-request observation captured by the observability middleware
 and written to ``usage_events`` by ``UsageStore.record``.
 
 Fields are nullable when not applicable to the kind of event (e.g. a
-``meeting`` create has no ``chars`` count yet).
+``file`` submit has no ``chars`` count yet).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ class UsageEvent:
 
     user_id: int
     ts: float  # unix seconds
-    kind: str  # "dictate" | "meeting" | ...
+    kind: str  # "dictate" | "file" | "v1_dictate" | ...
     status: int
     chars: int | None = None
     duration_ms: float | None = None

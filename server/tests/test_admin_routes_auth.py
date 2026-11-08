@@ -27,6 +27,7 @@ from wispralt.usage.events import UsageEvent
 
 if TYPE_CHECKING:
     from wispralt.accounts.store import AccountStore
+    from wispralt.jobs.store import JobStore
     from wispralt.usage.store import UsageStore
 
     from .conftest import MakeUser, Wire
@@ -189,22 +190,54 @@ def seeded(make_user: MakeUser, usage: UsageStore) -> User:
     return alice
 
 
-def test_overview_numbers_match_usage_store(
-    client: TestClient, admin: tuple[User, dict[str, str]], seeded: User, usage: UsageStore
-) -> None:
-    totals = usage.overview(time.time())["totals"]
-    assert (totals["dictations_24h"], totals["dictations_7d"], totals["dictations_30d"]) == (3, 4, 5)
-    html = client.get("/admin/", headers=admin[1]).text
+def _tiles(html: str) -> dict[str, str]:
     labels = re.findall(r'<div class="label">([^<]+)</div>\s*<div class="value">([^<]*)</div>', html)
-    values = {k.strip(): v.strip() for k, v in labels}
+    return {k.strip(): v.strip() for k, v in labels}
+
+
+def test_overview_numbers_match_the_stores(
+    client: TestClient,
+    admin: tuple[User, dict[str, str]],
+    seeded: User,
+    job_store: JobStore,
+) -> None:
+    now = time.time()
+    for age in (60, 3 * 86400):
+        job_store.insert_streaming_dictation_idempotent(
+            user_id=seeded.id,
+            text="hello",
+            duration_ms=None,
+            client_app_version=None,
+            client_dedup_id=f"00000000-0000-4000-8000-{age:012d}",
+            dictated_at=now - age,
+        )
+    html = client.get("/admin/", headers=admin[1]).text
+    values = _tiles(html)
+    # Dictation tiles count dictation rows (job_store), not usage_events requests.
     assert (values["Dictations 24h"], values["Dictations 7d"], values["Dictations 30d"]) == (
-        "3",
-        "4",
-        "5",
+        "1",
+        "2",
+        "2",
     )
-    assert values["Errors 24h"] == "1"
+    assert values["Errors 24h"] == "1"  # usage_events telemetry
     assert values["p50 latency 24h"] == "200 ms"
     assert "alice" in html
+
+
+def test_streamed_dictation_counts_once(
+    client: TestClient,
+    admin: tuple[User, dict[str, str]],
+    make_user: MakeUser,
+    usage: UsageStore,
+    job_store: JobStore,
+) -> None:
+    bob, _ = make_user(label="bob")
+    now = time.time()
+    for _chunk_or_finalize in range(4):  # 3 stream chunks + 1 finalize
+        usage.record(UsageEvent(user_id=bob.id, ts=now, kind="dictate", status=202))
+    job_store.insert_dictation(bob.id, "one dictation", 100, None)
+    values = _tiles(client.get("/admin/", headers=admin[1]).text)
+    assert values["Dictations 24h"] == "1"
 
 
 def test_user_detail_and_usage_pages(

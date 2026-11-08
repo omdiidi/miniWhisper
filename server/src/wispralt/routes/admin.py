@@ -3,7 +3,7 @@ routes/admin.py — Administrative endpoints for WisprAlt server.
 
 GET /metrics  (bearer auth)
     Returns structured observability data for parakeet, the file-job
-    pipeline (under the legacy ``meeting`` key), memory, and disk.
+    pipeline (``file``), memory, and disk.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from .. import observability
 from ..auth import require_admin
 from ..config import settings
-from ..jobs.runner import PHASE_LABELS
 from ..files import pipeline as files_pipeline
+from ..jobs.runner import PHASE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,7 @@ def _mlx_memory_mb() -> dict[str, int]:
 async def metrics(request: Request) -> JSONResponse:
     """Return observability snapshot.
 
-    The ``meeting.*`` block reports the file-job runner and the files
-    pipeline (the key name stays ``meeting`` until the portal relabel).
+    The ``file.*`` block reports the file-job runner and the files pipeline.
 
     Fields
     ------
@@ -66,11 +65,11 @@ async def metrics(request: Request) -> JSONResponse:
         (always 0 or 1 in steady state with one worker).
     parakeet.last_inference_at
         ISO-8601 timestamp of the most recent inference, or null.
-    meeting.active
+    file.active
         True if a file job is queued or running.
-    meeting.completed_24h / failed_24h
+    file.completed_24h / failed_24h
         File-job counts from the last 24 hours (JobStore).
-    meeting.current_eta_s
+    file.current_eta_s
         Estimated seconds until the active job completes, or null.
     memory.rss_mb
         Server process RSS in MiB.
@@ -129,7 +128,7 @@ async def metrics(request: Request) -> JSONResponse:
                 "queue_depth": 0,  # Phase 2: wire from executor queue size
                 "last_inference_at": last_inference_at,
             },
-            "meeting": {
+            "file": {
                 "active": file_job_active,
                 "active_job_id": active_job_id,
                 "completed_24h": completed_24h,
@@ -220,7 +219,6 @@ async def admin_active(request: Request) -> JSONResponse:
         jobs_payload.append({
             "id": job.id,
             "status": job.status,
-            "request_mode": job.request_mode,
             "mode": job.mode,
             "phase": phase,
             "phase_label": phase_label,
@@ -228,7 +226,7 @@ async def admin_active(request: Request) -> JSONResponse:
             "chunk_index": job.chunk_index,
             "total_chunks": job.total_chunks,
             "started_at": job.started_at,
-            "wav_path": job.wav_path,
+            "wav_path": str(job.wav_path),
             "audio_duration_s": job.audio_duration_s,
             "attempts": job.attempts,
             "cancel_requested": bool(job.cancel_requested),

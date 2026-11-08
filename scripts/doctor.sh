@@ -5,7 +5,7 @@
 #   1. server/.env exists, mode is 0600, owner is $USER
 #   2. cloudflared service status (best-effort)
 #   3. Disk free on $HOME (warn if < 4 GB)
-#   4. STAGING_DIR and MEETING_OUTPUT_DIR on same filesystem
+#   4. DATA_DIR/staging and DATA_DIR/outputs on same filesystem
 #   5. Poll /healthz until 200 or 401 (max 60s)
 #   6. Poll /readyz/dictation until 200 (max 60s × 5s intervals)
 #   7. /readyz/db (local SQLite DB answers, schema current)
@@ -62,8 +62,7 @@ _read_env_var() {
 }
 
 SERVER_URL="$(_read_env_var SERVER_URL)"
-STAGING_DIR="$(_read_env_var STAGING_DIR)"
-MEETING_OUTPUT_DIR="$(_read_env_var MEETING_OUTPUT_DIR)"
+DATA_DIR="$(_read_env_var DATA_DIR | tr -d '"' || true)"
 
 if [[ -f "$REPO_ROOT/server/.venv/bin/python" ]]; then
     PYTHON_BIN="$REPO_ROOT/server/.venv/bin/python"
@@ -124,19 +123,20 @@ fi
 
 # ── 4. Same filesystem check ──────────────────────────────────────────────────
 echo ""
-echo "Check 4: STAGING_DIR and MEETING_OUTPUT_DIR on same filesystem"
-if [[ -z "$STAGING_DIR" || -z "$MEETING_OUTPUT_DIR" ]]; then
-    warn "STAGING_DIR or MEETING_OUTPUT_DIR not set in .env — using defaults"
-    STAGING_DIR="$HOME/Library/Application Support/WisprAlt/staging"
-    MEETING_OUTPUT_DIR="$HOME/Library/Application Support/WisprAlt/meetings"
+echo "Check 4: staging and outputs on same filesystem"
+if [[ -z "$DATA_DIR" ]]; then
+    fail "DATA_DIR not set in .env — run setup-server.sh"
+    DATA_DIR="$HOME/Library/Application Support/WisprAlt"
 fi
-mkdir -p "$STAGING_DIR" "$MEETING_OUTPUT_DIR"
+STAGING_DIR="$DATA_DIR/staging"
+OUTPUTS_DIR="$DATA_DIR/outputs"
+mkdir -p "$STAGING_DIR" "$OUTPUTS_DIR"
 STAGING_DEV="$(stat -f "%d" "$STAGING_DIR" 2>/dev/null || echo "unknown")"
-OUTPUT_DEV="$(stat -f "%d" "$MEETING_OUTPUT_DIR" 2>/dev/null || echo "unknown")"
+OUTPUT_DEV="$(stat -f "%d" "$OUTPUTS_DIR" 2>/dev/null || echo "unknown")"
 if [[ "$STAGING_DEV" == "$OUTPUT_DEV" && "$STAGING_DEV" != "unknown" ]]; then
-    pass "STAGING_DIR and MEETING_OUTPUT_DIR are on the same filesystem (device $STAGING_DEV)"
+    pass "staging and outputs are on the same filesystem (device $STAGING_DEV)"
 else
-    fail "STAGING_DIR ($STAGING_DIR, dev=$STAGING_DEV) and MEETING_OUTPUT_DIR ($MEETING_OUTPUT_DIR, dev=$OUTPUT_DEV) are on DIFFERENT filesystems"
+    fail "staging ($STAGING_DIR, dev=$STAGING_DEV) and outputs ($OUTPUTS_DIR, dev=$OUTPUT_DEV) are on DIFFERENT filesystems"
     info "Atomic renames across filesystems are not truly atomic. Move both to the same volume."
 fi
 

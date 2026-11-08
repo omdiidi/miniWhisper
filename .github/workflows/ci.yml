@@ -88,12 +88,9 @@ jobs:
           # relative paths against the wrong working directory.
           PYTHONPATH: ${{ github.workspace }}/server/src:${{ github.workspace }}/ci-stubs
           SERVER_URL: "https://ci.example.invalid"
-          MEETING_OUTPUT_DIR: /tmp/wispralt-outputs
-          JOB_DB_PATH: /tmp/wispralt-jobs.db
-          STAGING_DIR: /tmp/wispralt-staging
           DATA_DIR: /tmp/wispralt-data
         run: |
-          mkdir -p /tmp/wispralt-outputs /tmp/wispralt-staging /tmp/wispralt-data
+          mkdir -p /tmp/wispralt-data
           cd server && pytest tests/ -v
 
   client:

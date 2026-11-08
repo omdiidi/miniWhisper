@@ -89,7 +89,7 @@ The cookie is read by `auth._extract_bearer` as a fallback when no
 Single-CTE dashboard (`_OVERVIEW_SQL` in `routes/admin_ui.py`). Tiles:
 
 - Active / total users.
-- Dictations in the last 24h / 7d / 30d.
+- Dictations in the last 24h / 7d / 30d — counted from `dictations` rows (one per finished dictation, however many stream-chunk requests it took; soft-deleted rows excluded).
 - Errors in the last 24h.
 - p50 latency over the last 24h (server-side, from `usage_events.duration_ms`).
 - Top 5 active users in the last 7 days.
@@ -376,10 +376,9 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 
 Third-party API traffic via the OpenAI-compat shim is recorded with
 `kind = "v1_dictate"` (native client traffic uses `kind = "dictate"`).
-Both `kind` values land in the same `wispralt.usage_events` table and
-are folded into the **Dictations 24h / 7d / 30d** tiles on
-`/admin/` and `/admin/users/{id}` because the underlying SQL aggregates
-by user, not by kind. Per-user event lists on `/admin/users/{id}` show
+Both `kind` values land in the same `usage_events` table and are folded
+into the per-user request tiles on `/admin/users/{id}` (the overview's
+Dictations tiles count `dictations` rows, which `/v1` does not write). Per-user event lists on `/admin/users/{id}` show
 `v1_dictate` rows alongside `dictate` and `file` rows so you can see
 which path generated each request.
 

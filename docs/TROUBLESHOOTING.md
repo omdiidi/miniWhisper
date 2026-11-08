@@ -88,7 +88,7 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 **Diagnosis:** WisprAlt processes one file job at a time (enforced by `asyncio.Semaphore(1)` in `jobs/runner.py`). This includes a job you just cancelled: Whisper transcribes the whole file in one call, so a cancelled running job holds the slot until that call returns, then its result is discarded.
 
 **Fix:**
-1. Check `GET /metrics` for `meeting.active: true` (the `meeting` block is the file-job block) and `meeting.active_job_id`.
+1. Check `GET /metrics` for `file.active: true` and `file.active_job_id`.
 2. Wait for the current job to finish, then resubmit.
 3. A 429 with `"code": "insufficient_memory"` means less than 2 GiB of RAM is free; check `memory.available_mb`. A 429 with no `code` is the per-IP rate limiter.
 
@@ -99,7 +99,7 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 **Symptom:** Dictation round-trip is consistently > 500ms after warmup.
 
 **Diagnosis steps:**
-1. Check `GET /metrics` for `meeting.active: true` — if a file job is running, dictation competes for unified memory.
+1. Check `GET /metrics` for `file.active: true` — if a file job is running, dictation competes for unified memory.
 2. Check `GET /readyz/dictation` for the `X-Dictation-Degraded: true` header — this confirms memory pressure.
 3. Check `parakeet.p50_ms` in `/metrics` — if > 300ms, the Mac mini may be thermally throttled.
 
@@ -117,8 +117,8 @@ Verify: `ls -la server/.env` should show `-rw-------`.
 
 **Fix:**
 1. Check `GET /metrics` for `disk.free_gb` and `disk.staging_count`.
-2. Clean up stale staging files: `ls -lh $STAGING_DIR` and remove any files older than a few days.
-3. Clean up old file-job outputs from `MEETING_OUTPUT_DIR` (the retention sweep removes finished jobs after `MEETING_JOB_RETENTION_DAYS`).
+2. Clean up stale staging files: `ls -lh "$DATA_DIR/staging"` and remove any files older than a few days.
+3. Clean up old file-job outputs from `$DATA_DIR/outputs` (the retention sweep removes finished jobs after `MEETING_JOB_RETENTION_DAYS`).
 4. The disk guard requires free space ≥ 2× the upload size before accepting a file.
 
 ---

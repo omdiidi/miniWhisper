@@ -57,7 +57,7 @@ Health-check suite. Checks:
 1. `server/.env` mode is 0600, owner is `$USER`
 2. cloudflared service status
 3. Disk free on `$HOME` (warns if < 4 GB)
-4. `STAGING_DIR` and `MEETING_OUTPUT_DIR` on the same filesystem
+4. `DATA_DIR/staging` and `DATA_DIR/outputs` on the same filesystem
 5. `/healthz` — polls up to 60 s
 6. `/readyz/dictation` — polls up to 60 s (Parakeet model load)
 7. Dictation round-trip: generates a silent WAV with Python + POSTs to `/transcribe/dictate`

@@ -162,7 +162,7 @@ async def transcribe_dictate(
             int(inference_ms) if inference_ms is not None else None
         )
         captured_text = text
-        captured_api_key_id = int(user.id)
+        captured_user_id = int(user.id)
         captured_dedup_id = client_dedup_id
 
         async def _persist_dictation() -> None:
@@ -175,7 +175,7 @@ async def transcribe_dictate(
                 # loop would block under SQLite-WAL contention.
                 await asyncio.to_thread(
                     job_store.insert_dictation_idempotent,
-                    api_key_id=captured_api_key_id,
+                    user_id=captured_user_id,
                     text=captured_text,
                     duration_ms=captured_inference_ms,
                     client_app_version=client_version,

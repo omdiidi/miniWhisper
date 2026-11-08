@@ -54,7 +54,7 @@ This is the only test that intentionally exercises the **honest limitation** doc
 
 ### SRT / VTT / TXT output-format regression
 
-File mode (`request_mode=file`) emits segments **without a `words[]` array** — `mlx_whisper.transcribe` is called with `word_timestamps=False` for performance. The output formatters in `server/src/wispralt/files/output.py` must never index `seg["words"]` in the SRT/VTT/TXT branches. To pin this:
+File transcription emits segments **without a `words[]` array** — `mlx_whisper.transcribe` is called with `word_timestamps=False` for performance. The output formatters in `server/src/wispralt/files/output.py` must never index `seg["words"]` in the SRT/VTT/TXT branches. To pin this:
 
 1. Run row #2 (5-min file).
 2. Diff the SRT, VTT, and TXT outputs against the post-swap golden (recorded from a known-good mlx-whisper run on the same input; the original goldens were captured from the last WhisperX run before Phase 10).
@@ -88,6 +88,8 @@ This section describes the rollback strategy that was in place during Phases 1�
 | `server/tests/test_database.py` | `Database` migrations (fresh, idempotent, failed, edited, missing, newer), pragmas, rollback, concurrent writers, `check()`, `DATA_DIR` validation |
 | `server/tests/test_db_health.py` | `/readyz/db` ok / `schema_outdated` / `db_error`; usage middleware writes one row per tracked POST; a failing write is counted, response kept |
 | `server/tests/test_auth.py` | per-request key lookup: revoked / disabled / unknown → 401, `sqlite3.Error` → 503, out-of-process revoke, disable → mint → new key works |
+| `server/tests/test_job_store.py` | `JobStore` on the shared DB: transitions + cancel rules, `requeue_interrupted` refund, FK `IntegrityError`, relative→absolute `wav_path`, `recover_orphans` policy + `reenqueue_pending` on absolute paths, dictation insert under a running job, `dictation_counts`, one insight row per scope, `stats_by_user` = `compute_user_stats` |
+| `server/tests/test_insights_cron.py` | the cron with a stub `InsightsClient`: a week with only a `file` transcript yields a person insight |
 | `server/tests/test_bootstrap.py` | `python -m wispralt.bootstrap` subprocesses under a pty: TTY refusal, client config + one token, already-exists, `--check`, `--rotate-admin`, bad `DATA_DIR` |
 | `client/Tests/WisprAltCoreTests/InjectionPredicateTests.swift` | 11-row injection truth table |
 | `client/Tests/WisprAltCoreTests/SecureFieldGateTests.swift` | 5-case secure-field refusal pin |

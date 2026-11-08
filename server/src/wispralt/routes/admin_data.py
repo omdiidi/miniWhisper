@@ -77,14 +77,10 @@ async def admin_data(
         users = sorted(
             await asyncio.to_thread(accounts.list_people, active=True), key=lambda u: u.id
         )
-        # Per-user stats for the leaderboard. Bounded by user count (small on
-        # this deployment); each call is a single SQLite query through the
-        # same connection so no N+1 round-trip blow-up.
-        per_user_stats = {}
-        for u in users:
-            per_user_stats[u.id] = await asyncio.to_thread(
-                job_store.compute_user_stats, u.id, since_epoch=since,
-            )
+        # Per-user stats for the leaderboard: one grouped query (no N+1).
+        activity = await asyncio.to_thread(job_store.stats_by_user, since)
+        empty = job_store.compute_user_stats(-1, since_epoch=since)  # all-zero shape
+        per_user_stats = {u.id: activity.get(u.id, empty) for u in users}
         # Top-tile aggregate for team view — sum the per-user stats we already
         # computed instead of leaving the tiles at 0. Time-saved is re-derived
         # from total_words (40 WPM baseline) so the rounding matches the
@@ -96,8 +92,8 @@ async def admin_data(
             "dictation_count": sum(
                 s.get("dictation_count", 0) for s in per_user_stats.values()
             ),
-            "meeting_count": sum(
-                s.get("meeting_count", 0) for s in per_user_stats.values()
+            "file_count": sum(
+                s.get("file_count", 0) for s in per_user_stats.values()
             ),
             "total_words": _total_words,
             "total_inference_ms": sum(
@@ -107,20 +103,20 @@ async def admin_data(
         }
 
         # Filler leaderboard for team view: pull every person row for this
-        # week via JobStore (no _exec leak), then resolve api_key_id →
+        # week via JobStore, then resolve user_id →
         # display_name so the UI reads "Alice: 42 fillers" instead of an opaque
         # numeric id.
         users_by_id: dict[int, str] = {
             u.id: (u.display_name or u.label) for u in users
         }
-        for api_key_id, n in job_store.list_filler_counts_for_week(
+        for filler_user_id, n in job_store.list_filler_counts_for_week(
             iso_year, iso_week,
         ):
             per_user_fillers.append(
                 {
-                    "api_key_id": api_key_id,
+                    "user_id": filler_user_id,
                     "name": users_by_id.get(
-                        api_key_id, f"#{api_key_id} (unknown)"
+                        filler_user_id, f"#{filler_user_id} (unknown)"
                     ),
                     "filler_word_count": n,
                 }

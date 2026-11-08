@@ -16,8 +16,8 @@ from typing import Callable
 from fastapi import FastAPI
 
 from wispralt.config import settings
-from wispralt.jobs.store import JobStore
 from wispralt.files.output import remove_job_outputs, sweep_stale_tmp
+from wispralt.jobs.store import JobStore
 from wispralt.ops import staging
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ def sweep_staging(job_store: JobStore) -> tuple[int, int, int]:
 
     WAVs referenced by pending or running jobs are excluded (C7 fix).
     """
-    active_wav_paths = {Path(j.wav_path) for j in job_store.list_active_jobs()}
+    active_wav_paths = {j.wav_path for j in job_store.list_active_jobs()}
     return (
         staging.sweep_old(
             settings.staging_dir,
@@ -38,7 +38,7 @@ def sweep_staging(job_store: JobStore) -> tuple[int, int, int]:
             exclude_paths=active_wav_paths,
         ),
         staging.sweep_chunked(settings.staging_dir, max_age_seconds=3600),
-        sweep_stale_tmp(settings.meeting_output_dir),
+        sweep_stale_tmp(settings.outputs_dir),
     )
 
 
@@ -48,36 +48,20 @@ def sweep_old_meetings(
     output_dir: Path,
     is_active: Callable[[str], bool] | None = None,
 ) -> int:
-    """Delete finished job rows older than *days* plus their output files.
+    """Delete finished job rows older than *days* plus their output files in *output_dir*.
 
-    ``days <= 0`` disables. Safeguards:
-
-    - Jobs the runner still tracks as active (*is_active*) are skipped: the
-      phase watchdog can mark a job ``failed`` while its executor thread is
-      still running.
-    - Files are removed from each job's persisted ``output_dir``, which must
-      resolve inside *output_dir* (the allowed root); otherwise no files are
-      touched for that job (path-traversal guard).
-    - If any file fails to delete, the row is kept so the next sweep retries.
-
-    Returns the number of rows deleted.
+    ``days <= 0`` disables. Jobs the runner still tracks as active
+    (*is_active*) are skipped (the watchdog can mark a job ``failed`` while
+    its executor thread still runs). If any file fails to delete, the row is
+    kept so the next sweep retries. Returns the number of rows deleted.
     """
     if days <= 0:
         return 0
-    root = output_dir.resolve()
-    deletable: list[str] = []
-    for jid, job_dir in job_store.list_expired_finished_jobs(days):
-        if is_active is not None and is_active(jid):
-            continue
-        target = Path(job_dir).resolve() if job_dir else root
-        if not target.is_relative_to(root):
-            logger.warning(
-                "Retention: job %s output_dir %s is outside %s; not touching files",
-                jid, job_dir, root,
-            )
-        elif not remove_job_outputs(target, jid):
-            continue
-        deletable.append(jid)
+    deletable = [
+        jid
+        for jid in job_store.list_expired_finished_jobs(days)
+        if not (is_active is not None and is_active(jid)) and remove_job_outputs(output_dir, jid)
+    ]
     return job_store.delete_finished_jobs(deletable) if deletable else 0
 
 
@@ -95,7 +79,7 @@ def run_daily_sweeps(
     if j or d:
         logger.info("Daily transcript sweep: jobs=%d, dictations=%d", j, d)
     purged = sweep_old_meetings(
-        job_store, settings.meeting_job_retention_days, settings.meeting_output_dir,
+        job_store, settings.meeting_job_retention_days, settings.outputs_dir,
         is_active,
     )
     if purged:

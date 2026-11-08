@@ -430,7 +430,7 @@ async def me_history_row(
     Unknown ``kind`` or non-owned ``row_id`` both return 404 uniformly so we
     don't leak existence to other users.
     """
-    if kind not in ("dictation", "meeting"):
+    if kind not in ("dictation", "file"):
         raise HTTPException(status_code=404)
 
     job_store: JobStore = request.app.state.job_store
@@ -469,7 +469,7 @@ async def me_history_delete(
     user: User = Depends(forbid_integration_kind),
 ) -> Response:
     """Soft-delete one owned row. Returns an HTMX OOB delete fragment."""
-    if kind not in ("dictation", "meeting"):
+    if kind not in ("dictation", "file"):
         raise HTTPException(status_code=404)
     if not verify_csrf(request, csrf_token):
         raise HTTPException(status_code=403)
@@ -496,7 +496,7 @@ async def me_history_restore(
     user: User = Depends(forbid_integration_kind),
 ) -> HTMLResponse:
     """Restore one soft-deleted owned row. Returns the compact row partial."""
-    if kind not in ("dictation", "meeting"):
+    if kind not in ("dictation", "file"):
         raise HTTPException(status_code=404)
     if not verify_csrf(request, csrf_token):
         raise HTTPException(status_code=403)
@@ -541,7 +541,7 @@ async def me_history_download(
     user: User = Depends(forbid_integration_kind),
 ) -> Response:
     """Plain-text or JSON download of one owned row."""
-    if kind not in ("dictation", "meeting"):
+    if kind not in ("dictation", "file"):
         raise HTTPException(status_code=404)
     if fmt not in ("txt", "json"):
         raise HTTPException(status_code=404)

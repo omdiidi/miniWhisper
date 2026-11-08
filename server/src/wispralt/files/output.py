@@ -76,7 +76,7 @@ def _atomic_write(content: bytes, dest: Path) -> None:
             if getattr(exc, "errno", None) == errno.EXDEV:
                 logger.critical(
                     "FATAL: os.replace('%s' -> '%s') failed with EXDEV — "
-                    "STAGING_DIR and MEETING_OUTPUT_DIR must be on the same filesystem.",
+                    "DATA_DIR/staging and DATA_DIR/outputs must be on the same filesystem.",
                     tmp.name,
                     dest,
                 )

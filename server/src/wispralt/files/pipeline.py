@@ -214,8 +214,8 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
             )
             # Self-check: invariant verification.
             delta_mb = pre_active_mb - post_active_mb
-            if (pre_active_mb > settings.meeting_eviction_pre_active_gate_mb
-                    and delta_mb < settings.meeting_eviction_delta_floor_mb):
+            if (pre_active_mb > settings.file_eviction_pre_active_gate_mb
+                    and delta_mb < settings.file_eviction_delta_floor_mb):
                 observability.eviction_failures_total.increment()
                 try:
                     mlx_whisper_version = _meta.version("mlx-whisper")
@@ -229,7 +229,7 @@ def evict_if_idle(idle_threshold_s: float) -> bool:
                     "docs/TROUBLESHOOTING.md section 'Trust invariants, "
                     "not flags'.",
                     os.getpid(), pre_active_mb, post_active_mb, delta_mb,
-                    settings.meeting_eviction_delta_floor_mb,
+                    settings.file_eviction_delta_floor_mb,
                     post_cache_mb_after, mlx_whisper_version,
                 )
 

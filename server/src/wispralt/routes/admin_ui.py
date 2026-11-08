@@ -147,7 +147,14 @@ async def login_submit(
 
 @authed_router.get("/", response_class=HTMLResponse)
 async def overview(request: Request) -> HTMLResponse:
-    stats = await asyncio.to_thread(_usage(request).overview, time.time())
+    now = time.time()
+    stats = await asyncio.to_thread(_usage(request).overview, now)
+    # "Dictations" tiles count dictation rows (a streamed dictation is one row,
+    # however many chunk requests it took); usage_events stays request telemetry.
+    counts = await asyncio.to_thread(request.app.state.job_store.dictation_counts, now)
+    stats["totals"].update(
+        dictations_24h=counts["24h"], dictations_7d=counts["7d"], dictations_30d=counts["30d"]
+    )
     integration_count = await asyncio.to_thread(_accounts(request).count_kind, "integration")
     return templates.TemplateResponse(
         "overview.html.j2",
