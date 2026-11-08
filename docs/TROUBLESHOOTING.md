@@ -587,6 +587,10 @@ malformed`) means the index drifted: rebuild it with
 
 - **"AI interpretation is off"** — an admin must turn it on in **Settings** after accepting
   the disclosure; measured stats work without it.
+- **A run started but no new row appears** — another run is already `running`
+  (perhaps a `python -m wispralt.insights.cron --manual` in a terminal): one run at a
+  time, enforced in the database. A row left `running` by a crash stops blocking after
+  2 hours.
 - **Runs cannot start / "OPENROUTER_API_KEY is not configured"** — set the key in
   `~/.config/wispralt/.env` (`OPENROUTER_API_KEY=…`), then `wispralt restart`.
 - **Data → AI runs shows a status other than `done`:**
@@ -596,6 +600,8 @@ malformed`) means the index drifted: rebuild it with
   | `aborted` · `budget` | The next call's worst-case cost (prompt + a full reply at the rate card) would cross the 30-day cap (checked before every call). | Wait for older spend to age out, or raise the cap in Settings. |
   | `aborted` · `rate_limit` | OpenRouter returned 429. | The scheduler retries after 6 hours; or start the week again later. |
   | `failed` · `all_people_failed` | Every person's reply was unusable or errored. | See the failures column (`openrouter_error`, `json_decode`, `schema`); check the model id in Settings. |
+  | `failed` · `some_people_failed` | At least one person's reply was unusable or errored; the others were saved, and no team summary was written (it would have left them out). | The scheduler retries after 6 hours (or start the week again): only the failed people and the team summary are paid for. A person who fails every time keeps the team summary away; check the failures column. |
+  | `aborted` · `cancelled` | The server shut down mid-run. | Start the week again (or let the scheduler). |
   | `failed` · `team_openrouter_error` / `team_unusable` | People were analysed but the team summary call errored, or its reply was unusable twice. | The scheduler retries after 6 hours (or start the week again); saved people are not paid for twice. |
   | `failed` · `<ExceptionName>` | The run crashed. | Check `wispralt.log` around the start time (logs hold ids and classes, never text). |
   | `skipped` · `ai_disabled` / `no_client` | AI is off, or no key. | See above. |

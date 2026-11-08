@@ -705,9 +705,22 @@ class JobStore:
 
     def start_insight_run(
         self, *, trigger: str, iso_year: int, iso_week: int, estimated_usd: float | None,
-        now: float,
-    ) -> int:
+        now: float, stale_after_s: float,
+    ) -> int | None:
+        """Insert a ``running`` row, or None when another run is already ``running``.
+
+        The DB-level run lock: the check and the insert share one ``BEGIN IMMEDIATE``
+        transaction, so the server and a CLI run (separate processes) can never both
+        hold it and spend the same remaining budget. A ``running`` row older than
+        *stale_after_s* is a crashed run and no longer holds the lock.
+        """
         with self.db.write() as con:
+            busy = con.execute(
+                "SELECT 1 FROM insight_runs WHERE status = 'running' AND started_at > ? LIMIT 1",
+                (now - stale_after_s,),
+            ).fetchone()
+            if busy is not None:
+                return None
             return con.execute(
                 "INSERT INTO insight_runs(trigger, iso_year, iso_week, status, estimated_usd,"
                 " started_at) VALUES (?, ?, ?, 'running', ?, ?) RETURNING id",

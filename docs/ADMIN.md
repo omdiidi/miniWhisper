@@ -202,10 +202,13 @@ weeks, optionally **Regenerate existing**, and click **Estimate cost**. The esti
 (words that would be sent × 1.35 tokens/word × the model's input rate, plus your
 30-day spend against the cap) appears with a **Start** button; nothing is sent until
 you press it. Progress (people done / total) updates every 2 seconds while a run is
-going. Each run ends as `done`, `failed` (every person failed, the team summary
-failed, or a crash), `aborted` (`budget`: the next call's worst-case cost would cross
-the 30-day cap, checked before every call; `rate_limit`: OpenRouter returned 429) or
-`skipped` (AI off). Running a week again (without Regenerate) skips people who already
+going. Each run ends as `done`, `failed` (every person failed, some person failed (then no
+team summary is written until a retry covers everyone), the team summary failed, or a
+crash), `aborted` (`budget`: the next call's worst-case cost would cross the 30-day
+cap, checked before every call; `rate_limit`: OpenRouter returned 429; `cancelled`: the
+server shut down mid-run) or `skipped` (AI off). Only one run goes at a time, also
+across the server and a `python -m wispralt.insights.cron --manual` run: a second one
+does not start. Running a week again (without Regenerate) skips people who already
 have an insight but still builds the team summary from all of them. Failures list only the person id and an error class.
 
 The scheduler checks once an hour and runs the **last full week** when it has no

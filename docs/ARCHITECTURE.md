@@ -964,7 +964,13 @@ run only by an explicit backfill.
 
 `run_weeks(app, weeks, trigger, force)` runs weeks one after another under
 `app.state.weekly_insights_lock` (a held lock → the call returns None; nothing
-overlaps or double-bills). Each week writes an `insight_runs` row:
+overlaps or double-bills). That lock is per process, so the run row is also the
+**DB run lock**: `JobStore.start_insight_run` checks for another `running` row and
+inserts its own in one `BEGIN IMMEDIATE` transaction, and returns None while one exists
+(`run_weeks` → None), so the server and a CLI run never both spend the same remaining
+budget. A `running` row older than `cron.RUN_LOCK_STALE_S` (2 h) is a crashed run and no
+longer counts; a cancelled run (shutdown) closes its row `aborted` / `cancelled`. Each
+week writes an `insight_runs` row:
 
 ```sql
 CREATE TABLE insight_runs(
@@ -978,14 +984,16 @@ CREATE TABLE insight_runs(
 ```
 
 Progress is updated after every person; the portal polls it every 2 s. A run ends
-`done`; `failed` (`all_people_failed`, `team_openrouter_error` / `team_unusable` when
-the team call errors or is unusable twice, or a crash with its exception class);
-`aborted` (`budget` or `rate_limit`); or `skipped` (`ai_disabled`, `no_client`). A
+`done`; `failed` (`all_people_failed`; `some_people_failed`, when any person call failed:
+the team pass is then skipped, since a team insight missing someone would be saved as
+complete and never revisited; `team_openrouter_error` / `team_unusable` when the team
+call errors or is unusable twice; or a crash with its exception class); `aborted`
+(`budget`, `rate_limit` or `cancelled`); or `skipped` (`ai_disabled`, `no_client`). A
 failed or aborted scheduled run is not `done`, so the scheduler retries it. Without
 `force` a week is restart-safe (people who already have a row are skipped, so nobody is
 paid for twice) but their saved insights still go into the team prompt; the team pass
-runs when the week has no team row, anyone new was analysed, or with `force`. `force`
-regenerates everyone.
+runs when the week has no team row, anyone new was analysed, or with `force`, and no
+person failed. `force` regenerates everyone.
 
 ### Cost control
 
