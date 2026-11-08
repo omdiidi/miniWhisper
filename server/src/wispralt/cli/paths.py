@@ -25,6 +25,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from dotenv import dotenv_values
+
 from wispralt.cli.system import CliError
 
 if TYPE_CHECKING:
@@ -208,6 +210,11 @@ def env_keys(path: Path) -> set[str]:
     if not path.exists():
         return set()
     return {m.group(1) for line in path.read_text().splitlines() if (m := _KEY_RE.match(line))}
+
+
+def env_value(path: Path, key: str) -> str | None:
+    """One value from a dotenv file (python-dotenv's parser), or None."""
+    return dotenv_values(path).get(key) if path.exists() else None
 
 
 def merge_missing(path: Path, values: dict[str, str]) -> list[str]:

@@ -14,7 +14,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from wispralt.cli import launchd
+from wispralt.cli import host, launchd
 from wispralt.cli.paths import Ctx, InstallState, Paths
 from wispralt.cli.system import EXIT_USAGE, CliError, Deps
 
@@ -95,35 +95,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     users = cmd("users", _todo, "list, add, disable or enable users")
     us = users.add_subparsers(dest="action", required=True, metavar="ACTION")
-    cmd("list", _todo, "list users", us)
-    p = cmd("add", _todo, "add a user and print its key once", us)
+    cmd("list", host.cmd_users_list, "list users", us)
+    p = cmd("add", host.cmd_users_add, "add a user and print its key once", us)
     p.add_argument("label")
     p.add_argument("--role", choices=["employee", "admin"], default="employee")
     p.add_argument("--kind", choices=["employee", "integration"], default="employee")
     token_file(p)
-    p = cmd("disable", _todo, "disable a user (all its keys stop working)", us)
+    p = cmd("disable", host.cmd_users_disable, "disable a user (all its keys stop working)", us)
     p.add_argument("user_id", type=int)
-    p = cmd("enable", _todo, "re-enable a user with a new key", us)
+    p = cmd("enable", host.cmd_users_enable, "re-enable a user with a new key", us)
     p.add_argument("user_id", type=int)
     token_file(p)
 
     keys = cmd("keys", _todo, "list, rotate or revoke keys")
     ks = keys.add_subparsers(dest="action", required=True, metavar="ACTION")
-    p = cmd("list", _todo, "list keys", ks)
+    p = cmd("list", host.cmd_keys_list, "list keys", ks)
     p.add_argument("--user", type=int, dest="user_id")
-    p = cmd("rotate", _todo, "replace a user's key (old one stops working)", ks)
+    p = cmd("rotate", host.cmd_keys_rotate, "replace a user's key (old one stops working)", ks)
     p.add_argument("user_id", type=int)
     token_file(p)
-    p = cmd("revoke", _todo, "revoke one key", ks)
+    p = cmd("revoke", host.cmd_keys_revoke, "revoke one key", ks)
     p.add_argument("key_id", type=int)
-    p = cmd("rotate-admin", _todo, "recover a lost admin key", ks)
+    p = cmd("rotate-admin", host.cmd_keys_rotate_admin, "recover a lost admin key", ks)
     p.add_argument("--user-id", type=int, help="the admin, when several exist")
     token_file(p)
 
     ret = cmd("retention", _todo, "show or set transcript retention")
     rs = ret.add_subparsers(dest="action", required=True, metavar="ACTION")
-    cmd("show", _todo, "current setting and what it would purge", rs)
-    p = cmd("set", _todo, "set retention in days (0 keeps forever)", rs)
+    cmd("show", host.cmd_retention_show, "current setting and what it would purge", rs)
+    p = cmd("set", host.cmd_retention_set, "set retention in days (0 keeps forever)", rs)
     p.add_argument("days", type=int)
 
     b = cmd("backup", _todo, "offline backup of the host data (stops the service briefly)")
