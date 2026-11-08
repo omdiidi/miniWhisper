@@ -31,7 +31,7 @@ private struct GlassCard<Content: View>: View {
 ///   3. Connection status with a working Test button (Local)
 ///   4. Hotkey timing + launch-at-login (frequently-tweaked)
 ///   5. Transcripts folder picker
-///   6. Advanced (collapsed) — OpenAI key; server URL, API key, key export/import (Local)
+///   6. Advanced (collapsed) — OpenAI model + key; server URL, API key, key export/import (Local)
 ///
 /// In Online every server-only row is hidden behind one `isLocal` predicate.
 struct SettingsView: View {
@@ -82,6 +82,9 @@ struct SettingsView: View {
     @State private var hasOpenAIKey: Bool = false
     @State private var openAIKeyError: String?
     @FocusState private var openAIKeyFocused: Bool
+    /// Last Local `/healthz` result for the status line (nil = not checked yet).
+    /// Checked only on popover open in Local or on a switch to Local.
+    @State private var localHealthy: Bool? = nil
 
     /// Server-only rows (connection, server, API key, identity, portal links,
     /// server log) exist only in Local mode.
@@ -109,6 +112,7 @@ struct SettingsView: View {
             advancedToggleSection
             if showAdvanced {
                 updateSection
+                openAIModelSection
                 openAIKeySection
                 if isLocal {
                     serverSection
@@ -126,7 +130,9 @@ struct SettingsView: View {
         .onAppear {
             loadCurrentValues()
             handleKeyEntryRequest()
+            checkLocalHealth()
         }
+        .onChange(of: settings.mode) { _, _ in checkLocalHealth() }
         .onChange(of: recordingState.keyEntryRequested) { _, _ in handleKeyEntryRequest() }
     }
 
@@ -151,6 +157,50 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Text(statusLine)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// `Online · <model> · key saved|key missing` (key presence only, no
+    /// network) or `Local · <host>` (+ last `/healthz`), plus "transcribing N".
+    private var statusLine: String {
+        var parts: [String]
+        if isLocal {
+            parts = ["Local", settings.serverURL?.host() ?? "no server set"]
+            if let ok = localHealthy { parts.append(ok ? "reachable" : "unreachable") }
+        } else {
+            parts = ["Online", settings.openAIModel, hasOpenAIKey ? "key saved" : "key missing"]
+        }
+        if recordingState.dictationsInFlight > 0 {
+            parts.append("transcribing \(recordingState.dictationsInFlight)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// OpenAI model picker: id, small price text and retire tag per row.
+    /// Applies to the next dictation (the snapshot is taken at FN press).
+    private var openAIModelSection: some View {
+        Section("OpenAI Model") {
+            Picker("Model", selection: $settings.openAIModel) {
+                ForEach(OpenAIModels.all) { m in
+                    HStack(spacing: 6) {
+                        Text(m.id)
+                        Text(m.displayPrice).font(.caption).foregroundStyle(.secondary)
+                        if let tag = m.retireTag {
+                            Text(tag).font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                    .tag(m.id)
+                }
+            }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+            Text("Files always use a file model. Dictation stops at "
+                 + "\(OpenAIModels.resolve(id: settings.openAIModel).dictationCapSeconds / 60) min for this model.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -581,6 +631,17 @@ struct SettingsView: View {
             Log.error("Failed to read API key from Keychain: \(error)", category: "settings")
         }
         hasStoredAPIKey = ((try? KeychainHelper.getAPIKey()) ?? nil)?.isEmpty == false
+    }
+
+    /// Local `/healthz` for the status line. Never runs in Online (the Local
+    /// host is not contacted there).
+    private func checkLocalHealth() {
+        localHealthy = nil
+        guard isLocal, settings.serverURL != nil else { return }
+        Task {
+            let ok = (try? await ServerClient.shared.healthz()) ?? false
+            await MainActor.run { if isLocal { localHealthy = ok } }
+        }
     }
 
     /// FN pressed in Online with no key: reveal Advanced and focus the key field.

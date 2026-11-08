@@ -110,7 +110,15 @@ extension MenuBarController {
         } catch {
             s.provider?.cancel()
             Log.error("dictation failed: \(ErrorLog.describe(error))", category: "dictation")
-            if let body = Self.failureMessage(ErrorLog.outcome(error), mode: s.snapshot.mode) {
+            let outcome = ErrorLog.outcome(error)
+            if outcome == .failed(.modelNotFound), s.snapshot.mode == .online, let model = s.snapshot.model {
+                // Reset the picker so the next dictation works.
+                let fallback = OpenAIModels.defaultID(for: model.kind)
+                Settings.shared.openAIModel = fallback
+                showToast("That OpenAI model is not available. Switched to \(fallback).")
+                return
+            }
+            if let body = Self.failureMessage(outcome, mode: s.snapshot.mode) {
                 AppNotifications.notify(title: "Dictation Failed", body: body)
             }
         }

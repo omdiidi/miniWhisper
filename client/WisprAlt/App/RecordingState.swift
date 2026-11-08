@@ -55,6 +55,10 @@ final class RecordingState: ObservableObject {
     /// `didSet`). Locks the mode picker while a Local upload has no job id yet.
     @Published var localUploadPhase: LocalUploadPhase = .none
 
+    /// Mirror of `MenuBarController.dictationsInFlight` (written only by its
+    /// `didSet`). The popover status line shows "transcribing N".
+    @Published var dictationsInFlight: Int = 0
+
     /// Set by `MenuBarController.openKeyEntry()` (FN pressed in Online with no
     /// key). The popover reveals Advanced, focuses the OpenAI key field and
     /// clears it.

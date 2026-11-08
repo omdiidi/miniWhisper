@@ -68,8 +68,14 @@ final class MenuBarController: NSObject {
     /// was released. `beginRun` increments it in the same main-actor turn that
     /// clears `currentSession`, and the spawned Task's first statement is
     /// `defer { dictationsInFlight -= 1 }`, so there is no turn in which a
-    /// finishing dictation reads as not-busy. Main-thread only.
-    var dictationsInFlight: Int = 0
+    /// finishing dictation reads as not-busy. Main-thread only. Mirrored to
+    /// `recordingState` for the popover's "transcribing N"; not an icon state.
+    var dictationsInFlight: Int = 0 {
+        didSet {
+            updateIcon()
+            recordingState.dictationsInFlight = dictationsInFlight
+        }
+    }
 
     /// Number of file-transcription Tasks (pick → upload → poll → download)
     /// still running. Incremented before the Task is created and decremented

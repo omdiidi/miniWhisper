@@ -29,6 +29,19 @@ public struct OpenAIModel: Identifiable, Equatable, Sendable {
         self.realtimeCommitLimit = realtimeCommitLimit
     }
 
+    /// Picker price text, e.g. "$0.0045/min"; "≈" marks a token-billed estimate.
+    public var displayPrice: String {
+        "\(priceIsEstimate ? "≈" : "")$\(pricePerMinute)/min"
+    }
+
+    /// Picker retire tag, e.g. "retires Feb 26, 2027"; nil for current models.
+    /// Fixed English month names, independent of the user's locale.
+    public var retireTag: String? {
+        guard let r = retires, let y = r.year, let m = r.month, let d = r.day, (1...12).contains(m) else { return nil }
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        return "retires \(months[m - 1]) \(d), \(y)"
+    }
+
     /// How long a dictation with this model may run before it stops and sends.
     public var dictationCapSeconds: Int {
         OpenAIModels.dictationCapSeconds(maxOutputTokens: maxOutputTokens, realtimeCommitLimit: realtimeCommitLimit)
@@ -63,6 +76,14 @@ public enum OpenAIModels {
     ]
 
     public static func model(id: String) -> OpenAIModel? { all.first { $0.id == id } }
+
+    /// The picker reset target after `model_not_found` for a model of `kind`.
+    public static func defaultID(for kind: OpenAIModel.Kind) -> String {
+        switch kind {
+        case .file: return defaultFileModelID
+        case .live: return defaultFileModelID   // Task 11 adds the live default.
+        }
+    }
 
     /// The stored model id, or the default when it is unknown or missing.
     public static func resolve(id: String?) -> OpenAIModel {

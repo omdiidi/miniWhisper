@@ -87,6 +87,10 @@ Required for AVAudioEngine dictation recording.
 
 The top of the popover has a **Mode** picker: **Online (OpenAI)** sends dictation audio straight to OpenAI (`gpt-transcribe` by default) using your own OpenAI key; **Local server** uses your self-hosted WisprAlt server (configured below). The default is still **Local** until Online file transcription lands. A change applies to the next dictation; a dictation already recording finishes on the mode it started in. The picker is locked only while a Local file is converting or uploading ("Finish or cancel the upload first").
 
+Under the picker a status line shows `Online · gpt-transcribe · key saved` (or `key missing`) or `Local · <server host>` with `reachable` / `unreachable` (checked when the popover opens in Local or when you switch to Local), plus `transcribing N` while dictations are still being transcribed.
+
+**Model.** Show advanced settings → **OpenAI Model** lists every OpenAI transcription model with its price per minute in small text (`≈` marks an estimate for token-billed models) and, for older models, the date OpenAI retires them (e.g. "retires Feb 26, 2027"). The default is `gpt-transcribe` ($0.0045/min). The choice applies to the next dictation; file transcription always uses a file model, and dictation stops at 10 minutes. If OpenAI reports the chosen model does not exist, the app switches back to `gpt-transcribe` and tells you.
+
 In Online mode nothing is sent to your Local server, and the server-only rows are hidden (Connection / Test Connection, Server URL, API Key and its backup, Your name, Open Portal, Open My Dictations, the job Log button). **Transcribe file…** and **Copy last dictation** are disabled in Online for now. Switching to Online while a Local file job is being watched stops watching it without cancelling it on the server; switching back resumes watching it.
 
 ### OpenAI API key

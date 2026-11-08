@@ -37,4 +37,18 @@ import WisprAltCore
             #expect(m.dictationCapSeconds * 32_000 + 44 < OpenAIModels.uploadLimitBytes, "\(m.id)")
         }
     }
+
+    @Test func displayPrice_andRetireTag_strings() {
+        #expect(OpenAIModels.model(id: "gpt-transcribe")?.displayPrice == "$0.0045/min")
+        #expect(OpenAIModels.model(id: "gpt-4o-mini-transcribe")?.displayPrice == "≈$0.003/min")
+        #expect(OpenAIModels.model(id: "gpt-4o-transcribe")?.displayPrice == "≈$0.006/min")
+        #expect(OpenAIModels.model(id: "whisper-1")?.displayPrice == "$0.006/min")
+        #expect(OpenAIModels.model(id: "gpt-transcribe")?.retireTag == nil)
+        #expect(OpenAIModels.model(id: "whisper-1")?.retireTag == "retires Feb 26, 2027")
+        #expect(OpenAIModels.model(id: "gpt-4o-mini-transcribe-2025-03-20")?.retireTag == "retires Jan 20, 2027")
+    }
+
+    @Test func modelNotFound_resetsToTheKindDefault() {
+        #expect(OpenAIModels.defaultID(for: .file) == "gpt-transcribe")
+    }
 }
