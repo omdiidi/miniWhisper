@@ -12,12 +12,13 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import shutil
 import sqlite3
 import stat
 import sys
-from contextlib import closing, contextmanager
-from dataclasses import asdict
+from contextlib import closing, contextmanager, suppress
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -610,6 +611,67 @@ def _delete(path: Path) -> None:
 _OWNED_FILES = tuple(offline.DB_NAME + s for s in ("", "-wal", "-shm", "-journal")) + (SETUP_CODE,)
 _OWNED_TREES = ("outputs", "staging")
 
+# Inside outputs/ and staging/ purge deletes only the names WisprAlt writes; anything
+# else is kept and listed (setup cannot prove those trees hold nothing else).
+_JOB_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"  # jobs/store.py
+_UPLOAD_ID = r"[A-Za-z0-9_-]{22}"  # routes/transcribe_file.py: token_urlsafe(16)
+_TRANSCRIPT_EXTS = (".json", ".srt", ".txt", ".vtt")  # files/output.py, importer/files.py
+_AUDIO_EXTS = (  # ops/staging.py _ALLOWED_EXTENSIONS
+    ".aac", ".aiff", ".caf", ".flac", ".m4a", ".m4v", ".mov",
+    ".mp3", ".mp4", ".ogg", ".opus", ".wav", ".webm",
+)  # fmt: skip
+
+
+def _alt(exts: tuple[str, ...]) -> str:
+    return "(?:" + "|".join(map(re.escape, exts)) + ")"
+
+
+@dataclass(frozen=True)
+class _Tree:
+    """The file names WisprAlt writes in one directory, and its subdirs by name."""
+
+    files: re.Pattern[str]
+    dirs: tuple[tuple[re.Pattern[str], _Tree], ...] = ()
+
+
+# outputs/: <job>.<fmt> (output.py, importer), .import-<job>.<fmt>.part (importer),
+# tmpXXXXXXXX.tmp (output.py's atomic write).
+_OUTPUTS = _Tree(
+    re.compile(
+        rf"{_JOB_ID}{_alt(_TRANSCRIPT_EXTS)}"
+        rf"|\.import-{_JOB_ID}{_alt(_TRANSCRIPT_EXTS)}\.part"
+        r"|tmp[a-z0-9_]{8}\.tmp"
+    )
+)
+# staging/: <uuid>.wav, <uuid hex><ext>, <upload id><ext> and their transcode targets
+# (<stem>.wav, <stem>_canonical.wav, each also as .partial); chunked/<upload id>/
+# holds meta.json and chunk-NNNN.part(.tmp).
+_CHUNKS = _Tree(re.compile(r"meta\.json|chunk-\d{4,}\.part(?:\.tmp)?"))
+_STAGING = _Tree(
+    re.compile(
+        rf"(?:{_JOB_ID}|[0-9a-f]{{32}}|{_UPLOAD_ID})(?:_canonical)?"
+        rf"{_alt(_AUDIO_EXTS)}(?:\.partial)?"
+    ),
+    ((re.compile("chunked"), _Tree(re.compile(r"(?!)"), ((re.compile(_UPLOAD_ID), _CHUNKS),))),),
+)
+_TREE_SPECS = {"outputs": _OUTPUTS, "staging": _STAGING}
+
+
+def _sweep(d: Path, tree: _Tree, kept: list[Path]) -> None:
+    """Unlink the files in *d* that *tree* names, recurse into its named subdirs, and
+    remove *d* if that empties it. Everything else (symlinks included) goes to *kept*."""
+    for entry in sorted(d.iterdir()):
+        real_dir = entry.is_dir() and not entry.is_symlink()
+        sub = next((t for pat, t in tree.dirs if pat.fullmatch(entry.name)), None)
+        if real_dir and sub is not None:
+            _sweep(entry, sub, kept)
+        elif entry.is_file() and not entry.is_symlink() and tree.files.fullmatch(entry.name):
+            entry.unlink()
+        else:
+            kept.append(entry)
+    with suppress(OSError):  # not empty: something was kept in it
+        d.rmdir()
+
 
 def _owned(data: Path) -> list[Path]:
     names = (*_OWNED_FILES, *_OWNED_TREES)
@@ -637,10 +699,25 @@ def _purge_backup(ctx: Ctx) -> Path | None:
 
 
 def _purge_data(ctx: Ctx) -> str:
-    """Delete WisprAlt's own files in the data dir; the dir itself only if then empty."""
+    """Delete WisprAlt's own files in the data dir; the dir itself only if then empty.
+
+    Files that WisprAlt did not write are kept and listed, even inside ``outputs/``
+    and ``staging/``.
+    """
     data = ctx.paths.data_dir
-    for path in _owned(data):
-        _delete(path)
+    kept: list[Path] = []
+    for name in _OWNED_FILES:
+        _delete(data / name)
+    for name, spec in _TREE_SPECS.items():
+        tree = data / name
+        if tree.is_dir() and not tree.is_symlink():
+            _sweep(tree, spec, kept)
+        elif tree.exists() or tree.is_symlink():
+            kept.append(tree)
+    if kept:
+        print(f"kept {len(kept)} item(s) WisprAlt did not write:")
+        for path in kept:
+            print(f"  {path}")
     try:
         data.rmdir()
     except FileNotFoundError:

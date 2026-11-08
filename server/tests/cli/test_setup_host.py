@@ -219,8 +219,8 @@ def test_shared_data_dir_is_refused_before_anything_is_written(
 ) -> None:
     """R3 fix: a data dir with other files and no DB (e.g. ~/Work) is never adopted.
 
-    Everything in a data dir is then WisprAlt's, so `uninstall --purge-data` may
-    delete its outputs/ and staging/ whole.
+    A dir that does hold a DB is adopted as is, so `uninstall --purge-data` deletes
+    only the names WisprAlt writes (see test_update_uninstall.py).
     """
     work = tmp_path / "Work"
     (work / "outputs").mkdir(parents=True)

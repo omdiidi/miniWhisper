@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from .conftest import CliFn, Execs, FakeHttp, FakeHub, FakeRunner
 
 EXE = installed_exe()
+JOB = "0b6e3f0c-6c1e-4d3a-9f57-2a8d1c4e5b6f"  # a jobs/store.py id (uuid4)
+UPLOAD = "AbCdEfGhIjKlMnOpQr_-12"  # a token_urlsafe(16) upload id
 
 
 @pytest.fixture
@@ -306,7 +308,7 @@ def test_purge_deletes_only_what_wispralt_owns(
     mine = installed.data_dir / "my-notes.txt"
     mine.write_text("not WisprAlt's")
     (installed.data_dir / "outputs").mkdir(exist_ok=True)
-    (installed.data_dir / "outputs" / "j.txt").write_text("t")
+    (installed.data_dir / "outputs" / f"{JOB}.txt").write_text("t")
     code, out, _ = cli("uninstall", "--purge-data", "--no-backup")
     assert code == 0 and "other files there were kept" in out
     assert mine.read_text() == "not WisprAlt's"
@@ -318,9 +320,47 @@ def test_purge_without_a_db_still_backs_up_the_files(installed: Paths, cli: CliF
     for suffix in ("", "-wal", "-shm"):
         installed.db_path.with_name(installed.db_path.name + suffix).unlink(missing_ok=True)
     (installed.data_dir / "outputs").mkdir(exist_ok=True)
-    (installed.data_dir / "outputs" / "j.txt").write_text("transcript")
+    (installed.data_dir / "outputs" / f"{JOB}.txt").write_text("transcript")
     code, out, _ = cli("uninstall", "--purge-data")
     assert code == 0 and "backup written" in out and "no database" in out
     [copy] = [d for d in installed.backup_dir.iterdir() if d.name.endswith("-files")]
-    assert (copy / "outputs" / "j.txt").read_text() == "transcript"
+    assert (copy / "outputs" / f"{JOB}.txt").read_text() == "transcript"
     assert not installed.data_dir.exists()
+
+
+def test_purge_keeps_foreign_files_inside_outputs_and_staging(installed: Paths, cli: CliFn) -> None:
+    """R4 fix: a shared data dir that holds the DB keeps what WisprAlt did not write."""
+    data = installed.data_dir
+    out, stage = data / "outputs", data / "staging"
+    chunk = stage / "chunked" / UPLOAD
+    for d in (out, chunk):
+        d.mkdir(parents=True, exist_ok=True)
+    ours = [
+        out / f"{JOB}.txt", out / f"{JOB}.json", out / f".import-{JOB}.srt.part",
+        out / "tmpab_c12x9.tmp", stage / f"{JOB}.wav", stage / f"{'a' * 32}.m4a",
+        stage / f"{UPLOAD}.mp3", stage / f"{UPLOAD}.wav.partial",
+        stage / f"{JOB}_canonical.wav", chunk / "meta.json", chunk / "chunk-0000.part",
+        chunk / "chunk-0001.part.tmp",
+    ]  # fmt: skip
+    foreign = [out / "notes.txt", out / "photos" / "a.jpg", stage / "budget.xlsx"]
+    foreign += [chunk / "readme.md"]
+    for f in ours + foreign:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x")
+    code, text, _ = cli("uninstall", "--purge-data", "--no-backup")
+    assert code == 0 and "other files there were kept" in text
+    assert not any(f.exists() for f in ours)
+    assert all(f.read_text() == "x" for f in foreign)
+    for kept in (out / "notes.txt", out / "photos", stage / "budget.xlsx", chunk / "readme.md"):
+        assert str(kept) in text
+    assert not installed.db_path.exists()
+
+
+def test_purge_patterns_cover_what_the_server_writes() -> None:
+    """The purge name lists are copies; they must track the modules that write the files."""
+    from wispralt.files.output import _OUTPUT_SUFFIXES
+    from wispralt.importer.files import PRIMARY_ORDER
+    from wispralt.ops.staging import _ALLOWED_EXTENSIONS
+
+    assert set(ops._TRANSCRIPT_EXTS) == set(_OUTPUT_SUFFIXES) == set(PRIMARY_ORDER)
+    assert set(ops._AUDIO_EXTS) == set(_ALLOWED_EXTENSIONS)
