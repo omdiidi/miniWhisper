@@ -108,12 +108,12 @@ def test_right_code_creates_one_admin_once(
     client: TestClient, accounts: AccountStore, _data_dir: Path
 ) -> None:
     setup_code.prepare(accounts, _data_dir)
-    resp = _post(client, _code(_data_dir), label="omid")
+    resp = _post(client, _code(_data_dir), label="dana")
     assert resp.status_code == 200, resp.text
     assert resp.headers["cache-control"] == "no-store"
     [token] = set(re.findall(r"\b[0-9a-f]{64}\b", resp.text))
     user = accounts.lookup_key(hash_token(token))
-    assert user is not None and user.role == "admin" and user.label == "omid"
+    assert user is not None and user.role == "admin" and user.label == "dana"
     assert f"{SESSION_COOKIE_NAME}={token}" in resp.headers["set-cookie"]
     assert not setup_code.code_path(_data_dir).exists()
     # The cookie now signs the admin in; setup is gone for good.

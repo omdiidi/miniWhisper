@@ -66,7 +66,7 @@ def client(wire: Wire) -> TestClient:
 
 @pytest.fixture
 def people(make_user: MakeUser) -> tuple[tuple[User, str], tuple[User, str]]:
-    return make_user(role="admin", label="omid"), make_user(label="alice")
+    return make_user(role="admin", label="dana"), make_user(label="alice")
 
 
 def _auth(token: str) -> dict[str, str]:

@@ -7,7 +7,7 @@ then see real HTTP errors instead of opaque "CORS error" failures.
 
 Scope: global. allow_origin="*" with allow_credentials=False — admin endpoints
 can't return cookies cross-origin, so leaking ACAO on /admin/* is safe.
-Same-origin admin UI on transcribe.integrateapi.ai unaffected.
+The same-origin admin UI is unaffected.
 """
 from __future__ import annotations
 

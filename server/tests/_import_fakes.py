@@ -18,7 +18,7 @@ def supabase_rows() -> dict[str, list[dict[str, Any]]]:
     """3 users (admin, revoked, employee), 10 usage (one ``meeting``, one orphan), 4 fallback."""
     users = [
         {"id": 1, "label": "owner", "token_hash": "h1", "role": "admin", "created_at": _ts(1),
-         "last_seen_at": _ts(9), "revoked_at": None, "notes": None, "display_name": "Omid",
+         "last_seen_at": _ts(9), "revoked_at": None, "notes": None, "display_name": "Dana",
          "kind": "employee"},
         {"id": 2, "label": "gone", "token_hash": "h2", "role": "employee", "created_at": _ts(2),
          "last_seen_at": None, "revoked_at": _ts(5), "notes": "left", "display_name": None,

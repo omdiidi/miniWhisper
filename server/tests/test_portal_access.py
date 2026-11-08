@@ -27,7 +27,7 @@ def client(wire: Wire) -> TestClient:
 @pytest.fixture
 def team(make_user: MakeUser) -> dict[str, tuple[User, dict[str, str]]]:
     out = {}
-    for name, role in (("omid", "admin"), ("alice", "employee"), ("bob", "employee")):
+    for name, role in (("dana", "admin"), ("alice", "employee"), ("bob", "employee")):
         user, token = make_user(role=role, label=name)
         out[name] = (user, {"Authorization": f"Bearer {token}"})
     return out
@@ -137,7 +137,7 @@ def test_employee_is_forbidden_on_team_records(client: TestClient, team, job_sto
 
 
 def test_admin_sees_team_hits_with_owner_names(client: TestClient, team, job_store: JobStore) -> None:
-    _admin, headers = team["omid"]
+    _admin, headers = team["dana"]
     alice, _ = team["alice"]
     bob, _ = team["bob"]
     _dictate(job_store, alice.id, "alice roadmap")
@@ -156,7 +156,7 @@ def test_admin_sees_team_hits_with_owner_names(client: TestClient, team, job_sto
 
 
 def test_deleted_records_are_hidden_everywhere(client: TestClient, team, job_store: JobStore) -> None:
-    _admin, admin_headers = team["omid"]
+    _admin, admin_headers = team["dana"]
     alice, headers = team["alice"]
     did = _dictate(job_store, alice.id, "regrettable roadmap")
     assert job_store.soft_delete_history_row(alice.id, "dictation", did)

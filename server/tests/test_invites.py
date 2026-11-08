@@ -40,7 +40,7 @@ def client(app: FastAPI) -> TestClient:
 
 @pytest.fixture
 def admin(make_user: MakeUser) -> tuple[User, dict[str, str]]:
-    user, token = make_user(role="admin", label="omid")
+    user, token = make_user(role="admin", label="dana")
     return user, {"Authorization": f"Bearer {token}"}
 
 
@@ -119,7 +119,7 @@ def test_every_failure_is_the_same_400(
         resp = client.post("/invites/redeem", content=bad, headers={"CF-Connecting-IP": "198.51.100.9"})
         bodies.append((resp.status_code, resp.content))
     assert set(bodies) == {(400, b'{"error":"invite_invalid"}')}
-    assert {u.label for u in accounts.list_people()} == {"omid", "a", "user-1"}
+    assert {u.label for u in accounts.list_people()} == {"dana", "a", "user-1"}
 
 
 def test_eleventh_attempt_in_a_minute_is_429(client: TestClient) -> None:

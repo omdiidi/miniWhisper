@@ -32,7 +32,7 @@ def client(wire: Wire) -> TestClient:
 
 @pytest.fixture
 def admin_headers(make_user: MakeUser) -> dict[str, str]:
-    _admin, token = make_user(role="admin", label="omid")
+    _admin, token = make_user(role="admin", label="dana")
     return {"Authorization": f"Bearer {token}"}
 
 

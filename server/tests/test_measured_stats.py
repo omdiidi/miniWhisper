@@ -161,7 +161,7 @@ def test_my_insights_renders_measured_with_ai_off_and_tiles_open_their_records(
 def test_admin_data_shows_team_measured_and_leaderboard(
     client: TestClient, make_user: MakeUser, job_store: JobStore
 ) -> None:
-    _admin, token = make_user(role="admin", label="omid")
+    _admin, token = make_user(role="admin", label="dana")
     alice, _ = make_user(label="alice")
     _dictate(job_store, alice.id, "um uh like words", time.time() - 60)
     headers = {"Authorization": f"Bearer {token}"}

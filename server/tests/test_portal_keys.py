@@ -36,7 +36,7 @@ def client(app: FastAPI) -> TestClient:
 
 @pytest.fixture
 def admin(make_user: MakeUser) -> tuple[User, str]:
-    return make_user(role="admin", label="omid")
+    return make_user(role="admin", label="dana")
 
 
 def _bearer(token: str) -> dict[str, str]:

@@ -13,7 +13,7 @@
     {{ ui.csrf(csrf_token) }}
     <label for="label">Label (required)</label>
     <input id="label" name="label" type="text" required autofocus maxlength="80"
-           value="{{ form_label or '' }}" placeholder="e.g. nicholas, alex-laptop" aria-describedby="label-hint">
+           value="{{ form_label or '' }}" placeholder="e.g. sam, alex-laptop" aria-describedby="label-hint">
     <p class="hint" id="label-hint">Internal identifier. 1–80 characters, no control characters.</p>
 
     <label for="display_name">Display name</label>

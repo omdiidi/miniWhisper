@@ -45,7 +45,7 @@ def client(wire: Wire) -> TestClient:
 
 @pytest.fixture
 def admin(make_user: MakeUser) -> tuple[User, dict[str, str]]:
-    user, token = make_user(role="admin", label="omid")
+    user, token = make_user(role="admin", label="dana")
     return user, {"Authorization": f"Bearer {token}"}
 
 
@@ -107,7 +107,7 @@ def test_admin_me_redirects_admin_and_renders_employee(
 
 
 def test_require_admin_role_gate() -> None:
-    admin_user = User(id=1, key_id=None, label="omid", role="admin", kind="employee")
+    admin_user = User(id=1, key_id=None, label="dana", role="admin", kind="employee")
     assert require_admin(admin_user) is admin_user
     with pytest.raises(HTTPException) as excinfo:
         require_admin(User(id=2, key_id=None, label="alice", role="employee", kind="employee"))
@@ -133,14 +133,14 @@ def test_add_employee_creates_user_and_install_command(
 ) -> None:
     monkeypatch.setattr(admin_ui.settings, "server_url", "https://example.test")
     resp = client.post(
-        "/admin/people/new", data={"label": "  nicholas  ", "role": "employee"}, headers=admin[1]
+        "/admin/people/new", data={"label": "  sam  ", "role": "employee"}, headers=admin[1]
     )
     assert resp.status_code == 200, resp.text
     assert "./install.sh --role client --client-mode local" in resp.text
     assert "https://example.test" in resp.text and "curl" not in resp.text
     [token] = set(re.findall(r"\b[0-9a-f]{64}\b", resp.text))
     user = accounts.lookup_key(hash_token(token))
-    assert user is not None and user.label == "nicholas" and user.kind == "employee"
+    assert user is not None and user.label == "sam" and user.kind == "employee"
 
 
 @pytest.mark.parametrize(
@@ -160,7 +160,7 @@ def test_add_employee_rejects_invalid_input(
 ) -> None:
     resp = client.post("/admin/people/new", data=data, headers=admin[1])
     assert resp.status_code == 400 and message in resp.text
-    assert [u.label for u in accounts.list_people()] == ["omid"]
+    assert [u.label for u in accounts.list_people()] == ["dana"]
 
 
 def test_users_page_shows_disabled_state(
@@ -287,7 +287,7 @@ def _mutation(name: str, employee: User, integration: User) -> tuple[str, str, d
         "integrations_new": ("POST", "/admin/integrations/new", {"data": {"program_name": "Buzz"}}, 200),
         "integrations_revoke": ("POST", f"/admin/integrations/{integration.id}/revoke", {"data": {}}, 303),
         "integrations_rotate": ("POST", f"/admin/integrations/{integration.id}/rotate", {"data": {}}, 200),
-        "patch_me": ("PATCH", "/me", {"json": {"display_name": "Omid Z"}}, 200),
+        "patch_me": ("PATCH", "/me", {"json": {"display_name": "Dana Z"}}, 200),
     }[name]
 
 
@@ -376,4 +376,3 @@ def test_key_added_shows_the_configured_server_url(
     monkeypatch.setattr(admin_ui.settings, "server_url", "https://mini.example.test/")
     resp = csrf_client.post("/admin/integrations/new", data={"program_name": "Buzz"}, headers=admin[1])
     assert "export OPENAI_BASE_URL=https://mini.example.test/v1" in resp.text
-    assert "integrateapi" not in resp.text

@@ -222,7 +222,7 @@ def page_client(wire: Wire) -> TestClient:
 def test_pages_link_sources_hide_deleted_mark_stale_and_recurring(
     page_client: TestClient, job_store: JobStore, make_user: MakeUser
 ) -> None:
-    admin, admin_token = make_user(role="admin", label="omid")
+    admin, admin_token = make_user(role="admin", label="dana")
     alice, token = make_user(label="alice")
     week = last_full_iso_week(TZ)
     start, _end = iso_week_epoch_bounds(*week, TZ)
