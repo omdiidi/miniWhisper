@@ -78,6 +78,9 @@ struct SettingsView: View {
     @State private var hasOpenAIKey: Bool = false
     @State private var openAIKeyError: String?
     @FocusState private var openAIKeyFocused: Bool
+    // OpenRouter key entry (Smart formatting). Read only while the toggle is on.
+    @State private var openRouterKeyText: String = ""
+    @State private var hasOpenRouterKey: Bool = false
     /// Last Local `/healthz` result for the status line (nil = not checked yet).
     /// Checked only on popover open in Local or on a switch to Local.
     @State private var localHealthy: Bool? = nil
@@ -460,19 +463,55 @@ struct SettingsView: View {
         )
     }
 
-    /// Smart-formatting toggle. Off by default. Adds light cleanup to longer
-    /// dictations (punctuation, capitalization, paragraph breaks) without
-    /// changing the words you said. Adds a small amount of latency.
+    /// Smart-formatting toggle (Mercury 2 on OpenRouter, run by this app in
+    /// both modes). Off by default. Sends the dictated text, never audio.
     private var smartFormattingSection: some View {
         Section {
             Toggle("Smart formatting", isOn: Binding(
                 get: { settings.smartFormatting },
-                set: { settings.smartFormatting = $0 }
+                set: { settings.smartFormatting = $0; if $0 { hasOpenRouterKey = OpenRouterKey.current() != nil } }
             ))
-            Text("Adds light cleanup — punctuation, capitalization, paragraph breaks — to longer dictations. Your wording is preserved. Off by default.")
+            Text("Adds light cleanup — punctuation, capitalization, paragraph breaks — to dictations of \(MercuryPolicy.minWords)+ words. Your wording is preserved. Off by default.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if settings.smartFormatting {
+                Text("Privacy: the dictated text (never audio) is sent to OpenRouter (Mercury 2) for cleanup.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    SecureField(hasOpenRouterKey ? "Key saved — paste to replace" : "Paste OpenRouter API key…",
+                                text: $openRouterKeyText)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(saveOpenRouterKey)
+                    Button("Save", action: saveOpenRouterKey)
+                        .disabled(openRouterKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Remove", role: .destructive) {
+                        do { try OpenRouterKey.remove(); hasOpenRouterKey = false } catch {
+                            Log.error("OpenRouter key remove failed: \(ErrorLog.describe(error))", category: "settings")
+                        }
+                    }
+                    .disabled(!hasOpenRouterKey)
+                }
+                Text(hasOpenRouterKey ? "OpenRouter key saved" : "OpenRouter key missing")
+                    .font(.caption)
+                    .foregroundStyle(hasOpenRouterKey ? .green : .orange)
+                if let status = LastTranscriptCaption.formattingStatus(recordingState.lastFormatting) {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
+            }
         } header: { Text("Quality") }
+    }
+
+    private func saveOpenRouterKey() {
+        let trimmed = openRouterKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try OpenRouterKey.save(trimmed)
+            openRouterKeyText = ""
+            hasOpenRouterKey = true
+        } catch {
+            Log.error("OpenRouter key save failed: \(ErrorLog.describe(error))", category: "settings")
+        }
     }
 
     /// Input mic picker — applies ONLY to WisprAlt's own dictation. The picker
@@ -548,6 +587,7 @@ struct SettingsView: View {
 
     private func loadCurrentValues() {
         hasOpenAIKey = OpenAIKey.current() != nil
+        if settings.smartFormatting { hasOpenRouterKey = OpenRouterKey.current() != nil }
         serverURLText = settings.serverURL?.absoluteString ?? ""
         // The Local key is read only in Local mode (its rows are hidden in Online).
         guard isLocal else { return }

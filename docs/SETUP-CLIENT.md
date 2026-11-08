@@ -158,15 +158,15 @@ Device enumeration lives in `client/WisprAlt/Audio/MicEnumerator.swift` (AVFound
 
 ### Smart formatting
 
-The popover has a **Smart formatting** toggle in the Settings section. When ON, every dictation is sent to the server with the `X-Smart-Format: true` header; for dictations of at least 100 words, the server hands the raw Parakeet output to OpenRouter Mercury 2, which fixes punctuation and casing, removes obvious fillers ("um", "uh", repeated words), and adds bullet-list formatting where you're clearly enumerating items. Meaning is preserved — no rephrasing, no summarization. Below 100 words the call short-circuits and you get raw Parakeet output. The threshold targets long-form dictation (e.g. LLM prompts, notes) where the cleanup is actually visible.
+The popover has a **Smart formatting** toggle in the Quality section. When ON, the app itself (in both Online and Local mode) sends the finished transcript of every dictation of at least 20 words to OpenRouter Mercury 2 (`inception/mercury-2`), which fixes punctuation and casing, removes obvious fillers ("um", "uh", repeated words), and adds bullet-list formatting where you're clearly enumerating items. Meaning is preserved — no rephrasing, no summarization. A length check (cleaned text within 0.70–1.10× of the raw word count) rejects anything that changed too much.
 
-- **Default**: OFF. Raw Parakeet output is what gets injected.
-- **Latency cost**: ~250ms additional wall-clock per dictation when the cleanup runs (the Mercury call is fail-soft — a timeout or HTTP error returns the raw text and the response field `smart_formatted: false`).
-- **Server requirement**: the operator must have set `SMART_FORMAT_ENABLED=true` (default is off) and `OPENROUTER_API_KEY` in `server/.env`. If the key is missing, every dictation comes back as raw text regardless of the toggle — there is no client-visible error, the toggle just silently does nothing. Ask your admin if cleaned output is what you expect but you keep getting raw output.
-- **Pricing**: per-cleanup is roughly $0.0001 against your operator's OpenRouter credit. Negligible for individual employees; visible in OpenRouter usage if you batch-dictate hundreds of clips.
-- **Privacy note**: smart formatting sends your raw transcript to OpenRouter (cloud). If you handle confidential material, leave the toggle OFF.
+- **Default**: OFF. The raw transcript is what gets injected.
+- **Key**: your own OpenRouter key, pasted into the field under the toggle or added from Terminal: `security add-generic-password -U -s co.wispralt.openrouter -a default -w`. It lives only in the Keychain (`co.wispralt.openrouter`). Without it the toggle does nothing and the popover says "OpenRouter key missing".
+- **Latency cost**: at most 2.5 s per dictation (hard deadline). Fail-soft: a timeout, HTTP error or rejected cleanup returns the raw text. The popover shows the last dictation's result ("formatted", "too short", "failed (timeout)", …).
+- **Pricing**: per-cleanup is roughly $0.0001 of OpenRouter credit.
+- **Privacy note**: smart formatting sends the transcript text (never audio) to OpenRouter (cloud). If you handle confidential material, leave the toggle OFF.
 
-The toggle does NOT affect file transcriptions — those run through mlx-whisper server-side and are never routed through Mercury.
+The client no longer asks the server to format (`smart_format` / `X-Smart-Format` are not sent since Part 3). The toggle does NOT affect file transcriptions — they are never routed through Mercury.
 
 ### Your name
 
@@ -204,7 +204,7 @@ If the toggle shows "requires approval" in System Settings, click it to turn it 
 
 ## Moving your API key
 
-Your keys live only in the macOS Keychain (`co.wispralt` for the Local server key, `co.wispralt.openai` for OpenAI). WisprAlt has no export, import or "Copy API Key" button: a key never lands in a file or on the clipboard from the app.
+Your keys live only in the macOS Keychain (`co.wispralt` for the Local server key, `co.wispralt.openai` for OpenAI, `co.wispralt.openrouter` for Smart formatting). WisprAlt has no export, import or "Copy API Key" button: a key never lands in a file or on the clipboard from the app.
 
 To set up another Mac, get the key again from where it was issued (your server operator for the Local key, the OpenAI dashboard for an OpenAI key) and paste it into Settings → Advanced on the new Mac, or add it from Terminal:
 

@@ -250,7 +250,7 @@ extension MenuBarController {
         recordingState.retryStatus = "Retrying…"
         Task { @MainActor in
             do {
-                let result = try await SpoolStore.shared.retry(id, mode: mode)
+                let result = await MercuryStep.apply(try await SpoolStore.shared.retry(id, mode: mode))
                 LastTextStore.save(result, mode: mode)
                 ClipboardInjector.copyOnly(result.text)
                 recordingState.retryStatus = "Copied — \(result.text.count.formatted(.number)) chars"

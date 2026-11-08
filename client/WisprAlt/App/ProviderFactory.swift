@@ -43,3 +43,17 @@ enum DictationRoute {
     case openAIFile(DictationProvider)
     case local(LocalCapture, ServerEndpoint)
 }
+
+/// Mercury smart formatting, in both modes, after transcription and before
+/// the text is saved or delivered. Runs only when `Settings.smartFormatting`
+/// is on; sends text (never audio) to OpenRouter; falls back to the raw text.
+enum MercuryStep {
+    static func apply(_ result: DictationResult) async -> DictationResult {
+        guard Settings.shared.smartFormatting else { return result }
+        let (text, formatting) = await MercuryClient(keyProvider: { OpenRouterKey.current() }).format(result.text)
+        var out = result
+        out.text = text
+        out.formatting = formatting
+        return out
+    }
+}

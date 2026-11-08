@@ -37,7 +37,7 @@ enum DictationAPI {
             return try await wholeFile(endpoint: endpoint, wavData: capture.wholeWAV, dedupId: dedupId)
         }
         do {
-            return try await session.finalize(tail: capture.tailWAV, smartFormat: Settings.shared.smartFormatting)
+            return try await session.finalize(tail: capture.tailWAV)
         } catch let terminal as LocalDictationError {
             await session.abort()
             throw terminal
@@ -59,7 +59,6 @@ enum DictationAPI {
         dedupId: String
     ) async throws -> LocalRequests.Response {
         let request = LocalRequests.wholeFile(endpoint: endpoint, dedupId: dedupId, wav: wavData,
-                                              smartFormat: Settings.shared.smartFormatting,
                                               clientVersion: ServerClient.clientVersion)
 
         // Attempt 1 — origin.

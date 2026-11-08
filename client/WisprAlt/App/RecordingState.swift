@@ -70,6 +70,9 @@ final class RecordingState: ObservableObject {
     /// Result line under the Retry list (last Retry / Export).
     @Published var retryStatus: String? = nil
 
+    /// Mercury outcome of the last dictation (shown under Smart formatting).
+    @Published var lastFormatting: Formatting? = nil
+
     /// Reset every per-job field. Caller is responsible for also clearing
     /// the UserDefaults `activeJobID` key — `reset()` only touches in-memory
     /// state so it can be called from contexts that shouldn't write defaults.

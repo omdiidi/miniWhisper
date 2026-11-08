@@ -26,9 +26,8 @@ extension StubURLSuites {
                                     clientVersion: "1.2+3"),
                 LocalRequests.finalize(endpoint: endpoint, sessionId: "sid", dedupId: dedup,
                                        speechStartedAt: Date(timeIntervalSince1970: 1_762_000_000.125),
-                                       tail: wav, smartFormat: true, clientVersion: "1.2+3"),
-                LocalRequests.wholeFile(endpoint: endpoint, dedupId: dedup, wav: wav, smartFormat: false,
-                                        clientVersion: "1.2+3"),
+                                       tail: wav, clientVersion: "1.2+3"),
+                LocalRequests.wholeFile(endpoint: endpoint, dedupId: dedup, wav: wav, clientVersion: "1.2+3"),
             ]
         }
 
@@ -44,6 +43,7 @@ extension StubURLSuites {
 
         @Test func allThree_carryAuthVersionAndLowercaseDedup() async throws {
             for r in try await send(all()) {
+                #expect(r.value(forHTTPHeaderField: "X-Smart-Format") == nil)
                 #expect(r.value(forHTTPHeaderField: "X-Client-Dedup-Id") == dedup.lowercased())
                 #expect(r.value(forHTTPHeaderField: "Authorization") == "Bearer local-key")
                 #expect(r.value(forHTTPHeaderField: "X-WisprAlt-Client-Version") == "1.2+3")
@@ -51,13 +51,13 @@ extension StubURLSuites {
             }
         }
 
-        @Test func finalize_carriesAllFourFields() async throws {
+        @Test func finalize_carriesItsFields_andNoSmartFormat() async throws {
             let started = Date(timeIntervalSince1970: 1_762_000_000.125)
             let r = try await send([all()[1]])[0]
             let b = body(r)
             #expect(b.contains("name=\"file\"; filename=\"tail.wav\""))
             #expect(b.contains("name=\"client_dedup_id\"\r\n\r\n\(dedup.lowercased())\r\n"))
-            #expect(b.contains("name=\"smart_format\"\r\n\r\ntrue\r\n"))
+            #expect(!b.contains("smart_format"))   // Mercury runs in the client since Part 3
             let field = try #require(b.components(separatedBy: "name=\"speech_started_at\"\r\n\r\n").last?
                 .components(separatedBy: "\r\n").first)
             #expect(Double(field) == started.timeIntervalSince1970)
@@ -65,7 +65,7 @@ extension StubURLSuites {
 
         @Test func noKey_noAuthorizationHeader() {
             let open = ServerEndpoint(baseURL: URL(string: "http://127.0.0.1:8000")!, apiKey: nil)
-            let r = LocalRequests.wholeFile(endpoint: open, dedupId: dedup, wav: wav, smartFormat: false, clientVersion: "v")
+            let r = LocalRequests.wholeFile(endpoint: open, dedupId: dedup, wav: wav, clientVersion: "v")
             #expect(r.value(forHTTPHeaderField: "Authorization") == nil)
             #expect(r.url?.absoluteString == "http://127.0.0.1:8000/transcribe/dictate")
         }

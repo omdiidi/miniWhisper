@@ -4,6 +4,8 @@ import Foundation
 /// Every request goes to the endpoint captured at FN press (never a global),
 /// with `Authorization`, `X-WisprAlt-Client-Version` and the lowercase
 /// `X-Client-Dedup-Id` (the dictation id; Part 4 dedup contract, A5).
+/// The `smart_format` field / `X-Smart-Format` header were removed in Part 3:
+/// Mercury formatting runs in the client (`MercuryClient`).
 public enum LocalRequests {
     /// `POST /transcribe/dictate/stream/{sessionId}/chunk/{index}` with one `file` part.
     public static func chunk(endpoint: ServerEndpoint, sessionId: String, index: Int, dedupId: String,
@@ -13,12 +15,10 @@ public enum LocalRequests {
     }
 
     /// `POST /transcribe/dictate/stream/{sessionId}/finalize` with `file`,
-    /// `client_dedup_id`, `speech_started_at` (seconds since 1970, Double) and
-    /// `smart_format`.
+    /// `client_dedup_id` and `speech_started_at` (seconds since 1970, Double).
     public static func finalize(endpoint: ServerEndpoint, sessionId: String, dedupId: String, speechStartedAt: Date,
-                                tail: Data, smartFormat: Bool, clientVersion: String) -> URLRequest {
+                                tail: Data, clientVersion: String) -> URLRequest {
         let form = Multipart(file: ("tail.wav", tail), fields: [
-            ("smart_format", smartFormat ? "true" : "false"),
             ("client_dedup_id", dedupId.lowercased()),
             ("speech_started_at", "\(speechStartedAt.timeIntervalSince1970)"),
         ])
@@ -26,12 +26,9 @@ public enum LocalRequests {
     }
 
     /// `POST /transcribe/dictate` with the whole recording (also the streaming
-    /// fallback and, later, Retry). Smart formatting rides on `X-Smart-Format`.
-    public static func wholeFile(endpoint: ServerEndpoint, dedupId: String, wav: Data, smartFormat: Bool,
-                                 clientVersion: String) -> URLRequest {
-        var request = post(endpoint, "/transcribe/dictate", dedupId, clientVersion, Multipart(file: ("audio.wav", wav)))
-        if smartFormat { request.setValue("true", forHTTPHeaderField: "X-Smart-Format") }
-        return request
+    /// fallback and Retry).
+    public static func wholeFile(endpoint: ServerEndpoint, dedupId: String, wav: Data, clientVersion: String) -> URLRequest {
+        post(endpoint, "/transcribe/dictate", dedupId, clientVersion, Multipart(file: ("audio.wav", wav)))
     }
 
     // MARK: - Responses

@@ -105,10 +105,10 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// Whether dictation requests should ask the server to apply smart formatting
-    /// (punctuation, casing, paragraph breaks) via the `X-Smart-Format` header.
-    /// Off by default. Adds ~250ms latency. Server silently ignores the flag if
-    /// `OPENROUTER_API_KEY` is not configured.
+    /// Smart formatting (punctuation, casing, paragraph breaks) by Mercury 2 on
+    /// OpenRouter, run by the client in both modes (`MercuryStep`) for
+    /// dictations of 20+ words. Off by default. Needs the OpenRouter key
+    /// (Keychain `co.wispralt.openrouter`); sends text only, never audio.
     @Published var smartFormatting: Bool {
         didSet {
             defaults.set(smartFormatting, forKey: Key.smartFormatting)

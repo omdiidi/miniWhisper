@@ -18,26 +18,34 @@ enum KeychainHelper {
     static func getAPIKey() throws -> String? { try server.get() }
     static func deleteAPIKey() throws { try server.delete() }
 
-    // MARK: - OpenRouter key (Mercury smart formatting; uncalled until Mercury moves client-side)
+    // MARK: - OpenRouter key (Mercury smart formatting; read through `OpenRouterKey`)
 
     static func setOpenRouterAPIKey(_ key: String) throws { try openRouter.set(key) }
     static func getOpenRouterAPIKey() throws -> String? { try openRouter.get() }
 }
 
-/// The OpenAI key, cached in memory. `current()` returns the cache, else
-/// re-reads the Keychain, so a key added from Terminal while the app runs is
-/// picked up on the next FN press. Warmed at launch; updated on Save/Remove.
-/// Safe from any thread.
-enum OpenAIKey {
-    private static let cache = OSAllocatedUnfairLock<String?>(initialState: nil)
+/// The OpenAI key (`co.wispralt.openai`) and the OpenRouter key
+/// (`co.wispralt.openrouter`, Mercury), each cached in memory.
+let OpenAIKey = CachedKey(item: KeychainHelper.openAI)
+let OpenRouterKey = CachedKey(item: KeychainHelper.openRouter)
 
-    static func current() -> String? {
+/// A Keychain key cached in memory. `current()` returns the cache, else
+/// re-reads the Keychain, so a key added from Terminal while the app runs is
+/// picked up on the next use. Warmed at launch; updated on Save/Remove.
+/// Safe from any thread.
+final class CachedKey: @unchecked Sendable {
+    private let item: KeychainItem
+    private let cache = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    init(item: KeychainItem) { self.item = item }
+
+    func current() -> String? {
         if let key = cache.withLock({ $0 }) { return key }
         let stored: String?
         do {
-            stored = try KeychainHelper.openAI.get()
+            stored = try item.get()
         } catch {
-            Log.warning("OpenAI key read failed: \(ErrorLog.describe(error))", category: "keychain")
+            Log.warning("Keychain key read failed: \(ErrorLog.describe(error))", category: "keychain")
             return nil
         }
         guard let key = stored?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { return nil }
@@ -45,13 +53,13 @@ enum OpenAIKey {
         return key
     }
 
-    static func save(_ key: String) throws {
-        try KeychainHelper.openAI.set(key)
+    func save(_ key: String) throws {
+        try item.set(key)
         cache.withLock { $0 = key }
     }
 
-    static func remove() throws {
-        try KeychainHelper.openAI.delete()
+    func remove() throws {
+        try item.delete()
         cache.withLock { $0 = nil }
     }
 }

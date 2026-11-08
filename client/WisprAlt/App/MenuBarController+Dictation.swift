@@ -67,7 +67,7 @@ extension MenuBarController {
         }
     }
 
-    /// Stop → route → transcribe → last text → inject → spool disposition.
+    /// Stop → route → transcribe → Mercury (opt-in) → last text → inject → spool disposition.
     /// Filter OSLog timing with:
     /// `log show --last 5m --predicate 'subsystem == "co.wispralt" AND category == "dictation"' --info`
     @MainActor func runDictation(_ s: DictationSession, targetPID: pid_t?, fnReleasedAt: Date) async {
@@ -83,7 +83,7 @@ extension MenuBarController {
             let stopMs = (clock.now - tStop).milliseconds
 
             let tNet = clock.now
-            let result: DictationResult
+            var result: DictationResult
             switch try s.route(local: out.local) {
             case .openAIFile(let provider): result = try await provider.finish(out.recording)
             case .local(let capture, let endpoint):
@@ -93,6 +93,8 @@ extension MenuBarController {
             let netMs = (clock.now - tNet).milliseconds
             let cut = TruncationCheck.isTruncated(outputTokens: result.outputTokens,
                                                   verifiedCap: s.snapshot.model?.maxOutputTokens)
+            result = await MercuryStep.apply(result)
+            recordingState.lastFormatting = result.formatting
 
             if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 outcome = .emptyText
@@ -109,7 +111,7 @@ extension MenuBarController {
             }
             Log.info(
                 "Dictation done: chars=\(result.text.count) model=\(result.modelUsed) mode=\(s.snapshot.mode.rawValue) " +
-                "saved=\(result.serverSaved) truncated=\(cut)",
+                "saved=\(result.serverSaved) truncated=\(cut) formatting=\(LastTranscriptCaption.formattingLabel(result.formatting))",
                 category: "dictation"
             )
 

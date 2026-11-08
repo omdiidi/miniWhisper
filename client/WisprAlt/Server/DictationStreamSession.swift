@@ -19,7 +19,7 @@ enum StreamingFailure: Error {
 /// `stop()` inside `LocalCapture`; spilled to the recorder's tap
 /// callback which calls `enqueueChunk(_:index:)` once per VAD-cut segment;
 /// finally drained by `DictationAPI.transcribe(capture:)` via
-/// `finalize(tail:smartFormat:)` which awaits all in-flight chunk POSTs and
+/// `finalize(tail:)` which awaits all in-flight chunk POSTs and
 /// then POSTs the trailing audio to the finalize endpoint.
 ///
 /// Concurrency notes
@@ -115,7 +115,7 @@ actor DictationStreamSession {
     /// joined transcribed text (+ the Part 4 `saved` flag). Any chunk failure
     /// cancels the remaining in-flight tasks and rethrows so the caller can
     /// fall back; a terminal `LocalDictationError` is rethrown as is.
-    func finalize(tail: Data, smartFormat: Bool) async throws -> LocalRequests.Response {
+    func finalize(tail: Data) async throws -> LocalRequests.Response {
         if let terminal { throw terminal }
         guard !aborted else { throw StreamingFailure.aborted }
         // Release consumed tasks on every exit path; the session is one-shot.
@@ -131,7 +131,7 @@ actor DictationStreamSession {
                 self.markAborted(cause: "chunk_failed")
                 throw error
             }
-            return try await self.postFinalize(tail: tail, smartFormat: smartFormat)
+            return try await self.postFinalize(tail: tail)
         }
     }
 
@@ -197,11 +197,11 @@ actor DictationStreamSession {
 
     // MARK: - Finalize POST
 
-    private func postFinalize(tail: Data, smartFormat: Bool) async throws -> LocalRequests.Response {
+    private func postFinalize(tail: Data) async throws -> LocalRequests.Response {
         if aborted { throw StreamingFailure.aborted }
         let request = LocalRequests.finalize(
             endpoint: endpoint, sessionId: sessionId, dedupId: clientDedupId, speechStartedAt: speechStartedAt,
-            tail: tail, smartFormat: smartFormat, clientVersion: ServerClient.clientVersion
+            tail: tail, clientVersion: ServerClient.clientVersion
         )
         let data = try await send(request, label: "finalize")
         let decoded: LocalRequests.Response
