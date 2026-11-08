@@ -126,7 +126,18 @@ def _bootstrap(ctx: Ctx) -> None:
 
 
 def _bootout(ctx: Ctx, label: str | None = None) -> None:
-    ctx.runner.run(["launchctl", "bootout", f"{domain()}/{label or ctx.paths.label}"], check=False)
+    """Boot the agent out and wait until launchd stops listing it.
+
+    ``launchctl bootout`` returns before the job is gone; a ``start`` in that window
+    sees it still loaded, kickstarts a dying job and leaves the service unloaded.
+    """
+    label = label or ctx.paths.label
+    ctx.runner.run(["launchctl", "bootout", f"{domain()}/{label}"], check=False)
+    for _ in range(max(1, int(STOP_TIMEOUT_S / _POLL_S))):
+        if not service(ctx, label).loaded:
+            return
+        ctx.deps.sleep(_POLL_S)
+    raise CliError(1, f"launchd still lists {label} {STOP_TIMEOUT_S:.0f} s after bootout")
 
 
 def wait_stopped(ctx: Ctx, timeout: float = STOP_TIMEOUT_S) -> None:

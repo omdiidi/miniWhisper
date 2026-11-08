@@ -120,7 +120,7 @@ def test_restart_changed_bytes_is_bootout_bootstrap(ctx: Ctx, runner: FakeRunner
     ctx.state.port = 8123
     runner.calls.clear()
     launchd.restart(ctx)
-    assert runner.verbs() == ["print", "print", "bootout", "bootstrap"]
+    assert runner.verbs() == ["print", "print", "bootout", "print", "bootstrap"]
     assert b"8123" in ctx.paths.plist.read_bytes()
 
 
@@ -144,6 +144,23 @@ def test_other_bootstrap_errors_do_not_retry(ctx: Ctx, runner: FakeRunner) -> No
     with pytest.raises(CliError):
         launchd.start(ctx)
     assert runner.verbs().count("bootstrap") == 1
+
+
+def test_start_after_stop_waits_for_launchd_to_drop_the_job(ctx: Ctx, runner: FakeRunner) -> None:
+    """bootout returns before the job is gone: start must bootstrap, not kickstart a dying job."""
+    launchd.start(ctx)
+    label = ctx.paths.label
+
+    def lingering(argv: list[str]) -> None:  # still listed for two more prints
+        runner.loaded.add(label)
+        runner.on("launchctl", "print", rc=0, out=f"\tstate = running\n", times=2)
+
+    runner.hook("launchctl", "bootout", fn=lingering)
+    launchd.stop(ctx)
+    runner.loaded.discard(label)
+    runner.calls.clear()
+    launchd.start(ctx)
+    assert "bootstrap" in runner.verbs() and "kickstart" not in runner.verbs()
 
 
 def test_stop_waits_for_the_server_lock(ctx: Ctx, runner: FakeRunner) -> None:
