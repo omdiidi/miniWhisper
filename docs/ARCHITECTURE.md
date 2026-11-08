@@ -491,7 +491,7 @@ Key invariants:
 - **Plaintext tokens exist only in `accounts/service.py`** and the one page or terminal that shows them. Logs carry ids only.
 - **First admin:** `wispralt setup --role host` creates it and hands over the key once (terminal or a new `--token-file`); `wispralt keys rotate-admin` replaces a lost admin key (`python -m wispralt.bootstrap` remains as a TTY-only shim over the same code). There is no env admin key and no break-glass path.
 - **`request.state.user`** is set for every authenticated request; the usage middleware reads it.
-- **Cookie fallback:** `require_api_key` falls back to the `wispralt_admin_token` cookie when no Bearer header is present (`/v1` never does). Set by `POST /admin/login` / `POST /me/login`; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`.
+- **Cookie fallback:** `require_api_key` falls back to the `wispralt_admin_token` cookie when no Bearer header is present (`/v1` never does). Set by `POST /admin/login` / `POST /me/login`; `HttpOnly`, `Secure`, `SameSite=Strict`, `max_age=8h`. `auth.cookie_secure(request)` drops `Secure` (session and CSRF cookies) only for plain http to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), so the setup URL `http://127.0.0.1:8000/admin` logs in on Safari; callers that pass no `request` stay Secure.
 
 #### `users` and `api_keys` (SQLite, `migrations/0001_initial.sql`)
 
@@ -579,6 +579,14 @@ Templates use the `.html.j2` extension. Jinja2's default autoescape list
 does **not** include this extension; `select_autoescape(enabled_extensions=("html.j2", "html", "j2"))`
 is set explicitly so user-supplied fields (label, notes, error_class)
 render escaped, closing the stored-XSS hole on the admin UI.
+
+Escaping does not protect a value inside an inline handler or an Alpine/HTMX
+expression (`onsubmit`, `x-data`, `@click`, `:class`, `hx-on`): the browser decodes
+`&#39;` back to `'` before evaluating it. So no template interpolates `{{ … }}` into
+such an attribute; values go in a `data-*` attribute and the expression reads
+`$el.dataset.*` / `this.dataset.*`. The routes also validate `range` with
+`timewindow.normalize_range` (unknown → the page default). `test_portal_render.py`
+fails on any template that breaks this rule.
 
 **Part 6 portal rules.** One stylesheet (`admin/static/portal.css`: CSS variables,
 light/dark via `prefers-color-scheme`, sidebar → top strip under 768 px, tables scroll
@@ -915,7 +923,8 @@ insights timezone (DB setting, else `INSIGHTS_TIMEZONE`, else the host zone from
    remain, so an invented ref, or another person's record (it was never in this
    person's prompt), can never survive. `quotable_line` is kept only when its text is an
    exact substring of the record it cites. The team pass receives the validated person
-   insights and its items may cite only refs those insights cite.
+   insights of the week (saved earlier or new in this run) and its items may cite only
+   refs those insights cite.
 4. **Render.** `sources.build_view` re-checks refs at view time
    (`JobStore.refs_exist(refs, viewer, is_admin)`): refs to deleted records, or to
    records the viewer may not open, are hidden, and an item left with none is hidden.
@@ -961,15 +970,23 @@ CREATE TABLE insight_runs(
 ```
 
 Progress is updated after every person; the portal polls it every 2 s. A run ends
-`done`; `failed` (`all_people_failed`, or a crash with its exception class); `aborted`
-(`budget` or `rate_limit`); or `skipped` (`ai_disabled`, `no_client`). Without `force`
-a week is restart-safe (people who already have a row are skipped, so nobody is paid
-for twice); `force` regenerates them.
+`done`; `failed` (`all_people_failed`, `team_openrouter_error` / `team_unusable` when
+the team call errors or is unusable twice, or a crash with its exception class);
+`aborted` (`budget` or `rate_limit`); or `skipped` (`ai_disabled`, `no_client`). A
+failed or aborted scheduled run is not `done`, so the scheduler retries it. Without
+`force` a week is restart-safe (people who already have a row are skipped, so nobody is
+paid for twice) but their saved insights still go into the team prompt; the team pass
+runs when the week has no team row, anyone new was analysed, or with `force`. `force`
+regenerates everyone.
 
 ### Cost control
 
 - The **30-day cap** is checked before **every** OpenRouter call (person and team),
-  against the 30-day spend at the start of the run plus this run's spend.
+  against the 30-day spend at the start of the run plus this run's spend **plus that
+  call's reserved worst case** (`cron.call_reserve_usd`: prompt tokens counted
+  generously, the larger of 1.35/word and 1 per 3 chars, plus a full `max_tokens`
+  reply, at the rate card via `client.worst_case_cost_usd`). A call that could cross
+  the cap is never made.
   `rolling_insights_cost_usd` takes the larger of the stored insights' cost and the
   runs' recorded spend (a forced rerun overwrites a row's cost; runs also count replies
   that were billed but unusable).

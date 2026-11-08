@@ -66,6 +66,12 @@ def input_rate_per_1k(model: str) -> float:
     return (INSIGHTS_PRICING_PER_1K.get(model) or INSIGHTS_PRICING_PER_1K["_default"])["input"]
 
 
+def worst_case_cost_usd(model: str, input_tokens: int, max_output_tokens: int) -> float:
+    """Upper-bound USD for one call: ``input_tokens`` plus a reply of ``max_output_tokens``
+    at the model's rate card. The cron reserves this before every call."""
+    return _estimate_cost_from_tokens(model, input_tokens, max_output_tokens)
+
+
 def _estimate_cost_from_tokens(
     model: str, input_tokens: int, output_tokens: int
 ) -> float:

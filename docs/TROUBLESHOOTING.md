@@ -535,12 +535,12 @@ Then reopen WisprAlt and grant all three permissions. This happens at most once 
 
 **Symptom:** Hitting `/admin/login` in a browser shows a "Not Secure" warning, or the login form posts but the cookie never appears in DevTools → Application → Cookies.
 
-**Diagnosis:** The session cookie is set with `secure=True`, which means browsers refuse to attach it unless the connection is HTTPS. If you're hitting `http://` (e.g. `http://localhost:8000/admin/login` for local dev), the cookie is silently dropped.
+**Diagnosis:** The session and CSRF cookies are `Secure`, so browsers drop them on plain `http://` to a non-loopback host (a LAN IP, or a hostname other than `localhost`). Plain http to a loopback host (`http://127.0.0.1:8000/admin`, `http://localhost:8000/admin`) gets cookies without `Secure` and works.
 
 **Fix:**
 
-- In production, the Cloudflare Tunnel (`https://transcribe.<your-domain>`) terminates HTTPS for you; the cookie works as long as you use the public URL, not `127.0.0.1`.
-- For local development against an HTTP-only server: edit `routes/admin_ui.py:login_submit` and temporarily set `secure=False`, or use the `Authorization: Bearer ...` header path (curl/Postman) instead of the cookie.
+- Use the public HTTPS URL (the Cloudflare Tunnel), or `http://127.0.0.1:8000/admin` on the host itself.
+- For scripts, use the `Authorization: Bearer ...` header instead of the cookie.
 
 ---
 
@@ -593,9 +593,10 @@ malformed`) means the index drifted: rebuild it with
 
   | Status / error | Meaning | What to do |
   |---|---|---|
-  | `aborted` · `budget` | The 30-day spending cap was reached (checked before every call). | Wait for older spend to age out, or raise the cap in Settings. |
+  | `aborted` · `budget` | The next call's worst-case cost (prompt + a full reply at the rate card) would cross the 30-day cap (checked before every call). | Wait for older spend to age out, or raise the cap in Settings. |
   | `aborted` · `rate_limit` | OpenRouter returned 429. | The scheduler retries after 6 hours; or start the week again later. |
   | `failed` · `all_people_failed` | Every person's reply was unusable or errored. | See the failures column (`openrouter_error`, `json_decode`, `schema`); check the model id in Settings. |
+  | `failed` · `team_openrouter_error` / `team_unusable` | People were analysed but the team summary call errored, or its reply was unusable twice. | The scheduler retries after 6 hours (or start the week again); saved people are not paid for twice. |
   | `failed` · `<ExceptionName>` | The run crashed. | Check `wispralt.log` around the start time (logs hold ids and classes, never text). |
   | `skipped` · `ai_disabled` / `no_client` | AI is off, or no key. | See above. |
 

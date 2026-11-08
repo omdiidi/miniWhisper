@@ -58,7 +58,7 @@ async def _page(request: Request, *, error: str | None = None, status_code: int 
         {"request": request, "invites": invites, "csrf_token": csrf, "error": error},
         status_code=status_code,
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 

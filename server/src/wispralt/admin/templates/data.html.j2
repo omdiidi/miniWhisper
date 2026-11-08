@@ -5,9 +5,9 @@
   <div class="page-head">
     <h1>Data · ISO {{ iso_year }}-W{{ "%02d" | format(iso_week) }}{% if target_user %} · {{ target_user.label }}{% endif %}</h1>
   </div>
-  <nav x-data="{ active: '{{ range }}' }" @range-changed.window="active = $event.detail" class="tabs" aria-label="Time range">
+  <nav data-active="{{ range }}" x-data="{ active: $el.dataset.active }" @range-changed.window="active = $event.detail" class="tabs" aria-label="Time range">
     {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
-      <button :class="active === '{{ r }}' ? 'active' : ''" @click="active = '{{ r }}'"
+      <button data-range="{{ r }}" :class="active === $el.dataset.range ? 'active' : ''" @click="active = $el.dataset.range"
               hx-get="/admin/data?range={{ r }}{% if user_id %}&user_id={{ user_id }}{% endif %}"
               hx-target="#insights-body" hx-swap="innerHTML" hx-push-url="true">{{ TAB_LABELS[r] }}</button>
     {% endfor %}

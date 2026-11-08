@@ -85,7 +85,9 @@ request (no cache).
    accepted** — the server routes by role.
 3. The server validates the token (`auth.resolve_token`, the same lookup), then
    sets a `wispralt_admin_token` cookie with `HttpOnly`, `Secure`,
-   `SameSite=Strict`, `max_age=8h`.
+   `SameSite=Strict`, `max_age=8h`. On plain `http://` to a loopback host
+   (`http://127.0.0.1:8000/admin` during setup) the session and CSRF cookies are sent
+   without `Secure` (Safari drops Secure cookies there); every other request keeps it.
 4. **Role-based redirect on success:**
    - `role='admin'` → 303 to `/admin/` (full overview dashboard).
    - `role='employee'` → 303 to `/admin/me` (the employee's own person page,
@@ -197,9 +199,11 @@ weeks, optionally **Regenerate existing**, and click **Estimate cost**. The esti
 (words that would be sent × 1.35 tokens/word × the model's input rate, plus your
 30-day spend against the cap) appears with a **Start** button; nothing is sent until
 you press it. Progress (people done / total) updates every 2 seconds while a run is
-going. Each run ends as `done`, `failed`, `aborted` (`budget`: the 30-day cap was
-reached, checked before every call; `rate_limit`: OpenRouter returned 429) or
-`skipped` (AI off). Failures list only the person id and an error class.
+going. Each run ends as `done`, `failed` (every person failed, the team summary
+failed, or a crash), `aborted` (`budget`: the next call's worst-case cost would cross
+the 30-day cap, checked before every call; `rate_limit`: OpenRouter returned 429) or
+`skipped` (AI off). Running a week again (without Regenerate) skips people who already
+have an insight but still builds the team summary from all of them. Failures list only the person id and an error class.
 
 The scheduler checks once an hour and runs the **last full week** when it has no
 finished scheduled run (a failed attempt is retried after 6 hours). Older weeks are
@@ -337,7 +341,7 @@ request.
 
 ### Revoking an integration key
 
-`POST /admin/integrations/{id}/revoke` disables the key's user (`users.disabled_at`).
+`POST /admin/integrations/{id}/revoke` disables the key's user (`users.disabled_at`). Both integration routes only act on integration-kind users: a person or admin id is a 404 (yourself a 400); people are disabled or rotated from their own page.
 Its next `/v1` request returns **401**.
 
 ### What integration keys can / can't access

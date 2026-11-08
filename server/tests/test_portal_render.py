@@ -117,3 +117,115 @@ def test_stylesheet_is_served(client: TestClient) -> None:
 def test_no_inline_style_blocks_in_templates() -> None:
     offenders = [p.name for p in _TEMPLATES.glob("*.j2") if re.search(r"<style\b", p.read_text())]
     assert offenders == []
+
+
+# ── XSS regressions: request/user data never reaches a JS/Alpine expression ──────
+
+_HOSTILE_RANGE = "7d' + alert(document.domain) + '"
+# Attributes whose value the browser (inline handlers) or Alpine/HTMX evaluates as code.
+_JS_ATTR = re.compile(
+    r"""(?<![\w-])(on[a-z]+|hx-on[\w:.-]*|x-[\w:.-]+|@[\w:.-]+|:[\w.-]+)\s*=\s*("[^"]*"|'[^']*')""",
+)
+
+
+@pytest.mark.parametrize(
+    ("page", "default"),
+    [("/me/insights", "7d"), ("/me/history", "30d"), ("/admin/data", "7d"), ("/admin/records", "30d")],
+)
+def test_hostile_range_is_rejected_and_never_rendered(
+    client: TestClient, people, page: str, default: str,
+) -> None:
+    (_admin, token), _ = people
+    resp = client.get(page, params={"range": _HOSTILE_RANGE}, headers=_auth(token))
+    assert resp.status_code == 200, resp.text[:300]
+    assert "alert(" not in resp.text
+    if 'class="tabs"' in resp.text:
+        assert f'data-active="{default}"' in resp.text
+
+
+def test_hostile_label_stays_out_of_confirm_handlers(client: TestClient, make_user) -> None:
+    _admin, token = make_user(role="admin", label="root")
+    evil, _ = make_user(label="x'); alert(1); ('")
+    resp = client.get(f"/admin/people/{evil.id}", headers=_auth(token))
+    assert resp.status_code == 200, resp.text[:300]
+    handlers = [m.group(2) for m in _JS_ATTR.finditer(resp.text)]
+    assert handlers and not any("alert" in h for h in handlers)
+    assert "data-confirm=\"Disable x&#39;); alert(1); (&#39;?" in resp.text
+
+
+def test_no_template_interpolates_into_a_js_attribute() -> None:
+    offenders = [
+        f"{p.name}: {m.group(0)[:80]}"
+        for p in _TEMPLATES.glob("*.j2")
+        for m in _JS_ATTR.finditer(p.read_text())
+        if "{{" in m.group(2) or "{%" in m.group(2)
+    ]
+    assert offenders == []
+
+
+def test_settings_page_points_at_the_real_env_file_when_the_key_is_missing(
+    client: TestClient, people, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wispralt.config import settings
+
+    monkeypatch.setattr(settings, "openrouter_api_key", None)
+    (_admin, token), _ = people
+    html = client.get("/admin/settings", headers=_auth(token)).text
+    assert "~/.config/wispralt/.env" in html and "wispralt restart" in html
+    assert "server/.env" not in html and "the CLI does this" not in html
+
+
+# ── Secure cookies vs plain-http loopback (setup opens http://127.0.0.1:8000/admin) ──
+
+
+def _cookie_headers(resp, name: str) -> list[str]:  # noqa: ANN001
+    """The ``name`` cookies being SET (not the legacy-path deletions, which expire them)."""
+    return [h for h in resp.headers.get_list("set-cookie")
+            if h.startswith(f"{name}=") and "max-age=0" not in h.lower()]
+
+
+@pytest.mark.parametrize(
+    ("base_url", "secure"),
+    [
+        ("http://127.0.0.1:8000", False),
+        ("http://localhost:8000", False),
+        ("https://127.0.0.1:8000", True),
+        ("http://wispralt.example.com", True),
+        ("https://wispralt.example.com", True),
+    ],
+)
+def test_portal_cookies_drop_secure_only_on_plain_http_loopback(
+    wire: Wire, make_user, base_url: str, secure: bool,
+) -> None:
+    from wispralt.auth import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME
+
+    _admin, token = make_user(role="admin", label="root")
+    c = TestClient(wire(create_app()), base_url=base_url)
+    form = c.get("/admin/login")
+    [csrf_cookie] = _cookie_headers(form, CSRF_COOKIE_NAME)
+    assert ("secure" in csrf_cookie.lower()) is secure, csrf_cookie
+    if base_url.startswith("http://") and secure:
+        return  # a Secure cookie is (correctly) not sent back over plain http
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', form.text).group(1)
+    resp = c.post("/admin/login", data={"token": token, "csrf_token": csrf},
+                  follow_redirects=False)
+    assert resp.status_code == 303, resp.text[:300]
+    [session_cookie] = _cookie_headers(resp, SESSION_COOKIE_NAME)
+    assert ("secure" in session_cookie.lower()) is secure, session_cookie
+    assert "httponly" in session_cookie.lower() and "samesite=strict" in session_cookie.lower()
+
+
+@pytest.mark.parametrize(
+    ("scheme", "host", "secure"),
+    [("http", "[::1]:8000", False), ("http", "127.0.0.2", False), ("https", "[::1]", True),
+     ("http", "10.0.0.5:8000", True), ("http", "localhost.evil.example", True)],
+)
+def test_cookie_secure_by_scheme_and_host(scheme: str, host: str, secure: bool) -> None:
+    from starlette.requests import Request
+
+    from wispralt.auth import cookie_secure
+
+    req = Request({"type": "http", "scheme": scheme, "path": "/", "query_string": b"",
+                   "headers": [(b"host", host.encode())]})
+    assert cookie_secure(req) is secure
+    assert cookie_secure(None) is True

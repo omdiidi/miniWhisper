@@ -17,7 +17,7 @@
       <label class="check"><input type="checkbox" name="acknowledge" value="1"> I have read the disclosure and accept it for this team.</label>
     {% endif %}
     <label class="check"><input type="checkbox" name="enabled" value="1" {% if cfg.enabled %}checked{% endif %}> Turn AI interpretation on</label>
-    <p class="hint">OpenRouter key: {% if key_configured %}{{ ui.badge("configured", "ok") }}{% else %}{{ ui.badge("not set", "warn") }} set <code>OPENROUTER_API_KEY</code> in <code>server/.env</code> (the CLI does this) and restart.{% endif %}</p>
+    <p class="hint">OpenRouter key: {% if key_configured %}{{ ui.badge("configured", "ok") }}{% else %}{{ ui.badge("not set", "warn") }} add <code>OPENROUTER_API_KEY=…</code> to <code>~/.config/wispralt/.env</code> on the host, then run <code>wispralt restart</code>.{% endif %}</p>
 
     <label for="model">Model</label>
     <input id="model" name="model" type="text" maxlength="100" value="{{ cfg.model }}">

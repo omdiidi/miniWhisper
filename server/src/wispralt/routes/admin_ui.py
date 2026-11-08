@@ -79,7 +79,7 @@ def _form_page(
     response = templates.TemplateResponse(
         template, {"request": request, "csrf_token": csrf, **ctx}, status_code=status_code
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -107,7 +107,7 @@ async def login_form(request: Request) -> HTMLResponse:
         "login.html.j2",
         {"request": request, "csrf_token": csrf},
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -121,7 +121,7 @@ def _render_admin_login_error(
         {"request": request, "error": error, "csrf_token": csrf},
         status_code=status_code,
     )
-    set_csrf_cookie(response, csrf)
+    set_csrf_cookie(response, csrf, request)
     return response
 
 
@@ -153,7 +153,7 @@ async def login_submit(
     resp = RedirectResponse(target, status_code=303)
     # Shared helper clears the legacy /admin/login-scoped cookie and sets the
     # unified path="/" session cookie so it scopes across /admin/* AND /me/*.
-    set_session_cookie(resp, token)
+    set_session_cookie(resp, token, request)
     return resp
 
 
@@ -219,7 +219,7 @@ async def setup_submit(
          "server_url": settings.server_url},
         headers=NO_STORE,
     )
-    set_session_cookie(response, plaintext)
+    set_session_cookie(response, plaintext, request)
     return response
 
 
@@ -541,11 +541,22 @@ async def integrations_add_submit(
     )
 
 
+async def _require_integration(request: Request, user_id: int) -> None:
+    """404 unless ``user_id`` is an integration-kind user: the integration routes must not
+    disable or rotate a person (or an admin) — people have their own guarded routes."""
+    target = await asyncio.to_thread(_accounts(request).get_user, user_id)
+    if target is None or target.kind != "integration":
+        raise HTTPException(status_code=404, detail="Integration not found")
+
+
 @authed_router.post("/integrations/{user_id}/revoke")
 async def integrations_revoke(
-    request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
+    request: Request, user_id: int, admin: User = Depends(require_admin_csrf)
 ) -> RedirectResponse:
     """Revoke an integration (disables its user; applies to the next request)."""
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="You cannot disable yourself")
+    await _require_integration(request, user_id)
     await asyncio.to_thread(_accounts(request).disable_user, user_id)
     return RedirectResponse("/admin/integrations", status_code=303)
 
@@ -555,6 +566,7 @@ async def integrations_rotate(
     request: Request, user_id: int, _admin: User = Depends(require_admin_csrf)
 ) -> HTMLResponse:
     """Rotate an integration key in place; show the new key once."""
+    await _require_integration(request, user_id)
     new_plaintext = await _rotate_or_404(request, user_id)
     profile = await asyncio.to_thread(_accounts(request).profile, user_id)
     return templates.TemplateResponse(

@@ -7,7 +7,8 @@ it at ``/admin/settings`` after acknowledging the disclosure
 other keys: ``insights_model`` (default ``config.insights_model``),
 ``insights_cap_30d_usd`` (default 8), ``insights_timezone`` (default
 ``config.insights_timezone``, else the host zone, else UTC). The OpenRouter key is
-never stored here: it comes only from ``server/.env``.
+never stored here: it comes only from the environment (the host service reads
+``~/.config/wispralt/.env``).
 
 Readers fail closed: no store, or a DB error, means AI off.
 """
