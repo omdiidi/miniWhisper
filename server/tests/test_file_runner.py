@@ -662,3 +662,60 @@ async def test_source_error_with_db_error_keeps_source(
     jid2 = store.create(src, user_id=owner)
     await _runner(store)._run_source(jid2, src)
     assert store.get(jid2).status == "failed" and not src.exists()
+
+
+# (h) ffmpeg stderr is drained -------------------------------------------------
+
+
+def test_transcode_drains_a_flood_of_ffmpeg_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """More stderr than a pipe holds must not stall the decode (it used to block)."""
+    import os
+    import stat
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "head -c 1000000 /dev/zero | tr '\\0' 'x' >&2\n"  # ~1 MB, far past 64 KB
+        'for last; do :; done\n'
+        'head -c 200 /dev/zero > "$last"\n'
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    src = tmp_path / "in.m4a"
+    src.write_bytes(b"not really audio")
+
+    started = time.monotonic()
+    out = staging.transcode_to_canonical_wav(
+        src, target_channels=1,
+        cancel_cb=lambda: time.monotonic() - started > 20,  # a stall fails, never hangs
+    )
+    assert out.exists() and out.stat().st_size == 200
+
+
+def test_transcode_failure_reports_the_stderr_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import stat
+
+    from fastapi import HTTPException
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' 'x' >&2\n"
+        "echo >&2\necho 'Invalid data found when processing input' >&2\nexit 1\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    src = tmp_path / "in.m4a"
+    src.write_bytes(b"junk")
+    with pytest.raises(HTTPException) as exc:
+        staging.transcode_to_canonical_wav(src, target_channels=1)
+    assert exc.value.status_code == 422
+    assert "Invalid data found" in exc.value.detail
