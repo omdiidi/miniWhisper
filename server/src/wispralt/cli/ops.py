@@ -12,12 +12,13 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import shutil
 import sqlite3
 import stat
 import sys
-from contextlib import closing, contextmanager
-from dataclasses import asdict
+from contextlib import closing, contextmanager, suppress
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -377,23 +378,47 @@ _OFFLINE_ERRORS = (ServerRunning, BackupRefused, RestoreRefused, InsufficientSpa
 
 
 @contextmanager
-def service_stopped(ctx: Ctx) -> Iterator[None]:
-    """Stop the service (proven by ``server_lock``) and start it again afterwards if it ran."""
-    was_loaded = launchd.service(ctx).loaded
-    if was_loaded:
-        launchd.stop(ctx)
+def service_stopped(
+    ctx: Ctx, failed: str, *, active: bool = True, restart: bool = True
+) -> Iterator[bool]:
+    """Stop the service (proven by ``server_lock``) around the body; yields whether it ran.
+
+    The loaded check comes first and the stop itself sits inside the guard, so a
+    stop that boots the agent out and then times out on the data lock still brings
+    it back. Any failure restarts a service that was loaded and turns an expected
+    error into ``CliError(1)`` starting with *failed*. On success it is restarted
+    only when *restart* (``update`` leaves that to phase 2). ``active=False`` skips
+    the service entirely (a client-only install) but keeps the error handling.
+    """
+    was_loaded = active and launchd.service(ctx).loaded
     try:
-        yield
-    except _OFFLINE_ERRORS as exc:
-        raise CliError(1, f"{type(exc).__name__}: {exc}") from exc
-    finally:
-        if was_loaded:
+        if active:
+            launchd.stop(ctx)
+        yield was_loaded
+    except BaseException as exc:
+        _stopped_failed(ctx, exc, failed=failed, restart=was_loaded)
+        raise
+    if was_loaded and restart:
+        launchd.start(ctx)
+        if not launchd.wait_healthy(ctx):
+            print(
+                f"warning: the service restarted but {ctx.url}/healthz is not answering",
+                file=sys.stderr,
+            )
+
+
+def _stopped_failed(ctx: Ctx, exc: BaseException, *, failed: str, restart: bool) -> None:
+    """Restart the stopped service after a failure; expected errors become a CliError."""
+    if isinstance(exc, CliError):
+        why = exc.msg
+    elif isinstance(exc, (*_OFFLINE_ERRORS, sqlite3.Error, OSError)):
+        why = f"{type(exc).__name__}: {exc}"
+    else:  # KeyboardInterrupt, a bug: restart, then let the original propagate unchanged
+        if restart:
             launchd.start(ctx)
-            if not launchd.wait_healthy(ctx):
-                print(
-                    f"warning: the service restarted but {ctx.url}/healthz is not answering",
-                    file=sys.stderr,
-                )
+        return
+    note = f"\n{_start_after_failure(ctx)}" if restart else ""
+    raise CliError(1, f"{failed}: {why}{note}") from exc
 
 
 def new_backup_dest(ctx: Ctx) -> Path:
@@ -403,7 +428,7 @@ def new_backup_dest(ctx: Ctx) -> Path:
 
 def run_backup(ctx: Ctx, dest: Path) -> Path:
     """Offline backup with the service stopped; returns the backup dir."""
-    with service_stopped(ctx):
+    with service_stopped(ctx, "backup failed"):
         return offline.backup(ctx.paths.data_dir, dest)
 
 
@@ -461,7 +486,7 @@ def cmd_restore(ctx: Ctx, args: argparse.Namespace) -> int:
     if not ctx.confirm("Stop the service and restore this backup?"):
         print("nothing changed")
         return 0
-    with service_stopped(ctx):
+    with service_stopped(ctx, "restore failed"):
         aside = offline.restore(src, ctx.paths.data_dir)
     print(f"restored {src}")
     if aside is not None:
@@ -487,22 +512,15 @@ def cmd_update(ctx: Ctx, args: argparse.Namespace) -> int:
         r.run(["git", "-C", str(source), "pull", "--ff-only"])
     is_host = state.role in {"host", "both"}
     backup_path: Path | None = None
-    # Read before stopping: a stop that boots the agent out and then times out on the
-    # data lock must still bring it back, so the stop itself sits inside the guard.
-    was_loaded = is_host and launchd.service(ctx).loaded
-    try:
-        if is_host:
-            launchd.stop(ctx)
+    # Whatever fails here (the stop timing out, a refused backup, disk full during
+    # VACUUM INTO, a failed install, Ctrl-C), the old code is still in place:
+    # service_stopped brings the service back. On success phase 2 restarts it.
+    failed = "update failed before the reinstall finished"
+    with service_stopped(ctx, failed, active=is_host, restart=False) as was_loaded:
         if is_host and not args.no_backup:
             backup_path = offline.backup(ctx.paths.data_dir, new_backup_dest(ctx))
             print(f"backup written: {backup_path}")
         reinstall_cli(ctx, source, extra=is_host, reinstall=True)
-    except BaseException as exc:
-        # Whatever failed (the stop timing out, a refused backup, disk full during
-        # VACUUM INTO, a failed install, Ctrl-C), the old code is still in place:
-        # bring the service back.
-        _phase1_failed(ctx, exc, restart=was_loaded)
-        raise
     extra = ["--_backup", str(backup_path)] if backup_path else []
     try:
         # A missing or broken new install fails here, while this process can still
@@ -518,20 +536,6 @@ def cmd_update(ctx: Ctx, args: argparse.Namespace) -> int:
             f"the newly installed wispralt cannot run ({why}); rerun ./install.sh{note}{hint}",
         ) from exc
     return 0  # only reached when execv is faked
-
-
-def _phase1_failed(ctx: Ctx, exc: BaseException, *, restart: bool) -> None:
-    """Restart the stopped service after a phase-1 failure; expected errors become a CliError."""
-    if isinstance(exc, CliError):
-        why = exc.msg
-    elif isinstance(exc, (*_OFFLINE_ERRORS, sqlite3.Error, OSError)):
-        why = f"{type(exc).__name__}: {exc}"
-    else:  # KeyboardInterrupt, a bug: restart, then let the original propagate unchanged
-        if restart:
-            launchd.start(ctx)
-        return
-    note = f"\n{_start_after_failure(ctx)}" if restart else ""
-    raise CliError(1, f"update failed before the reinstall finished: {why}{note}") from exc
 
 
 def _start_after_failure(ctx: Ctx) -> str:
@@ -607,6 +611,67 @@ def _delete(path: Path) -> None:
 _OWNED_FILES = tuple(offline.DB_NAME + s for s in ("", "-wal", "-shm", "-journal")) + (SETUP_CODE,)
 _OWNED_TREES = ("outputs", "staging")
 
+# Inside outputs/ and staging/ purge deletes only the names WisprAlt writes; anything
+# else is kept and listed (setup cannot prove those trees hold nothing else).
+_JOB_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"  # jobs/store.py
+_UPLOAD_ID = r"[A-Za-z0-9_-]{22}"  # routes/transcribe_file.py: token_urlsafe(16)
+_TRANSCRIPT_EXTS = (".json", ".srt", ".txt", ".vtt")  # files/output.py, importer/files.py
+_AUDIO_EXTS = (  # ops/staging.py _ALLOWED_EXTENSIONS
+    ".aac", ".aiff", ".caf", ".flac", ".m4a", ".m4v", ".mov",
+    ".mp3", ".mp4", ".ogg", ".opus", ".wav", ".webm",
+)  # fmt: skip
+
+
+def _alt(exts: tuple[str, ...]) -> str:
+    return "(?:" + "|".join(map(re.escape, exts)) + ")"
+
+
+@dataclass(frozen=True)
+class _Tree:
+    """The file names WisprAlt writes in one directory, and its subdirs by name."""
+
+    files: re.Pattern[str]
+    dirs: tuple[tuple[re.Pattern[str], _Tree], ...] = ()
+
+
+# outputs/: <job>.<fmt> (output.py, importer), .import-<job>.<fmt>.part (importer),
+# tmpXXXXXXXX.tmp (output.py's atomic write).
+_OUTPUTS = _Tree(
+    re.compile(
+        rf"{_JOB_ID}{_alt(_TRANSCRIPT_EXTS)}"
+        rf"|\.import-{_JOB_ID}{_alt(_TRANSCRIPT_EXTS)}\.part"
+        r"|tmp[a-z0-9_]{8}\.tmp"
+    )
+)
+# staging/: <uuid>.wav, <uuid hex><ext>, <upload id><ext> and their transcode targets
+# (<stem>.wav, <stem>_canonical.wav, each also as .partial); chunked/<upload id>/
+# holds meta.json and chunk-NNNN.part(.tmp).
+_CHUNKS = _Tree(re.compile(r"meta\.json|chunk-\d{4,}\.part(?:\.tmp)?"))
+_STAGING = _Tree(
+    re.compile(
+        rf"(?:{_JOB_ID}|[0-9a-f]{{32}}|{_UPLOAD_ID})(?:_canonical)?"
+        rf"{_alt(_AUDIO_EXTS)}(?:\.partial)?"
+    ),
+    ((re.compile("chunked"), _Tree(re.compile(r"(?!)"), ((re.compile(_UPLOAD_ID), _CHUNKS),))),),
+)
+_TREE_SPECS = {"outputs": _OUTPUTS, "staging": _STAGING}
+
+
+def _sweep(d: Path, tree: _Tree, kept: list[Path]) -> None:
+    """Unlink the files in *d* that *tree* names, recurse into its named subdirs, and
+    remove *d* if that empties it. Everything else (symlinks included) goes to *kept*."""
+    for entry in sorted(d.iterdir()):
+        real_dir = entry.is_dir() and not entry.is_symlink()
+        sub = next((t for pat, t in tree.dirs if pat.fullmatch(entry.name)), None)
+        if real_dir and sub is not None:
+            _sweep(entry, sub, kept)
+        elif entry.is_file() and not entry.is_symlink() and tree.files.fullmatch(entry.name):
+            entry.unlink()
+        else:
+            kept.append(entry)
+    with suppress(OSError):  # not empty: something was kept in it
+        d.rmdir()
+
 
 def _owned(data: Path) -> list[Path]:
     names = (*_OWNED_FILES, *_OWNED_TREES)
@@ -634,10 +699,25 @@ def _purge_backup(ctx: Ctx) -> Path | None:
 
 
 def _purge_data(ctx: Ctx) -> str:
-    """Delete WisprAlt's own files in the data dir; the dir itself only if then empty."""
+    """Delete WisprAlt's own files in the data dir; the dir itself only if then empty.
+
+    Files that WisprAlt did not write are kept and listed, even inside ``outputs/``
+    and ``staging/``.
+    """
     data = ctx.paths.data_dir
-    for path in _owned(data):
-        _delete(path)
+    kept: list[Path] = []
+    for name in _OWNED_FILES:
+        _delete(data / name)
+    for name, spec in _TREE_SPECS.items():
+        tree = data / name
+        if tree.is_dir() and not tree.is_symlink():
+            _sweep(tree, spec, kept)
+        elif tree.exists() or tree.is_symlink():
+            kept.append(tree)
+    if kept:
+        print(f"kept {len(kept)} item(s) WisprAlt did not write:")
+        for path in kept:
+            print(f"  {path}")
     try:
         data.rmdir()
     except FileNotFoundError:

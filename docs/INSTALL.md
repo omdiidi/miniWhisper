@@ -186,9 +186,10 @@ stay.
   `staging/`, `setup-code`) and `.env`, after taking a backup (skip it with
   `--no-backup`; with no database it copies the files to
   `wispralt-<ts>-files`). Other files in the data directory are kept, and the
-  directory goes only if it is then empty. `outputs/` and `staging/` are
-  deleted whole: setup never adopts a folder that already holds other files
-  without a `wispralt.db`, so those subfolders are always WisprAlt's. It refuses when there is no
+  directory goes only if it is then empty. Inside `outputs/` and `staging/` it
+  deletes only the files WisprAlt writes there (transcripts and audio named by
+  job or upload id, and its upload chunks); anything else is kept, listed in the
+  output, and keeps its folder. It refuses when there is no
   `install-state.json` or when the backup directory is inside the data
   directory.
 - `--client` moves the app to the Trash. It never deletes your transcripts

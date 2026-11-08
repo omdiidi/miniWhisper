@@ -11,6 +11,7 @@ from wispralt.accounts import service
 from wispralt.accounts.store import AccountStore
 from wispralt.cli import host, launchd, ops
 from wispralt.database import Database
+from wispralt.ops.backup import server_lock
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,6 +57,23 @@ def test_backup_failure_still_restarts_and_exits_1(
     code, _, err = cli("backup")
     assert code == 1 and "InsufficientSpace" in err
     assert runner.verbs().count("bootstrap") == 1
+
+
+@pytest.mark.parametrize("cmd", [("backup",), ("restore", "BK", "--yes")])
+def test_stop_timeout_rebootstraps_the_agent(
+    running: Ctx, cli: CliFn, runner: FakeRunner, tmp_path: Path, cmd: tuple[str, ...]
+) -> None:
+    """R4 fix: the bootout happened, then the lock wait timed out: the agent comes back."""
+    bk = tmp_path / "bk"
+    assert cli("backup", "--dest", str(bk))[0] == 0
+    runner.calls.clear()
+    argv = [str(bk) if a == "BK" else a for a in cmd]
+    with server_lock(running.paths.data_dir):  # the "old server" never lets go
+        code, _, err = cli(*argv)
+    assert code == 1 and "still holds" in err and "restarted" in err
+    verbs = runner.verbs()
+    assert "bootout" in verbs and verbs[-1] == "bootstrap"
+    assert ops.list_backups(running) == [] and ops.pre_restore_dirs(running) == []
 
 
 def test_not_running_is_not_started(ctx: Ctx, cli: CliFn, runner: FakeRunner) -> None:

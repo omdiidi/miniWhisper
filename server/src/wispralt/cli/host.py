@@ -600,9 +600,10 @@ def _retention(ctx: Ctx, state: InstallState, flag: int | None, jobs: JobStore) 
 def check_data_dir(data_dir: Path) -> None:
     """Refuse a data dir that already holds other things and no ``wispralt.db``.
 
-    So everything in a data dir is WisprAlt's: ``uninstall --purge-data`` may then
-    delete its ``outputs/`` and ``staging/`` whole. A missing or empty dir (Finder's
-    ``.DS_Store`` aside) is fine; so is an existing install's dir.
+    A missing or empty dir (Finder's ``.DS_Store`` aside) is fine; so is any dir
+    holding a ``wispralt.db``, which proves nothing about its other files: that is
+    why ``uninstall --purge-data`` deletes only the names WisprAlt writes, even
+    inside ``outputs/`` and ``staging/``.
     """
     if (data_dir / DB_NAME).exists() or not data_dir.is_dir():
         return
