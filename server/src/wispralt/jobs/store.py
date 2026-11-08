@@ -69,6 +69,62 @@ class Job:
     deleted_at: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class HistoryHit:
+    """One full-text hit. ``snippet`` is RAW text with matches wrapped in ``\\x02…\\x03``:
+    render it only through ``web.templates_env.highlight`` (escape, then ``<mark>``)."""
+
+    kind: str  # dictation | file
+    row_id: str
+    user_id: int
+    created_at: float
+    word_count: int | None
+    snippet: str
+    user_label: str | None = None  # team search only
+
+
+_FTS_MAX_CHARS = 200
+_FTS_MAX_TOKENS = 12
+_FAR_FUTURE = 1e12
+
+
+def fts_query(q: str | None) -> str | None:
+    """User input → a safe FTS5 MATCH expression, or None (no search).
+
+    Never passes input through raw: whitespace tokens, each double-quoted (``"`` → ``""``),
+    implicitly ANDed, the last one a prefix match. Tokens with no letter or digit are dropped
+    (an empty phrase matches nothing useful). Capped at 200 chars and 12 tokens.
+    """
+    if not q:
+        return None
+    tokens = [t for t in q[:_FTS_MAX_CHARS].split() if any(c.isalnum() for c in t)]
+    tokens = tokens[:_FTS_MAX_TOKENS]
+    if not tokens:
+        return None
+    quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
+    quoted[-1] += "*"
+    return " ".join(quoted)
+
+
+# One leg per source table. {who} selects the owner label (team) or NULL; {scope} binds
+# the owner. Both legs always join the source row, so deleted rows never surface.
+_SEARCH_DICTATIONS = (
+    "SELECT 'dictation' AS kind, CAST(d.id AS TEXT) AS row_id, d.user_id AS user_id,"
+    " d.created_at AS created_at, d.word_count AS word_count, snippet(dictations_fts, 0, char(2), char(3), '…', 12) AS snippet, {who}"
+    " FROM dictations_fts JOIN dictations d ON d.id = dictations_fts.rowid {join}"
+    " WHERE dictations_fts MATCH :m AND d.deleted_at IS NULL"
+    " AND d.created_at >= :s AND d.created_at < :u {scope}"
+)
+_SEARCH_JOBS = (
+    "SELECT 'file' AS kind, j.id AS row_id, j.user_id AS user_id, j.created_at AS created_at,"
+    " j.word_count AS word_count,"
+    " snippet(jobs_fts, 0, char(2), char(3), '…', 12) AS snippet, {who}"
+    " FROM jobs_fts JOIN jobs j ON j.id = jobs_fts.job_id {join}"
+    " WHERE jobs_fts MATCH :m AND j.deleted_at IS NULL AND j.transcript_text IS NOT NULL"
+    " AND j.created_at >= :s AND j.created_at < :u {scope}"
+)
+
+
 def _word_count(text: str | None) -> int | None:
     return len(text.split()) if text else None
 
@@ -652,6 +708,91 @@ class JobStore:
             return (rows[-1]["created_at"], rows[-1]["row_id"]) if len(rows) == limit else None
 
         return merged, _next(dict_rows), _next(job_rows)
+
+    # ── full-text history search (FTS5, migration 0002) ──────────────────────
+
+    def _search(
+        self,
+        match: str,
+        *,
+        owner_id: int | None,
+        team: bool,
+        since: float | None,
+        until: float | None,
+        kind: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[HistoryHit]:
+        legs = []
+        for leg_kind, template, alias in (
+            ("dictation", _SEARCH_DICTATIONS, "d"),
+            ("file", _SEARCH_JOBS, "j"),
+        ):
+            if kind in (None, leg_kind):
+                legs.append(
+                    template.format(
+                        who="COALESCE(u.display_name, u.label) AS user_label" if team else
+                        "NULL AS user_label",
+                        join=f"JOIN users u ON u.id = {alias}.user_id" if team else "",
+                        scope=f"AND {alias}.user_id = :uid" if owner_id is not None else "",
+                    )
+                )
+        if not legs:
+            return []
+        sql = (
+            "SELECT * FROM (" + " UNION ALL ".join(legs) + ")"
+            " ORDER BY created_at DESC, row_id LIMIT :lim OFFSET :off"
+        )
+        params = {
+            "m": match,
+            "uid": owner_id,
+            "s": 0.0 if since is None else since,
+            "u": _FAR_FUTURE if until is None else until,
+            "lim": limit,
+            "off": offset,
+        }
+        with self.db.read() as con:
+            return [HistoryHit(**dict(r)) for r in con.execute(sql, params)]
+
+    def search_history(
+        self,
+        user_id: int,
+        q: str,
+        *,
+        since: float | None = None,
+        until: float | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[HistoryHit]:
+        """The viewer's OWN matching rows, newest first. ``user_id`` is always bound in SQL."""
+        match = fts_query(q)
+        if match is None:
+            return []
+        return self._search(
+            match, owner_id=int(user_id), team=False, since=since, until=until,
+            kind=kind, limit=limit, offset=offset,
+        )
+
+    def search_history_team(
+        self,
+        q: str,
+        *,
+        user_id: int | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[HistoryHit]:
+        """Team-wide search with owner labels. Admin routes only (LD 15)."""
+        match = fts_query(q)
+        if match is None:
+            return []
+        return self._search(
+            match, owner_id=user_id, team=True, since=since, until=until,
+            kind=kind, limit=limit, offset=offset,
+        )
 
     # ── /me/history rows (kind: dictation | file) ─────────────────────────────
 

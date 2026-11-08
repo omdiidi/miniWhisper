@@ -120,7 +120,12 @@ class Database:
             for version in sorted(files.keys() - applied.keys()):
                 sql = files[version].read_text()
                 for stmt in split_statements(sql):
-                    con.execute(stmt)
+                    try:
+                        con.execute(stmt)
+                    except sqlite3.OperationalError as exc:
+                        if "no such module: fts5" in str(exc):
+                            raise MigrationError("SQLite lacks FTS5") from exc
+                        raise
                 con.execute(
                     "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
                     (version, files[version].name, _sha256(sql), time.time()),
