@@ -92,31 +92,37 @@ if [[ ! -d "$ASSETS_SRC" ]]; then
 fi
 ACTOOL_TMP="$(mktemp -d)"
 trap "rm -rf '$ACTOOL_TMP'" EXIT
-xcrun actool \
-    --compile "$ACTOOL_TMP" \
-    --platform macosx \
-    --minimum-deployment-target 14.0 \
-    --app-icon AppIcon \
-    --output-partial-info-plist "$ACTOOL_TMP/AppIcon-info.plist" \
-    "$ASSETS_SRC" >/dev/null 2>&1 || {
-    echo "ERROR: actool failed to compile $ASSETS_SRC into Assets.car." >&2
+mkdir -p "$APP_PATH/Contents/Resources"
+if xcrun --find actool >/dev/null 2>&1; then
     xcrun actool \
         --compile "$ACTOOL_TMP" \
         --platform macosx \
         --minimum-deployment-target 14.0 \
         --app-icon AppIcon \
         --output-partial-info-plist "$ACTOOL_TMP/AppIcon-info.plist" \
-        "$ASSETS_SRC" >&2 || true
-    exit 1
-}
-if [[ ! -f "$ACTOOL_TMP/Assets.car" ]]; then
-    echo "ERROR: actool ran but did not produce Assets.car." >&2
-    ls -la "$ACTOOL_TMP" >&2
-    exit 1
+        "$ASSETS_SRC" >&2 || { echo "ERROR: actool failed to compile $ASSETS_SRC into Assets.car." >&2; exit 1; }
+    if [[ ! -f "$ACTOOL_TMP/Assets.car" ]]; then
+        echo "ERROR: actool ran but did not produce Assets.car." >&2
+        exit 1
+    fi
+    cp "$ACTOOL_TMP/Assets.car" "$APP_PATH/Contents/Resources/Assets.car"
+    echo "  Compiled + copied Assets.car"
+else
+    # Command Line Tools only (no Xcode, so no actool): the catalog holds just the app
+    # icon, so build AppIcon.icns with iconutil (part of macOS) and name it in Info.plist.
+    ICONSET="$ACTOOL_TMP/AppIcon.iconset"
+    mkdir -p "$ICONSET"
+    for f in "$ASSETS_SRC"/AppIcon.appiconset/icon_*.png; do
+        name="$(basename "$f" .png)"           # icon_16 or icon_16@2x
+        size="${name#icon_}"; size="${size%@2x}"
+        suffix=""; [[ "$name" == *@2x ]] && suffix="@2x"
+        cp "$f" "$ICONSET/icon_${size}x${size}${suffix}.png"
+    done
+    iconutil -c icns "$ICONSET" -o "$APP_PATH/Contents/Resources/AppIcon.icns"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP_PATH/Contents/Info.plist" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$APP_PATH/Contents/Info.plist"
+    echo "  No actool (Command Line Tools only): built AppIcon.icns with iconutil"
 fi
-mkdir -p "$APP_PATH/Contents/Resources"
-cp "$ACTOOL_TMP/Assets.car" "$APP_PATH/Contents/Resources/Assets.car"
-echo "  Compiled + copied Assets.car"
 
 xattr -cr "$APP_PATH"
 

@@ -161,7 +161,8 @@ def test_client_checks(ctx: Ctx, cli: CliFn, runner: FakeRunner) -> None:
     runner.on("pgrep", rc=1)
     code, out, _ = cli("doctor", "--client", "--json")
     checks = {c["name"]: c["status"] for c in json.loads(out)["checks"]}
-    assert checks["xcode"] == "warn" and checks["signing-identity"] == "warn"
+    # The Command Line Tools are enough to build the app (iconutil stands in for actool).
+    assert checks["developer-tools"] == "ok" and checks["signing-identity"] == "warn"
     assert checks["app"] == "fail" and code == 3
     assert not any("-w" in c for c in runner.calls if c[:1] == ["security"])
 

@@ -116,7 +116,7 @@ def build_and_install(ctx: Ctx, source: Path, *, rebuild: bool) -> None:
     if not rebuild and current and current == wanted:
         print(f"client {current} already installed (pass --rebuild to rebuild)")
         return
-    print("building the client (needs Xcode and an Apple Development identity) …")
+    print("building the client (needs the Command Line Tools and an Apple Development identity) …")
     ctx.runner.run(["bash", str(source / BUILD_SCRIPT)])
     install_app(ctx, source / "client" / "build" / "WisprAlt.app")
 

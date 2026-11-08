@@ -33,7 +33,7 @@ open a new terminal.
 | macOS | 14 (Sonoma) or newer | 14 or newer |
 | Chip | Apple Silicon (MLX) | any |
 | Disk | 6 GB free (models are about 4 GB) | about 200 MB |
-| Tools | Homebrew, `ffmpeg`, `uv` (installed for you) | the same; plus, to build the app, full Xcode and an Apple Development identity (Xcode > Settings > Accounts). With a signed DMG (`--dmg`) neither is needed. |
+| Tools | Homebrew, `ffmpeg`, `uv` (installed for you) | the same; plus, to build the app, the Command Line Tools (`xcode-select --install`; full Xcode is not needed) and an Apple Development signing identity (create one once in Xcode > Settings > Accounts on any Mac, or at developer.apple.com, and import it). With a signed DMG (`--dmg`) neither is needed. |
 
 The host runs as a per-user LaunchAgent, so it runs only while you are logged
 in. `wispralt doctor` says so and checks everything else in this table.

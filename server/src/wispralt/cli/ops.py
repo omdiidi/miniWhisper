@@ -319,9 +319,8 @@ def client_checks(ctx: Ctx) -> list[Check]:
         ).returncode
         == 0
     )
-    full_xcode = bool(xcode) and "CommandLineTools" not in xcode
     return [
-        verdict(full_xcode, "xcode", xcode or "none", "install Xcode from the App Store (building the app needs it; a DMG install does not)", warn=True),
+        verdict(bool(xcode), "developer-tools", xcode or "none", "xcode-select --install (the Command Line Tools are enough to build the app; a DMG install needs neither)", warn=True),
         verdict("Apple Development" in ids, "signing-identity", "Apple Development" if "Apple Development" in ids else "none", "Xcode > Settings > Accounts: add your Apple ID and create an Apple Development certificate", warn=True),
         verdict(app.is_dir(), "app", str(app), "wispralt setup --role client"),
         verdict(running, "app-running", "running" if running else "not running", f"open '{app}'", warn=True),
