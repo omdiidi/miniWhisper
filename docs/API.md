@@ -258,7 +258,7 @@ Close out a streaming session. The dedup id is claimed first and a stored dictat
 }
 ```
 
-`duration_ms` on streaming rows is **cumulative** per-chunk Parakeet inference time (sum of N chunks), not single-pass wall-clock. See [ARCHITECTURE.md → Known limitations](ARCHITECTURE.md#known-limitations) for the semantic drift versus single-shot dictation rows. The response envelope is otherwise byte-identical to `/transcribe/dictate` so the client's existing decoder is unchanged. As there, blank joined text is not stored and reports `"saved": true`; the session remembers it, so a retried finalize with the same dedup id replays it (`"replayed": true`) instead of getting 410 `Session is finalized` (until a server restart, which drops in-memory sessions).
+`duration_ms` on streaming rows is **cumulative** per-chunk Parakeet inference time (sum of N chunks), not single-pass wall-clock. See [ARCHITECTURE.md → Known limitations](ARCHITECTURE.md#known-limitations) for the semantic drift versus single-shot dictation rows. The response envelope is otherwise byte-identical to `/transcribe/dictate` so the client's existing decoder is unchanged. As there, blank joined text is not stored and reports `"saved": true`; the session remembers it, so a retried finalize with the same dedup id replays it (`"replayed": true`) instead of getting 410 `Session is finalized`. Known limitation: that replay lives only in the in-memory session, so after a server restart, or once the sweeper evicts the session (900 s after it ended), the retry gets 404 and the client falls back to its whole-file `/transcribe/dictate` upload.
 
 **Errors:**
 
