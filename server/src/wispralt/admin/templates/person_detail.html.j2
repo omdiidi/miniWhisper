@@ -16,13 +16,15 @@
         <button type="submit">Add device</button>
       </form>
       <form class="inline" method="post" action="/admin/people/{{ person.id }}/rotate"
-            onsubmit="return confirm('Rotate? Every key of {{ person.label }} stops working and one new key is shown.');">
+            data-confirm="Rotate? Every key of {{ person.label }} stops working and one new key is shown."
+            onsubmit="return confirm(this.dataset.confirm);">
         {{ ui.csrf(csrf_token) }}
         <button type="submit">Rotate key</button>
       </form>
       {% if not person.disabled_at %}
       <form class="inline" method="post" action="/admin/people/{{ person.id }}/disable"
-            onsubmit="return confirm('Disable {{ person.label }}? None of their keys will work.');">
+            data-confirm="Disable {{ person.label }}? None of their keys will work."
+            onsubmit="return confirm(this.dataset.confirm);">
         {{ ui.csrf(csrf_token) }}
         <button type="submit" class="danger">Disable person</button>
       </form>

@@ -50,6 +50,7 @@ from wispralt.insights.timewindow import (
     epoch_for_range,
     iso_week_epoch_bounds,
     last_full_iso_week,
+    normalize_range,
 )
 from wispralt.web import records
 from wispralt.web.htmx import is_htmx
@@ -257,7 +258,7 @@ async def me_insights(
     """Employee self-view of their last-week LLM insight + time-range stats.
 
     """
-
+    range = normalize_range(range, "7d")
     tz = await insights_settings.timezone_for(request.app)
     iso_year, iso_week = last_full_iso_week(tz)
     job_store: JobStore = request.app.state.job_store
@@ -355,6 +356,7 @@ async def me_history(
     """
     if kind not in ("dictation", "file"):
         kind = None
+    range = normalize_range(range, "30d")
     tz = await insights_settings.timezone_for(request.app)
     lo, hi = records.window(range, since, until, tz)
     query = records.wants_search(q)

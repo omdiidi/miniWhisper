@@ -29,7 +29,12 @@ from ..auth import require_admin, require_admin_csrf, set_csrf_cookie
 from ..config import settings
 from ..insights import cron, measured, sources
 from ..insights import settings as insights_settings
-from ..insights.timewindow import epoch_for_range, iso_week_epoch_bounds, last_full_iso_week
+from ..insights.timewindow import (
+    epoch_for_range,
+    iso_week_epoch_bounds,
+    last_full_iso_week,
+    normalize_range,
+)
 from ..web import records
 from ..web.htmx import is_htmx
 from ..web.templates_env import templates
@@ -55,6 +60,7 @@ async def admin_data(
     user_id: int | None = None,
 ):
     """Admin Data tab — team overview, leaderboards, drill-down by ?user_id."""
+    range = normalize_range(range, "7d")
     cfg = await insights_settings.load_for(request.app)
     tz = cfg.timezone
     iso_year, iso_week = last_full_iso_week(tz)
@@ -151,6 +157,7 @@ async def admin_records(
     """Team search (``search_history_team``) or the newest-first team list, with owners."""
     if kind not in ("dictation", "file"):
         kind = None
+    range = normalize_range(range, "30d")
     tz = await insights_settings.timezone_for(request.app)
     lo, hi = records.window(range, since, until, tz)
     query = records.wants_search(q)

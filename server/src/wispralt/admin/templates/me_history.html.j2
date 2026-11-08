@@ -10,9 +10,9 @@
     </div>
   </div>
   {% if since is none and until is none %}
-  <nav x-data="{ active: '{{ range }}' }" @range-changed.window="active = $event.detail" class="tabs" aria-label="Time range">
+  <nav data-active="{{ range }}" x-data="{ active: $el.dataset.active }" @range-changed.window="active = $event.detail" class="tabs" aria-label="Time range">
     {% for r in ['today', '7d', '30d', '90d', '1y', 'all'] %}
-      <button :class="active === '{{ r }}' ? 'active' : ''" @click="active = '{{ r }}'"
+      <button data-range="{{ r }}" :class="active === $el.dataset.range ? 'active' : ''" @click="active = $el.dataset.range"
               hx-get="/me/history" hx-vals='{{ {"range": r, "kind": kind or "", "q": q or ""} | tojson }}'
               hx-target="#history-body" hx-swap="innerHTML" hx-push-url="true">{{ TAB_LABELS[r] }}</button>
     {% endfor %}

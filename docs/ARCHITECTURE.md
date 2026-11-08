@@ -578,6 +578,14 @@ does **not** include this extension; `select_autoescape(enabled_extensions=("htm
 is set explicitly so user-supplied fields (label, notes, error_class)
 render escaped, closing the stored-XSS hole on the admin UI.
 
+Escaping does not protect a value inside an inline handler or an Alpine/HTMX
+expression (`onsubmit`, `x-data`, `@click`, `:class`, `hx-on`): the browser decodes
+`&#39;` back to `'` before evaluating it. So no template interpolates `{{ … }}` into
+such an attribute; values go in a `data-*` attribute and the expression reads
+`$el.dataset.*` / `this.dataset.*`. The routes also validate `range` with
+`timewindow.normalize_range` (unknown → the page default). `test_portal_render.py`
+fails on any template that breaks this rule.
+
 **Part 6 portal rules.** One stylesheet (`admin/static/portal.css`: CSS variables,
 light/dark via `prefers-color-scheme`, sidebar → top strip under 768 px, tables scroll
 inside `.table-wrap`) and the `_ui.html.j2` macros; no `<style>` blocks, no build

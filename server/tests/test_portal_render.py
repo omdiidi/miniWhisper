@@ -117,3 +117,47 @@ def test_stylesheet_is_served(client: TestClient) -> None:
 def test_no_inline_style_blocks_in_templates() -> None:
     offenders = [p.name for p in _TEMPLATES.glob("*.j2") if re.search(r"<style\b", p.read_text())]
     assert offenders == []
+
+
+# ── XSS regressions: request/user data never reaches a JS/Alpine expression ──────
+
+_HOSTILE_RANGE = "7d' + alert(document.domain) + '"
+# Attributes whose value the browser (inline handlers) or Alpine/HTMX evaluates as code.
+_JS_ATTR = re.compile(
+    r"""(?<![\w-])(on[a-z]+|hx-on[\w:.-]*|x-[\w:.-]+|@[\w:.-]+|:[\w.-]+)\s*=\s*("[^"]*"|'[^']*')""",
+)
+
+
+@pytest.mark.parametrize(
+    ("page", "default"),
+    [("/me/insights", "7d"), ("/me/history", "30d"), ("/admin/data", "7d"), ("/admin/records", "30d")],
+)
+def test_hostile_range_is_rejected_and_never_rendered(
+    client: TestClient, people, page: str, default: str,
+) -> None:
+    (_admin, token), _ = people
+    resp = client.get(page, params={"range": _HOSTILE_RANGE}, headers=_auth(token))
+    assert resp.status_code == 200, resp.text[:300]
+    assert "alert(" not in resp.text
+    if 'class="tabs"' in resp.text:
+        assert f'data-active="{default}"' in resp.text
+
+
+def test_hostile_label_stays_out_of_confirm_handlers(client: TestClient, make_user) -> None:
+    _admin, token = make_user(role="admin", label="root")
+    evil, _ = make_user(label="x'); alert(1); ('")
+    resp = client.get(f"/admin/people/{evil.id}", headers=_auth(token))
+    assert resp.status_code == 200, resp.text[:300]
+    handlers = [m.group(2) for m in _JS_ATTR.finditer(resp.text)]
+    assert handlers and not any("alert" in h for h in handlers)
+    assert "data-confirm=\"Disable x&#39;); alert(1); (&#39;?" in resp.text
+
+
+def test_no_template_interpolates_into_a_js_attribute() -> None:
+    offenders = [
+        f"{p.name}: {m.group(0)[:80]}"
+        for p in _TEMPLATES.glob("*.j2")
+        for m in _JS_ATTR.finditer(p.read_text())
+        if "{{" in m.group(2) or "{%" in m.group(2)
+    ]
+    assert offenders == []

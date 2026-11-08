@@ -71,3 +71,12 @@ def epoch_for_range(range_: str, tz_name: str) -> float:
 
 
 VALID_RANGES: frozenset[str] = frozenset({"today", "7d", "30d", "90d", "1y", "all"})
+
+
+def normalize_range(range_: str | None, default: str) -> str:
+    """``range_`` when it is one of ``VALID_RANGES``, else ``default``.
+
+    Routes call this at the boundary so a request value never reaches a template
+    unvalidated (it is rendered into attributes next to Alpine expressions).
+    """
+    return range_ if range_ in VALID_RANGES else default
