@@ -597,6 +597,25 @@ def _retention(ctx: Ctx, state: InstallState, flag: int | None, jobs: JobStore) 
     print(f"retention: {describe_retention(flag)} (change it with `wispralt retention set N`)")
 
 
+def check_data_dir(data_dir: Path) -> None:
+    """Refuse a data dir that already holds other things and no ``wispralt.db``.
+
+    So everything in a data dir is WisprAlt's: ``uninstall --purge-data`` may then
+    delete its ``outputs/`` and ``staging/`` whole. A missing or empty dir (Finder's
+    ``.DS_Store`` aside) is fine; so is an existing install's dir.
+    """
+    if (data_dir / DB_NAME).exists() or not data_dir.is_dir():
+        return
+    other = sorted(e.name for e in data_dir.iterdir() if e.name != ".DS_Store")
+    if other:
+        shown = ", ".join(other[:3]) + (", …" if len(other) > 3 else "")
+        raise CliError(
+            2,
+            f"{data_dir} already holds other files ({shown}) and no {DB_NAME}; "
+            "WisprAlt needs a data dir of its own: pick a new or empty --data-dir",
+        )
+
+
 def setup_host(ctx: Ctx, args: argparse.Namespace, state: InstallState) -> str | None:
     """Install or repair the host; returns the new admin key when one was minted."""
     preflight(ctx)
@@ -614,6 +633,7 @@ def setup_host(ctx: Ctx, args: argparse.Namespace, state: InstallState) -> str |
         if args.data_dir:
             raise CliError(2, f"--data-dir disagrees with DATA_DIR={configured} in {p.env_file}")
         ctx.paths = p = replace(p, data_dir=Path(configured))
+    check_data_dir(p.data_dir)
     if source:
         state.source_dir = str(source)
     state.paths = {"data_dir": str(p.data_dir), "backup_dir": str(p.backup_dir)}
