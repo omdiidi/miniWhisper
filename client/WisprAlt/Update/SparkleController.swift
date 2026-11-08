@@ -22,10 +22,9 @@ final class SparkleController: NSObject, SPUUpdaterDelegate {
     // MARK: - Init
 
     override init() {
-        // We construct the controller but DO NOT start the updater. The Tier 1.5
-        // distribution path uses GitHub Releases via the /wispralt-update slash
-        // command (see scripts/release-client.sh + ~/.claude-dotfiles/commands/
-        // wispralt-update.md). Sparkle's appcast feed is a placeholder URL and
+        // We construct the controller but DO NOT start the updater. Updates come
+        // from `wispralt update --client` (UpdateChecker only notices a release;
+        // see scripts/release-client.sh). Sparkle's appcast feed is a placeholder URL and
         // SUPublicEDKey is unset — starting the updater would background-check
         // a bogus URL and surface "Unable to Check For Updates" dialogs to the
         // user every few hours. When we move to Tier 2 distribution (Apple
