@@ -66,7 +66,7 @@ from wispralt.jobs.store import JobStore
 from wispralt.middleware import openai_errors
 from wispralt.middleware.rate_limit import RateLimitMiddleware
 from wispralt.ops import background, monitoring, staging
-from wispralt.ops.backup import server_lock
+from wispralt.ops.backup import pin_until_exit, server_lock
 from wispralt.ops.env_writer import find_env_path
 from wispralt.ops.logging_setup import configure_file_logging
 from wispralt.routes import (
@@ -352,7 +352,11 @@ async def _serve(app: FastAPI) -> AsyncIterator[None]:
     # interrupts keeps its staged input and goes back to pending with its
     # attempt refunded (Locked Decision 8).
     app.state.shutting_down = True
-    await file_runner.shutdown()
+    if not await file_runner.shutdown():
+        # A file-job thread is still writing under DATA_DIR and Python joins it
+        # at exit: keep the lock held until the process is really gone, so a
+        # restore cannot swap the tree under it.
+        pin_until_exit(settings.data_dir)
     logger.info("Shutdown: file runner stopped.")
 
     # Cancel the daily transcript sweep AND the weekly insights cron together.

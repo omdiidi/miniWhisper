@@ -442,7 +442,9 @@ The SIGTERM handler (registered in the lifespan when running on the main thread)
 3. drops the stores (`app.state.db` etc.);
 4. releases the server lock (`<data_dir>.lock`) last.
 
-A worker that finished (`done`/`failed`) during shutdown cleans up its input as usual. The executor thread itself cannot be cancelled; it is abandoned (`shutdown(wait=False, cancel_futures=True)`).
+A worker that finished (`done`/`failed`) during shutdown cleans up its input as usual. The executor thread itself cannot be cancelled: an ffmpeg decode stops at its next cancel poll, an mlx-whisper call runs to its end. `file_runner.shutdown()` waits up to `EXECUTOR_DRAIN_S` (10 s) for it; if the thread is still running, the lifespan calls `ops.backup.pin_until_exit`, which keeps the server lock held until the process really exits (Python joins the thread at exit), so a restore can never swap `DATA_DIR` under it.
+
+A job's staged input (source or WAV) is deleted only once its row reads back `done` / `failed`. If marking it failed hits a DB error, the row stays `running` with its input, and the next start's `recover_orphans` requeues it.
 
 ### Orphan Recovery (`recover_orphans`)
 

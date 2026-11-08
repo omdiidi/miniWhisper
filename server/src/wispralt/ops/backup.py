@@ -4,7 +4,9 @@ ops/backup.py — the server lock and offline backup / restore (Locked Decision 
 * ``server_lock(data_dir)`` — ``flock(LOCK_EX | LOCK_NB)`` on the sibling
   ``<data_dir>.lock`` of the *resolved* data dir (one lock however the path
   is spelled, symlinks included; outside the tree restore swaps, so it never moves).
-  The lifespan holds it for the server's life; backup and restore take it
+  The lifespan holds it for the server's life (``pin_until_exit`` keeps it
+  held past the lifespan while a file-job thread is still running); backup
+  and restore take it
   too, so each refuses (``ServerRunning``) while a server runs. The Part 5
   CLI stops the service, runs them, and restarts it.
 * ``preflight(need, parent)`` — ``need × 1.1`` must fit in the free space of
@@ -55,6 +57,11 @@ def lock_path(data_dir: Path) -> Path:
     return data.with_name(data.name + ".lock")
 
 
+# Lock fds held by ``server_lock`` in this process, and dups kept open until exit.
+_HELD: dict[Path, int] = {}
+_PINNED: list[int] = []
+
+
 @contextmanager
 def server_lock(data_dir: Path) -> Iterator[Path]:
     """Hold ``<data_dir>.lock`` exclusively, or raise ``ServerRunning`` at once."""
@@ -65,9 +72,28 @@ def server_lock(data_dir: Path) -> Iterator[Path]:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ServerRunning(f"a server holds {path}; stop it first") from exc
-        yield path
+        _HELD[path] = fd
+        try:
+            yield path
+        finally:
+            _HELD.pop(path, None)
     finally:
-        os.close(fd)  # closing the description releases the flock
+        os.close(fd)  # closing the description releases the flock (unless pinned)
+
+
+def pin_until_exit(data_dir: Path) -> bool:
+    """Keep the held ``<data_dir>.lock`` locked until this process exits.
+
+    For a shutdown that leaves a thread still writing to the data dir: the
+    flock belongs to the open file description, so a dup kept open outlives
+    ``server_lock``'s close and the OS releases it only when the process dies.
+    Returns False when this process does not hold the lock.
+    """
+    fd = _HELD.get(lock_path(data_dir))
+    if fd is None:
+        return False
+    _PINNED.append(os.dup(fd))
+    return True
 
 
 def preflight(need_bytes: int, target_parent: Path) -> None:

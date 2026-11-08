@@ -15,7 +15,8 @@ Design decisions (v3 deltas P4#3 + P5#1 + P5#11):
   ``store.requeue_interrupted`` puts the row back to ``pending`` with its
   attempt refunded, so a deploy never loses or spends a job.
 - ``shutdown()`` (lifespan, before the DB goes away) cancels and awaits the
-  workers, then shuts the executor down without waiting for its thread.
+  workers, then waits up to ``EXECUTOR_DRAIN_S`` for the executor thread; if
+  it is still running the lifespan pins the server lock until process exit.
 - reenqueue_pending(): called at startup after recover_orphans() to re-run any
   pending jobs whose source files survived the previous restart.
 
@@ -46,6 +47,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -64,6 +67,10 @@ logger = logging.getLogger(__name__)
 _2GiB = 2 * 1024**3
 
 _CANCELLED = "cancelled by user"
+
+# How long shutdown waits for a running executor call (ffmpeg / mlx-whisper)
+# before abandoning it; inside launchd's ExitTimeOut.
+EXECUTOR_DRAIN_S = 10.0
 
 
 # Per-phase wall budgets (seconds). Scalar entries are absolute; callable
@@ -129,6 +136,8 @@ class FileJobRunner:
         # runs, so the semaphore alone would admit a second job. The set also
         # holds strong references so the event loop cannot drop a task.
         self._workers: set[asyncio.Task[None]] = set()
+        # Set by shutdown(): an in-flight ffmpeg decode stops at its next cancel poll.
+        self._closing = False
 
     # ── public properties ──────────────────────────────────────────────────────
 
@@ -220,18 +229,42 @@ class FileJobRunner:
                 continue
             self._spawn(jid, src_path)
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, drain_timeout_s: float | None = None) -> bool:
         """Stop the workers (lifespan shutdown, before the DB and the lock are released).
 
         Cancelling a worker keeps its input and requeues its row (see
-        ``_interrupted``). ``run_in_executor`` work cannot be cancelled, so
-        the executor is shut down without waiting for its thread.
+        ``_interrupted``). ``run_in_executor`` work cannot be cancelled: an
+        ffmpeg decode aborts at its next cancel poll (``_closing``), but an
+        mlx-whisper call runs to its end. So wait up to *drain_timeout_s* for
+        the executor thread to finish. Returns True when it did; False means
+        the thread is still running (abandoned) and the caller must keep the
+        server lock held until the process exits (``backup.pin_until_exit``).
         """
+        if drain_timeout_s is None:
+            drain_timeout_s = EXECUTOR_DRAIN_S
+        self._closing = True
         workers = list(self._workers)
         for task in workers:
             task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+
+        drained = threading.Event()
+
+        def _drain() -> None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            drained.set()
+
+        threading.Thread(target=_drain, name="wispralt-files-drain", daemon=True).start()
+        deadline = time.monotonic() + drain_timeout_s
+        while not drained.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if not drained.is_set():
+            logger.critical(
+                "File-job executor thread still running after %.0fs; abandoning it"
+                " (the server lock stays held until the process exits).",
+                drain_timeout_s,
+            )
+        return drained.is_set()
 
     # ── private ───────────────────────────────────────────────────────────────
 
@@ -241,6 +274,34 @@ class FileJobRunner:
             bool(getattr(self.app_state, "shutting_down", False))
             and self.store.get_status(jid) == "running"
         )
+
+    def _is_terminal(self, jid: str) -> bool:
+        """True when the row reads back ``done`` / ``failed`` (or is gone); a DB error is False."""
+        try:
+            return self.store.get_status(jid) in ("done", "failed", None)
+        except sqlite3.Error:
+            logger.exception("[%s] status read failed; keeping the job's input", jid)
+            return False
+
+    def _is_done(self, jid: str) -> bool:
+        try:
+            return self.store.get_status(jid) == "done"
+        except sqlite3.Error:
+            return False
+
+    def _fail_unless_terminal(self, jid: str, reason: str) -> None:
+        """Mark *jid* failed unless it already ended; a DB error is logged, not raised.
+
+        Callers then delete the input only when :meth:`_is_terminal` — a row
+        left ``running`` by a transient error keeps its input, so
+        ``recover_orphans`` can requeue it.
+        """
+        try:
+            current = self.store.get(jid)
+            if current is None or current.status not in ("done", "failed"):
+                self._fail(jid, reason)
+        except sqlite3.Error:
+            logger.exception("[%s] could not mark the job failed", jid)
 
     def _fail(self, jid: str, reason: str) -> None:
         """Fail *jid*; a requested cancel wins over any other reason (timeouts, watchdog, errors)."""
@@ -357,21 +418,20 @@ class FileJobRunner:
             raise
         except Exception as exc:
             error_repr = repr(exc)
-            current = self.store.get(jid)
-            if current is None or current.status != "done":
+            logger.exception("[%s] File job failed: %s", jid, error_repr)
+            if not self._is_done(jid):
                 # write_outputs_atomic can leave earlier formats behind when a
                 # later write fails; never leave partial outputs for a job
                 # that did not finish.
                 remove_job_outputs(output_dir, jid)
-            if current is None or current.status not in ("done", "failed"):
-                self._fail(jid, error_repr)
-            logger.exception("[%s] File job failed: %s", jid, error_repr)
+            self._fail_unless_terminal(jid, error_repr)
 
         finally:
             self._active_job_id = None
-            # Clean up the staging WAV (R1#2) unless shutdown interrupted the
-            # job: then it is the input the requeued row needs.
-            if not self._interrupted(jid, cancelled):
+            # Clean up the staging WAV (R1#2) only once the row has ended:
+            # shutdown requeues it, and a row a DB error left ``running`` is
+            # requeued by ``recover_orphans`` — both need the input.
+            if not self._interrupted(jid, cancelled) and self._is_terminal(jid):
                 staging.cleanup(wav_path)
 
     async def _run_source(
@@ -447,7 +507,9 @@ class FileJobRunner:
                 target_channels = 1 if channel_count == 1 else 2
 
                 # Phase 2: ffmpeg_decode — REAL timeout, REAL abort, cancel-aware.
-                cancel_cb = lambda: self.store.check_cancel_requested(jid)  # noqa: E731
+                cancel_cb = lambda: (  # noqa: E731
+                    self._closing or self.store.check_cancel_requested(jid)
+                )
                 wav_path = await self._phase(
                     jid, "ffmpeg_decode", PHASE_BUDGETS["ffmpeg_decode"],
                     functools.partial(
@@ -499,13 +561,10 @@ class FileJobRunner:
                 # mark the job terminal. Otherwise we'd overwrite a more
                 # precise pipeline failure.
                 error_repr = repr(exc)
-                current = self.store.get(jid)
-                if current is None or current.status not in ("done", "failed"):
-                    self._fail(jid, error_repr)
-                logger.exception(
-                    "[%s] File job failed: %s", jid, error_repr
-                )
-                src_path.unlink(missing_ok=True)
+                logger.exception("[%s] File job failed: %s", jid, error_repr)
+                self._fail_unless_terminal(jid, error_repr)
+                if self._is_terminal(jid):  # else recover_orphans requeues it
+                    src_path.unlink(missing_ok=True)
             finally:
                 if watchdog_task is not None:
                     watchdog_task.cancel()
