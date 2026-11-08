@@ -54,7 +54,7 @@ Your friend installs only the client — they connect to your existing host. The
 Send your friend:
 - The DMG (they run `wispralt setup --role client --dmg …`), or have them clone and run `./install.sh --role client`.
 - Your host's URL (your `tailscale serve` or tunnel URL).
-- A key of their own, made with `wispralt users add THEIR-NAME` on the host, over a private channel (see [Moving your API key](#moving-your-api-key)). They paste it into Settings → API Key.
+- A join link from the portal (**Invites** → invite them; see [Server Configuration](#server-configuration)), or a key of their own made with `wispralt users add THEIR-NAME` on the host, over a private channel (see [Moving your API key](#moving-your-api-key)), which they paste into Settings → API Key.
 
 Your friend will see the same Gatekeeper prompt and the same permission wizard described above.
 
@@ -117,6 +117,8 @@ Use a **project-scoped** OpenAI key (a project just for WisprAlt) with a **month
 ## Server Configuration
 
 After the permission wizard, the app is ready for server configuration (Local mode).
+
+**Join link (easiest).** If your admin sent a `wispralt://join?…` link from the portal (**Invites**), click it. WisprAlt asks "Join the WisprAlt server?" and shows the server's address; click **Join**. The app redeems the invite, saves your key in the Keychain (`co.wispralt`), sets the Server URL and switches to Local mode. A link is single use and expires after 10 minutes; an expired or used one says "This invite has expired or was already used". A link whose server is plain `http://` to another machine is refused. The token and key are never logged. Otherwise set things up by hand:
 
 1. Get the server URL and a key from the host: `wispralt setup` prints both for the first admin, and `wispralt users add NAME` makes a key for anyone else. On a Mac set up with `--role both`, both are filled in already.
 2. Click the WisprAlt menubar icon → toggle **Show advanced settings**.

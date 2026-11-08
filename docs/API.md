@@ -641,7 +641,7 @@ Start weekly AI insights for the last full week or a backfill — estimate first
 
 **Auth:** none (public; reachable through the tunnel). Rate limit: 10 attempts per 60 s per client IP (`CF-Connecting-IP`, else the peer) → **429** `{"error": "rate_limited"}`.
 
-Redeems a single-use invite made at `/admin/invites`. The invite reaches the app as the join link **`wispralt://join?host=<url-encoded SERVER_URL>&invite=<token>`** (or the token pasted by hand); the app posts the token here.
+Redeems a single-use invite made at `/admin/invites`. The invite reaches the app as the join link **`wispralt://join?host=<url-encoded SERVER_URL>&invite=<token>`** ; the macOS app opens it (`InviteLink`), asks the user to confirm and posts the token here.
 
 **Request:** `application/json`
 
