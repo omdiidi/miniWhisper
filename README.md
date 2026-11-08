@@ -68,40 +68,29 @@ For the full architecture diagram and latency budget, see [docs/ARCHITECTURE.md]
 | **Dictation latency** | ~250–400ms p50 | ~200–500ms (varies) |
 | **File transcription** | Yes — any audio/video file | No |
 | **Platforms** | macOS 14+ | macOS, iOS, Windows |
-| **Setup** | ~20 minutes (one script) | Instant (SaaS) |
+| **Setup** | one command (`./install.sh`) | Instant (SaaS) |
 
 ## Status
 
 **Alpha** — core dictation and file transcription are implemented and functional. This is a polished GitHub showcase project; production use is at your own discretion. Issues and pull requests welcome.
 
-## Quickstart — Server
+## Quickstart
 
-> Prerequisites: macOS 13+, Python 3.11, ~4 GB free disk, Homebrew. No Hugging Face account or token is needed (both models are public).
-
-```bash
-git clone https://github.com/yourusername/wisprflowALT.git
-cd wisprflowALT
-./scripts/setup-server.sh
-```
-
-The script handles everything: Python venv, model downloads (~2.7 GB), API key generation, Cloudflare Tunnel setup (token read from stdin — never written to disk), and launchd registration. When it finishes it prints a one-liner you paste into the client.
-
-Full walkthrough: [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md)
-
-## Quickstart — Client (employees)
-
-Open Terminal on the Mac you want to dictate from, paste this, hit enter:
+> Prerequisites: macOS 14+. The host (the local transcription server) needs Apple Silicon and ~6 GB free disk. No Hugging Face account or token is needed (both models are public).
 
 ```bash
-curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-  | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
+git clone <repo-url> wispralt
+cd wispralt
+./install.sh            # choose host, client or both
 ```
 
-The app opens, walks you through 3 macOS permissions (Accessibility, Input Monitoring, Microphone), and you're ready to dictate.
+`install.sh` installs Homebrew (if missing), `ffmpeg`, `uv` and the `wispralt` CLI, then runs `wispralt setup`: models (verified), database, first admin, LaunchAgent and the menubar app. It is safe to rerun and never uses `sudo`. After that, `wispralt status`, `wispralt doctor`, `wispralt backup` and `wispralt update` run the Mac; `wispralt --help` lists every command.
+
+The app walks you through 3 macOS permissions (Accessibility, Input Monitoring, Microphone), and you're ready to dictate.
 
 Hold FN to dictate. Release to inject text at the cursor. Use "Transcribe file…" in the menubar to transcribe an audio or video file.
 
-See [docs/INSTALL.md](docs/INSTALL.md) for the full install guide and troubleshooting.
+See [docs/INSTALL.md](docs/INSTALL.md) for the full install guide, the command reference and scripted (agent) installs.
 
 Building from source (developers only): [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md).
 
@@ -110,7 +99,8 @@ Building from source (developers only): [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT
 | Document | Description |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, latency budget, model residency |
-| [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md) | Full server setup walkthrough |
+| [docs/INSTALL.md](docs/INSTALL.md) | Install and the `wispralt` command reference |
+| [docs/SETUP-SERVER.md](docs/SETUP-SERVER.md) | Host details: models, remote access, `.env` |
 | [docs/SETUP-CLIENT.md](docs/SETUP-CLIENT.md) | Client install, permissions, and config |
 | [docs/API.md](docs/API.md) | HTTP endpoint reference |
 | [docs/OPENAI-COMPAT.md](docs/OPENAI-COMPAT.md) | OpenAI Whisper API drop-in (`/v1/*`) — canonical reference |

@@ -32,14 +32,14 @@ schema enforces `role IN ('admin', 'employee')` via a `CHECK` constraint
 (`server/src/wispralt/migrations/0001_initial.sql`); future roles require a
 migration.
 
-The first admin is created once, in a terminal, by
-`python -m wispralt.bootstrap --label owner` (run from `server/`;
-`setup-server.sh` step 7 does this). It prints the client config — server URL
-and the one-time admin token — and refuses to run if an enabled admin already
-exists or stdout is not a terminal. Lost the admin key?
-`python -m wispralt.bootstrap --rotate-admin` (add `--user-id N` when there
-are several admins) revokes the old key and prints a new one. There is no env
-admin key and no break-glass path.
+The first admin is created once, by `wispralt setup --role host` (see
+[INSTALL.md](INSTALL.md)). It prints the client config — server URL and the
+one-time admin token — to a terminal, or writes the token to a new 0600
+`--token-file`; a rerun never creates or rotates an admin. Lost the admin key?
+`wispralt keys rotate-admin` (add `--user-id N` when there are several admins)
+revokes the old key and issues a new one. `python -m wispralt.bootstrap`
+remains as a shim over the same code (run it where the host `.env` is). There
+is no env admin key and no break-glass path.
 
 ---
 
@@ -357,6 +357,26 @@ formats — lives in [OPENAI-COMPAT.md](OPENAI-COMPAT.md).
    401 — no wait, no restart.
 3. **Mint** on the same row later issues a fresh key and re-enables them.
 
+### From the command line
+
+The same account operations work offline from a terminal on the host (they
+open the database directly; the running server sees every change on the next
+request):
+
+| Command | Effect |
+|---|---|
+| `wispralt users list [--json]` | people and integrations with role, kind, last seen, disabled |
+| `wispralt users add LABEL [--role admin] [--kind integration] [--token-file F]` | a new user and its one key |
+| `wispralt users disable ID` | none of its keys work (the last enabled admin is refused) |
+| `wispralt users enable ID [--token-file F]` | re-enable with a **new** key (old keys stay revoked) |
+| `wispralt keys list [--user ID] [--json]` | every key, active and revoked (never a hash) |
+| `wispralt keys rotate USER_ID [--token-file F]` | revoke the user's keys and issue one new key |
+| `wispralt keys revoke KEY_ID` | revoke one key |
+| `wispralt keys rotate-admin [--user-id N] [--token-file F]` | recover a lost admin key |
+
+A new key is printed only to a terminal; without one, pass `--token-file` (a
+new file, created 0600) or the command refuses (exit 2) before minting.
+
 ---
 
 ## Server env vars (admin-relevant)
@@ -366,7 +386,7 @@ configuration reference see [SETUP-SERVER.md](SETUP-SERVER.md).
 
 | Variable | Required | Notes |
 |---|---|---|
-| `DATA_DIR` | Yes | Absolute path of the data directory (`wispralt.db`, outputs, staging). `setup-server.sh` writes `$HOME/Library/Application Support/WisprAlt`. |
+| `DATA_DIR` | Yes | Absolute path of the data directory (`wispralt.db`, outputs, staging). `wispralt setup` writes `$HOME/Library/Application Support/WisprAlt/host` (or `--data-dir`). |
 | `SERVER_LOG_PATH` / `SERVER_LOG_MAX_BYTES` / `SERVER_LOG_BACKUP_COUNT` | No | Rotating application log (default `~/Library/Logs/WisprAlt/wispralt.log`, 10 MB x 5 backups). `/admin/server-log` reads it. launchd's `server.log` / `server.err.log` hold crash output only. |
 | `OPENROUTER_API_KEY` | No | Enables weekly insights. When unset, the insights cron is a no-op. (Server smart formatting was removed in Part 4.) Get a key at https://openrouter.ai/keys. |
 
@@ -426,7 +446,7 @@ transcript files you kept. Part 7's importer brings both into the local
 3. **Import.** Stop the server, then run the same command without `--dry-run`. At a
    terminal it shows the dry run and asks before writing; in a script use `--yes`
    (accepted only when the owner proposal is unambiguous) or name the owner with
-   `--owner-map PG_ID=LOCAL_ID`. Run `python -m wispralt.bootstrap` first if no local
+   `--owner-map PG_ID=LOCAL_ID`. Run `wispralt setup --role host` first if no local
    admin exists yet. Start the server again afterwards.
 4. **Transcript files (optional).** `python -m wispralt.importer files ~/Documents/WisprAlt… --owner LOCAL_USER_ID --dry-run`,
    then again with `--yes`. Each transcript becomes a file job in that person's

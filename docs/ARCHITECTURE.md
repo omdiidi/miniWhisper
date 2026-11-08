@@ -71,7 +71,7 @@ The Cloudflare Tunnel is **outbound-only** from the Mac mini — no inbound port
 | **MicEnumerator** | `client/WisprAlt/Audio/MicEnumerator.swift` | Stateless static helper bridging AVFoundation device discovery to CoreAudio HAL property reads. `availableInputs()` uses `[.external, .microphone]` (macOS 15+ — `.builtInMicrophone` is deprecated, subsumed by `.microphone`); dedup by uniqueID. `audioDeviceID(forUID:)` translates an AV `uniqueID` to an `AudioDeviceID` via `kAudioHardwarePropertyTranslateUIDToDevice` (using `withUnsafePointer(to: &cfUID)` and `qualifierSize = MemoryLayout<CFString?>.size`). `systemDefaultInputName()` exposes the current default's localized name for the picker label. Powers the SwiftUI Input Mic picker in `SettingsView`. |
 | **AppDelegate** | `client/WisprAlt/App/AppDelegate.swift` | App lifecycle. Exposes `static weak var shared: AppDelegate?` for cross-controller access. Sweeps leftover `wispralt-online-*` temp dirs (`OnlineFileJob.sweepLeftovers`), recovers last session's spool into Retry (`recoverSpoolAtLaunch`; nothing is sent), warms the OpenAI key cache, then runs `menuBarController.applyModeEvent(.launch)`: in Local mode with a server URL + key it resumes a saved Local file job and fetches `/me` once; in Online it contacts neither. |
 | **PermissionGate** | `client/WisprAlt/App/PermissionGate.swift` | Sequential 3-permission wizard: Accessibility → Input Monitoring → Microphone. On macOS 14.4+, posts a blocking "Quit and Reopen Required" sheet after Input Monitoring is granted (`CGRequestListenEventAccess` returns `true` but real grant requires process restart). |
-| **SparkleController** | `client/WisprAlt/Update/SparkleController.swift` | Sparkle 2 wrapper. Defers the update sheet while `MenuBarController.isBusy`. Auto-updates intentionally **disabled** in be720a1 — `startingUpdater: false` + `SUEnableAutomaticChecks=false` in Info.plist. Tier 1.5 distribution rides on `install.sh` (curl one-liner; see docs/INSTALL.md) for fresh installs and `/wispralt-update` (Claude Code) for in-place updates. |
+| **SparkleController** | `client/WisprAlt/Update/SparkleController.swift` | Sparkle 2 wrapper. Defers the update sheet while `MenuBarController.isBusy`. Auto-updates intentionally **disabled** in be720a1 — `startingUpdater: false` + `SUEnableAutomaticChecks=false` in Info.plist. Fresh installs: clone + `./install.sh`; updates: `wispralt update --client` (see docs/INSTALL.md). |
 
 ### Online mode (OpenAI direct)
 
@@ -574,6 +574,21 @@ is set explicitly so user-supplied fields (label, notes, error_class)
 render escaped, closing the stored-XSS hole on the admin UI.
 
 ---
+
+## Operating the host (`wispralt` CLI)
+
+`wispralt` (console script `wispralt.cli.main:main`, installed by `uv tool install <clone>/server`) installs, runs and maintains a host and/or client; [INSTALL.md](INSTALL.md) is the command reference. It wraps the server's own functions (accounts, retention, `ops.backup`) and never re-implements them.
+
+- **Layout.** `cli/main.py` (argparse + dispatch), `paths.py` (`Paths`, `InstallState`, `Ctx`, `.env` merge), `system.py` (`Runner`, `http_get`, `Deps` — the only `subprocess`/`execv` seam), `launchd.py`, `host.py`, `client.py`, `ops.py`.
+- **Paths.** `WISPRALT_ROOT` (default `$HOME`) re-roots the config dir `~/.config/wispralt/` (`.env` and `install-state.json`, both 0600), the data dir `~/Library/Application Support/WisprAlt/host`, `HF_HOME` `…/WisprAlt/models`, logs `~/Library/Logs/WisprAlt/` and backups `~/WisprAlt-Backups/`. `--data-dir`/`--backup-dir` override and are recorded. The LaunchAgent plist always goes in `$HOME/Library/LaunchAgents`; `WISPRALT_LABEL` overrides its label (tests, Part 8 E2E).
+- **State.** `install-state.json` records `{version, source_dir, role, label, port, paths, models, artifacts, data, retention_prompted, last_run}`, written atomically. `artifacts` are what a plain `uninstall` removes; `data` only goes with `--purge-data`; backups are never removed by the CLI.
+- **Setup is idempotent.** `setup` adds only absent `.env` keys, re-verifies the models (sha256 of the LFS files against the Hub's metadata at the resolved commit; nothing is downloaded when the cache matches), never creates a second admin or rotates a key, and asks the retention question once. A missing `[host]` extra is installed with `uv tool install --force` and the CLI `execv`s the fresh entry point, so new code is never half-imported. The first admin's key is handed over right after it is minted (terminal or `--token-file`), before the warm-up and health wait.
+- **Service.** A per-user LaunchAgent `co.wispralt.host` (`gui/$UID`) runs uvicorn from the tool venv on `127.0.0.1:<port>` with the config dir as its working directory; remote access goes through `tailscale serve` or the optional tunnel. `stop` is proven by taking `server_lock` (bootout returns before teardown ends); `restart` reloads only when the rendered plist changed. A mini-era `co.wispralt.server` agent is booted out and its plist moved to `config/legacy/`.
+- **Status and doctor.** `status` reports allocated sizes (`st_blocks`, so APFS clones are not double-counted), backups, `*.pre-restore-*` copies and retention. `doctor` is read-only (`mode=ro` integrity check, Keychain presence without reading secrets); only `--warmup` loads the dictation model, so a running host never pays its RAM twice.
+- **Offline operations.** `backup`, `restore` and `update` run inside `service_stopped`: boot the agent out, prove it stopped by taking `server_lock`, run the Part 4 function (`ops.backup.backup` / `restore`), and start the agent again in `finally` if it had been loaded. `restore` keeps the old tree at `<data_dir>.pre-restore-<ts>`; the CLI never deletes those or any backup.
+- **Update and uninstall.** `update` pulls (`--ff-only`, refusing a dirty clone), stops the service, backs up, reinstalls the tool and `execv`s its second phase in the new code, which re-verifies models, restarts the agent and waits for `/healthz` + `/readyz/db` (migrations run in the lifespan). `uninstall` removes only the recorded `artifacts` (and only under the install root or LaunchAgents), with `uv tool uninstall` last; `--purge-data` backs up first.
+- **Exit codes.** 0 ok, 1 failed, 2 usage error or missing non-interactive answer, 3 doctor failures. `--non-interactive` never prompts; `--json` is machine output.
+- The CLI never imports `wispralt.config` (its module-level `Settings()` needs a `.env`): it takes the data dir from `install-state.json`, and the service reads the config `.env` from its launchd `WorkingDirectory`.
 
 ## Background maintenance and logging
 
@@ -1172,8 +1187,10 @@ labels them so users can tell which dictations went through the old path.
 A lightweight in-app update checker runs alongside the still-disabled Sparkle
 wrapper. The new module lives at
 `client/WisprAlt/Update/UpdateChecker.swift` and is **deliberately not Sparkle**
-— it reuses `install.sh` (the curl one-liner) as the canonical install path so
-there is exactly one update mechanism to reason about.
+— it shells the old `install.sh` curl one-liner. Part 5 replaced that
+installer (it now needs a clone and prints "clone first" when piped), so until
+the checker is retargeted at `wispralt update --client` the in-app update does
+not install anything.
 
 - **Polling.** The checker fires 60 s after launch and then every 6 h,
   debounced via `Settings.shared.lastUpdateCheck` so a wake-from-sleep doesn't

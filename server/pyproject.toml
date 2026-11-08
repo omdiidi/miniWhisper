@@ -26,6 +26,9 @@ dependencies = [
     "jinja2>=3.1,<4",
 ]
 
+[project.scripts]
+wispralt = "wispralt.cli.main:main"
+
 [project.optional-dependencies]
 # Apple-Silicon inference stack for the Local-mode host. Install with
 # `uv sync --extra host` (or `pip install -e '.[host]'`). `wispralt.main`

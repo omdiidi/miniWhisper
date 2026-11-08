@@ -10,8 +10,9 @@ Run from ``server/`` (``Settings`` reads ``.env`` from the cwd)::
 The first two print a one-time token, so they refuse (exit 2) unless stdout is
 a terminal: a launchd or CI log must never capture a credential. They create
 ``DATA_DIR`` (0700) if it is missing and migrate the DB first. ``--check``
-prints no secret and never creates anything. Part 5's CLI replaces this module
-and calls the same ``accounts.service`` functions.
+prints no secret and never creates anything. The ``wispralt`` CLI is the main
+entry point (``wispralt setup`` / ``wispralt keys rotate-admin``); this module
+stays as a thin shim over the same ``cli.host`` functions.
 """
 
 from __future__ import annotations
@@ -23,9 +24,10 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
-from wispralt._errors import AlreadyBootstrapped, MigrationError
-from wispralt.accounts import service
+from wispralt._errors import AlreadyBootstrapped
 from wispralt.accounts.store import AccountStore
+from wispralt.cli import host
+from wispralt.cli.system import CliError
 from wispralt.database import Database
 
 if TYPE_CHECKING:
@@ -71,23 +73,6 @@ def _check(settings: Settings) -> int:
     return EXIT_OK if ok else EXIT_FAIL
 
 
-def _pick_admin(accounts: AccountStore, user_id: int | None) -> int | None:
-    admins = accounts.list_enabled_admins()
-    if not admins:
-        _err("No enabled admin exists: run without --rotate-admin to create one.")
-        return None
-    if user_id is not None:
-        if user_id not in {a.id for a in admins}:
-            _err(f"User {user_id} is not an enabled admin.")
-            return None
-        return user_id
-    if len(admins) > 1:
-        ids = ", ".join(f"{a.id} ({a.label})" for a in admins)
-        _err(f"Several enabled admins ({ids}): pass --user-id N.")
-        return None
-    return admins[0].id
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m wispralt.bootstrap")
     mode = parser.add_mutually_exclusive_group()
@@ -107,29 +92,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         return _check(settings)
 
-    settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    db = Database(settings.db_path)
     try:
-        db.migrate()
-    except MigrationError as exc:
-        _err(f"Database migration refused: {exc}")
-        return EXIT_FAIL
-    accounts = AccountStore(db)
-
-    if args.rotate_admin:
-        user_id = _pick_admin(accounts, args.user_id)
-        if user_id is None:
-            return EXIT_FAIL
-        _user, token = service.rotate_user_key(accounts, user_id)
-        _print_client_config(settings.server_url, token, heading="Admin key rotated.")
-        return EXIT_OK
-
-    try:
-        _user, token = service.bootstrap_first_admin(accounts, args.label)
+        if args.rotate_admin:
+            _user, token = host.rotate_admin(settings.data_dir, args.user_id)
+            heading = "Admin key rotated."
+        else:
+            _user, token = host.bootstrap_admin(settings.data_dir, args.label)
+            heading = "First admin created."
     except AlreadyBootstrapped:
         _err("An enabled admin already exists. Lost its key? Use --rotate-admin.")
         return EXIT_FAIL
-    _print_client_config(settings.server_url, token, heading="First admin created.")
+    except CliError as exc:
+        _err(exc.msg)
+        return EXIT_FAIL
+    _print_client_config(settings.server_url, token, heading=heading)
     return EXIT_OK
 
 

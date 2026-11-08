@@ -25,7 +25,7 @@ cd "$REPO_ROOT"
 
 VERSION="${1:?usage: $0 <version, e.g. 0.2.0>}"
 TAG="v${VERSION}"
-REPO_SLUG="omdiidi/miniWhisper"
+REPO_SLUG="${REPO_SLUG:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"  # owner/name of origin
 
 # 0. Pre-flight guards.
 

@@ -61,6 +61,17 @@ class UserProfile:
     last_seen_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class KeyRow:
+    """One API key (never its hash) for operator listings."""
+
+    id: int
+    user_id: int
+    user_label: str
+    created_at: datetime
+    revoked_at: datetime | None
+
+
 def _dt(ts: float | None) -> datetime | None:
     return None if ts is None else datetime.fromtimestamp(ts, tz=UTC)
 
@@ -129,6 +140,28 @@ class AccountStore:
                 " ORDER BY u.created_at DESC, u.id DESC"
             )
             return [_user_row(r) for r in rows]
+
+    def list_keys(self, user_id: int | None = None) -> list[KeyRow]:
+        """Every key (active and revoked), newest first; optionally one user's."""
+        where, params = (" WHERE k.user_id = ?", (user_id,)) if user_id is not None else ("", ())
+        with self.db.read() as con:
+            rows = con.execute(
+                "SELECT k.id, k.user_id, u.label, k.created_at, k.revoked_at"
+                "  FROM api_keys k JOIN users u ON u.id = k.user_id"
+                + where
+                + " ORDER BY k.created_at DESC, k.id DESC",
+                params,
+            )
+            return [
+                KeyRow(
+                    id=r["id"],
+                    user_id=r["user_id"],
+                    user_label=r["label"],
+                    created_at=datetime.fromtimestamp(r["created_at"], tz=UTC),
+                    revoked_at=_dt(r["revoked_at"]),
+                )
+                for r in rows
+            ]
 
     def count_kind(self, kind: str) -> int:
         """Enabled users of *kind*."""

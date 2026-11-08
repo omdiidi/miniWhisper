@@ -21,7 +21,7 @@ Once on the Mac mini that already runs WisprAlt server:
 3. **Restart the launchd agent** so the new env var and the Postgres pool
    come up:
    ```bash
-   bash scripts/server-launchd.sh restart
+   wispralt restart
    ```
 4. **Verify** — the lifespan auto-seeds the first admin row from
    `WISPRALT_API_KEY` if `wispralt.users` is empty. Confirm:
@@ -140,19 +140,9 @@ either roll back the commit (`git reset --hard HEAD~1`) or bump VERSION.
    is never persisted in plaintext anywhere.
 3. Text the token to the employee via Signal / iMessage. **Never email**
    — keys-in-email is a hard "no" per the brief.
-4. Tell them to run the `install.sh` curl one-liner from a Terminal,
-   substituting their token for `sk_xxx` (full guide in
-   [INSTALL.md](INSTALL.md)):
-
-   ```bash
-   curl -q -fsSL https://raw.githubusercontent.com/omdiidi/miniWhisper/main/install.sh \
-     | WISPRALT_API_KEY=sk_xxx WISPRALT_SERVER=https://transcribe.integrateapi.ai bash
-   ```
-
-   The installer downloads the latest signed DMG from GitHub Releases,
-   verifies the SHA256, copies the app to `/Applications`, strips
-   quarantine, seeds the API key into the Keychain, and opens the
-   System Settings panes for the three required permissions.
+4. Tell them to clone the repo and run `./install.sh --role client`
+   (full guide in [INSTALL.md](INSTALL.md)), then paste the server URL
+   and their token into the app's Settings.
 
 The employee's first dictation populates `wispralt.usage_events`; they
 appear on `/admin/users` with a non-null `last_seen_at`.
@@ -170,5 +160,5 @@ appear on `/admin/users` with a non-null `last_seen_at`.
 4. **For instant lockout** (no 60s wait), restart the launchd agent —
    the cache is in-process only:
    ```bash
-   bash scripts/server-launchd.sh restart
+   wispralt restart
    ```

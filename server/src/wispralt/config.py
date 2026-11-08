@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     server_url: str
 
     # Local-mode data root: wispralt.db, outputs/ and staging/ live here.
-    # Required and absolute (an empty value would mean cwd). setup-server.sh
-    # writes it into .env; the server never creates it (bootstrap does).
+    # Required and absolute (an empty value would mean cwd). `wispralt setup`
+    # writes it into .env; the server never creates it (setup does).
     data_dir: Path
 
     # Upload guard (default 2 GiB)
