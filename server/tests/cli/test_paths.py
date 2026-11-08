@@ -156,3 +156,13 @@ def test_unknown_state_keys_are_ignored(tmp_path: Path) -> None:
     path.write_text(json.dumps({"role": "client", "future": 1}))
     st = p.InstallState.load(path)
     assert st is not None and st.role == "client"
+
+
+def test_set_values_replaces_in_place_and_appends(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("# note\nexport SERVER_URL=old\nA=1\nSERVER_URL=dup")
+    assert p.set_values(env, {"SERVER_URL": "https://new", "B": "2"}) == ["SERVER_URL", "B"]
+    assert env.read_text() == '# note\nSERVER_URL="https://new"\nA=1\nB="2"\n'
+    assert p.set_values(env, {"SERVER_URL": "https://new"}) == []
+    with pytest.raises(p.CliError):
+        p.set_values(env, {"X": 'a"b'})

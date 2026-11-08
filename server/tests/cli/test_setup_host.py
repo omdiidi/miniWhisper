@@ -189,3 +189,26 @@ def test_unhealthy_service_fails_after_the_key_is_handed_over(
     code, _, err = _setup(cli, clone, "--token-file", str(tok), "--no-open")
     assert code == 1 and "server.err.log" in err
     assert tok.exists()  # minted before the health wait, so it is never lost
+
+
+def test_rerun_with_explicit_server_url_and_port_updates_env(
+    cli: CliFn, hub: FakeHub, clone: Path, tmp_path: Path
+) -> None:
+    """Review fix: explicit flags on a rerun win; defaults never clobber."""
+    assert _setup(cli, clone, "--token-file", str(tmp_path / "a.key"), "--no-open")[0] == 0
+    paths = Paths.resolve()
+    with paths.env_file.open("a") as f:
+        f.write("# keep me\n")
+    assert _setup(cli, clone, "--no-open", "--port", "8123")[0] == 0
+    env = dotenv_values(paths.env_file)
+    assert env["SERVER_URL"] == "http://127.0.0.1:8123"  # the loopback default follows --port
+    code, _, err = _setup(cli, clone, "--no-open", "--server-url", "https://t.example.com")
+    assert code == 0, err
+    assert dotenv_values(paths.env_file)["SERVER_URL"] == "https://t.example.com"
+    assert _setup(cli, clone, "--no-open", "--port", "8124")[0] == 0  # a public URL stays
+    text = paths.env_file.read_text()
+    assert dotenv_values(paths.env_file)["SERVER_URL"] == "https://t.example.com"
+    assert text.count("SERVER_URL=") == 1 and "# keep me" in text
+    before = paths.env_file.read_bytes()
+    assert _setup(cli, clone, "--no-open")[0] == 0  # no flags: no byte changes
+    assert paths.env_file.read_bytes() == before
